@@ -1,0 +1,29 @@
+{
+  "name": "@veritas/llm",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Claude クライアント抽象。サブスク認証の claude CLI を叩く(従量 API にしない。DESIGN 前提)",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --import tsx --disable-warning=ExperimentalWarning --test 'src/**/*.test.ts'",
+    "clean": "rm -rf dist *.tsbuildinfo"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.6",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  }
+}

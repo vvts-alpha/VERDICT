@@ -1,0 +1,26 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+*.tsbuildinfo
+
+# runtime artifacts (see DESIGN §10)
+runs/
+browser-profiles/
+
+# sqlite state stores
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# 資格情報を含む実 manifest(scope_manifest.example.json だけ残す)
+scope_manifest.json
+scope_manifest_*.json
+*.manifest.json
+vault.json
+.env
+
+# misc
+.DS_Store
+*.log

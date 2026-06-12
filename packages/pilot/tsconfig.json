@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "paths": {
+      "@veritas/core": ["../core/src/index.ts"],
+      "@veritas/crawler": ["../crawler/src/index.ts"],
+      "@veritas/llm": ["../llm/src/index.ts"],
+      "@veritas/scanner": ["../scanner/src/index.ts"]
+    }
+  },
+  "include": ["src/**/*.ts"]
+}

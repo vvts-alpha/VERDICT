@@ -1,0 +1,35 @@
+{
+  "name": "@veritas/cli",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Umbra Hands CLI — run / status / list (DESIGN §11, §12 M0)",
+  "bin": {
+    "veritas": "./dist/main.js"
+  },
+  "main": "./dist/main.js",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "clean": "rm -rf dist *.tsbuildinfo",
+    "dev": "node --import tsx --disable-warning=ExperimentalWarning src/main.ts"
+  },
+  "dependencies": {
+    "@veritas/agent": "workspace:*",
+    "@veritas/core": "workspace:*",
+    "@veritas/crawler": "workspace:*",
+    "@veritas/llm": "workspace:*",
+    "@veritas/pilot": "workspace:*",
+    "@veritas/scanner": "workspace:*",
+    "@veritas/server": "workspace:*",
+    "@veritas/webui": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.6",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  }
+}

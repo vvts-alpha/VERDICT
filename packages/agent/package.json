@@ -1,0 +1,35 @@
+{
+  "name": "@veritas/agent",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Phase2 ビジネスロジック: 画面別に攻撃仮説を生成(LLM)→ 証拠規律で検証(DESIGN §7.2/§7.4)",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --import tsx --disable-warning=ExperimentalWarning --test 'src/**/*.test.ts'",
+    "clean": "rm -rf dist *.tsbuildinfo"
+  },
+  "dependencies": {
+    "@veritas/core": "workspace:*",
+    "@veritas/llm": "workspace:*",
+    "@veritas/scanner": "workspace:*",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.6",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  }
+}

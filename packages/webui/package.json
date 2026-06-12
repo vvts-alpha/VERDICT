@@ -1,0 +1,25 @@
+{
+  "name": "@veritas/webui",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "観測 WebUI(React 3 ペイン: 状態バー + サイトツリー + 画面詳細。DESIGN §8)",
+  "scripts": {
+    "build": "vite build",
+    "typecheck": "tsc -p tsconfig.json",
+    "dev": "vite",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@veritas/core": "workspace:*",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.7.3",
+    "vite": "^6.0.7"
+  }
+}

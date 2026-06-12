@@ -1,0 +1,22 @@
+import type { HumanHandoff } from "@veritas/core";
+
+// DESIGN §6.3 / §8.3 — 人間ハンドオフ通知。人間が生ブラウザでログイン完了後「続行」を押す。
+export function HandoffBar({ handoffs, onResolve }: { handoffs: HumanHandoff[]; onResolve: (id: string) => void }) {
+  const pending = handoffs.filter((h) => h.status === "pending");
+  if (pending.length === 0) return null;
+  return (
+    <div className="handoffs">
+      {pending.map((h) => (
+        <div key={h.id} className="handoff">
+          <span className="hicon">🔐</span>
+          <span className="htext">
+            要・人間対応 [{h.reason}]: <b className="mono">{h.url ?? ""}</b> — {h.message}
+          </span>
+          <button type="button" onClick={() => onResolve(h.id)}>
+            ログイン完了 → 続行
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}

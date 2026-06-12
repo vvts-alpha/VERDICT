@@ -1,0 +1,22 @@
+{
+  "_comment": "VERITAS 事前情報フォーマット。`assess --manifest <file>` で読む。資格情報を含む実ファイルは gitignore(scope_manifest.json / *.manifest.json)。",
+
+  "target": "http://192.168.74.148:3000/",
+
+  "scope": {
+    "inScopeHosts": ["192.168.74.148:3000"],
+    "outOfScopePathPrefixes": ["/logout"],
+    "rate": { "requestsPerMinute": 30, "maxConcurrent": 2 }
+  },
+
+  "crawl": { "followLinks": true, "maxDepth": 10 },
+  "model": "claude-opus-4-8",
+
+  "auth": {
+    "_note": "資格情報(name/pass)だけ。ログインURL・フォーム項目はエージェントが自動発見する。roles[0]=主ログイン、全部=auth-diff(権限比較)。実ファイルは gitignore、state.sqlite には書かれない。CAPTCHA/MFA で詰まったら headed ブラウザで人手(--login-wait)。",
+    "roles": [
+      { "name": "alice", "pass": "abc123" },
+      { "name": "bob",   "pass": "def456" }
+    ]
+  }
+}

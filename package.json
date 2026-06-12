@@ -1,0 +1,17 @@
+{
+  "name": "veritas-newagent",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "VERITAS NewAgent — autonomous web/API pentest agent (TypeScript monorepo)",
+  "packageManager": "pnpm@9.15.4",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "build": "pnpm -r run build",
+    "typecheck": "pnpm -r run typecheck",
+    "test": "pnpm -r run test",
+    "clean": "pnpm -r run clean"
+  }
+}

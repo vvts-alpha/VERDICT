@@ -1,0 +1,35 @@
+{
+  "name": "@veritas/crawler",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Phase1: Playwright crawl + 傍受 + dedup + rule-based labeling → screen_inventory.json (DESIGN §6)",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --import tsx --disable-warning=ExperimentalWarning --test 'src/**/*.test.ts'",
+    "clean": "rm -rf dist *.tsbuildinfo"
+  },
+  "dependencies": {
+    "@veritas/core": "workspace:*",
+    "@veritas/llm": "workspace:*",
+    "playwright-core": "^1.49.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.6",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  }
+}
