@@ -110,7 +110,14 @@ WebUI で **SITE TREE / Screen(スクショ+API+findings)/ Findings / APIs / 診
 
 ## manifest(scope + 認証)
 
-`scope_manifest.example.json` を参照。資格情報を含む実ファイルは gitignore すること。
+手書きするなら `scope_manifest.example.json` を参照。対話型で作るなら:
+
+```bash
+node packages/cli/dist/main.js manifest          # 質問に答えると scope_manifest_<host>.json を生成
+node packages/cli/dist/main.js manifest --out m.json
+```
+
+資格情報を含む実ファイルは gitignore すること(生成名 `scope_manifest_*.json` は既に対象)。
 
 ```json
 {
@@ -144,6 +151,7 @@ WebUI で **SITE TREE / Screen(スクショ+API+findings)/ Findings / APIs / 診
 
 | コマンド | 用途 |
 |---|---|
+| `manifest`(別名 `init`) | **対話型 scope-manifest ジェネレータ**: 質問に答えるだけで manifest JSON を生成(target / in・out-of-scope hosts・path / rate / crawl / model / 認証ロール)。`--out <file>` で出力先指定、password はエコー伏字。生成名 `scope_manifest_<host>.json` は gitignore 済み |
 | **`pilot`** | Claude 主導アセスメント(full)。`--manifest` / `--url`、`--model`、`--max-turns`、`--rate`、`--headed`、`--browser-path`、`--no-sandbox`、`--burp-proxy <url>`、`--keepalive-min <n>`(認証セッション維持: 画面の合間にトップへ navigate して cookie 再同期。既定 4 分、`0` で無効) |
 | `pilot --survey-only` | **調査のみ**: 画面マップ+スクショ+API だけ。診断/finding はしない(安い recon、後で `--resume`) |
 | `pilot --resume --id <id>` | 既存 run の**未診断(queued)画面だけ**診断(落ちた run の仕上げ / survey-only の続き) |

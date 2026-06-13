@@ -53,6 +53,7 @@ pnpm --filter @veritas/cli dev <command> [opts]            # tsx, src-resolved
 
 | Command | Purpose |
 |---|---|
+| `manifest` (alias `init`) | Interactive scope-manifest generator (`node:readline` line-queue, no deps): prompts for target / in·out-of-scope hosts+paths / rate / crawl / model / auth roles → writes the `AssessManifest` JSON that `pilot`/`assess` read. `--out <file>` / `--force`; passwords are read with echo masked. Default name `scope_manifest_<host>.json` is gitignored. |
 | `pilot` | **Claude-led, staged** assessment (survey → methodology → diagnosis). `--manifest`/`--url`, `--model` (deep) + `--fast-model` (model tiering), `--max-turns`, `--headed`, `--burp-proxy <url>` (route all traffic through Burp; off by default = unchanged), `--keepalive-min <n>` (touch the top page between screens to keep an authed session warm; default 4, `0` = off). |
 | `pilot --survey-only` | Map only (screens + screenshots + APIs); no methodology/diagnosis/findings. Cheap recon → resume later. |
 | `pilot --resume --id <id>` | Continue an existing run: skip survey/methodology, diagnose only non-terminal (queued) screens. Reuses the run's browser-profile for auth. |

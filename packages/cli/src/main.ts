@@ -33,6 +33,9 @@ const RUNS_DIR_DEFAULT = "runs";
 const USAGE = `veritas <command> [options]
 
 commands:
+  manifest [--out <file.json>] [--force]   (別名: init)
+            対話型 scope-manifest ジェネレータ: 質問に答えると pilot/assess が読む JSON を生成
+            (target / in・out-of-scope hosts・path / rate / crawl / model / 認証ロール。password はエコー伏字)
   pilot   --manifest <file.json> | --url <url> [--model <m>] [--fast-model <m>] [--max-turns <n>] [--rate <ms>] [--headed] [--browser-path <bin>] [--no-sandbox] [--out <dir>]
             ★Claude 主導: Claude がツール(browser/http/login/record)を操縦して自律的に探索・検証・記録
             manifest の auth.roles を login(role) ツールで使う。決定論パイプラインより柔軟(従量API無し/Maxサブスク)
@@ -1136,9 +1139,158 @@ async function cmdBurpImport(args: string[]): Promise<void> {
   console.log(`\nburp-import ${id}: ${issues.length} issue(s) → +${added} net-new(dup ${skipped} / out-of-scope ${oos})`);
 }
 
+// 対話型 scope-manifest ジェネレータ(独立して使える。pilot/assess が読む JSON を組み立てる)。
+async function cmdManifest(args: string[]): Promise<void> {
+  const { values } = parseArgs({ args, options: { out: { type: "string" }, force: { type: "boolean" } } });
+  const { createInterface } = await import("node:readline/promises");
+  const isTty = process.stdin.isTTY === true;
+  const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: isTty });
+
+  // 行キュー(readline/promises の question はパイプ入力で 2 問目以降ハングするので 'line' イベントで読む)。
+  const queue: string[] = [];
+  const waiters: Array<{ res: (v: string) => void; rej: (e: Error) => void }> = [];
+  let closed = false;
+  rl.on("line", (l) => {
+    const w = waiters.shift();
+    if (w) w.res(l);
+    else queue.push(l);
+  });
+  rl.on("close", () => {
+    closed = true;
+    while (waiters.length) waiters.shift()?.rej(new Error("input closed"));
+  });
+  // パスワードのエコーを伏せる(端末スクロールバック/肩越し対策)。readline の出力フックを mute フラグで制御。
+  let muted = false;
+  const ri = rl as unknown as { _writeToOutput?: (s: string) => void };
+  const baseWrite = ri._writeToOutput?.bind(ri);
+  if (baseWrite) ri._writeToOutput = (s: string): void => { if (!muted) baseWrite(s); };
+
+  const readLine = (): Promise<string> => {
+    const q = queue.shift();
+    if (q !== undefined) return Promise.resolve(q);
+    if (closed) return Promise.reject(new Error("input closed"));
+    return new Promise((res, rej) => waiters.push({ res, rej }));
+  };
+  const ask = async (q: string, def?: string): Promise<string> => {
+    process.stdout.write(def ? `${q} [${def}]: ` : `${q}: `);
+    const a = (await readLine()).trim();
+    return a || def || "";
+  };
+  const askBool = async (q: string, def: boolean): Promise<boolean> =>
+    (await ask(`${q} (y/n)`, def ? "y" : "n")).toLowerCase().startsWith("y");
+  const askInt = async (q: string, def: number): Promise<number> => {
+    const n = Number.parseInt(await ask(q, String(def)), 10);
+    return Number.isFinite(n) ? n : def;
+  };
+  const askList = async (q: string): Promise<string[]> => {
+    const a = await ask(q);
+    return a ? a.split(",").map((s) => s.trim()).filter(Boolean) : [];
+  };
+  const askSecret = async (q: string): Promise<string> => {
+    process.stdout.write(`${q}: `);
+    muted = true;
+    try {
+      return (await readLine()).trim();
+    } finally {
+      muted = false;
+      process.stdout.write("\n");
+    }
+  };
+
+  type Role = { name: string; username?: string; password?: string; cookieFile?: string };
+
+  try {
+    console.log("\n=== Umbra Hands scope-manifest generator ===");
+    console.log("認可済みターゲットのみ。各項目は Enter で既定値。\n");
+
+    let target = "";
+    while (!target) {
+      target = await ask("Target seed URL (例 https://app.example.com/)");
+      try {
+        new URL(target);
+      } catch {
+        console.log("  ↳ 有効な URL を入力してください");
+        target = "";
+      }
+    }
+    const host = new URL(target).host;
+
+    console.log(`\n--- スコープ(既定 in-scope: ${host}) ---`);
+    const extraHosts = await askList("追加 in-scope hosts (カンマ区切り, 任意)");
+    const inScopeHosts = [...new Set([host, ...extraHosts])];
+    const outOfScopeHosts = await askList("Out-of-scope hosts (任意)");
+    const outOfScopePathPrefixes = await askList("Out-of-scope path prefixes (例 /logout,/signout)");
+    const approvalPathPrefixes = await askList("承認が要る path prefixes (機微領域。例 /admin)");
+    const requestsPerMinute = await askInt("Rate: requests / minute", 30);
+    const maxConcurrent = await askInt("Rate: max concurrent", 2);
+
+    console.log("\n--- クロール ---");
+    const followLinks = await askBool("リンクを辿る?", true);
+    const maxDepth = await askInt("最大深さ", 8);
+
+    const model = await ask("\nModel", "claude-sonnet-4-6");
+
+    console.log("\n--- 認証ロール(名前を空 Enter で終了) ---");
+    console.log("  資格情報 か 事前取得 Cookie ファイルのどちらか。[0]=主ログイン、複数指定で auth-diff。");
+    const roles: Role[] = [];
+    for (;;) {
+      const name = await ask(`\nRole #${roles.length + 1} name (空で終了)`);
+      if (!name) break;
+      const kind = (await ask("  種別: (c)資格情報 / (k)Cookie ファイル", "c")).toLowerCase();
+      if (kind.startsWith("k")) {
+        const cookieFile = await ask("  cookie ファイルのパス");
+        if (cookieFile) roles.push({ name, cookieFile });
+        else console.log("  ↳ パス未入力のためスキップ");
+      } else {
+        const username = await ask("  username (空なら role 名を使用)");
+        const password = await askSecret("  password");
+        if (password) roles.push(username ? { name, username, password } : { name, password });
+        else console.log("  ↳ password 未入力のためスキップ");
+      }
+    }
+
+    const manifest: AssessManifest = {
+      target,
+      scope: {
+        inScopeHosts,
+        outOfScopeHosts,
+        inScopePathPrefixes: ["/"],
+        outOfScopePathPrefixes,
+        approvalPathPrefixes,
+        approvalMethods: ["DELETE", "PUT", "PATCH"],
+        rate: { requestsPerMinute, maxConcurrent },
+      },
+      crawl: { followLinks, maxDepth },
+      model,
+    };
+    if (roles.length) manifest.auth = { roles };
+
+    const safeHost = host.replace(/[^a-zA-Z0-9._-]/g, "_");
+    const outPath = values.out ?? (await ask("\n出力ファイル", `scope_manifest_${safeHost}.json`));
+    if (existsSync(outPath) && !values.force) {
+      if (!(await askBool(`${outPath} は既に存在します。上書きしますか?`, false))) {
+        console.log("中止しました。");
+        return;
+      }
+    }
+    writeFileSync(outPath, `${JSON.stringify(manifest, null, 2)}\n`);
+    console.log(`\n✓ 書き出しました: ${outPath}`);
+    if (roles.length) {
+      console.log("⚠ 資格情報/Cookie を含む = 秘密ファイル。gitignore 済みパターン scope_manifest_*.json に一致させてください。");
+    }
+    console.log(`\n次の一手:\n  node packages/cli/dist/main.js pilot --manifest ${outPath} --model ${model}\n`);
+  } finally {
+    rl.close();
+  }
+}
+
 async function main(): Promise<void> {
   const [cmd, ...rest] = process.argv.slice(2);
   switch (cmd) {
+    case "manifest":
+    case "init":
+      await cmdManifest(rest);
+      return;
     case "assess":
       await cmdAssess(rest);
       return;
