@@ -195,7 +195,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
               turns += 1;
               const t = block.text.trim();
               opts.onText?.(t);
-              opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: `🤖 ${t.slice(0, 400)}` } });
+              opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: t.slice(0, 400) } });
             } else if (block.type === "tool_use") {
               opts.onTool?.(block.name, block.input);
             }

@@ -740,7 +740,7 @@ async function cmdPilot(args: string[]): Promise<void> {
       ...(values["keepalive-min"] ? { keepAliveMinutes: Number.parseInt(values["keepalive-min"], 10) } : {}),
       ...(browserPath ? { browserPath } : {}),
       ...(values["no-sandbox"] ? { noSandbox: true } : {}),
-      onText: (t) => console.log(`\n🤖 ${t}`),
+      onText: (t) => console.log(`\n${t}`),
       onTool: (n, i) => console.log(`  ⚙ ${n.replace("mcp__veritas__", "")} ${JSON.stringify(i).slice(0, 160)}`),
     });
     const finalState = store.loadAssessment(id);
