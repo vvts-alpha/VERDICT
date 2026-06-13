@@ -22,6 +22,60 @@ LLM は **`claude` CLI(Max サブスク認証)**を使う。従量 API キーは
 
 ---
 
+## 動作フロー
+
+```
+manifest (scope + 認証)
+   │
+   ├── pilot   ── Claude 主導 ── survey → methodology → diagnosis → report
+   └── assess  ── 決定論一括   ── crawl → label → scan → logic → report
+```
+
+`pilot` の中身(各ステージ = 1 回の `query()`。Claude が下のツールを操縦する):
+
+```
+pilot --manifest scope_manifest.json
+│
+├─ 0. 起動
+│     └─ manifest 読込 → scope ゲート構築(isInScope)→ 状態ストア(state.sqlite)初期化
+│
+├─ 1. 調査  survey ……………… 1× query()  〔fast-model〕
+│     ├─ browser_navigate / fill / click … 画面を巡回してマップ
+│     ├─ login(role) ……………………… 資格情報→smartLogin / cookieFile→注入
+│     ├─ probe_paths ………………………… 既知パス当て
+│     └─ survey_done ………………………… frontier(未訪問)が空で確定
+│           └─▶ Screen[] + スクショ + API 抽出 を永続化
+│
+├─ 2. 方法論  methodology …… 1× query()  〔fast-model〕
+│     ├─ get_inventory ……………………… 全画面の一覧
+│     └─ record_methodology ………… 画面ごとに「どのクラスをどう試すか」立案
+│           └─▶ plan を各 screen に紐付け
+│
+├─ 3. 診断  diagnosis ………… 1 画面 = 1× query()  〔高価値画面のみ deep-model〕
+│     │     ※ 画面の合間に keepalive(トップへ navigate + cookie 再同期)
+│     ├─ get_screen ………………………… 詳細 + plan を取得
+│     ├─ http_request / probe_params … 検証トラフィック
+│     ├─ verify_access ………………………… auth-bypass の機械 veto(302/401/403/login body は HARD veto)
+│     ├─ analyze_session …………………… cookie の構造・予測可能性を解析
+│     └─ record_finding ─────────┐
+│           証拠規律: 陰性コントロール失敗 + 2× positive replay でのみ confirmed
+│           catch-all / 0-byte-200 / login-redirect は refuted
+│           (カテゴリ × エンドポイント × param)で dedup
+│           └─▶ EvidenceStore に req/resp 全体(request.http.txt)を保存
+│
+└─ 4. レポート
+      └─ buildReport → runs/<id>/report.md
+
+   （全工程を通して WebUI が events ログを購読し、SITE TREE / 進捗 / findings をライブ投影）
+```
+
+モード差分:
+- `--survey-only` … **1 で停止**(map だけ。診断/finding なし)。後で `--resume` に繋ぐ。
+- `--resume --id <id>` … **1・2 をスキップ**し、3 を未診断(非 terminal)画面だけで再開。
+- `--burp-proxy <url>` … 全 HTTP+ブラウザ通信を Burp 経由(off で挙動不変)。スキャン後 `burp-import` で net-new を merge。
+
+---
+
 ## 前提・セットアップ
 
 - **Node.js >= 24**(状態ストアに組み込み `node:sqlite` を使用。native 依存なし)。`nvm use 24`。
@@ -175,7 +229,7 @@ node packages/cli/dist/main.js header-audit --id <run-id> --headers csp,hsts
 - **scope ゲートは全ネットワーク操作に**。out-of-scope は例外でなくブロック。
 - **証拠規律**: confirmed = 陰性コントロール + 2 positive replays。catch-all / 0-byte-200 / 不安定は refuted。手で confirmed にしない。
 - **LLM = `claude` CLI サブスク**(従量 API 不使用)。テストは `FakeLlmClient`。
-- **認証 = 資格情報のみ、Cookie 注入しない**。MFA/CAPTCHA は `detectStuck` → 非ブロッキング HumanHandoff(headed で人手)。
+- **認証 = operator 供給の資格情報 OR 事前 Cookie ファイル**(`smartLogin` / `loadCookieFile`)。エージェントは Cookie を捏造/盗まない。MFA/CAPTCHA で Cookie も無ければ `detectStuck` → 非ブロッキング HumanHandoff(headed で人手)。
 - **状態は append-only + 再生可能**。UI は純投影(`buildStateView` / `buildSiteTree`)。
 
 > 状態: ステージ型 Claude 主導 pilot(調査→方法論→診断)+ 決定論 assess、WebUI 観測、Burp/header 連携、survey-only/resume モード — すべて実装・実機検証済み。`pnpm -r test` は緑。
