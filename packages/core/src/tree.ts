@@ -42,33 +42,83 @@ function toNodes(children: Map<string, MutNode>): TreeNode[] {
     }));
 }
 
-/** screens(+ カバレッジ台帳)から URL 階層ツリー(forest)を構築。 */
+/** 画面のホスト(observedUrls 優先、無ければ絶対 urlTemplate から)。判らなければ null。 */
+function hostOf(screen: Screen): string | null {
+  for (const u of screen.observedUrls) {
+    try {
+      const h = new URL(u).host;
+      if (h) return h;
+    } catch {
+      /* not an absolute URL */
+    }
+  }
+  try {
+    const h = new URL(screen.urlTemplate).host;
+    if (h) return h;
+  } catch {
+    /* path-only */
+  }
+  return null;
+}
+
+const ensure = (level: Map<string, MutNode>, segment: string, path: string): MutNode => {
+  let node = level.get(segment);
+  if (!node) {
+    node = { segment, path, screenId: null, screenType: null, scanStatus: null, children: new Map() };
+    level.set(segment, node);
+  }
+  return node;
+};
+
+/** screen の urlTemplate を level 以下にパスとして畳み込み、葉に screen を載せる。
+ *  prefix は path(=折りたたみキー)の一意化のための接頭辞(マルチドメイン時はホスト名)。
+ *  ルート("/")の screen は homeNode(あれば)に直接載せる。 */
+function foldPath(
+  level: Map<string, MutNode>,
+  screen: Screen,
+  status: ScreenScanStatus | null,
+  prefix: string,
+  homeNode: MutNode | null,
+): void {
+  const segs = segmentsOf(screen.urlTemplate);
+  if (homeNode && segs.length === 1 && segs[0] === "/") {
+    homeNode.screenId = screen.screenId;
+    homeNode.screenType = screen.screenType;
+    homeNode.scanStatus = status;
+    return;
+  }
+  let cur = level;
+  let acc = prefix;
+  let node: MutNode | null = null;
+  for (const seg of segs) {
+    acc = seg === "/" ? `${prefix}/` : `${acc}/${seg}`;
+    node = ensure(cur, seg, acc);
+    cur = node.children;
+  }
+  if (node) {
+    node.screenId = screen.screenId;
+    node.screenType = screen.screenType;
+    node.scanStatus = status;
+  }
+}
+
+/** screens(+ カバレッジ台帳)から URL 階層ツリー(forest)を構築。
+ *  既知ホストが 2 つ以上にまたがる場合はトップをドメインで分ける(API が別ドメインの時に混ざらない)。
+ *  単一/不明ホストなら従来どおりパス森(ドメインはステータスバー側で判る)。 */
 export function buildSiteTree(screens: Screen[], scans: ScreenScan[]): TreeNode[] {
   const statusById = new Map(scans.map((s) => [s.screenId, s.status] as const));
+  const distinctHosts = new Set(screens.map(hostOf).filter((h): h is string => h !== null));
+  const groupByHost = distinctHosts.size >= 2;
+
   const roots = new Map<string, MutNode>();
-
-  const ensure = (level: Map<string, MutNode>, segment: string, path: string): MutNode => {
-    let node = level.get(segment);
-    if (!node) {
-      node = { segment, path, screenId: null, screenType: null, scanStatus: null, children: new Map() };
-      level.set(segment, node);
-    }
-    return node;
-  };
-
   for (const screen of screens) {
-    let level = roots;
-    let acc = "";
-    let node: MutNode | null = null;
-    for (const seg of segmentsOf(screen.urlTemplate)) {
-      acc = seg === "/" ? "/" : `${acc}/${seg}`;
-      node = ensure(level, seg, acc);
-      level = node.children;
-    }
-    if (node) {
-      node.screenId = screen.screenId;
-      node.screenType = screen.screenType;
-      node.scanStatus = statusById.get(screen.screenId) ?? null;
+    const status = statusById.get(screen.screenId) ?? null;
+    if (groupByHost) {
+      const host = hostOf(screen) ?? "(unknown host)";
+      const hostNode = ensure(roots, host, host); // トップ = ドメイン
+      foldPath(hostNode.children, screen, status, host, hostNode);
+    } else {
+      foldPath(roots, screen, status, "", null);
     }
   }
 

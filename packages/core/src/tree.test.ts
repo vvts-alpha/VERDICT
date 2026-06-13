@@ -8,11 +8,16 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-function screen(id: string, urlTemplate: string, screenType: Screen["screenType"] = "other"): Screen {
+function screen(
+  id: string,
+  urlTemplate: string,
+  screenType: Screen["screenType"] = "other",
+  observedUrls: string[] = [],
+): Screen {
   return {
     screenId: id,
     urlTemplate,
-    observedUrls: [],
+    observedUrls,
     authState: "unauth",
     screenType,
     description: "",
@@ -49,6 +54,40 @@ test("buildSiteTree folds urlTemplates into a hierarchy with scan badges", () =>
   assert.equal(detail?.path, "/products/{id}");
   assert.equal(detail?.screenType, "detail");
   assert.equal(detail?.scanStatus, "finding", "badge comes from the coverage ledger");
+});
+
+test("buildSiteTree groups by domain when screens span ≥2 hosts", () => {
+  const screens = [
+    screen("s-0001", "/", "dashboard", ["https://app.example.com/"]),
+    screen("s-0002", "/login", "auth", ["https://app.example.com/login"]),
+    screen("s-0003", "/v1/users/{id}", "detail", ["https://api.example.com/v1/users/42"]),
+    screen("s-0004", "/login", "auth", ["https://api.example.com/login"]), // 別ドメインの同名パスは混ざらない
+  ];
+  const tree = buildSiteTree(screens, []);
+
+  // トップ = ドメイン(ソート順)
+  assert.deepEqual(
+    tree.map((n) => n.segment),
+    ["api.example.com", "app.example.com"],
+  );
+
+  const app = tree.find((n) => n.segment === "app.example.com");
+  assert.equal(app?.screenId, "s-0001", "ルート(/)画面はドメインノードに直付け");
+  assert.deepEqual(app?.children.map((c) => c.segment), ["login"]);
+
+  const api = tree.find((n) => n.segment === "api.example.com");
+  // 同名 /login が別ドメイン配下に独立して存在(path はホストで一意化)
+  assert.equal(api?.children.find((c) => c.segment === "login")?.path, "api.example.com/login");
+  assert.equal(app?.children.find((c) => c.segment === "login")?.path, "app.example.com/login");
+});
+
+test("buildSiteTree stays a flat path forest for a single host", () => {
+  const screens = [
+    screen("s-0001", "/", "dashboard", ["https://app.example.com/"]),
+    screen("s-0002", "/products", "listing", ["https://app.example.com/products"]),
+  ];
+  const tree = buildSiteTree(screens, []);
+  assert.deepEqual(tree.map((n) => n.segment), ["/", "products"], "単一ドメインはドメイン段を足さない");
 });
 
 test("buildStateView projects AssessmentState for the UI", () => {
