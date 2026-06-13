@@ -13,6 +13,7 @@ import type { EvidenceStore, FetchHttpClient, HttpRequest, HttpResponse } from "
 import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { join } from "node:path";
+import { readFileSync } from "node:fs";
 
 export interface PilotSession {
   driver: PlaywrightDriver;
@@ -25,6 +26,8 @@ export interface PilotSession {
   scope: ScopePolicy;
   targetUrl: string;
   roleCreds: Map<string, LoginCreds>;
+  /** ロール名 → 事前取得 Cookie ファイルのパス(資格情報の代わり。自動ログインできない壁向け)。 */
+  roleCookieFiles: Map<string, string>;
   loginLlm: LlmClient;
   currentCookie: string;
   currentRole: string;
@@ -175,6 +178,44 @@ const PARAM_PROBES: Array<{ name: string; value: string; kind: "idor" | "redirec
 
 function cookieHeader(s: PilotSession): Record<string, string> {
   return s.currentCookie ? { cookie: s.currentCookie } : {};
+}
+
+/** operator 提供の Cookie ファイルを読む。生 Cookie ヘッダ("a=1; b=2")/ Playwright storageState JSON
+ *  ({cookies:[...]})/ 単純配列([{name,value}])を自動判別 → http 用ヘッダ + ブラウザ注入用 cookie。 */
+export function loadCookieFile(
+  path: string,
+  targetUrl: string,
+): { header: string; browserCookies: Array<{ name: string; value: string; domain: string; path: string }> } {
+  const raw = readFileSync(path, "utf8").trim();
+  let host = "";
+  try {
+    host = new URL(targetUrl).hostname;
+  } catch {
+    host = "";
+  }
+  // JSON(storageState or 配列)を試す
+  try {
+    const j = JSON.parse(raw) as unknown;
+    const arr = Array.isArray(j) ? j : ((j as { cookies?: unknown[] }).cookies ?? []);
+    const bc = (arr as Array<{ name?: string; value?: unknown; domain?: string; path?: string }>)
+      .filter((c) => c && c.name)
+      .map((c) => ({ name: c.name as string, value: String(c.value ?? ""), domain: c.domain || host, path: c.path || "/" }));
+    if (bc.length > 0) return { header: bc.map((c) => `${c.name}=${c.value}`).join("; "), browserCookies: bc };
+  } catch {
+    /* JSON でない → 生ヘッダ扱い */
+  }
+  // 生 Cookie ヘッダ: "Cookie: a=1; b=2" または "a=1; b=2"
+  const header = raw.replace(/^cookie:\s*/i, "").split(/\r?\n/)[0]?.trim() ?? "";
+  const browserCookies = header
+    .split(";")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((kv) => {
+      const i = kv.indexOf("=");
+      return { name: kv.slice(0, i).trim(), value: kv.slice(i + 1).trim(), domain: host, path: "/" };
+    })
+    .filter((c) => c.name);
+  return { header, browserCookies };
 }
 
 // ── auth-bypass の hybrid 判定: 機械が「明白に認証が効いてる」を veto、グレーだけ Claude に渡す ──
@@ -436,7 +477,7 @@ export function buildTools(s: PilotSession) {
           screenId: s.currentScreenId ?? "pilot",
           validator: "claude-pilot",
           kind: "positive_replay",
-          request: req,
+          request: { ...req, headers: s.http.effectiveHeaders(req.headers) }, // 送信ヘッダ全部を証拠に残す
           response: res,
           note: note ?? `${req.method} ${url} as ${s.currentRole || "unauth"}`,
         });
@@ -456,8 +497,27 @@ export function buildTools(s: PilotSession) {
       "Log in as one of the provided roles to reach authenticated surface. Updates the browser + http session to that role.",
       { role: z.string() },
       async ({ role }) => {
+        // ① 事前取得 Cookie ファイルがあれば、ログインせずに注入(自動ログイン不能な壁向け)。
+        const cookieFile = s.roleCookieFiles.get(role);
+        if (cookieFile) {
+          try {
+            const { header, browserCookies } = loadCookieFile(cookieFile, s.targetUrl);
+            if (!header) return txt(`cookie file for '${role}' is empty/unparseable: ${cookieFile}`);
+            await s.driver.clearSession();
+            await s.driver.addCookies(browserCookies);
+            s.currentCookie = header;
+            s.currentRole = role;
+            return txt(`role '${role}': injected ${browserCookies.length} pre-captured cookie(s) from file (no login).`);
+          } catch (e) {
+            return txt(`cookie file error for '${role}': ${String(e).slice(0, 150)}`);
+          }
+        }
+        // ② 資格情報で smartLogin。
         const creds = s.roleCreds.get(role);
-        if (!creds) return txt(`no credentials for '${role}'. Available roles: ${[...s.roleCreds.keys()].join(", ") || "none"}`);
+        if (!creds) {
+          const avail = [...new Set([...s.roleCreds.keys(), ...s.roleCookieFiles.keys()])].join(", ") || "none";
+          return txt(`no credentials/cookie for '${role}'. Available roles: ${avail}`);
+        }
         try {
           await s.driver.clearSession();
           const r = await smartLogin(s.driver, s.loginLlm, creds, {
@@ -628,7 +688,7 @@ export function buildTools(s: PilotSession) {
             screenId: s.currentScreenId ?? "pilot",
             validator: "claude-pilot",
             kind: "positive_replay",
-            request: { method: "GET", url: u, headers: cookieHeader(s), body: null },
+            request: { method: "GET", url: u, headers: s.http.effectiveHeaders(cookieHeader(s)), body: null },
             response: res,
             note: `probe ${pr.name}=${pr.value} (${pr.kind})`,
           });
@@ -713,7 +773,7 @@ export function buildTools(s: PilotSession) {
             screenId: s.currentScreenId ?? "pilot",
             validator: "verify_access",
             kind: "negative_control",
-            request: { method: "GET", url, headers: {}, body: null },
+            request: { method: "GET", url, headers: s.http.effectiveHeaders({}), body: null },
             response: rUnauth,
             note: "unauthenticated access attempt",
           }).id,
@@ -724,7 +784,7 @@ export function buildTools(s: PilotSession) {
               screenId: s.currentScreenId ?? "pilot",
               validator: "verify_access",
               kind: "positive_replay",
-              request: { method: "GET", url, headers: cookieHeader(s), body: null },
+              request: { method: "GET", url, headers: s.http.effectiveHeaders(cookieHeader(s)), body: null },
               response: rAuth,
               note: `authenticated baseline as ${s.currentRole || "?"}`,
             }).id,

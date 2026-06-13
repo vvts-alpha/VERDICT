@@ -6,7 +6,7 @@
 
 import { createSdkMcpServer, query } from "@anthropic-ai/claude-agent-sdk";
 import type { AssessmentStore, Screen, ScopePolicy } from "@veritas/core";
-import { isInScope } from "@veritas/core";
+import { isInScope, recordTokens } from "@veritas/core";
 import type { LoginCreds } from "@veritas/crawler";
 import { InventoryBuilder, PlaywrightDriver } from "@veritas/crawler";
 import { ClaudeCliClient } from "@veritas/llm";
@@ -23,6 +23,8 @@ export interface RunPilotOptions {
   profileDir: string;
   artifactsDir: string;
   roleCreds: Map<string, LoginCreds>;
+  /** ロール名 → 事前取得 Cookie ファイルのパス(資格情報の代わり。自動ログイン不能な壁向け)。 */
+  roleCookieFiles?: Map<string, string>;
   /** 診断の「深い」モデル(創発が要る高価値画面)。例 claude-opus-4-8。未指定なら SDK 既定。 */
   model?: string;
   /** survey/methodology/login と低価値画面の「速い」モデル(例 claude-sonnet-4-6)。
@@ -42,6 +44,9 @@ export interface RunPilotOptions {
   surveyOnly?: boolean;
   /** Burp 等の上流プロキシ(例 http://127.0.0.1:8080)。指定時のみ HTTP+ブラウザを経由。未指定=現状通り。 */
   burpProxy?: string;
+  /** 認証セッション維持: 診断中、この分数を超えて間が空いたら画面の合間にトップへ navigate して
+   *  cookie を再同期する(0 で無効)。sliding/短命トークンの stale 化対策。既定 4 分。 */
+  keepAliveMinutes?: number;
   onText?: (text: string) => void;
   onTool?: (name: string, input: unknown) => void;
 }
@@ -50,6 +55,10 @@ export interface PilotResult {
   findings: PilotSession["findings"];
   summary: string;
   turns: number;
+  /** この run で使ったトークン(input+output+cache の合計)。 */
+  tokensUsed: number;
+  /** この run の概算コスト(USD。サブスクなら API 換算の目安)。 */
+  costUsd: number;
 }
 
 const DISALLOWED = ["Bash", "Read", "Write", "Edit", "NotebookEdit", "WebFetch", "WebSearch", "Glob", "Grep"];
@@ -94,6 +103,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     scope: opts.scope,
     targetUrl: opts.targetUrl,
     roleCreds: opts.roleCreds,
+    roleCookieFiles: opts.roleCookieFiles ?? new Map(),
     loginLlm: new ClaudeCliClient({ defaultModel: fastModel ?? "claude-sonnet-4-6" }),
     currentCookie: "",
     currentRole: "",
@@ -117,7 +127,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
   };
 
   const server = createSdkMcpServer({ name: "veritas", version: "1.0.0", tools: buildTools(session) });
-  const rolesLine = [...opts.roleCreds.keys()].join(", ") || "none";
+  const rolesLine = [...new Set([...opts.roleCreds.keys(), ...(opts.roleCookieFiles?.keys() ?? [])])].join(", ") || "none";
   const maxTurns = opts.maxTurns ?? 60;
 
   // ── resume: 既存 run から再シード(survey/methodology はスキップ、未診断画面だけ診断) ──
@@ -149,6 +159,11 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       payload: { message: `↺ resume: ${prev.screens.length} screens / ${prev.findings.length} findings 引継ぎ、残り未診断画面を診断` },
     });
   }
+
+  // トークン使用量: 各 query() の result からトークンを拾い、run の budget(累計)に貯めて永続化。
+  let budget = (prev ?? opts.store.loadAssessment(opts.assessmentId))?.budget ?? null;
+  let runTokens = 0; // この run の増分(サマリ表示用)
+  let costUsd = 0;
 
   // 1 ステージ = 1 query()。stage の done フラグが立つか、Claude が手を止めたら抜ける。
   const runStage = async (p: {
@@ -185,6 +200,22 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
               opts.onTool?.(block.name, block.input);
             }
           }
+        } else if (msg.type === "result") {
+          // query() 終了時の usage を budget に積む(input+output+cache)。
+          const r = msg as unknown as { usage?: Record<string, number>; total_cost_usd?: number };
+          const u = r.usage;
+          if (u) {
+            const delta =
+              (u.input_tokens ?? 0) + (u.output_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0);
+            if (delta > 0) {
+              runTokens += delta;
+              if (budget) {
+                budget = recordTokens(budget, delta);
+                opts.store.updateBudget(opts.assessmentId, budget); // WebUI/status にライブ反映
+              }
+            }
+          }
+          costUsd += r.total_cost_usd ?? 0;
         }
         if (p.shouldStop()) break;
       }
@@ -234,16 +265,43 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     // ── STAGE 3: 診断(1 画面ずつ。台帳の queued を潰し切る) ── ※ survey-only ならスキップ
     if (!opts.surveyOnly && !session.done) {
       opts.store.setPhase(opts.assessmentId, "phase2_scan");
-      const all = session.inv.screens().slice(0, opts.maxScreens ?? 40);
-      // resume 時は terminal(clean/finding/excluded)を飛ばし、未診断だけ回す。
+      // resume 時は terminal(clean/finding/excluded)を**先に**飛ばし、未診断だけを maxScreens まで回す。
+      // ※ slice を先にすると先頭が全部 terminal の場合に queued を見ずに 0 件で終わる(バグだった)。
       const TERMINAL = new Set(["clean", "finding", "excluded"]);
-      const screens = resumeStatus
-        ? all.filter((sc) => !TERMINAL.has(resumeStatus.get(sc.screenId) ?? "queued"))
-        : all;
+      const candidates = resumeStatus
+        ? session.inv.screens().filter((sc) => !TERMINAL.has(resumeStatus.get(sc.screenId) ?? "queued"))
+        : session.inv.screens();
+      const screens = candidates.slice(0, opts.maxScreens ?? 40);
+      opts.onText?.(
+        `🔬 diagnosing ${screens.length} screen(s)${resumeStatus ? ` of ${candidates.length} queued` : ""}${candidates.length > screens.length ? ` (capped at ${opts.maxScreens ?? 40}; resume again or raise --max-screens for the rest)` : ""}`,
+      );
       // 複数エンドポイントの画面は IDOR 確定までに >25 turn 要る。25 だと記録直前で頭打ちしていた。
       const perScreen = Math.min(maxTurns, 40);
+
+      // ── 認証セッション維持(A) ── 画面の合間に間が空いたらトップへ navigate して cookie を再同期。
+      //   sliding/短命トークンが生 HTTP 経路で stale 化するのを防ぐ。currentCookie が無い(unauth)なら何もしない。
+      const keepAliveMs = (opts.keepAliveMinutes ?? 4) * 60_000;
+      let lastTouch = Date.now();
+      const keepSessionWarm = async (): Promise<void> => {
+        if (keepAliveMs <= 0 || !session.currentCookie) return;
+        if (Date.now() - lastTouch < keepAliveMs) return;
+        try {
+          await driver.gotoUrl(opts.targetUrl); // browser 経路でトップへ(Set-Cookie ローテーションに追従)
+          const fresh = await driver.sessionCookieHeader(); // 生 HTTP 経路の cookie も再同期
+          if (fresh) session.currentCookie = fresh;
+          opts.store.appendEvent(opts.assessmentId, {
+            type: "note",
+            payload: { message: "🫀 keepalive: トップへ navigate + cookie 再同期(セッション維持)" },
+          });
+        } catch (e) {
+          opts.onText?.(`⚠ keepalive failed: ${String(e).slice(0, 120)}`);
+        }
+        lastTouch = Date.now();
+      };
+
       for (const sc of screens) {
         if (session.done) break;
+        await keepSessionWarm();
         session.currentScreenId = sc.screenId;
         session.screenDone = false;
         session.screenVerdict = null;
@@ -274,5 +332,5 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     ? `survey only: ${session.inv.screens().length} screen(s) mapped (not diagnosed; resume to diagnose).`
     : session.doneSummary ||
       `${session.findings.length} finding(s) across ${session.inv.screens().length} screen(s).`;
-  return { findings: session.findings, summary, turns };
+  return { findings: session.findings, summary, turns, tokensUsed: runTokens, costUsd };
 }

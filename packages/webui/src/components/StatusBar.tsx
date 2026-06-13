@@ -30,6 +30,10 @@ export function StatusBar({
         findings: <b>{view.findings.length}</b>
       </span>
       <span>
+        tokens:{" "}
+        <b>{view.budget.tokensUsed >= 1000 ? `${(view.budget.tokensUsed / 1000).toFixed(1)}k` : view.budget.tokensUsed}</b>
+      </span>
+      <span>
         handoffs: <b>{view.handoffs.filter((h) => h.status === "pending").length}</b>
       </span>
       <button type="button" className="pausebtn" onClick={onTogglePause}>

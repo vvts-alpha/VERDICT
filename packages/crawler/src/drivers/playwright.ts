@@ -410,6 +410,14 @@ export class PlaywrightDriver implements Driver {
     await this.context.clearCookies().catch(() => {});
   }
 
+  /** operator が事前取得した Cookie をコンテキストに注入(Cookie ファイル認証用)。 */
+  async addCookies(
+    cookies: Array<{ name: string; value: string; domain?: string; path?: string; url?: string; httpOnly?: boolean; secure?: boolean }>,
+  ): Promise<void> {
+    if (cookies.length === 0) return;
+    await this.context.addCookies(cookies as Parameters<BrowserContext["addCookies"]>[0]).catch(() => {});
+  }
+
   /** 現在ページの URL(ログイン後の着地点 = 認証済み再クロールの起点に使う)。 */
   currentUrl(): string {
     return this.page.url();

@@ -222,11 +222,20 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptio
     } catch {
       /* no body */
     }
+    const readText = (f: string): string | null => {
+      try {
+        return readFileSync(join(found as string, f), "utf8");
+      } catch {
+        return null;
+      }
+    };
     sendJson(res, 200, {
       request: readJson("request.json"),
       response: readJson("response.json"),
       meta: readJson("meta.json"),
       body: body.slice(0, 20000),
+      requestRaw: readText("request.http.txt"), // リクエスト全体(生 HTTP)
+      responseRaw: readText("response.http.txt")?.slice(0, 24000) ?? null,
     });
     return;
   }

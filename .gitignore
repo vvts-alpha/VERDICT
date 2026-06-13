@@ -21,6 +21,14 @@ scope_manifest_*.json
 vault.json
 .env
 
+# 事前取得 Cookie ファイル(セッション秘密 — 絶対にコミットしない)
+cookies/
+*.cookies
+*.cookies.*
+*cookie*.json
+*cookie*.txt
+*_cookie*.json
+
 # misc
 .DS_Store
 *.log

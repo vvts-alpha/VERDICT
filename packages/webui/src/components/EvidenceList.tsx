@@ -1,10 +1,12 @@
 import { useState } from "react";
 
 interface Ev {
-  request?: { method?: string; url?: string; body?: string | null } | null;
+  request?: { method?: string; url?: string; headers?: Record<string, string>; body?: string | null } | null;
   response?: { status?: number; finalUrl?: string; headers?: Record<string, string> } | null;
   meta?: { kind?: string; note?: string } | null;
   body?: string;
+  requestRaw?: string | null; // リクエスト全体(生 HTTP)
+  responseRaw?: string | null;
 }
 
 const HDR_KEYS = ["content-type", "location", "set-cookie", "www-authenticate", "access-control-allow-origin"];
@@ -48,8 +50,22 @@ export function EvidenceList({ assessmentId, evidenceIds }: { assessmentId: stri
               ) : (
                 <div className="evbody">
                   <div className="evreq mono">
-                    <span className="evarrow">▷ req</span> <b>{d.request?.method}</b> {d.request?.url}
-                    {d.request?.body ? <pre className="evpre">{d.request.body}</pre> : null}
+                    <span className="evarrow">▷ request</span>
+                    {d.requestRaw ? (
+                      // リクエスト全体(生 HTTP: request line + 全ヘッダ + body)
+                      <pre className="evpre">{d.requestRaw}</pre>
+                    ) : (
+                      <>
+                        {" "}
+                        <b>{d.request?.method}</b> {d.request?.url}
+                        {d.request?.headers && Object.keys(d.request.headers).length ? (
+                          <pre className="evpre">
+                            {Object.entries(d.request.headers).map(([k, v]) => `${k}: ${v}`).join("\n")}
+                          </pre>
+                        ) : null}
+                        {d.request?.body ? <pre className="evpre">{d.request.body}</pre> : null}
+                      </>
+                    )}
                   </div>
                   <div className="evres mono">
                     <span className="evarrow">◁ res</span> <b>{d.response?.status}</b> {d.response?.finalUrl ?? ""}

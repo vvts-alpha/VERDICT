@@ -71,13 +71,16 @@ WebUI で **SITE TREE / Screen(スクショ+API+findings)/ Findings / APIs / 診
   "auth": {
     "roles": [
       { "name": "alice", "pass": "..." },
-      { "name": "bob",   "pass": "..." }
+      { "name": "bob",   "pass": "..." },
+      { "name": "carol", "cookieFile": "carol.cookies" }
     ]
   }
 }
 ```
 
-- **認証は資格情報だけでよい** — ログイン URL・フォーム項目はエージェントが自動発見(`smartLogin`)。MFA/CAPTCHA で詰まったら headed ブラウザで人手フォールバック(`detectStuck` が非ブロッキングで起票)。**Cookie/トークンは注入しない。**
+- **認証は資格情報だけでよい** — ログイン URL・フォーム項目はエージェントが自動発見(`smartLogin`)。`auth.roles[0]` = 主ログイン、複数 role = クロスユーザ/auth-diff のソース。
+- **事前取得 Cookie でもよい** — 自動ログインできない壁(Arkose/MFA 等)向けに、role に `cookieFile`(または `cookie_file_path`)を指定できる。中身は **生 `Cookie:` ヘッダ(`sid=…; foo=…`)** か **Playwright `storageState` JSON** のどちらでも可(自動判別)。`login(role)` がそれを **ブラウザ + http セッションに注入**してログインを省く。**Cookie ファイルはセッション秘密 → 必ず gitignore(`*.cookies` 等)。** エージェントが Cookie を捏造/盗むのではなく、operator が供給する点は不変。
+- MFA/CAPTCHA で Cookie も無ければ headed ブラウザで人手フォールバック(`detectStuck` が非ブロッキングで起票)。
 - `auth.roles[0]` = 主ログイン、複数 role = クロスユーザ/auth-diff のソース。
 - `--url <url>` で manifest 無し起動も可(scope は同一オリジン導出、認証なし)。
 
@@ -87,7 +90,7 @@ WebUI で **SITE TREE / Screen(スクショ+API+findings)/ Findings / APIs / 診
 
 | コマンド | 用途 |
 |---|---|
-| **`pilot`** | Claude 主導アセスメント(full)。`--manifest` / `--url`、`--model`、`--max-turns`、`--rate`、`--headed`、`--browser-path`、`--no-sandbox`、`--burp-proxy <url>` |
+| **`pilot`** | Claude 主導アセスメント(full)。`--manifest` / `--url`、`--model`、`--max-turns`、`--rate`、`--headed`、`--browser-path`、`--no-sandbox`、`--burp-proxy <url>`、`--keepalive-min <n>`(認証セッション維持: 画面の合間にトップへ navigate して cookie 再同期。既定 4 分、`0` で無効) |
 | `pilot --survey-only` | **調査のみ**: 画面マップ+スクショ+API だけ。診断/finding はしない(安い recon、後で `--resume`) |
 | `pilot --resume --id <id>` | 既存 run の**未診断(queued)画面だけ**診断(落ちた run の仕上げ / survey-only の続き) |
 | `assess` | 決定論パイプライン一括: crawl → label → scan → logic → report |

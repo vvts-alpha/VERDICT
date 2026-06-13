@@ -159,6 +159,7 @@ function cmdStatus(args: string[]): void {
     `  coverage: ${cov.terminal}/${cov.total} terminal, ${cov.remaining} remaining, ${cov.scannable} scannable${cov.complete ? " (complete)" : ""}`,
   );
   console.log(`  findings: ${state.findings.length}`);
+  console.log(`  tokens:   ${state.budget.tokensUsed.toLocaleString()} / ${state.budget.limits.maxTokens.toLocaleString()}`);
   console.log(`  handoffs: ${pending} pending`);
   console.log(`  events:   ${state.events.length}`);
   const stop = evaluateStop(state);
@@ -204,8 +205,10 @@ function cmdList(args: string[]): void {
     store.close();
     if (!state) continue;
     const cov = coverage(state);
+    const tk = state.budget.tokensUsed;
+    const tkStr = tk >= 1000 ? `${(tk / 1000).toFixed(1)}k` : `${tk}`;
     console.log(
-      `${state.id}  ${state.phase.padEnd(13)} screens=${state.screens.length} cov=${cov.terminal}/${cov.total} findings=${state.findings.length}  ${describeTarget(state.target)}`,
+      `${state.id}  ${state.phase.padEnd(13)} screens=${state.screens.length} cov=${cov.terminal}/${cov.total} findings=${state.findings.length} tok=${tkStr}  ${describeTarget(state.target)}`,
     );
   }
 }
@@ -373,6 +376,10 @@ interface AssessManifest {
       username?: string;
       pass?: string;
       password?: string;
+      /** 事前取得した Cookie ファイルのパス(pass の代わり。自動ログイン不能な壁向け)。 */
+      cookieFile?: string;
+      cookie_file?: string;
+      cookie_file_path?: string;
       headers?: Record<string, string>;
     }>;
   };
@@ -392,6 +399,16 @@ function manifestRoleCreds(m: AssessManifest | null): Array<{ name: string; cred
   for (const role of m?.auth?.roles ?? []) {
     const password = role.password ?? role.pass;
     if (password) out.push({ name: role.name, creds: { username: role.username ?? role.name, password } });
+  }
+  return out;
+}
+
+/** ロール名 → 事前取得 Cookie ファイル(pass の代わりに指定可能)。 */
+function manifestRoleCookies(m: AssessManifest | null): Array<{ name: string; file: string }> {
+  const out: Array<{ name: string; file: string }> = [];
+  for (const role of m?.auth?.roles ?? []) {
+    const file = role.cookieFile ?? role.cookie_file ?? role.cookie_file_path;
+    if (file) out.push({ name: role.name, file });
   }
   return out;
 }
@@ -641,7 +658,9 @@ async function cmdPilot(args: string[]): Promise<void> {
       headless: { type: "boolean" },
       rate: { type: "string" },
       "max-turns": { type: "string" },
+      "max-screens": { type: "string" },
       "burp-proxy": { type: "string" },
+      "keepalive-min": { type: "string" },
     },
   });
   const runsDir = values.out ?? RUNS_DIR_DEFAULT;
@@ -690,11 +709,14 @@ async function cmdPilot(args: string[]): Promise<void> {
   for (const rc of manifestRoleCreds(manifest)) roleCreds.set(rc.name, rc.creds);
   const primary = manifestPrimaryCreds(manifest);
   if (roleCreds.size === 0 && primary) roleCreds.set(primary.username || "user", primary);
+  const roleCookieFiles = new Map<string, string>();
+  for (const rc of manifestRoleCookies(manifest)) roleCookieFiles.set(rc.name, rc.file);
 
   const mode = surveyOnly ? " · survey-only" : resume ? " · resume" : "";
   console.log(`▶ pilot ${id}  (Claude 主導${mode})`);
   console.log(`  target ${seedUrl} | scope hosts=[${scope.inScopeHosts.join(",")}] | model ${model}${values["fast-model"] ? ` (deep) / ${values["fast-model"]} (fast)` : ""} | rate ${rate}ms`);
-  console.log(`  roles: ${[...roleCreds.keys()].join(", ") || "none"} | max-turns ${maxTurns}${surveyOnly ? " | 調査のみ(診断なし)" : resume ? " | 未診断画面だけ再開" : ""}\n`);
+  const allRoles = [...new Set([...roleCreds.keys(), ...roleCookieFiles.keys()])];
+  console.log(`  roles: ${allRoles.map((r) => (roleCookieFiles.has(r) ? `${r}(cookie)` : r)).join(", ") || "none"} | max-turns ${maxTurns}${surveyOnly ? " | 調査のみ(診断なし)" : resume ? " | 未診断画面だけ再開" : ""}\n`);
 
   try {
     const res = await runPilot({
@@ -711,8 +733,11 @@ async function cmdPilot(args: string[]): Promise<void> {
       headless: !headed,
       ...(resume ? { resume: true } : {}),
       ...(surveyOnly ? { surveyOnly: true } : {}),
+      ...(values["max-screens"] ? { maxScreens: Number.parseInt(values["max-screens"], 10) } : {}),
+      ...(roleCookieFiles.size ? { roleCookieFiles } : {}),
       ...(values["fast-model"] ? { fastModel: values["fast-model"] } : {}),
       ...(values["burp-proxy"] ? { burpProxy: values["burp-proxy"] } : {}),
+      ...(values["keepalive-min"] ? { keepAliveMinutes: Number.parseInt(values["keepalive-min"], 10) } : {}),
       ...(browserPath ? { browserPath } : {}),
       ...(values["no-sandbox"] ? { noSandbox: true } : {}),
       onText: (t) => console.log(`\n🤖 ${t}`),
@@ -720,7 +745,8 @@ async function cmdPilot(args: string[]): Promise<void> {
     });
     const finalState = store.loadAssessment(id);
     if (finalState) writeFileSync(join(runsDir, id, "report.md"), buildReport(finalState));
-    console.log(`\n=== ${res.findings.length} finding(s) in ${res.turns} turns ===`);
+    const tk = res.tokensUsed >= 1000 ? `${(res.tokensUsed / 1000).toFixed(1)}k` : `${res.tokensUsed}`;
+    console.log(`\n=== ${res.findings.length} finding(s) in ${res.turns} turns · ${tk} tokens${res.costUsd > 0 ? ` · ~$${res.costUsd.toFixed(2)}` : ""} ===`);
     for (const f of res.findings) console.log(`  - [${f.severity}] ${f.title}`);
     console.log(`\nreport → ${join(runsDir, id, "report.md")}`);
     console.log(`観測: serve 済みなら http://127.0.0.1:4317/?id=${id}`);
