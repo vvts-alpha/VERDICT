@@ -381,9 +381,21 @@ export class PlaywrightDriver implements Driver {
     return cookies.map((c) => `${c.name}=${c.value}`).join("; ");
   }
 
-  /** 現在ページのスクリーンショットを path に保存(WebUI 表示用)。親ディレクトリは自動作成。 */
-  async saveScreenshot(path: string): Promise<boolean> {
+  /** 現在ページのスクリーンショットを path に保存(WebUI 表示用)。親ディレクトリは自動作成。
+   *  真っ白スクショ対策: 撮る前に描画が落ち着くのを待つ(networkidle → フォント ready → 小休止)。
+   *  settleMs で追加の固定待ちを調整可(既定 700ms)。 */
+  async saveScreenshot(path: string, settleMs = 700): Promise<boolean> {
     try {
+      await this.page.waitForLoadState("networkidle", { timeout: 4_000 }).catch(() => {});
+      // フォント読み込み完了を待つ(text が消えた真っ白フレームを防ぐ)。直列化のため boolean に畳む。
+      // in-page コールバックは (globalThis as any) 経由で DOM へ(crawler tsconfig は dom lib 無し)。
+      await this.page
+        .evaluate(() => {
+          const g = globalThis as any;
+          return g.document?.fonts?.ready?.then(() => true) ?? true;
+        })
+        .catch(() => {});
+      if (settleMs > 0) await this.page.waitForTimeout(settleMs);
       await this.page.screenshot({ path, fullPage: false, timeout: 5_000 });
       return true;
     } catch {
