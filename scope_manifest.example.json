@@ -1,5 +1,5 @@
 {
-  "_comment": "VERITAS 事前情報フォーマット。`assess --manifest <file>` で読む。資格情報を含む実ファイルは gitignore(scope_manifest.json / *.manifest.json)。",
+  "_comment": "事前情報フォーマット。`assess --manifest <file>` で読む。資格情報を含む実ファイルは gitignore(scope_manifest.json / *.manifest.json)。",
 
   "target": "http://192.168.74.148:3000/",
 
