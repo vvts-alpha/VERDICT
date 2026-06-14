@@ -131,6 +131,8 @@ export function roleLabel(role: string, descriptions?: Map<string, string>): str
 export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
   const launchBase = {
     headless: opts.headless ?? true,
+    // x-umbra-hands マーカーは driver 側で「同一オリジンのみ」に付く(クロスオリジンは付けない=第三者を壊さない)。
+    // スコープは別概念で、別ドメイン/API を含めて広げてよい(診断は http 経路で in-scope なら何でも叩ける)。
     ...(opts.browserPath ? { executablePath: opts.browserPath } : {}),
     ...(opts.noSandbox ? { args: ["--no-sandbox"] } : {}),
     ...(opts.burpProxy ? { proxy: opts.burpProxy } : {}),
