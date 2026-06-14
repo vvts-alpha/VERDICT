@@ -161,16 +161,31 @@ export const CATEGORIES = [
   "other",
 ] as const;
 
-/** probe_paths の「簡単なディレクトリリスト」= 未リンク endpoint を踏むための厳選ワードリスト。 */
+/** probe_paths の「簡単なディレクトリリスト」= 未リンク endpoint を踏むための厳選ワードリスト。
+ *  ※ logout/signout 系は **入れない**。認証済みセッションで GET するとサーバ側セッションが破棄され、
+ *    以降の認証診断が全滅する(自滅)。isSessionDestroyingPath でも二重に弾く。 */
 const PATH_WORDLIST = [
   "/admin", "/administrator", "/api", "/api/profile", "/api/users", "/api/user", "/api/orders", "/api/admin", "/api/config",
   "/account", "/account/edit", "/profile", "/settings", "/users", "/user", "/dashboard",
   "/status", "/health", "/healthz", "/metrics", "/debug", "/server-status", "/actuator", "/info", "/version",
   "/config", "/.env", "/.git/config", "/backup", "/robots.txt", "/sitemap.xml",
-  "/login", "/logout", "/register", "/signup", "/upload", "/uploads", "/files", "/download",
+  "/login", "/register", "/signup", "/upload", "/uploads", "/files", "/download",
   "/search", "/orders", "/cart", "/checkout", "/support", "/continue", "/redirect", "/go",
   "/swagger", "/api-docs", "/graphql", "/.well-known/security.txt",
 ];
+
+/** セッションを破棄する副作用を持つパス(logout/signout/SSO ログアウト等)。認証済みアセスメントで
+ *  自動踏破するとサーバ側セッションが消えて以降の認証診断が全部死ぬため、probe_paths は絶対に踏まない。 */
+const SESSION_DESTROYING = /(^|\/)(logout|log-out|logoff|log-off|signout|sign-out|sign_out|disconnect|(sso|saml|oidc|oauth2?|account|auth|session|user)\/(logout|signout|sign-out))(\/|$|\?|#)/i;
+export function isSessionDestroyingPath(pathOrUrl: string): boolean {
+  let p = pathOrUrl;
+  try {
+    p = new URL(pathOrUrl, "http://x/").pathname;
+  } catch {
+    /* 相対/不正はそのまま判定 */
+  }
+  return SESSION_DESTROYING.test(p);
+}
 
 /** 外部到達を試さない安全マーカー(open-redirect / 反射検出用、非解決ドメイン)。 */
 const OOB_MARKER = "veritas-oob.example";
@@ -299,6 +314,7 @@ function recordObservation(s: PilotSession, o: Observation): { screen: Screen; i
       continue;
     }
     if (!isInScope(abs, s.scope)) continue;
+    if (isSessionDestroyingPath(abs)) continue; // logout/signout リンクは frontier に積まない(踏むと自滅)
     if (!s.visited.has(abs)) s.frontier.add(abs);
   }
   return { screen, isNew };
@@ -353,6 +369,9 @@ export function buildTools(s: PilotSession) {
       { url: z.string() },
       async ({ url }) => {
         if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} is out of scope`);
+        // logout/signout への遷移はセッションを破棄し以降の認証診断を全滅させるので踏まない。
+        if (isSessionDestroyingPath(url))
+          return txt(`SKIPPED: ${url} は logout/sign-out 系です。遷移すると認証セッションが壊れて以降の診断が全滅するため訪問しません。`);
         try {
           const o = await s.driver.visit(url);
           const { screen, isNew } = recordObservation(s, o);
@@ -669,6 +688,7 @@ export function buildTools(s: PilotSession) {
         }
         const list = [...PATH_WORDLIST, ...(extra ?? [])];
         const hits: Array<Record<string, unknown>> = [];
+        let skippedLogout = 0;
         for (const path of list) {
           let url: string;
           try {
@@ -677,6 +697,11 @@ export function buildTools(s: PilotSession) {
             continue;
           }
           if (!isInScope(url, s.scope)) continue;
+          // logout/signout 系は絶対に GET しない(認証セッションを破棄して以降の診断を全滅させるため)。
+          if (isSessionDestroyingPath(url)) {
+            skippedLogout += 1;
+            continue;
+          }
           let res: HttpResponse;
           try {
             res = await s.http.send({ method: "GET", url, headers: cookieHeader(s), body: null });
@@ -689,8 +714,11 @@ export function buildTools(s: PilotSession) {
           hits.push({ path, status: res.status, type: ct, len: res.body.length, location: res.headers["location"] });
           if (res.status < 400 && /html/.test(ct) && !s.visited.has(stripHash(url))) s.frontier.add(stripHash(url));
         }
-        s.store.appendEvent(s.assessmentId, { type: "note", payload: { message: `🔍 probe_paths: ${hits.length} hit(s)/${list.length}, frontier=${s.frontier.size}` } });
-        return txt(JSON.stringify({ hits, queuedToFrontier: s.frontier.size }));
+        s.store.appendEvent(s.assessmentId, {
+          type: "note",
+          payload: { message: `🔍 probe_paths: ${hits.length} hit(s)/${list.length}, frontier=${s.frontier.size}${skippedLogout ? `, skipped ${skippedLogout} logout-path(s)` : ""}` },
+        });
+        return txt(JSON.stringify({ hits, queuedToFrontier: s.frontier.size, ...(skippedLogout ? { skippedLogoutPaths: skippedLogout } : {}) }));
       },
     ),
 
