@@ -44,9 +44,10 @@ commands:
             調査のみ: 画面マップ+スクショ+API 抽出だけ実行し、診断/finding はしない(安い recon。後で --resume で診断)
   pilot --resume --id <id> [--manifest <file.json>] [--browser-path <bin>] [--no-sandbox] [--out <dir>]
             既存 run の続きから: survey/methodology を飛ばし、未診断(queued)画面だけ診断(落ちた run の仕上げ)
-  pilot --attended --manifest <file.json> [--login-url <u>] [--keepalive-min <n>] [...]
+  pilot --attended[ a,b,c] (--manifest <file.json> | --url <url>) [--login-url <u>] [--keepalive-min <n>] [...]
             手動マルチセッション認証(headed 必須): ロールごとに永続コンテキストを開き、人手でログイン(CAPTCHA/MFA/Arkose 突破)
             → Enter 確認 → 生きたセッションで調査・診断。診断はロール別ライブ Cookie を使い、合間にセッションを維持(失効時は再ログイン要求)
+            ロールは --attended admin,userA,userB でCLI直指定も可(manifest 不要・上書き)。単体 --attended は manifest の auth.roles を使用
             ※ pilot は任意で [--burp-proxy http://127.0.0.1:8080] を付けると全通信を Burp 経由(既定オフ=挙動不変)
   burp-import --id <id> --report <burp.xml> [--out <dir>]
             Burp Pro の XML レポートを取り込み、既存 finding と重複しない net-new だけ追加(連携はフラグ式・任意)
@@ -658,8 +659,35 @@ async function cmdAssess(args: string[]): Promise<void> {
   console.log(`\n✓ done. 観測: serve 済みなら http://127.0.0.1:4317/?id=${id}`);
 }
 
+/** `--attended admin,userA,userB` のインライン CSV を切り出す前処理。
+ *  `--attended` の直後がフラグでない(=ロール CSV)ときだけ値として拾い、`--attended` 自体は boolean のまま残す。
+ *  `--attended=admin,userA` 形 / 単体 `--attended`(manifest 由来) も両立。 */
+export function extractAttendedRoles(args: string[]): { args: string[]; roles?: string[] } {
+  const out: string[] = [];
+  let roles: string[] | undefined;
+  const csv = (s: string): string[] => s.split(",").map((x) => x.trim()).filter(Boolean);
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i] ?? "";
+    if (a === "--attended") {
+      out.push("--attended");
+      const next = args[i + 1];
+      if (next !== undefined && !next.startsWith("-")) {
+        roles = csv(next);
+        i++; // CSV 値を消費(positional として残さない)
+      }
+    } else if (a.startsWith("--attended=")) {
+      out.push("--attended");
+      roles = csv(a.slice("--attended=".length));
+    } else {
+      out.push(a);
+    }
+  }
+  return roles ? { args: out, roles } : { args: out };
+}
+
 // Claude 主導アセスメント: Claude がツールを操縦して自律的に探索・検証・記録(@veritas/pilot)。
-async function cmdPilot(args: string[]): Promise<void> {
+async function cmdPilot(rawArgs: string[]): Promise<void> {
+  const { args, roles: inlineAttendedRoles } = extractAttendedRoles(rawArgs);
   const { values } = parseArgs({
     args,
     options: {
@@ -740,9 +768,10 @@ async function cmdPilot(args: string[]): Promise<void> {
   const mode = `${surveyOnly ? " · survey-only" : resume ? " · resume" : ""}${attended ? " · attended(手動マルチセッション)" : ""}`;
   console.log(`▶ pilot ${id}  (Claude 主導${mode})`);
   console.log(`  target ${seedUrl} | scope hosts=[${scope.inScopeHosts.join(",")}] | model ${model}${values["fast-model"] ? ` (deep) / ${values["fast-model"]} (fast)` : ""} | rate ${rate}ms`);
-  // attended は manifest の全ロール名で窓を開く(creds/cookie が無い純手動ロールも含む)ので一覧に含める。
-  const manifestRoleNames = attended ? (manifest?.auth?.roles ?? []).map((r) => r.name) : [];
-  const allRoles = [...new Set([...manifestRoleNames, ...roleCreds.keys(), ...roleCookieFiles.keys()])];
+  // attended で窓を開くロール: インライン CSV(--attended a,b,c)が最優先、無ければ manifest の全ロール名
+  // (creds/cookie が無い純手動ロールも含む)。一覧表示にも使う。
+  const attendedRoles = attended ? (inlineAttendedRoles ?? (manifest?.auth?.roles ?? []).map((r) => r.name)) : [];
+  const allRoles = [...new Set([...attendedRoles, ...roleCreds.keys(), ...roleCookieFiles.keys()])];
   const roleLabel = (r: string): string => {
     const kind = roleCookieFiles.has(r) ? `${r}(cookie)` : roleCreds.has(r) ? r : attended ? `${r}(manual)` : r;
     const d = roleDescriptions.get(r);
@@ -779,8 +808,8 @@ async function cmdPilot(args: string[]): Promise<void> {
             attended: true,
             attendedProfilesDir: join(runsDir, id, "profiles"),
             promptOperator,
-            // manifest の全ロール名で窓を開く(pass も cookieFile も無い純手動ロールも含む)。
-            ...((manifest?.auth?.roles ?? []).length ? { attendedRoles: (manifest!.auth!.roles ?? []).map((r) => r.name) } : {}),
+            // インライン CSV か manifest 由来のロール名で窓を開く(pass/cookieFile が無い純手動ロールも含む)。
+            ...(attendedRoles.length ? { attendedRoles } : {}),
           }
         : {}),
       ...(values["login-url"] ? { loginUrl: values["login-url"] } : {}),
