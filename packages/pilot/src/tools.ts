@@ -15,7 +15,15 @@ import { z } from "zod";
 import { join } from "node:path";
 import { readFileSync } from "node:fs";
 
+/** attended(手動マルチセッション)で 1 ロール = 1 永続コンテキスト。生きたセッションを保持する。 */
+export interface RoleSession {
+  driver: PlaywrightDriver;
+  /** 直近に同期した Cookie ヘッダ(http 経路用)。keepalive で再同期される。 */
+  cookie: string;
+}
+
 export interface PilotSession {
+  /** 現在アクティブなロールの driver。attended では login() でロール間を swap する。 */
   driver: PlaywrightDriver;
   http: FetchHttpClient;
   evidence: EvidenceStore;
@@ -28,6 +36,8 @@ export interface PilotSession {
   roleCreds: Map<string, LoginCreds>;
   /** ロール名 → 事前取得 Cookie ファイルのパス(資格情報の代わり。自動ログインできない壁向け)。 */
   roleCookieFiles: Map<string, string>;
+  /** ロール名 → 権限の自由記述(例: "全権管理者" / "一般ユーザ(読取のみ)")。auth-diff の高/低権限判断に使う。 */
+  roleDescriptions: Map<string, string>;
   loginLlm: LlmClient;
   currentCookie: string;
   currentRole: string;
@@ -59,6 +69,9 @@ export interface PilotSession {
   surveyDone: boolean;
   methodologyDone: boolean;
   screenDone: boolean;
+  // ── attended(手動マルチセッション認証)──
+  /** 手動ログイン済みのロール別ライブセッション。未指定 = 通常(単一コンテキスト)モード。 */
+  roleSessions?: Map<string, RoleSession>;
 }
 
 /** ステージごとに見せるツール(基底名)。run.ts が `mcp__veritas__` を付けて allowedTools に渡す。 */
@@ -180,6 +193,16 @@ function cookieHeader(s: PilotSession): Record<string, string> {
   return s.currentCookie ? { cookie: s.currentCookie } : {};
 }
 
+/** login() で使えるロールの一覧(名前 + 任意の権限説明)。attended は生セッションのキー(純手動ロール含む)、
+ *  通常は資格情報 + Cookie ファイルのキー。description は auth-diff で高/低権限を見分ける材料。 */
+function availableRoles(s: PilotSession): Array<{ name: string; description?: string }> {
+  const names = s.roleSessions ? [...s.roleSessions.keys()] : [...new Set([...s.roleCreds.keys(), ...s.roleCookieFiles.keys()])];
+  return names.map((name) => {
+    const description = s.roleDescriptions.get(name);
+    return description ? { name, description } : { name };
+  });
+}
+
 /** operator 提供の Cookie ファイルを読む。生 Cookie ヘッダ("a=1; b=2")/ Playwright storageState JSON
  *  ({cookies:[...]})/ 単純配列([{name,value}])を自動判別 → http 用ヘッダ + ブラウザ注入用 cookie。 */
 export function loadCookieFile(
@@ -222,6 +245,19 @@ export function loadCookieFile(
 const LOGIN_MARKERS = /sign[\s-]?in|log[\s-]?in|\bpassword\b|forbidden|unauthorized|access denied|ログイン|サインイン|認証が必要|権限/i;
 function looksLikeLogin(body: string): boolean {
   return LOGIN_MARKERS.test(body.slice(0, 4000));
+}
+
+/** attended の keepalive 用: ロールのコンテキストがログインへ戻された(= セッション失効)かを判定。
+ *  URL パスが login/signin/auth/sso 系、または可視テキストがログイン文言 → dead 扱い(再ログイン要求)。 */
+export function sessionLooksDead(snap: { url: string; visibleText: string }): boolean {
+  let path = snap.url.toLowerCase();
+  try {
+    path = new URL(snap.url).pathname.toLowerCase();
+  } catch {
+    /* 相対/不正 URL はそのまま小文字で判定 */
+  }
+  if (/(^|\/)(login|signin|sign-in|auth|sso|account\/login)(\/|$|\?)/.test(path)) return true;
+  return looksLikeLogin(snap.visibleText);
 }
 
 export type AccessVerdict = "not_bypass" | "needs_judgment" | "inconclusive";
@@ -376,7 +412,7 @@ export function buildTools(s: PilotSession) {
         return txt(
           JSON.stringify({
             currentRole: s.currentRole || "unauth",
-            rolesAvailable: [...s.roleCreds.keys()],
+            rolesAvailable: availableRoles(s),
             screensDiscovered: screens.length,
             screensSample: screens.map((sc) => `${sc.authState === "post-login" ? "🔒" : ""}${sc.urlTemplate}`).slice(0, 40),
             visited: s.visited.size,
@@ -442,7 +478,7 @@ export function buildTools(s: PilotSession) {
             screen: { ...screenDigest(sc), observedUrls: sc.observedUrls.slice(0, 6), description: sc.description },
             plan: s.plans.get(sc.screenId) ?? "(no recorded plan — use judgement)",
             currentRole: s.currentRole || "unauth",
-            rolesAvailable: [...s.roleCreds.keys()],
+            rolesAvailable: availableRoles(s),
             knownObjectIds: knownObjectIds(s),
             alreadyConfirmed: [...s.findingsByKey.keys()],
           }),
@@ -497,6 +533,19 @@ export function buildTools(s: PilotSession) {
       "Log in as one of the provided roles to reach authenticated surface. Updates the browser + http session to that role.",
       { role: z.string() },
       async ({ role }) => {
+        const desc = s.roleDescriptions.get(role);
+        const tag = desc ? ` [${desc}]` : ""; // 権限説明(あれば)を応答に添える
+        // ⓪ attended(手動マルチセッション): ロールごとに既に生きたコンテキストがある。
+        //    ログインし直さず、アクティブな driver / cookie をそのロールへ swap するだけ。
+        const live = s.roleSessions?.get(role);
+        if (live) {
+          s.driver = live.driver;
+          const fresh = await live.driver.sessionCookieHeader().catch(() => live.cookie);
+          if (fresh) live.cookie = fresh;
+          s.currentCookie = live.cookie;
+          s.currentRole = role;
+          return txt(`switched to live attended session for role '${role}'${tag} (manual login; cookie ${live.cookie ? "present" : "empty"}).`);
+        }
         // ① 事前取得 Cookie ファイルがあれば、ログインせずに注入(自動ログイン不能な壁向け)。
         const cookieFile = s.roleCookieFiles.get(role);
         if (cookieFile) {
@@ -507,7 +556,7 @@ export function buildTools(s: PilotSession) {
             await s.driver.addCookies(browserCookies);
             s.currentCookie = header;
             s.currentRole = role;
-            return txt(`role '${role}': injected ${browserCookies.length} pre-captured cookie(s) from file (no login).`);
+            return txt(`role '${role}'${tag}: injected ${browserCookies.length} pre-captured cookie(s) from file (no login).`);
           } catch (e) {
             return txt(`cookie file error for '${role}': ${String(e).slice(0, 150)}`);
           }
@@ -515,7 +564,7 @@ export function buildTools(s: PilotSession) {
         // ② 資格情報で smartLogin。
         const creds = s.roleCreds.get(role);
         if (!creds) {
-          const avail = [...new Set([...s.roleCreds.keys(), ...s.roleCookieFiles.keys()])].join(", ") || "none";
+          const avail = availableRoles(s).map((r) => (r.description ? `${r.name} (${r.description})` : r.name)).join(", ") || "none";
           return txt(`no credentials/cookie for '${role}'. Available roles: ${avail}`);
         }
         try {
@@ -527,7 +576,7 @@ export function buildTools(s: PilotSession) {
           if (r.ok) {
             s.currentCookie = await s.driver.sessionCookieHeader();
             s.currentRole = role;
-            return txt(`logged in as '${role}'; now at ${s.driver.currentUrl()}`);
+            return txt(`logged in as '${role}'${tag}; now at ${s.driver.currentUrl()}`);
           }
           return txt(`login as '${role}' did not complete: ${r.reason}`);
         } catch (e) {

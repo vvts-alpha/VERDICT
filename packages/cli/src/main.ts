@@ -44,6 +44,9 @@ commands:
             調査のみ: 画面マップ+スクショ+API 抽出だけ実行し、診断/finding はしない(安い recon。後で --resume で診断)
   pilot --resume --id <id> [--manifest <file.json>] [--browser-path <bin>] [--no-sandbox] [--out <dir>]
             既存 run の続きから: survey/methodology を飛ばし、未診断(queued)画面だけ診断(落ちた run の仕上げ)
+  pilot --attended --manifest <file.json> [--login-url <u>] [--keepalive-min <n>] [...]
+            手動マルチセッション認証(headed 必須): ロールごとに永続コンテキストを開き、人手でログイン(CAPTCHA/MFA/Arkose 突破)
+            → Enter 確認 → 生きたセッションで調査・診断。診断はロール別ライブ Cookie を使い、合間にセッションを維持(失効時は再ログイン要求)
             ※ pilot は任意で [--burp-proxy http://127.0.0.1:8080] を付けると全通信を Burp 経由(既定オフ=挙動不変)
   burp-import --id <id> --report <burp.xml> [--out <dir>]
             Burp Pro の XML レポートを取り込み、既存 finding と重複しない net-new だけ追加(連携はフラグ式・任意)
@@ -376,6 +379,9 @@ interface AssessManifest {
     /** ロール(name=ユーザー名, pass/password=パスワード)。[0]=主ログイン, 全部=auth-diff */
     roles?: Array<{
       name: string;
+      /** 権限レベルの自由記述(例: "全権管理者" / "一般ユーザ(読取のみ)")。auth-diff の高/低権限判断に使う。 */
+      description?: string;
+      desc?: string;
       username?: string;
       pass?: string;
       password?: string;
@@ -402,6 +408,16 @@ function manifestRoleCreds(m: AssessManifest | null): Array<{ name: string; cred
   for (const role of m?.auth?.roles ?? []) {
     const password = role.password ?? role.pass;
     if (password) out.push({ name: role.name, creds: { username: role.username ?? role.name, password } });
+  }
+  return out;
+}
+
+/** ロール名 → 権限説明(任意)。auth-diff で高/低権限を見分ける材料としてエージェントに渡す。 */
+function manifestRoleDescriptions(m: AssessManifest | null): Array<{ name: string; description: string }> {
+  const out: Array<{ name: string; description: string }> = [];
+  for (const role of m?.auth?.roles ?? []) {
+    const description = (role.description ?? role.desc ?? "").trim();
+    if (description) out.push({ name: role.name, description });
   }
   return out;
 }
@@ -659,6 +675,8 @@ async function cmdPilot(args: string[]): Promise<void> {
       "no-sandbox": { type: "boolean" },
       headed: { type: "boolean" },
       headless: { type: "boolean" },
+      attended: { type: "boolean" },
+      "login-url": { type: "string" },
       rate: { type: "string" },
       "max-turns": { type: "string" },
       "max-screens": { type: "string" },
@@ -671,7 +689,9 @@ async function cmdPilot(args: string[]): Promise<void> {
   const model = values.model ?? manifest?.model ?? "claude-sonnet-4-6";
   const rate = values.rate ? Number.parseInt(values.rate, 10) : 250;
   const maxTurns = values["max-turns"] ? Number.parseInt(values["max-turns"], 10) : 80;
-  const headed = !values.headless && !!values.headed;
+  const attended = !!values.attended; // 手動マルチセッション認証(必ず headed)
+  const headed = attended || (!values.headless && !!values.headed);
+  if (attended && values.headless) console.log("⚠ --attended は手動ログインのため headed 必須です(--headless は無視)");
   const browserPath = values["browser-path"] ?? process.env.VERITAS_BROWSER_PATH;
   const resume = !!values.resume;
   const surveyOnly = !!values["survey-only"];
@@ -714,12 +734,30 @@ async function cmdPilot(args: string[]): Promise<void> {
   if (roleCreds.size === 0 && primary) roleCreds.set(primary.username || "user", primary);
   const roleCookieFiles = new Map<string, string>();
   for (const rc of manifestRoleCookies(manifest)) roleCookieFiles.set(rc.name, rc.file);
+  const roleDescriptions = new Map<string, string>();
+  for (const rc of manifestRoleDescriptions(manifest)) roleDescriptions.set(rc.name, rc.description);
 
-  const mode = surveyOnly ? " · survey-only" : resume ? " · resume" : "";
+  const mode = `${surveyOnly ? " · survey-only" : resume ? " · resume" : ""}${attended ? " · attended(手動マルチセッション)" : ""}`;
   console.log(`▶ pilot ${id}  (Claude 主導${mode})`);
   console.log(`  target ${seedUrl} | scope hosts=[${scope.inScopeHosts.join(",")}] | model ${model}${values["fast-model"] ? ` (deep) / ${values["fast-model"]} (fast)` : ""} | rate ${rate}ms`);
-  const allRoles = [...new Set([...roleCreds.keys(), ...roleCookieFiles.keys()])];
-  console.log(`  roles: ${allRoles.map((r) => (roleCookieFiles.has(r) ? `${r}(cookie)` : r)).join(", ") || "none"} | max-turns ${maxTurns}${surveyOnly ? " | 調査のみ(診断なし)" : resume ? " | 未診断画面だけ再開" : ""}\n`);
+  // attended は manifest の全ロール名で窓を開く(creds/cookie が無い純手動ロールも含む)ので一覧に含める。
+  const manifestRoleNames = attended ? (manifest?.auth?.roles ?? []).map((r) => r.name) : [];
+  const allRoles = [...new Set([...manifestRoleNames, ...roleCreds.keys(), ...roleCookieFiles.keys()])];
+  const roleLabel = (r: string): string => {
+    const kind = roleCookieFiles.has(r) ? `${r}(cookie)` : roleCreds.has(r) ? r : attended ? `${r}(manual)` : r;
+    const d = roleDescriptions.get(r);
+    return d ? `${kind} — ${d}` : kind;
+  };
+  console.log(`  roles: ${allRoles.map(roleLabel).join(", ") || "none"} | max-turns ${maxTurns}${surveyOnly ? " | 調査のみ(診断なし)" : resume ? " | 未診断画面だけ再開" : ""}\n`);
+
+  // attended の人手操作待ち: メッセージを出して Enter で解決する(手動ログイン/再ログインの同期点)。
+  const { createInterface } = await import("node:readline");
+  const rl = attended ? createInterface({ input: process.stdin, output: process.stdout }) : null;
+  const promptOperator = (message: string): Promise<void> =>
+    new Promise((resolve) => {
+      if (!rl) return resolve();
+      rl.question(`\n${message} `, () => resolve());
+    });
 
   try {
     const res = await runPilot({
@@ -736,8 +774,19 @@ async function cmdPilot(args: string[]): Promise<void> {
       headless: !headed,
       ...(resume ? { resume: true } : {}),
       ...(surveyOnly ? { surveyOnly: true } : {}),
+      ...(attended
+        ? {
+            attended: true,
+            attendedProfilesDir: join(runsDir, id, "profiles"),
+            promptOperator,
+            // manifest の全ロール名で窓を開く(pass も cookieFile も無い純手動ロールも含む)。
+            ...((manifest?.auth?.roles ?? []).length ? { attendedRoles: (manifest!.auth!.roles ?? []).map((r) => r.name) } : {}),
+          }
+        : {}),
+      ...(values["login-url"] ? { loginUrl: values["login-url"] } : {}),
       ...(values["max-screens"] ? { maxScreens: Number.parseInt(values["max-screens"], 10) } : {}),
       ...(roleCookieFiles.size ? { roleCookieFiles } : {}),
+      ...(roleDescriptions.size ? { roleDescriptions } : {}),
       ...(values["fast-model"] ? { fastModel: values["fast-model"] } : {}),
       ...(values["burp-proxy"] ? { burpProxy: values["burp-proxy"] } : {}),
       ...(values["keepalive-min"] ? { keepAliveMinutes: Number.parseInt(values["keepalive-min"], 10) } : {}),
@@ -754,6 +803,7 @@ async function cmdPilot(args: string[]): Promise<void> {
     console.log(`\nreport → ${join(runsDir, id, "report.md")}`);
     console.log(`観測: serve 済みなら http://127.0.0.1:4317/?id=${id}`);
   } finally {
+    rl?.close();
     store.close();
   }
 }
@@ -1197,7 +1247,7 @@ async function cmdManifest(args: string[]): Promise<void> {
     }
   };
 
-  type Role = { name: string; username?: string; password?: string; cookieFile?: string };
+  type Role = { name: string; description?: string; username?: string; password?: string; cookieFile?: string };
 
   try {
     console.log("\n=== Umbra Hands scope-manifest generator ===");
@@ -1236,15 +1286,17 @@ async function cmdManifest(args: string[]): Promise<void> {
     for (;;) {
       const name = await ask(`\nRole #${roles.length + 1} name (空で終了)`);
       if (!name) break;
+      // 権限レベルの説明(任意)。auth-diff で「どれが高権限/低権限か」をエージェントが判断する材料。
+      const description = await ask("  説明/権限 (任意。例: 全権管理者 / 一般ユーザ(読取のみ))");
       const kind = (await ask("  種別: (c)資格情報 / (k)Cookie ファイル", "c")).toLowerCase();
       if (kind.startsWith("k")) {
         const cookieFile = await ask("  cookie ファイルのパス");
-        if (cookieFile) roles.push({ name, cookieFile });
+        if (cookieFile) roles.push({ name, ...(description ? { description } : {}), cookieFile });
         else console.log("  ↳ パス未入力のためスキップ");
       } else {
         const username = await ask("  username (空なら role 名を使用)");
         const password = await askSecret("  password");
-        if (password) roles.push(username ? { name, username, password } : { name, password });
+        if (password) roles.push({ name, ...(description ? { description } : {}), ...(username ? { username } : {}), password });
         else console.log("  ↳ password 未入力のためスキップ");
       }
     }

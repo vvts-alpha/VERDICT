@@ -131,8 +131,8 @@ node packages/cli/dist/main.js manifest --out m.json
   "model": "claude-sonnet-4-6",
   "auth": {
     "roles": [
-      { "name": "alice", "pass": "..." },
-      { "name": "bob",   "pass": "..." },
+      { "name": "alice", "pass": "...", "description": "全権管理者" },
+      { "name": "bob",   "pass": "...", "description": "一般ユーザ(読取のみ)" },
       { "name": "carol", "cookieFile": "carol.cookies" }
     ]
   }
@@ -140,6 +140,7 @@ node packages/cli/dist/main.js manifest --out m.json
 ```
 
 - **認証は資格情報だけでよい** — ログイン URL・フォーム項目はエージェントが自動発見(`smartLogin`)。`auth.roles[0]` = 主ログイン、複数 role = クロスユーザ/auth-diff のソース。
+- **`description`(任意)で権限レベルを添える** — 例 `"全権管理者"` / `"一般ユーザ(読取のみ)"`。エージェントの `login`/`get_screen` に渡り、auth-diff で「どれが高権限/低権限か(=境界越えの方向)」を判断する材料になる。秘密ではないが state には永続しない。
 - **事前取得 Cookie でもよい** — 自動ログインできない壁(Arkose/MFA 等)向けに、role に `cookieFile`(または `cookie_file_path`)を指定できる。中身は **生 `Cookie:` ヘッダ(`sid=…; foo=…`)** か **Playwright `storageState` JSON** のどちらでも可(自動判別)。`login(role)` がそれを **ブラウザ + http セッションに注入**してログインを省く。**Cookie ファイルはセッション秘密 → 必ず gitignore(`*.cookies` 等)。** エージェントが Cookie を捏造/盗むのではなく、operator が供給する点は不変。
 - MFA/CAPTCHA で Cookie も無ければ headed ブラウザで人手フォールバック(`detectStuck` が非ブロッキングで起票)。
 - `auth.roles[0]` = 主ログイン、複数 role = クロスユーザ/auth-diff のソース。
@@ -155,6 +156,7 @@ node packages/cli/dist/main.js manifest --out m.json
 | **`pilot`** | Claude 主導アセスメント(full)。`--manifest` / `--url`、`--model`、`--max-turns`、`--rate`、`--headed`、`--browser-path`、`--no-sandbox`、`--burp-proxy <url>`、`--keepalive-min <n>`(認証セッション維持: 画面の合間にトップへ navigate して cookie 再同期。既定 4 分、`0` で無効) |
 | `pilot --survey-only` | **調査のみ**: 画面マップ+スクショ+API だけ。診断/finding はしない(安い recon、後で `--resume`) |
 | `pilot --resume --id <id>` | 既存 run の**未診断(queued)画面だけ**診断(落ちた run の仕上げ / survey-only の続き) |
+| `pilot --attended` | **手動マルチセッション認証**(headed 必須)。ロールごとに永続コンテキストを開き、人手でログイン(CAPTCHA/MFA/Arkose 突破)→ Enter 確認 → 生きたセッションで調査・診断。`login(role)` は再ログインせず**そのロールのライブセッションへ切替**。合間に全ロールを keepalive(失効=ログイン画面に戻されたら再ログインを要求)。`--login-url <u>`(手動ログインの入口、既定 target)/ `--keepalive-min <n>`(既定 1 分)。自動ログイン/Cookie ファイルで越えられない壁向け |
 | `assess` | 決定論パイプライン一括: crawl → label → scan → logic → report |
 | `serve` | 観測 WebUI + 状態 API/WS(既定 `127.0.0.1:4317`、LAN 公開は `--host 0.0.0.0`) |
 | `report` / `status` / `list` | report.md 生成 / phase・coverage・stop 判定 / `runs/` 一覧 |
@@ -182,7 +184,16 @@ node packages/cli/dist/main.js pilot --survey-only --manifest m.json   # ① 全
 node packages/cli/dist/main.js pilot --resume --id <run-id> --manifest m.json   # ② queued だけ診断
 ```
 
-**C. Burp 連携(任意・フラグ式)** — `--burp-proxy` を付けない限り挙動は不変
+**C. 手動マルチセッション認証(attended)** — CAPTCHA/MFA/Arkose・絶対TTL 失効など 自動ログインで越えられない壁向け
+```bash
+# ロールごとに headed の窓が開く → 各窓で人手ログイン → ターミナルで Enter
+node packages/cli/dist/main.js pilot --attended --manifest m.json
+#   --login-url <u> で手動ログインの入口を指定(既定 target)。--keepalive-min n で維持間隔(既定 1 分)。
+#   診断中に login(role) すると、再ログインせず そのロールのライブセッションへ切替。
+#   セッションが切れた(ログイン画面に戻された)ら、その窓で再ログインして Enter。
+```
+
+**D. Burp 連携(任意・フラグ式)** — `--burp-proxy` を付けない限り挙動は不変
 ```bash
 # Burp Pro の Proxy リスナを起動(別端末なら All interfaces に bind)
 node packages/cli/dist/main.js pilot --manifest m.json --burp-proxy http://127.0.0.1:8080
@@ -240,4 +251,4 @@ node packages/cli/dist/main.js header-audit --id <run-id> --headers csp,hsts
 - **認証 = operator 供給の資格情報 OR 事前 Cookie ファイル**(`smartLogin` / `loadCookieFile`)。エージェントは Cookie を捏造/盗まない。MFA/CAPTCHA で Cookie も無ければ `detectStuck` → 非ブロッキング HumanHandoff(headed で人手)。
 - **状態は append-only + 再生可能**。UI は純投影(`buildStateView` / `buildSiteTree`)。
 
-> 状態: ステージ型 Claude 主導 pilot(調査→方法論→診断)+ 決定論 assess、WebUI 観測、Burp/header 連携、survey-only/resume モード — すべて実装・実機検証済み。`pnpm -r test` は緑。
+> 状態: ステージ型 Claude 主導 pilot(調査→方法論→診断)+ 決定論 assess、WebUI 観測、Burp/header 連携、survey-only/resume/attended(手動マルチセッション)モード — すべて実装・実機検証済み。`pnpm -r test` は緑。
