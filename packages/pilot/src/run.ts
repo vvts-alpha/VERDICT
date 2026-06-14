@@ -73,6 +73,25 @@ function screenIsHighValue(sc: Screen): boolean {
   return false;
 }
 
+/** resume 時に「前回 run で survey / methodology がどこまで終わったか」を判定する純関数。
+ *  survey_done マーカーはモデルが呼ばず出ないことがある(maxTurns で stage 終了)ので、
+ *  phase(recon を越えている=phase1_label 以降)と methodology の 📋 PLAN イベントも OR で見る。 */
+export function resumeStageState(
+  prev: { phase: string; events: ReadonlyArray<{ type: string; payload: unknown }> } | null,
+): { surveyDone: boolean; methodologyDone: boolean } {
+  if (!prev) return { surveyDone: false, methodologyDone: false };
+  const notes = prev.events
+    .filter((e) => e.type === "note")
+    .map((e) => {
+      const m = (e.payload as { message?: unknown }).message;
+      return typeof m === "string" ? m : "";
+    });
+  const methodologyDone = notes.some((m) => /📋 PLAN s-\d+/.test(m));
+  const DONE_PHASES = new Set(["phase1_label", "phase2_scan", "report", "done"]);
+  const surveyDone = DONE_PHASES.has(prev.phase) || methodologyDone || notes.some((m) => m.includes("SURVEY done"));
+  return { surveyDone, methodologyDone };
+}
+
 export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
   const driver = await PlaywrightDriver.launch({
     userDataDir: opts.profileDir,
@@ -156,7 +175,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     }
     opts.store.appendEvent(opts.assessmentId, {
       type: "note",
-      payload: { message: `↺ resume: ${prev.screens.length} screens / ${prev.findings.length} findings 引継ぎ、残り未診断画面を診断` },
+      payload: { message: `↺ resume: ${prev.screens.length} screens / ${prev.findings.length} findings 引継ぎ` },
     });
   }
 
@@ -236,8 +255,16 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
 
   let turns = 0;
   try {
-    if (!opts.resume) {
-      // ── STAGE 1: 調査(写像のみ) ──
+    // resume 時に survey/methodology が前回どこまで進んだかを events から判定する。
+    // ※ survey-only も「完了」だが phase は phase1_recon のままなので phase では中断と区別できない。
+    //   survey_done が出す "SURVEY done" マーカーと、methodology の "📋 PLAN" イベントで判定する。
+    const { surveyDone: surveyDonePrev, methodologyDone: methodologyDonePrev } = resumeStageState(prev);
+    const doSurvey = !opts.resume || !surveyDonePrev; // resume でも survey 未完なら調査から
+    const doMethodology = !opts.surveyOnly && (!surveyDonePrev || !methodologyDonePrev);
+
+    if (doSurvey) {
+      // ── STAGE 1: 調査(写像のみ) ── resume で survey 未完なら既存 screens を seed したまま継続。
+      if (opts.resume) opts.onText?.("↻ survey が未完だったので調査(recon)から再開します");
       opts.store.setPhase(opts.assessmentId, "phase1_recon");
       turns += await runStage({
         system: SURVEY_PROMPT,
@@ -247,19 +274,19 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         model: fastModel, // 調査は機械的 → fast
         shouldStop: () => session.surveyDone || session.done,
       });
+    }
 
-      // ── STAGE 2: 方法論(全画面の攻撃計画) ── ※ survey-only ならスキップ
-      if (!opts.surveyOnly && !session.done) {
-        opts.store.setPhase(opts.assessmentId, "phase1_label");
-        turns += await runStage({
-          system: METHODOLOGY_PROMPT,
-          goal: `${session.inv.screens().length} screens were mapped. Call get_inventory, then record_methodology for EVERY screen, then methodology_done.`,
-          allowed: STAGE_TOOLS.methodology,
-          maxTurns: Math.min(maxTurns, 30),
-          model: fastModel, // 方法論も fast(構造化された計画立案)
-          shouldStop: () => session.methodologyDone || session.done,
-        });
-      }
+    // ── STAGE 2: 方法論(全画面の攻撃計画) ── survey-only はスキップ。resume は未完のときだけ実行。
+    if (doMethodology && !session.done) {
+      opts.store.setPhase(opts.assessmentId, "phase1_label");
+      turns += await runStage({
+        system: METHODOLOGY_PROMPT,
+        goal: `${session.inv.screens().length} screens were mapped. Call get_inventory, then record_methodology for EVERY screen, then methodology_done.`,
+        allowed: STAGE_TOOLS.methodology,
+        maxTurns: Math.min(maxTurns, 30),
+        model: fastModel, // 方法論も fast(構造化された計画立案)
+        shouldStop: () => session.methodologyDone || session.done,
+      });
     }
 
     // ── STAGE 3: 診断(1 画面ずつ。台帳の queued を潰し切る) ── ※ survey-only ならスキップ
@@ -323,7 +350,15 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     }
 
     // survey-only は phase1_recon のまま(全 screen queued=未診断)→ 後で resume できる。
-    if (!opts.surveyOnly) opts.store.setPhase(opts.assessmentId, "report");
+    if (!opts.surveyOnly) {
+      opts.store.setPhase(opts.assessmentId, "report");
+    } else {
+      // survey-only が(クラッシュせず)正常終了 = 調査は完了扱い。resume が recon ではなく診断へ進めるよう印を残す。
+      opts.store.appendEvent(opts.assessmentId, {
+        type: "note",
+        payload: { message: `🗺  SURVEY done (survey-only): ${session.inv.screens().length} screens` },
+      });
+    }
   } finally {
     await driver.close();
   }
