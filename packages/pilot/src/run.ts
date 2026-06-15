@@ -5,6 +5,7 @@
 // 文脈で回す(= カバレッジ台帳の queued を全部 terminal にする)ので、画面の取りこぼしが構造的に出ない。
 
 import { createSdkMcpServer, query } from "@anthropic-ai/claude-agent-sdk";
+import type { HookCallback } from "@anthropic-ai/claude-agent-sdk";
 import type { AssessmentStore, Screen, ScopePolicy } from "@veritas/core";
 import { isInScope, recordTokens } from "@veritas/core";
 import type { LoginCreds } from "@veritas/crawler";
@@ -80,6 +81,28 @@ export interface PilotResult {
 }
 
 const DISALLOWED = ["Bash", "Read", "Write", "Edit", "NotebookEdit", "WebFetch", "WebSearch", "Glob", "Grep"];
+
+/** pilot は veritas の MCP ツールだけで回す(bounded 設計)。だが SDK は Bash/Read 以外にも Task/Agent/
+ *  Monitor/Skill/ToolSearch/TaskCreate… を公開しており、bypassPermissions 下ではモデルがそれらを呼べてしまう
+ *  (Monitor/Skill は実質 shell 実行 = Bash 禁止のすり抜け、Agent は無制限サブエージェント生成)。
+ *  PreToolUse フックで mcp__veritas__* 以外を一律 deny する。disallowedTools の列挙に依存しない allowlist で、
+ *  bypassPermissions 下でも PreToolUse の deny は効く(SDK 仕様)。新ツールが増えても自動で塞がる。 */
+/** pilot で呼んでよいツールか(veritas の MCP ツールのみ許可)。Task/Agent/Monitor/Skill/ToolSearch 等は false。 */
+export function isPilotAllowedTool(name: string): boolean {
+  return name.startsWith("mcp__veritas__");
+}
+
+const onlyVeritasToolsHook: HookCallback = async (input) => {
+  const name = (input as { tool_name?: string }).tool_name ?? "";
+  if (isPilotAllowedTool(name)) return { continue: true };
+  return {
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason: `pilot は veritas ツールのみ許可。'${name}' は拒否(get_inventory の結果はそのまま record_methodology で処理すること。外部ツールへ退避しない)。`,
+    },
+  };
+};
 
 /** 診断のモデル使い分け: 認証下 / object-ref・id param / idor-candidate 等ラベル / 認証付き API を持つ
  *  「高価値画面」は deep(例 opus)で診断、入力の無い静的画面は fast(例 sonnet)。 */
@@ -300,6 +323,8 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         allowedTools: p.allowed.map((n) => `mcp__veritas__${n}`),
         disallowedTools: DISALLOWED,
         permissionMode: "bypassPermissions",
+        // veritas MCP ツール以外(Task/Agent/Monitor/Skill/ToolSearch/… 含む)を PreToolUse で全拒否する allowlist。
+        hooks: { PreToolUse: [{ hooks: [onlyVeritasToolsHook] }] },
         ...(p.model ? { model: p.model } : {}),
         systemPrompt: { type: "preset", preset: "claude_code", append: p.system },
         maxTurns: p.maxTurns,
