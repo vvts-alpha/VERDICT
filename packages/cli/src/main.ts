@@ -42,6 +42,8 @@ commands:
             --fast-model 指定でモデル使い分け: survey/methodology/login と低価値画面を fast、高価値画面の診断だけ --model(例 --model opus --fast-model sonnet)
   pilot --survey-only --manifest <file.json> | --url <url> [...]
             調査のみ: 画面マップ+スクショ+API 抽出だけ実行し、診断/finding はしない(安い recon。後で --resume で診断)
+            ※ 既定では survey 中にモデルが低価値な CMS コンテンツ木などを ignore_paths で動的に間引く(frontier 爆発の抑制)。
+              [--exhaustive] を付けると間引きを無効化し全画面を抽出(=画面調査の全量モード)。
   pilot --resume --id <id> [--manifest <file.json>] [--browser-path <bin>] [--no-sandbox] [--out <dir>]
             既存 run の続きから: survey/methodology を飛ばし、未診断(queued)画面だけ診断(落ちた run の仕上げ)
   pilot --attended[ a,b,c] (--manifest <file.json> | --url <url>) [--login-url <u>] [--keepalive-min <n>] [...]
@@ -704,6 +706,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       headed: { type: "boolean" },
       headless: { type: "boolean" },
       attended: { type: "boolean" },
+      exhaustive: { type: "boolean" },
       "login-url": { type: "string" },
       rate: { type: "string" },
       "max-turns": { type: "string" },
@@ -803,6 +806,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       headless: !headed,
       ...(resume ? { resume: true } : {}),
       ...(surveyOnly ? { surveyOnly: true } : {}),
+      ...(values.exhaustive ? { exhaustiveSurvey: true } : {}),
       ...(attended
         ? {
             attended: true,

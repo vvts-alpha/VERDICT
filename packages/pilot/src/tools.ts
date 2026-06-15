@@ -59,6 +59,10 @@ export interface PilotSession {
   visited: Set<string>;
   /** スコープ内・未訪問リンク(調査の残タスク=省略防止の frontier)。 */
   frontier: Set<string>;
+  /** ignore_paths でモデルが動的に間引いた低価値パスのパターン(CMS コンテンツ木など)。frontier 追加時に弾く。 */
+  ignorePaths: string[];
+  /** 全量抽出モード(--exhaustive)。true なら ignore_paths は無効(全画面マップ)。 */
+  exhaustive: boolean;
   /** screenId → 方法論(攻撃計画)。 */
   plans: Map<string, string>;
   /** 診断中の screenId(record_finding / http_request evidence の紐付け先)。 */
@@ -76,7 +80,7 @@ export interface PilotSession {
 
 /** ステージごとに見せるツール(基底名)。run.ts が `mcp__veritas__` を付けて allowedTools に渡す。 */
 export const STAGE_TOOLS = {
-  survey: ["browser_navigate", "browser_fill", "browser_click", "login", "probe_paths", "survey_status", "survey_done"],
+  survey: ["browser_navigate", "browser_fill", "browser_click", "login", "probe_paths", "ignore_paths", "survey_status", "survey_done"],
   methodology: ["get_inventory", "record_methodology", "methodology_done"],
   diagnose: ["get_screen", "login", "http_request", "probe_params", "analyze_session", "verify_access", "browser_navigate", "browser_fill", "browser_click", "record_finding", "screen_done"],
 } as const;
@@ -208,6 +212,28 @@ function cookieHeader(s: PilotSession): Record<string, string> {
   return s.currentCookie ? { cookie: s.currentCookie } : {};
 }
 
+/** ignore_paths のパターン照合。`*` をワイルドカードとして扱い、`*` を含まないパターンは前方一致。
+ *  例: "/news/" は /news/ 配下すべて、"/artikel/*" も同様、"/p" は /p で始まる全パス。URL/相対どちらも path で判定。 */
+export function pathIsIgnored(urlOrPath: string, patterns: ReadonlyArray<string>, base: string): boolean {
+  if (patterns.length === 0) return false;
+  let path: string;
+  try {
+    path = new URL(urlOrPath, base).pathname;
+  } catch {
+    path = urlOrPath.split("?")[0] ?? urlOrPath;
+  }
+  path = path.toLowerCase();
+  return patterns.some((raw) => {
+    const p = raw.toLowerCase().trim();
+    if (!p) return false;
+    if (p.includes("*")) {
+      const rx = new RegExp(`^${p.split("*").map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*")}`);
+      return rx.test(path);
+    }
+    return path.startsWith(p);
+  });
+}
+
 /** login() で使えるロールの一覧(名前 + 任意の権限説明)。attended は生セッションのキー(純手動ロール含む)、
  *  通常は資格情報 + Cookie ファイルのキー。description は auth-diff で高/低権限を見分ける材料。 */
 function availableRoles(s: PilotSession): Array<{ name: string; description?: string }> {
@@ -315,6 +341,7 @@ function recordObservation(s: PilotSession, o: Observation): { screen: Screen; i
     }
     if (!isInScope(abs, s.scope)) continue;
     if (isSessionDestroyingPath(abs)) continue; // logout/signout リンクは frontier に積まない(踏むと自滅)
+    if (pathIsIgnored(abs, s.ignorePaths, s.targetUrl)) continue; // モデルが間引いた低価値パスは積まない
     if (!s.visited.has(abs)) s.frontier.add(abs);
   }
   return { screen, isNew };
@@ -437,8 +464,32 @@ export function buildTools(s: PilotSession) {
             visited: s.visited.size,
             frontierRemaining: s.frontier.size,
             frontier: [...s.frontier].slice(0, 40),
+            ignoring: s.ignorePaths,
+            exhaustive: s.exhaustive,
           }),
         );
+      },
+    ),
+    tool(
+      "ignore_paths",
+      "Dynamically prune the survey: mark in-scope path patterns as low-value so they're dropped from the frontier and not mapped further. Use when the frontier keeps growing with the SAME-skeleton content pages that add no new functional/interactive surface (e.g. a CMS article/news tree). `patterns` are path prefixes or globs with `*` (e.g. /artikel/, /news/*, /en/kultur/). A short `reason` is logged. Already-queued matching links are removed immediately; future links matching them are skipped. This does NOT delete already-mapped screens. (No effect when running --exhaustive / full-extraction.)",
+      { patterns: z.array(z.string()).min(1), reason: z.string() },
+      async ({ patterns, reason }) => {
+        if (s.exhaustive)
+          return txt("exhaustive mode: ignore is disabled — mapping the full surface. (run without --exhaustive to allow dynamic pruning.)");
+        for (const p of patterns) if (p.trim()) s.ignorePaths.push(p.trim());
+        let pruned = 0;
+        for (const u of [...s.frontier]) {
+          if (pathIsIgnored(u, s.ignorePaths, s.targetUrl)) {
+            s.frontier.delete(u);
+            pruned += 1;
+          }
+        }
+        s.store.appendEvent(s.assessmentId, {
+          type: "note",
+          payload: { message: `🗑 ignore_paths +[${patterns.join(", ")}]: ${reason.slice(0, 120)} — frontier -${pruned} → ${s.frontier.size}` },
+        });
+        return txt(JSON.stringify({ ignoring: s.ignorePaths, prunedFromFrontier: pruned, frontierRemaining: s.frontier.size }));
       },
     ),
     tool(
@@ -697,6 +748,7 @@ export function buildTools(s: PilotSession) {
             continue;
           }
           if (!isInScope(url, s.scope)) continue;
+          if (pathIsIgnored(url, s.ignorePaths, s.targetUrl)) continue; // モデルが間引いたパスはプローブしない
           // logout/signout 系は絶対に GET しない(認証セッションを破棄して以降の診断を全滅させるため)。
           if (isSessionDestroyingPath(url)) {
             skippedLogout += 1;

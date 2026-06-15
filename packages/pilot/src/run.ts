@@ -44,6 +44,9 @@ export interface RunPilotOptions {
   maxScreens?: number;
   /** 既存 run の再開: survey/methodology をスキップし、未診断(非 terminal)画面だけ診断する。 */
   resume?: boolean;
+  /** 全量抽出(画面調査): survey の動的間引き(ignore_paths)を無効化し、全画面をマップする。
+   *  未指定なら ignore_paths が有効(モデルが低価値な CMS コンテンツ木などを自分で間引いて frontier 爆発を抑える)。 */
+  exhaustiveSurvey?: boolean;
   /** 調査のみ: survey ステージだけ実行し、methodology/診断をしない(screens/スクショ/API は出す、finding は出さない)。
    *  後で `resume` で診断に繋げられる(map now / diagnose later)。 */
   surveyOnly?: boolean;
@@ -245,6 +248,8 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     inv: new InventoryBuilder(),
     visited: new Set(),
     frontier: new Set(),
+    ignorePaths: [],
+    exhaustive: !!opts.exhaustiveSurvey,
     plans: new Map(),
     currentScreenId: null,
     screenVerdict: null,

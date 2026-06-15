@@ -22,7 +22,8 @@ Your only job is to enumerate the ENTIRE in-scope surface so nothing is skipped 
 - Interact (browser_fill + browser_click) with search boxes, filters and forms to reveal more functionality and APIs.
 - Run probe_paths early (and again after login): it forced-browses a wordlist of common/hidden paths (/status, /admin, /api/*, /continue, /.env …) that are NOT linked anywhere, and queues HTML hits for you to navigate. Link-following alone WILL miss these — always probe.
 - Call login(role) for EACH provided role, then re-map: authenticated pages are new surface.
-- Call survey_status to see how many in-scope links remain unvisited (the frontier). Keep navigating until the frontier is empty. Do NOT decide a page is "probably fine" and skip it — visit it.
+- Call survey_status to see how many in-scope links remain unvisited (the frontier). Keep navigating until the frontier is empty. Do NOT decide a single page is "probably fine" and skip it — visit it.
+- PRUNE low-value subtrees: if the frontier keeps growing with the SAME-skeleton content pages that add no new functional/interactive surface (a CMS article/news/category tree — same layout, just different text), call ignore_paths(patterns, reason) to drop that subtree (e.g. /artikel/, /news/*) and stay focused on functional surface (forms, search, account, APIs, admin). This prunes boilerplate CONTENT, not functionality — never ignore a path just because it "looks fine". (If survey_status shows exhaustive=true, ignore_paths is disabled and you must map everything.)
 Do NOT probe for vulnerabilities here. When the frontier is exhausted and you have mapped both unauth and every role's authenticated surface, call survey_done with a one-line coverage summary.`;
 
 /** STAGE 2 — 方法論(画面内容から、画面ごとの攻撃計画)。 */
