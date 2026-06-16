@@ -17,9 +17,17 @@ browser-profiles/
 # 資格情報を含む実 manifest(scope_manifest.example.json だけ残す)
 scope_manifest.json
 scope_manifest_*.json
+scope_manifest.*.json
+!scope_manifest.example.json
 *.manifest.json
 vault.json
 .env
+
+# ターゲット別の作業ディレクトリ(実認証情報・実 manifest・実 run を含む — 絶対にコミットしない)
+projects/
+
+# pnpm プロジェクトなので npm の lock は混入物(コミットしない)
+package-lock.json
 
 # 事前取得 Cookie ファイル(セッション秘密 — 絶対にコミットしない)
 cookies/
