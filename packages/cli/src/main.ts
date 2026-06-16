@@ -16,13 +16,15 @@ import {
   evaluateStop,
   isInScope,
   newAssessmentId,
+  type AssessmentState,
   type ScopePolicy,
   type TargetInput,
 } from "@veritas/core";
 import { PlaywrightDriver, buildInventory, crawl, exploreScreen, labelInventory, normalizePath, smartLogin, writeScreenInventory } from "@veritas/crawler";
 import type { LoginCreds } from "@veritas/crawler";
 import { ClaudeCliClient } from "@veritas/llm";
-import { EvidenceStore, FetchHttpClient, SECURITY_HEADERS, auditHeaders, coarseCategory, parseBurpReport, burpSeverity, scanInventory } from "@veritas/scanner";
+import { EvidenceStore, FetchHttpClient, SECURITY_HEADERS, auditHeaders, coarseCategory, parseBurpReport, burpSeverity, scanInventory, startBurpScan, getBurpScan } from "@veritas/scanner";
+import type { BurpIssue } from "@veritas/scanner";
 import { assessLogicInventory, assessScreenLogic, authDiffScreen } from "@veritas/agent";
 import type { RoleContext } from "@veritas/agent";
 import { runPilot } from "@veritas/pilot";
@@ -51,6 +53,17 @@ commands:
             → Enter 確認 → 生きたセッションで調査・診断。診断はロール別ライブ Cookie を使い、合間にセッションを維持(失効時は再ログイン要求)
             ロールは --attended admin,userA,userB でCLI直指定も可(manifest 不要・上書き)。単体 --attended は manifest の auth.roles を使用
             ※ pilot は任意で [--burp-proxy http://127.0.0.1:8080] を付けると全通信を Burp 経由(既定オフ=挙動不変)
+  burp-scan --id <id> [--burp-api http://127.0.0.1:1337] [--api-key <key>] [--config "<named config>"]... [--resource-pool <name>] [--manifest <m.json>] [--max-min <n>] [--poll <sec>] [--out <dir>]
+            Burp Pro の REST API で能動スキャンを起動→完了までポーリング→issue を取り込む(XML export 不要)。
+            対象URL = その run の AI がマップした in-scope 画面(=対象は AI が決める)。検査内容/速度 = Burp の named config。
+            --config は複数指定可(クロール速度 + 監査内容を重ねる)。スキャン速度は Burp のクロール戦略プリセットで決まる:
+              例) --config "Crawl strategy - fastest" --config "Audit checks - critical issues only"  (速い)
+                  --config "Crawl strategy - most complete" --config "Audit checks - all except time-based detection methods"  (網羅・遅い)
+              無指定なら "Audit checks - all except time-based detection methods"。
+            速度/throttle = Burp の Resource pool(最大同時リクエスト数・リクエスト間ディレイ)。REST は ms を数値で持てず名前参照のみ。
+              既定は "250ms" プールを使う(Burp で要作成: Settings → Resource pool → Add → 同時1/Delay 250ms)。
+              無ければ Burp 既定プールで自動続行(作り方を案内)。--resource-pool <name> で上書き、--resource-pool "" で Burp 既定。
+            --manifest の資格情報を渡すと認証スキャン。API キーは --api-key か環境変数 BURP_API_KEY。Burp Pro 側で REST API 有効化が必要。
   burp-import --id <id> --report <burp.xml> [--out <dir>]
             Burp Pro の XML レポートを取り込み、既存 finding と重複しない net-new だけ追加(連携はフラグ式・任意)
   assess  --manifest <file.json> | --url <url> [--login-url <u>] [--login-wait <s>] [--no-label] [--no-logic] [--no-explore] [--browser-path <bin>] [--no-sandbox] [--model <m>] [--out <dir>]
@@ -1132,6 +1145,80 @@ async function cmdHeaderAudit(args: string[]): Promise<void> {
   console.log(`\n${missing.size} header finding(s) recorded → reload the WebUI (severity フィルタで info を出し入れ可)`);
 }
 
+// Burp issue(XML or REST 由来)を run にマージ。既存 finding と (粗カテゴリ × 正規化エンドポイント) で
+// 重複排除し、スコープ外は捨てる。burp-import / burp-scan の両方が使う共通ロジック。
+function mergeBurpIssues(
+  store: AssessmentStore,
+  id: string,
+  state: AssessmentState,
+  runsDir: string,
+  issues: ReadonlyArray<BurpIssue>,
+  prefix = "b",
+): { added: number; skipped: number; oos: number } {
+  const evidence = new EvidenceStore(join(runsDir, id, "artifacts"));
+  const keyOf = (cat: string, path: string): string => {
+    try {
+      return `${cat}::${normalizePath(path).template}`;
+    } catch {
+      return `${cat}::${path}`;
+    }
+  };
+  const existing = new Set<string>();
+  for (const f of state.findings) {
+    const ep = /(\/[A-Za-z0-9_{}/.-]+)/.exec(f.title)?.[1] ?? "/";
+    existing.add(keyOf(coarseCategory(f.title), ep));
+  }
+  let added = 0;
+  let skipped = 0;
+  let oos = 0;
+  for (const issue of issues) {
+    let url: string;
+    try {
+      url = new URL(issue.path || "/", issue.host).toString();
+    } catch {
+      url = issue.host;
+    }
+    if (!isInScope(url, state.scope)) {
+      oos += 1;
+      continue;
+    }
+    let path: string;
+    try {
+      path = new URL(url).pathname;
+    } catch {
+      path = issue.path || "/";
+    }
+    const key = keyOf(coarseCategory(issue.name), path);
+    if (existing.has(key)) {
+      skipped += 1;
+      continue;
+    }
+    existing.add(key);
+    added += 1;
+    const ev = evidence.record({
+      screenId: "burp",
+      validator: "burp",
+      kind: "positive_replay",
+      request: { method: "GET", url, headers: {}, body: issue.request || null },
+      response: { status: 0, finalUrl: url, durationMs: 0, headers: {}, body: issue.response },
+      note: issue.name,
+    });
+    store.upsertFinding(id, {
+      id: `${prefix}-${String(added).padStart(3, "0")}`,
+      screenId: null,
+      title: `[burp] ${issue.name}`,
+      severity: burpSeverity(issue.severity),
+      source: { kind: "validator", validatorName: "burp" },
+      description: `${(issue.detail || issue.background).slice(0, 600)} @ ${url}`,
+      reproSteps: "Burp が検出。証拠に request/response(Cookie/Authorization は伏字)。",
+      evidenceIds: [ev.id],
+      scopeBasis: "burp scan (in-scope)",
+    });
+    console.log(`  + ${prefix}-${String(added).padStart(3, "0")} [${burpSeverity(issue.severity)}] ${issue.name}`);
+  }
+  return { added, skipped, oos };
+}
+
 // Burp Pro の XML レポートを取り込み、既存 finding と重複しない net-new だけを追加する。
 // 連携の流れ: pilot --burp-proxy <burp> で全トラフィックを Burp 経由 → Burp でスキャン → レポート XML
 // を export → このコマンドで取り込み。重複排除は (粗カテゴリ × 正規化エンドポイント) で行う。
@@ -1155,71 +1242,121 @@ async function cmdBurpImport(args: string[]): Promise<void> {
   }
 
   const issues = parseBurpReport(readFileSync(values.report, "utf8"));
-  const evidence = new EvidenceStore(join(runsDir, id, "artifacts"));
-  const keyOf = (cat: string, path: string): string => {
-    try {
-      return `${cat}::${normalizePath(path).template}`;
-    } catch {
-      return `${cat}::${path}`;
-    }
-  };
-  // 既存 finding(エージェントが見つけた分)の粗キーを集める → Burp の重複を弾く。
-  const existing = new Set<string>();
-  for (const f of state.findings) {
-    const ep = /(\/[A-Za-z0-9_{}/.-]+)/.exec(f.title)?.[1] ?? "/";
-    existing.add(keyOf(coarseCategory(f.title), ep));
-  }
-
-  let added = 0;
-  let skipped = 0;
-  let oos = 0;
-  for (const issue of issues) {
-    let url: string;
-    try {
-      url = new URL(issue.path || "/", issue.host).toString();
-    } catch {
-      url = issue.host;
-    }
-    if (!isInScope(url, state.scope)) {
-      oos += 1;
-      continue; // スコープ外の Burp issue は取り込まない
-    }
-    let path: string;
-    try {
-      path = new URL(url).pathname;
-    } catch {
-      path = issue.path || "/";
-    }
-    const key = keyOf(coarseCategory(issue.name), path);
-    if (existing.has(key)) {
-      skipped += 1;
-      continue; // エージェントが既に見つけている → net-new ではない
-    }
-    existing.add(key);
-    added += 1;
-    const ev = evidence.record({
-      screenId: "burp",
-      validator: "burp",
-      kind: "positive_replay",
-      request: { method: "GET", url, headers: {}, body: issue.request || null },
-      response: { status: 0, finalUrl: url, durationMs: 0, headers: {}, body: issue.response },
-      note: issue.name,
-    });
-    store.upsertFinding(id, {
-      id: `b-${String(added).padStart(3, "0")}`,
-      screenId: null,
-      title: `[burp] ${issue.name}`,
-      severity: burpSeverity(issue.severity),
-      source: { kind: "validator", validatorName: "burp" },
-      description: `${(issue.detail || issue.background).slice(0, 600)} @ ${url}`,
-      reproSteps: "Burp が検出。証拠にプロキシで捕えた request/response(Cookie/Authorization は伏字)。",
-      evidenceIds: [ev.id],
-      scopeBasis: "burp scan (proxied, in-scope)",
-    });
-    console.log(`  + b-${String(added).padStart(3, "0")} [${burpSeverity(issue.severity)}] ${issue.name}`);
-  }
+  const { added, skipped, oos } = mergeBurpIssues(store, id, state, runsDir, issues);
   store.close();
   console.log(`\nburp-import ${id}: ${issues.length} issue(s) → +${added} net-new(dup ${skipped} / out-of-scope ${oos})`);
+}
+
+// Burp Pro の REST API を叩いて能動スキャンを起動 → 完了までポーリング → issue を取り込む(XML export 不要のライブ版)。
+// 対象URL = AI がマップした in-scope の具体URL(=実質 AI が対象を決める)。検査内容 = Burp の named config(--config)。
+async function cmdBurpScan(args: string[]): Promise<void> {
+  const { values } = parseArgs({
+    args,
+    options: {
+      id: { type: "string" },
+      out: { type: "string" },
+      "burp-api": { type: "string" },
+      "api-key": { type: "string" },
+      config: { type: "string", multiple: true },
+      "resource-pool": { type: "string" },
+      manifest: { type: "string" },
+      "max-min": { type: "string" },
+      poll: { type: "string" },
+    },
+  });
+  if (!values.id) fail("burp-scan requires --id <assessment-id>");
+  const id = values.id;
+  const runsDir = values.out ?? RUNS_DIR_DEFAULT;
+  const dbPath = dbPathFor(runsDir, id);
+  if (!existsSync(dbPath)) fail(`no state.sqlite at ${dbPath}`);
+  const store = AssessmentStore.open(dbPath);
+  const state = store.loadAssessment(id);
+  if (!state) {
+    store.close();
+    fail(`assessment ${id} not found in ${dbPath}`);
+  }
+
+  const base = values["burp-api"] ?? "http://127.0.0.1:1337";
+  const apiKey = values["api-key"] ?? process.env.BURP_API_KEY;
+  // --config は複数指定可(クロール速度 + 監査内容を別プリセットで重ねる)。無指定なら時間ベース除く全 audit。
+  const configs = values.config?.length ? values.config : ["Audit checks - all except time-based detection methods"];
+  // throttle = Burp の Resource pool(並列数・リクエスト間ディレイ)。REST は ms を数値で持てず名前参照のみ。
+  // 既定はツール共通の 250ms に合わせるべく "Umbra 250ms" プールを使う(Burp 側で要作成)。--resource-pool "" で無効。
+  const DEFAULT_POOL = "250ms";
+  const resourcePool = values["resource-pool"] === undefined ? DEFAULT_POOL : values["resource-pool"];
+  const usePool = resourcePool !== "";
+  const pollSec = values.poll ? Number.parseInt(values.poll, 10) : 10;
+  const maxMin = values["max-min"] ? Number.parseInt(values["max-min"], 10) : 30;
+
+  // シードURL: AI がマップした in-scope の具体URL(observedUrls)+ target。Burp はここから crawl+audit する。
+  const seeds = new Set<string>();
+  if ("url" in state.target && state.target.url) seeds.add(state.target.url);
+  for (const sc of state.screens) {
+    for (const u of sc.observedUrls ?? []) {
+      if (isInScope(u, state.scope)) seeds.add((u.split("#")[0] ?? u));
+    }
+  }
+  const urls = [...seeds].slice(0, 300);
+  if (urls.length === 0) {
+    store.close();
+    fail("no in-scope URLs to scan — run survey/pilot first so screens exist");
+  }
+
+  // 認証スキャン(任意): manifest の資格情報を Burp の application_logins に渡す。
+  const manifest = values.manifest ? loadManifest(values.manifest) : null;
+  const logins = manifestRoleCreds(manifest).map((rc) => ({ username: rc.creds.username, password: rc.creds.password }));
+
+  console.log(`▶ burp-scan ${id} → ${base}`);
+  console.log(`  config: ${configs.join(" + ")}${usePool ? ` | pool: ${resourcePool}` : " | pool: (Burp 既定)"} | seeds: ${urls.length} in-scope URL(s)${logins.length ? ` | auth: ${logins.length} login(s)` : ""}`);
+
+  const startScan = (pool: string | undefined): Promise<string> =>
+    startBurpScan({ base, ...(apiKey ? { apiKey } : {}), urls, configs, ...(pool ? { resourcePool: pool } : {}), ...(logins.length ? { logins } : {}) });
+
+  let taskId: string;
+  try {
+    taskId = await startScan(usePool ? resourcePool : undefined);
+  } catch (e) {
+    // 既定の 250ms プールが Burp に無い → Burp 既定プールで続行し、作り方を案内(初回をハードに落とさない)。
+    if (usePool && /resource pool/i.test(String(e))) {
+      console.log(`⚠ Burp に resource pool "${resourcePool}" が無いため Burp 既定プールで続行します。`);
+      console.log(`   250ms スロットルにするには Burp で同名プールを作成: Settings → Resource pool → Add → Maximum concurrent requests 1, Delay between requests 250ms。`);
+      taskId = await startScan(undefined).catch((e2: unknown) => {
+        store.close();
+        return fail(`Burp REST start failed: ${String(e2).slice(0, 200)}`);
+      });
+    } else {
+      store.close();
+      return fail(`Burp REST start failed: ${String(e).slice(0, 200)}\n  → Burp Pro の REST API は有効? (User options → Misc → REST API, default 127.0.0.1:1337) / --api-key は?`);
+    }
+  }
+  console.log(`  scan task ${taskId} started; polling every ${pollSec}s (timeout ${maxMin}m)…`);
+
+  const deadline = Date.now() + maxMin * 60_000;
+  let last: Awaited<ReturnType<typeof getBurpScan>> | null = null;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, pollSec * 1000));
+    try {
+      last = await getBurpScan(base, apiKey, taskId);
+    } catch (e) {
+      console.log(`  ⚠ poll error: ${String(e).slice(0, 120)}`);
+      continue;
+    }
+    console.log(`  [${last.status}] progress ${last.progress}% · ${last.issueEvents} issue event(s)`);
+    if (last.status === "succeeded" || last.status === "failed") break;
+  }
+  if (!last) {
+    store.close();
+    fail("no scan status received (timeout before first poll?)");
+  }
+  if (last.status !== "succeeded") console.log(`⚠ scan ended status=${last.status} — 現時点の issue を取り込みます`);
+
+  const { added, skipped, oos } = mergeBurpIssues(store, id, state, runsDir, last.issues, "bs");
+  if (added > 0) {
+    const finalState = store.loadAssessment(id);
+    if (finalState) writeFileSync(join(runsDir, id, "report.md"), buildReport(finalState));
+  }
+  store.close();
+  console.log(`\nburp-scan ${id}: ${last.issues.length} issue(s) → +${added} net-new(dup ${skipped} / out-of-scope ${oos})`);
 }
 
 // 対話型 scope-manifest ジェネレータ(独立して使える。pilot/assess が読む JSON を組み立てる)。
@@ -1408,6 +1545,9 @@ async function main(): Promise<void> {
       return;
     case "header-audit":
       await cmdHeaderAudit(rest);
+      return;
+    case "burp-scan":
+      await cmdBurpScan(rest);
       return;
     case "burp-import":
       await cmdBurpImport(rest);

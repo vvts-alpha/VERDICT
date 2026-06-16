@@ -30,3 +30,5 @@ export type { HeaderRule } from "./headers.js";
 
 export { parseBurpReport, burpSeverity, coarseCategory } from "./burp.js";
 export type { BurpIssue } from "./burp.js";
+export { startBurpScan, getBurpScan, restIssuesToBurpIssues } from "./burp-rest.js";
+export type { BurpScanRequest, BurpScanStatus } from "./burp-rest.js";
