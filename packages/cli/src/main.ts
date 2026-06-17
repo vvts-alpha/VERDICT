@@ -1492,7 +1492,7 @@ async function cmdManifest(args: string[]): Promise<void> {
   type Role = { name: string; description?: string; username?: string; password?: string; cookieFile?: string };
 
   try {
-    console.log("\n=== Umbra Hands scope-manifest generator ===");
+    console.log("\n=== AMRAAM scope-manifest generator ===");
     console.log("認可済みターゲットのみ。各項目は Enter で既定値。\n");
 
     let target = "";

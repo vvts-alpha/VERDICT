@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Umbra Hands CLI — run / status / list (DESIGN §11, §12 M0)",
+  "description": "AMRAAM CLI — run / status / list (DESIGN §11, §12 M0)",
   "bin": {
     "veritas": "./dist/main.js"
   },

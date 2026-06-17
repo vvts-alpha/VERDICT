@@ -54,7 +54,7 @@ export interface PlaywrightDriverOptions {
   navTimeoutMs?: number;
   settleMs?: number;
   maxBodySample?: number;
-  /** x-umbra-hands マーカーを付ける URL の **追加** 絞り込み(任意)。マーカーは常に「同一オリジン(+遷移)」
+  /** x-amraam マーカーを付ける URL の **追加** 絞り込み(任意)。マーカーは常に「同一オリジン(+遷移)」
    *  だけに付く(クロスオリジンには絶対付けない = 第三者 CDN/解析/別ドメイン API を CORS preflight で壊さない)。
    *  この述語を渡すと、その同一オリジン要求の中でさらに true のものだけに限定できる(既定=全許可)。
    *  ※ スコープ(評価対象)とは別概念: スコープは別ドメイン/API を含めて広げてよい。 */
@@ -62,7 +62,7 @@ export interface PlaywrightDriverOptions {
 }
 
 /** ブラウザ由来トラフィックを識別するためのマーカーヘッダ(同一オリジンには無害、クロスオリジンは preflight 化)。 */
-const MARKER_HEADER = "x-umbra-hands";
+const MARKER_HEADER = "x-amraam";
 const MARKER_VALUE = "assessment";
 
 interface SettledOptions {
@@ -181,7 +181,7 @@ export class PlaywrightDriver implements Driver {
       maxBodySample: options.maxBodySample ?? 4096,
     });
     await context.addInitScript(INIT_SCRIPT);
-    // x-umbra-hands マーカーは **同一オリジン(+ドキュメント遷移)** のリクエストにだけ付ける。クロスオリジンには
+    // x-amraam マーカーは **同一オリジン(+ドキュメント遷移)** のリクエストにだけ付ける。クロスオリジンには
     // 一切付けない(= スコープに別ドメイン/API を含めても、ブラウザが第三者を CORS preflight で壊さない)。
     // スコープとマーカーは別概念: スコープ=何を評価してよいか(別ドメイン・API 込みで広げてOK)、
     // マーカー=識別ヘッダで、同一オリジンなら preflight 不要なので常に無害。markerAllow で更に絞れる(既定=全許可)。

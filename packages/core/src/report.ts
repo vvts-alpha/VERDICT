@@ -12,7 +12,7 @@ export function buildReport(state: AssessmentState, now: Date = new Date()): str
   const confirmedHypotheses = state.hypotheses.filter((h) => h.status === "confirmed").length;
 
   const out: string[] = [];
-  out.push(`# Umbra Hands Assessment Report — \`${state.id}\``, "");
+  out.push(`# AMRAAM Assessment Report — \`${state.id}\``, "");
   out.push(`- **Target**: ${target}`);
   out.push(`- **Phase**: ${state.phase}`);
   out.push(`- **Screens**: ${cov.total} (scanned ${cov.terminal}, remaining ${cov.remaining})`);

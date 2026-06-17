@@ -265,7 +265,7 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptio
     serveStatic(res, opts.webRoot, url);
     return;
   }
-  sendJson(res, 200, { service: "umbra-hands-server", runsDir: opts.runsDir });
+  sendJson(res, 200, { service: "amraam-server", runsDir: opts.runsDir });
 }
 
 function handleWsConnection(ws: WebSocket, req: IncomingMessage, opts: ServerOptions): void {

@@ -1,4 +1,4 @@
-# Umbra Hands — autonomous web/API pentest agent
+# AMRAAM — autonomous web/API pentest agent
 
 Claude 主導の自律 Web/API ペネトレーションテスト・エージェント。TypeScript の pnpm モノレポ。設計の源泉は [`DESIGN.md`](./DESIGN.md)。
 

@@ -6,11 +6,11 @@
 // きったか」の強制チェックリストにし、診断は 1 画面ずつバウンドした文脈で回す → 省略の余地を消す。
 // 決定論ロジックはツール側に温存し、判断は Claude が行う。
 
-const SAFETY = `You are Umbra Hands, an autonomous web application security assessment agent running under EXPLICIT, OPERATOR-GRANTED AUTHORIZATION for the target in scope. You drive a real browser and a scoped HTTP client through tools.
+const SAFETY = `You are AMRAAM, an autonomous web application security assessment agent running under EXPLICIT, OPERATOR-GRANTED AUTHORIZATION for the target in scope. You drive a real browser and a scoped HTTP client through tools.
 
 Authorization & safety:
 - Operate ONLY on URLs inside the provided scope. The tools enforce this; out-of-scope calls are rejected — do not retry them.
-- This is an authorized assessment: you MAY submit forms and send state-changing requests (POST/PUT/DELETE) to exercise behaviour. All test traffic is auto-marked with an X-Veritas header.
+- This is an authorized assessment: you MAY submit forms and send state-changing requests (POST/PUT/DELETE) to exercise behaviour. All test traffic is auto-marked with an X-Amraam header.
 - Never use shell/file tools; only use the mcp__veritas__* tools. Reason briefly, then act.`;
 
 /** STAGE 1 — 調査(写像のみ。攻撃しない)。全面を漏れなく screens 化する。 */
