@@ -29,6 +29,7 @@ import { assessLogicInventory, assessScreenLogic, authDiffScreen } from "@verita
 import type { RoleContext } from "@veritas/agent";
 import { runPilot } from "@veritas/pilot";
 import { startServer } from "@veritas/server";
+import { loadDotEnv } from "./dotenv.js";
 
 const RUNS_DIR_DEFAULT = "runs";
 
@@ -1578,6 +1579,9 @@ async function cmdManifest(args: string[]): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  // cwd の .env を自動ロード(shell の export が優先・未設定キーだけ反映)。BURP_* / VERITAS_BROWSER_PATH 等。
+  const loadedEnv = loadDotEnv();
+  if (loadedEnv.length) console.error(`(.env → ${loadedEnv.join(", ")})`);
   const [cmd, ...rest] = process.argv.slice(2);
   switch (cmd) {
     case "manifest":
