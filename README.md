@@ -90,6 +90,8 @@ pnpm -r test         # node:test(外部ネット/LLM 不要、Fake で完結)
 ```
 
 > ブラウザパスは一度 `export VERITAS_BROWSER_PATH=/path/to/chrome` しておけば、各コマンドで `--browser-path` を省略できる。`--no-sandbox` はサンドボックスが通らない環境(コンテナ/root)でだけ付ける。
+>
+> **環境変数は cwd の `.env` から自動ロード**される(`VERITAS_BROWSER_PATH` / `BURP_API` / `BURP_PROXY` / `BURP_API_KEY` / `BURP_RESOURCE_POOL`)。shell の `export` が優先・未設定キーだけ `.env` で埋める。`.env` は gitignore 済み。詳細は §ワークフロー D(Burp 連携)。
 
 ---
 
@@ -153,7 +155,7 @@ node packages/cli/dist/main.js manifest --out m.json
 | コマンド | 用途 |
 |---|---|
 | `manifest`(別名 `init`) | **対話型 scope-manifest ジェネレータ**: 質問に答えるだけで manifest JSON を生成(target / in・out-of-scope hosts・path / rate / crawl / model / 認証ロール)。`--out <file>` で出力先指定、password はエコー伏字。生成名 `scope_manifest_<host>.json` は gitignore 済み |
-| **`pilot`** | Claude 主導アセスメント(full)。`--manifest` / `--url`、`--model`、`--max-turns`、`--rate`、`--headed`、`--browser-path`、`--no-sandbox`、`--burp-proxy <url>`、`--keepalive-min <n>`(認証セッション維持: 画面の合間にトップへ navigate して cookie 再同期。既定 4 分、`0` で無効) |
+| **`pilot`** | Claude 主導アセスメント(full)。`--manifest` / `--url`、`--model`、`--max-turns`、`--rate`、`--headed`、`--browser-path`、`--no-sandbox`、`--burp-proxy [url]`(全通信を Burp 経由。値なしなら env `BURP_PROXY`)、`--burp-scan`(診断後に Burp 能動スキャンも実施→マージ)、`--keepalive-min <n>`(認証セッション維持: 画面の合間にトップへ navigate して cookie 再同期。既定 4 分、`0` で無効) |
 | `pilot --survey-only` | **調査のみ**: 画面マップ+スクショ+API だけ。診断/finding はしない(安い recon、後で `--resume`) |
 | `pilot --resume --id <id>` | 既存 run の**未診断(queued)画面だけ**診断(落ちた run の仕上げ / survey-only の続き) |
 | `pilot --attended` | **手動マルチセッション認証**(headed 必須)。ロールごとに永続コンテキストを開き、人手でログイン(CAPTCHA/MFA/Arkose 突破)→ Enter 確認 → 生きたセッションで調査・診断。`login(role)` は再ログインせず**そのロールのライブセッションへ切替**。合間に全ロールを keepalive(失効=ログイン画面に戻されたら再ログインを要求)。`--login-url <u>`(手動ログインの入口、既定 target)/ `--keepalive-min <n>`(既定 1 分)。自動ログイン/Cookie ファイルで越えられない壁向け |
@@ -162,6 +164,7 @@ node packages/cli/dist/main.js manifest --out m.json
 | `report` / `status` / `list` | report.md 生成 / phase・coverage・stop 判定 / `runs/` 一覧 |
 | `shots --id <id>` | 既存 run の各画面スクショを backfill(run の認証済プロファイル再利用・ナビゲートのみ) |
 | `header-audit --id <id>` | Info 系: レスポンスヘッダ監査(CSP/HSTS/XFO/…)。`--headers csp,hsts,…` で絞る。トグル=走らせる/走らせない |
+| `burp-scan --id <id>` | **Burp Pro の REST API で能動スキャンを起動**→完了までポーリング→issue を net-new だけマージ(XML export 不要)。対象URLは run の AI がマップした in-scope 面。`--config "<名前>"`(複数可・速度/監査プリセット)、`--resource-pool <名>`(throttle)、`--manifest`(認証)、`--burp-api`/`--api-key`。接続は env(`BURP_API` 等)既定 |
 | `burp-import --id <id> --report <xml>` | Burp Pro の XML レポートを取り込み、既存と重複しない net-new だけ finding 追加 |
 | `run` / `crawl` / `label` / `scan` / `logic` | 決定論パイプラインの個別ステップ(`assess` の中身) |
 
@@ -193,23 +196,46 @@ node packages/cli/dist/main.js pilot --attended --manifest m.json
 #   セッションが切れた(ログイン画面に戻された)ら、その窓で再ログインして Enter。
 ```
 
-**D. Burp 連携(任意・フラグ式)** — `--burp-proxy` を付けない限り挙動は不変
+**D. Burp Suite 連携(任意・フラグ式)** — `--burp-proxy` / `--burp-scan` を付けない限り挙動は不変
+
+接続情報は **env(cwd の `.env` を起動時に自動ロード)→ 引数で上書き**。`.env` は gitignore 済み:
 ```bash
-# Burp Pro の Proxy リスナを起動(別端末なら All interfaces に bind)
-node packages/cli/dist/main.js pilot --manifest m.json --burp-proxy http://127.0.0.1:8080
-#   → 全 HTTP+ブラウザ通信が Burp 経由(TLS は検証スキップ、Burp CA 不要)
-# Burp でスキャン → レポートを XML で export →
-node packages/cli/dist/main.js burp-import --id <run-id> --report burp.xml
-#   → Burp の net-new(ヘッダ/脆弱JS/バージョン開示 等)だけ finding に merge(重複は弾く)
+# .env(リポジトリ直下。実行時に自動読込。shell の export が優先)
+VERITAS_BROWSER_PATH=/path/to/chrome
+BURP_API=http://127.0.0.1:1337        # REST API(キー無しなら BURP_API_KEY 不要)
+BURP_PROXY=http://127.0.0.1:8080      # Proxy リスナ(WSL→Windows は All interfaces に bind)
+BURP_RESOURCE_POOL=250ms              # throttle 用 Resource pool 名(既定)
 ```
 
-**D. Info 系を足す(Burp 無しの軽量版)**
+使い方は 3 つ:
+```bash
+# ① プロキシ経由 — 全 HTTP+ブラウザ通信を Burp に流す(認証済みトラフィックも蓄積)
+node packages/cli/dist/main.js pilot --manifest m.json --burp-proxy
+#   値なし=env BURP_PROXY / 値で上書き: --burp-proxy http://別:8080。TLS 検証スキップ(Burp CA 不要)
+
+# ② Burp 能動スキャンも実施 — REST API で起動→診断後に in-scope 面をスキャン→net-new をマージ
+node packages/cli/dist/main.js pilot --manifest m.json --burp-scan
+#   要: Burp Pro → Settings → Misc → REST API を有効化(既定 127.0.0.1:1337)
+#   既存 run に単体実行 + 速度/監査プリセット(複数 --config を重ねる):
+node packages/cli/dist/main.js burp-scan --id <run-id> \
+  --config "Crawl strategy - fastest" --config "Audit checks - critical issues only"
+
+# ③ 手動 Burp スキャンの XML を取り込み — net-new(ヘッダ/脆弱JS/バージョン開示 等)だけ merge
+node packages/cli/dist/main.js burp-import --id <run-id> --report burp.xml
+```
+
+> **attended と組み合わせるとき**は **`--burp-proxy` を使う**。手動ログイン(CAPTCHA/MFA)の
+> 生きたセッションを Burp REST(`--burp-scan`)は引き継げず未認証スキャンになるため。認証下を Burp で
+> 能動スキャンしたいなら、proxy で認証済み通信を溜め → Burp UI で Active scan か `burp-import`。
+> 速度/throttle は Burp の **Resource pool**(`--resource-pool` / `BURP_RESOURCE_POOL`、既定 `250ms`)。
+
+役割分担: **エージェント = 創発的ロジック**(IDOR 連鎖・マスアサイン・business logic)/ **Burp = 注入系の機械網羅(A03 SQLi/XSS 等)+ パッシブ**。重複は `burp-scan`/`burp-import` が排除する。
+
+**E. Info 系を足す(Burp 無しの軽量版)**
 ```bash
 node packages/cli/dist/main.js header-audit --id <run-id>            # 既定リスト
 node packages/cli/dist/main.js header-audit --id <run-id> --headers csp,hsts
 ```
-
-役割分担: **エージェント = 創発的ロジック**(IDOR 連鎖・マスアサイン・business logic)/ **Burp = 網羅パッシブ+能動**。重複は `burp-import` が排除する。
 
 ---
 
@@ -251,4 +277,4 @@ node packages/cli/dist/main.js header-audit --id <run-id> --headers csp,hsts
 - **認証 = operator 供給の資格情報 OR 事前 Cookie ファイル**(`smartLogin` / `loadCookieFile`)。エージェントは Cookie を捏造/盗まない。MFA/CAPTCHA で Cookie も無ければ `detectStuck` → 非ブロッキング HumanHandoff(headed で人手)。
 - **状態は append-only + 再生可能**。UI は純投影(`buildStateView` / `buildSiteTree`)。
 
-> 状態: ステージ型 Claude 主導 pilot(調査→方法論→診断)+ 決定論 assess、WebUI 観測、Burp/header 連携、survey-only/resume/attended(手動マルチセッション)モード — すべて実装・実機検証済み。`pnpm -r test` は緑。
+> 状態: ステージ型 Claude 主導 pilot(調査→方法論→診断)+ 決定論 assess、WebUI 観測、Burp 連携(proxy / REST 能動スキャン `burp-scan` / XML import、`.env` 自動ロード)、header 監査、survey-only/resume/attended(手動マルチセッション)モード、survey の動的間引き(`ignore_paths`/`--exhaustive`) — すべて実装・実機検証済み。`pnpm -r test` は緑。
