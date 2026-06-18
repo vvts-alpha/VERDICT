@@ -1572,7 +1572,7 @@ async function cmdManifest(args: string[]): Promise<void> {
     if (roles.length) {
       console.log("⚠ 資格情報/Cookie を含む = 秘密ファイル。gitignore 済みパターン scope_manifest_*.json に一致させてください。");
     }
-    console.log(`\n次の一手:\n  node packages/cli/dist/main.js pilot --manifest ${outPath} --model ${model}\n`);
+    console.log(`\nCommand:\n  node packages/cli/dist/main.js pilot --manifest ${outPath} --model ${model}\n`);
   } finally {
     rl.close();
   }
