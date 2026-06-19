@@ -6,7 +6,7 @@ const SEV_ORDER: Record<string, number> = { critical: 0, high: 1, medium: 2, low
 // ツリーで選んだ 1 画面の詳細。順序は「ページの情報(スクショ→概要→API/params)→ その画面の findings」。
 export function ScreenView({ view, screen, onExclude }: { view: StateView; screen?: Screen; onExclude: (id: string) => void }) {
   if (!screen) {
-    return <p className="muted log-empty">← ツリーから画面を選択。</p>;
+    return <p className="muted log-empty">← Select a screen from the tree.</p>;
   }
   const status = view.screenScans.find((s) => s.screenId === screen.screenId)?.status ?? "queued";
   const fs = view.findings
@@ -19,7 +19,7 @@ export function ScreenView({ view, screen, onExclude }: { view: StateView; scree
         <span className="mono sv-url">{screen.urlTemplate}</span>
         <span className={`statuspill st-${status}`}>{status}</span>
         <button type="button" className="excludebtn" onClick={() => onExclude(screen.screenId)}>
-          除外
+          Exclude
         </button>
       </div>
       <div className="sv-meta">
@@ -35,7 +35,7 @@ export function ScreenView({ view, screen, onExclude }: { view: StateView; scree
         />
       ) : (
         <div className="sv-shot noshot">
-          no screenshot — <code>shots --id {view.id}</code> で backfill できます
+          no screenshot — backfill with <code>shots --id {view.id}</code>
         </div>
       )}
 

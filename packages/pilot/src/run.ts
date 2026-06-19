@@ -102,7 +102,7 @@ const onlyVeritasToolsHook: HookCallback = async (input) => {
     hookSpecificOutput: {
       hookEventName: "PreToolUse",
       permissionDecision: "deny",
-      permissionDecisionReason: `pilot は veritas ツールのみ許可。'${name}' は拒否(get_inventory の結果はそのまま record_methodology で処理すること。外部ツールへ退避しない)。`,
+      permissionDecisionReason: `pilot only permits veritas tools. '${name}' is denied (process get_inventory results directly with record_methodology; do not offload to external tools).`,
     },
   };
 };
@@ -151,7 +151,7 @@ export function stageTokenDelta(assistantTokens: number, resultTokens: number, s
  *  手動ログイン窓で「どのアカウントでログインすべきか(管理者/一般 等)」が分かるようにする。 */
 export function roleLabel(role: string, descriptions?: Map<string, string>): string {
   const d = descriptions?.get(role);
-  return d ? `「${role}」(${d})` : `「${role}」`;
+  return d ? `'${role}' (${d})` : `'${role}'`;
 }
 
 export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
@@ -171,7 +171,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
   let primaryRole = "";
   let primaryCookie = "";
   if (opts.attended) {
-    if (!opts.promptOperator) throw new Error("attended mode requires promptOperator (Enter 確認のコールバック)");
+    if (!opts.promptOperator) throw new Error("attended mode requires promptOperator (Enter-confirm callback)");
     // 窓を開くロール: 明示の attendedRoles を最優先(純手動ロールも含む)。無ければ creds/cookie のキーから。
     const roles = [
       ...new Set([...(opts.attendedRoles ?? []), ...opts.roleCreds.keys(), ...(opts.roleCookieFiles?.keys() ?? [])]),
@@ -179,7 +179,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     if (roles.length === 0) roles.push("primary"); // ロール未設定でも単一の手動セッションは張れる
     const baseDir = opts.attendedProfilesDir ?? join(opts.profileDir, "..", "profiles");
     roleSessions = new Map();
-    opts.onText?.(`👤 attended: ${roles.length} ロールの headed セッションを起動します（手動ログイン）`);
+    opts.onText?.(`👤 attended: launching ${roles.length} headed session(s) per role (manual login)`);
     for (const role of roles) {
       const d = await PlaywrightDriver.launch({ ...launchBase, userDataDir: join(baseDir, role), headless: false });
       const cookieFile = opts.roleCookieFiles?.get(role);
@@ -190,17 +190,17 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
           await d.clearSession();
           await d.addCookies(browserCookies);
           await d.gotoUrl(opts.targetUrl);
-          opts.onText?.(`🍪 ロール${roleLabel(role, opts.roleDescriptions)}: ${browserCookies.length} 件の事前 Cookie を注入（手動ログイン不要）`);
+          opts.onText?.(`🍪 role ${roleLabel(role, opts.roleDescriptions)}: injected ${browserCookies.length} pre-captured cookie(s) (no manual login needed)`);
         } catch (e) {
           opts.onText?.(`⚠ role '${role}' cookie file error: ${String(e).slice(0, 120)}`);
         }
       } else {
         await d.gotoUrl(opts.loginUrl ?? opts.targetUrl);
-        await opts.promptOperator(`▶ ロール${roleLabel(role, opts.roleDescriptions)}のブラウザ窓で手動ログインしてください（CAPTCHA/MFA も突破）。完了したら Enter…`);
+        await opts.promptOperator(`▶ Please log in manually in the browser window for role ${roleLabel(role, opts.roleDescriptions)} (clear CAPTCHA/MFA too). Press Enter when done…`);
       }
       const cookie = await d.sessionCookieHeader();
       roleSessions.set(role, { driver: d, cookie });
-      opts.onText?.(`✅ ロール${roleLabel(role, opts.roleDescriptions)} セッション確立（cookie ${cookie ? "あり" : "なし"}）`);
+      opts.onText?.(`✅ role ${roleLabel(role, opts.roleDescriptions)} session established (cookie ${cookie ? "present" : "absent"})`);
     }
     primaryRole = roles[0]!;
     const prim = roleSessions.get(primaryRole)!;
@@ -295,7 +295,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     }
     opts.store.appendEvent(opts.assessmentId, {
       type: "note",
-      payload: { message: `↺ resume: ${prev.screens.length} screens / ${prev.findings.length} findings 引継ぎ` },
+      payload: { message: `↺ resume: ${prev.screens.length} screens / ${prev.findings.length} findings carried over` },
     });
   }
 
@@ -393,7 +393,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
 
     if (doSurvey) {
       // ── STAGE 1: 調査(写像のみ) ── resume で survey 未完なら既存 screens を seed したまま継続。
-      if (opts.resume) opts.onText?.("↻ survey が未完だったので調査(recon)から再開します");
+      if (opts.resume) opts.onText?.("↻ survey was incomplete, resuming from recon");
       opts.store.setPhase(opts.assessmentId, "phase1_recon");
       turns += await runStage({
         system: SURVEY_PROMPT,
@@ -447,8 +447,8 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
             await rs.driver.gotoUrl(opts.targetUrl); // 各ロールの生コンテキストをトップへ(Set-Cookie 追従)
             const snap = await rs.driver.snapshot();
             if (sessionLooksDead(snap) && opts.promptOperator) {
-              opts.onText?.(`🔴 ロール${roleLabel(role, opts.roleDescriptions)} のセッションが切れた様子（ログイン画面に戻されました）`);
-              await opts.promptOperator(`▶ ロール${roleLabel(role, opts.roleDescriptions)}のブラウザ窓で再ログインしてください。完了したら Enter…`);
+              opts.onText?.(`🔴 role ${roleLabel(role, opts.roleDescriptions)} session appears to have expired (bounced back to the login page)`);
+              await opts.promptOperator(`▶ Please log in again in the browser window for role ${roleLabel(role, opts.roleDescriptions)}. Press Enter when done…`);
             }
             const fresh = await rs.driver.sessionCookieHeader();
             if (fresh) {
@@ -461,7 +461,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         }
         opts.store.appendEvent(opts.assessmentId, {
           type: "note",
-          payload: { message: `🫀 keepalive(attended): ${roleSessions.size} ロールを再同期（セッション維持）` },
+          payload: { message: `🫀 keepalive (attended): re-synced ${roleSessions.size} role(s) (keep session alive)` },
         });
       };
       const keepSessionWarm = async (): Promise<void> => {
@@ -479,7 +479,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
           if (fresh) session.currentCookie = fresh;
           opts.store.appendEvent(opts.assessmentId, {
             type: "note",
-            payload: { message: "🫀 keepalive: トップへ navigate + cookie 再同期(セッション維持)" },
+            payload: { message: "🫀 keepalive: navigate to top + re-sync cookies (keep session alive)" },
           });
         } catch (e) {
           opts.onText?.(`⚠ keepalive failed: ${String(e).slice(0, 120)}`);

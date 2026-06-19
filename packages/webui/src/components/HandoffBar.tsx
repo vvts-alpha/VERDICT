@@ -10,10 +10,10 @@ export function HandoffBar({ handoffs, onResolve }: { handoffs: HumanHandoff[]; 
         <div key={h.id} className="handoff">
           <span className="hicon">🔐</span>
           <span className="htext">
-            要・人間対応 [{h.reason}]: <b className="mono">{h.url ?? ""}</b> — {h.message}
+            Needs human [{h.reason}]: <b className="mono">{h.url ?? ""}</b> — {h.message}
           </span>
           <button type="button" onClick={() => onResolve(h.id)}>
-            ログイン完了 → 続行
+            Logged in → continue
           </button>
         </div>
       ))}

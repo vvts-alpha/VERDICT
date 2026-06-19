@@ -7,9 +7,9 @@ import { roleLabel } from "./run.js";
 
 test("roleLabel: description があれば手動ログイン窓に権限を出す", () => {
   const d = new Map([["admin", "全権管理者"]]);
-  assert.equal(roleLabel("admin", d), "「admin」(全権管理者)");
-  assert.equal(roleLabel("viewer", d), "「viewer」"); // 説明なしは素のまま
-  assert.equal(roleLabel("admin", undefined), "「admin」");
+  assert.equal(roleLabel("admin", d), "'admin' (全権管理者)");
+  assert.equal(roleLabel("viewer", d), "'viewer'"); // 説明なしは素のまま
+  assert.equal(roleLabel("admin", undefined), "'admin'");
 });
 
 test("ログイン系 URL パスは dead(再ログイン要求)", () => {

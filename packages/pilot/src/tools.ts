@@ -398,7 +398,7 @@ export function buildTools(s: PilotSession) {
         if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} is out of scope`);
         // logout/signout への遷移はセッションを破棄し以降の認証診断を全滅させるので踏まない。
         if (isSessionDestroyingPath(url))
-          return txt(`SKIPPED: ${url} は logout/sign-out 系です。遷移すると認証セッションが壊れて以降の診断が全滅するため訪問しません。`);
+          return txt(`SKIPPED: ${url} is a logout/sign-out path. Navigating to it would break the auth session and wipe out all subsequent diagnosis, so it is not visited.`);
         try {
           const o = await s.driver.visit(url);
           const { screen, isNew } = recordObservation(s, o);
@@ -672,8 +672,8 @@ export function buildTools(s: PilotSession) {
         if (category === "auth-bypass") {
           const av = s.accessVerdicts.get(normEndpoint(endpoint, s.targetUrl));
           if (av === "not_bypass")
-            return txt(`REJECTED: verify_access on ${endpoint} returned 'not_bypass'(redirect→login / 401 / 403 = 認証が効いてる)。機械 veto なので記録不可。`);
-          if (!av) return txt(`REQUIRED: auth-bypass を記録する前に verify_access(${endpoint}) を通すこと(302→login / 401 / 403 は bypass ではない)。`);
+            return txt(`REJECTED: verify_access on ${endpoint} returned 'not_bypass' (redirect→login / 401 / 403 = auth is enforced). Mechanical veto, cannot record.`);
+          if (!av) return txt(`REQUIRED: run verify_access(${endpoint}) before recording auth-bypass (302→login / 401 / 403 is not a bypass).`);
         }
         s.recordCalls += 1;
         s.screenVerdict = "finding";
