@@ -90,6 +90,44 @@ test("buildSiteTree stays a flat path forest for a single host", () => {
   assert.deepEqual(tree.map((n) => n.segment), ["/", "products"], "単一ドメインはドメイン段を足さない");
 });
 
+test("buildSiteTree branches SPA hash routes recovered from observedUrls", () => {
+  // 同一 pathname `/app` だが hash route が違う → URL では分離できないが枝分かれさせたい
+  const screens = [
+    screen("s-0001", "/app", "dashboard", ["https://app.example.com/app#/"]),
+    screen("s-0002", "/app", "listing", ["https://app.example.com/app#/admin/users"]),
+    screen("s-0003", "/app", "detail", ["https://app.example.com/app#/admin/users/42"]),
+  ];
+  const tree = buildSiteTree(screens, []);
+  const app = tree.find((n) => n.segment === "app");
+  assert.ok(app, "/app ノードが存在");
+  const admin = app!.children.find((n) => n.segment === "#admin");
+  assert.ok(admin, "hash route #admin が枝になる");
+  const users = admin!.children.find((n) => n.segment === "users");
+  assert.ok(users, "#admin/users");
+  assert.equal(users!.screenId, "s-0002");
+  // id っぽい hash セグメントは {id} に畳む
+  assert.ok(users!.children.some((n) => n.segment === "{id}" && n.screenId === "s-0003"), "#admin/users/{id}");
+});
+
+test("buildSiteTree branches URL-stable (pure-state) SPA screens via skeleton tag", () => {
+  // hash も無く pathname も同一(URL が一切変わらない state 駆動 SPA)。DOM 骨格 hash で枝分かれ。
+  const screens = [
+    screen("s-0001", "/console", "dashboard", ["https://app.example.com/console"]),
+    screen("s-0002", "/console", "listing", ["https://app.example.com/console"]),
+  ];
+  const tree = buildSiteTree(screens, []);
+  const console_ = tree.find((n) => n.segment === "console");
+  assert.ok(console_, "/console ノードが存在");
+  assert.equal(console_!.screenId, null, "衝突した親には screen を載せない");
+  assert.equal(console_!.children.length, 2, "2 つの state ビューが ~tag で枝分かれ");
+  const tags = console_!.children.map((n) => n.segment).sort();
+  assert.deepEqual(tags, ["~s-0001", "~s-0002"], "domSkeletonHash 由来の短縮子で一意化");
+  assert.deepEqual(
+    console_!.children.map((n) => n.screenId).sort(),
+    ["s-0001", "s-0002"],
+  );
+});
+
 test("buildStateView projects AssessmentState for the UI", () => {
   const dir = mkdtempSync(join(tmpdir(), "veritas-view-"));
   try {
