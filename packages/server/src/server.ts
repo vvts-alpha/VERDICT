@@ -8,7 +8,9 @@ import { extname, join, normalize } from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
 
 import { AssessmentStore, buildStateView } from "@veritas/core";
-import type { WsMessage } from "@veritas/core";
+import type { TargetInput, WsMessage } from "@veritas/core";
+import { handleAuthSubmit, handleLogout, isAuthedReq, loginPageHtml } from "./auth.js";
+import { Supervisor, type RunLauncherConfig, type StartRunInput } from "./supervisor.js";
 
 export interface ServerOptions {
   runsDir: string;
@@ -20,6 +22,12 @@ export interface ServerOptions {
   pollMs?: number;
   /** 接続/push を可観測化するログ(CLI が console.log を渡す。テストは未指定=無音)。 */
   onLog?: (msg: string) => void;
+  /** 設定すると WebUI/API/WS を単一パスワードでゲート(/login フォーム + 署名 Cookie)。
+   *  未設定なら従来どおり無認証。cmdServe が --password / env AMRAAM_WEB_PASSWORD で渡す。 */
+  authPassword?: string;
+  /** 設定すると WebUI から run を起動/停止/再開できる(server が CLI を子プロセスで spawn)。
+   *  未設定なら /api/run 等は無効。cmdServe が CLI パス等を DI。 */
+  runLauncher?: RunLauncherConfig;
 }
 
 export interface RunningServer {
@@ -44,11 +52,14 @@ interface AssessmentSummaryRow {
   phase: string;
   screens: number;
   findings: number;
+  target: TargetInput;
+  createdAt: string;
+  updatedAt: string;
 }
 
 function listAssessments(runsDir: string): AssessmentSummaryRow[] {
   if (!existsSync(runsDir)) return [];
-  const rows: Array<AssessmentSummaryRow & { mtime: number }> = [];
+  const rows: AssessmentSummaryRow[] = [];
   for (const ent of readdirSync(runsDir, { withFileTypes: true })) {
     if (!ent.isDirectory()) continue;
     const dbPath = join(runsDir, ent.name, "state.sqlite");
@@ -56,6 +67,7 @@ function listAssessments(runsDir: string): AssessmentSummaryRow[] {
     try {
       const store = AssessmentStore.open(dbPath);
       const state = store.loadAssessment(ent.name);
+      const summary = store.listAssessments().find((s) => s.id === ent.name);
       store.close();
       if (state) {
         rows.push({
@@ -63,16 +75,18 @@ function listAssessments(runsDir: string): AssessmentSummaryRow[] {
           phase: state.phase,
           screens: state.screens.length,
           findings: state.findings.length,
-          mtime: statSync(dbPath).mtimeMs,
+          target: state.target,
+          createdAt: summary?.createdAt ?? "",
+          updatedAt: summary?.updatedAt ?? "",
         });
       }
     } catch {
       /* skip unreadable */
     }
   }
-  // 最近書き込まれた順(= 実行中 / 直近)。WebUI の既定選択(?id 無し)が最新を指すように。
-  rows.sort((a, b) => b.mtime - a.mtime);
-  return rows.map(({ mtime: _mtime, ...r }) => r);
+  // 更新が新しい順(= 実行中 / 直近)。一覧の先頭が最新になる。
+  rows.sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0));
+  return rows;
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
@@ -108,8 +122,60 @@ function serveStatic(res: ServerResponse, webRoot: string, urlPath: string): voi
 }
 
 // DESIGN §8.3 — WebUI 最小操作: pause/resume / handoff resolve / screen exclude。
-function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOptions): void {
+// + Phase-1 制御面: run の起動(/api/run) / 停止 / 再開(supervisor 経由)。
+function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOptions, supervisor?: Supervisor): void {
   const url = req.url ?? "";
+
+  // run 起動: body = { command, manifest, options }。supervisor が CLI を spawn し、新 id を返す。
+  if (url === "/api/run") {
+    if (!supervisor) return sendJson(res, 400, { error: "run launcher disabled" });
+    let body = "";
+    let tooBig = false;
+    req.on("data", (c) => {
+      body += c;
+      if (body.length > 256 * 1024) {
+        tooBig = true;
+        req.destroy();
+      }
+    });
+    req.on("end", () => {
+      if (tooBig) return;
+      let input: StartRunInput;
+      try {
+        input = JSON.parse(body) as StartRunInput;
+      } catch {
+        return sendJson(res, 400, { error: "invalid JSON body" });
+      }
+      if (input.command !== "pilot" && input.command !== "assess") {
+        return sendJson(res, 400, { error: "command must be 'pilot' or 'assess'" });
+      }
+      if (!input.manifest || typeof input.manifest !== "object" || !(input.manifest as { target?: unknown }).target) {
+        return sendJson(res, 400, { error: "manifest.target is required" });
+      }
+      try {
+        const { id } = supervisor.start(input);
+        sendJson(res, 200, { id });
+      } catch (e) {
+        sendJson(res, 500, { error: `failed to launch: ${String(e).slice(0, 200)}` });
+      }
+    });
+    return;
+  }
+
+  // run プロセス停止 / 再開(/api/run 名前空間。/api/assessments の pause/resume(状態)とは別物)
+  const runCtl = url.match(/^\/api\/run\/([^/]+)\/(stop|resume)$/);
+  if (runCtl) {
+    if (!supervisor) return sendJson(res, 400, { error: "run launcher disabled" });
+    const id = decodeURIComponent(runCtl[1] ?? "");
+    if (runCtl[2] === "stop") {
+      const ok = supervisor.stop(id);
+      return sendJson(res, ok ? 200 : 409, ok ? { ok: true } : { error: "not running" });
+    }
+    if (supervisor.isRunning(id)) return sendJson(res, 409, { error: "already running" });
+    supervisor.resume(id);
+    return sendJson(res, 200, { ok: true });
+  }
+
   const openStore = (id: string): AssessmentStore | null => {
     const dbPath = join(opts.runsDir, id, "state.sqlite");
     return existsSync(dbPath) ? AssessmentStore.open(dbPath) : null;
@@ -153,14 +219,42 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
   sendJson(res, 404, { error: "unknown control endpoint" });
 }
 
-function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptions): void {
+function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptions, supervisor?: Supervisor): void {
+  const url = req.url ?? "/";
+  // 認証ゲート(authPassword 設定時のみ)。/login と POST /auth は素通し、それ以外は Cookie 必須。
+  const secret = opts.authPassword;
+  if (secret) {
+    const now = Date.now();
+    if (req.method === "POST" && (url === "/auth" || url.startsWith("/auth?"))) {
+      handleAuthSubmit(req, res, secret, now);
+      return;
+    }
+    if (req.method === "GET" && (url === "/login" || url.startsWith("/login?"))) {
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      res.end(loginPageHtml(url.includes("e=1")));
+      return;
+    }
+    if (req.method === "GET" && url === "/logout") {
+      handleLogout(res);
+      return;
+    }
+    if (!isAuthedReq(req, secret, now)) {
+      if (url.startsWith("/api/") || req.method === "POST") {
+        sendJson(res, 401, { error: "unauthorized" });
+      } else {
+        res.writeHead(302, { location: "/login" });
+        res.end();
+      }
+      return;
+    }
+  }
   if (req.method === "POST") {
-    handleControl(req, res, opts);
+    handleControl(req, res, opts, supervisor);
     return;
   }
-  const url = req.url ?? "/";
   if (url === "/api/assessments") {
-    sendJson(res, 200, listAssessments(opts.runsDir));
+    const rows = listAssessments(opts.runsDir).map((r) => ({ ...r, running: supervisor?.isRunning(r.id) ?? false }));
+    sendJson(res, 200, rows);
     return;
   }
   // 画面スクショ: runs/<id>/artifacts/screens/<screenId>.png を配信(WebUI 表示用)。
@@ -329,8 +423,16 @@ function handleWsConnection(ws: WebSocket, req: IncomingMessage, opts: ServerOpt
 export async function startServer(opts: ServerOptions): Promise<RunningServer> {
   const host = opts.host ?? "127.0.0.1";
   const pollMs = opts.pollMs ?? 1000;
-  const httpServer = createServer((req, res) => handleHttp(req, res, opts));
-  const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
+  const supervisor = opts.runLauncher ? new Supervisor(opts.runLauncher) : undefined;
+  const httpServer = createServer((req, res) => handleHttp(req, res, opts, supervisor));
+  // authPassword 設定時は WS upgrade も Cookie で弾く(verifyClient)。
+  const wss = new WebSocketServer({
+    server: httpServer,
+    path: "/ws",
+    ...(opts.authPassword
+      ? { verifyClient: (info: { req: IncomingMessage }) => isAuthedReq(info.req, opts.authPassword as string, Date.now()) }
+      : {}),
+  });
   const sockets = new Set<WebSocket>();
   wss.on("connection", (ws, req) => {
     sockets.add(ws);
@@ -349,6 +451,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
     async close() {
       if (closing) return;
       closing = true;
+      await supervisor?.closeAll(); // 子の run を停止
       // 開いている WS / keep-alive 接続を強制クローズ(そうしないと httpServer.close が完走しない)。
       for (const ws of sockets) {
         try {

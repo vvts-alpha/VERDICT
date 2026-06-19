@@ -62,6 +62,42 @@ test("HTTP API lists assessments and projects a StateView", async () => {
   }
 });
 
+test("auth gate: password-protects WebUI/API with login form + signed cookie", async () => {
+  const runsDir = mkdtempSync(join(tmpdir(), "veritas-srv-"));
+  const store = seed(runsDir, "a-auth");
+  store.close();
+  const srv = await startServer({ runsDir, pollMs: 50, authPassword: "s3cret" });
+  const form = { "content-type": "application/x-www-form-urlencoded" };
+  try {
+    // 未認証 API → 401、未認証 HTML → 302 /login、/login フォーム → 200
+    assert.equal((await fetch(`${srv.url}/api/assessments`, { redirect: "manual" })).status, 401);
+    const root = await fetch(`${srv.url}/`, { redirect: "manual" });
+    assert.equal(root.status, 302);
+    assert.equal(root.headers.get("location"), "/login");
+    assert.equal((await fetch(`${srv.url}/login`)).status, 200);
+
+    // 誤PW → 302 /login?e=1・Cookie なし
+    const bad = await fetch(`${srv.url}/auth`, { method: "POST", headers: form, body: "password=nope", redirect: "manual" });
+    assert.equal(bad.headers.get("location"), "/login?e=1");
+    assert.equal(bad.headers.getSetCookie().length, 0);
+
+    // 正PW → 302 /・Set-Cookie
+    const ok = await fetch(`${srv.url}/auth`, { method: "POST", headers: form, body: "password=s3cret", redirect: "manual" });
+    assert.equal(ok.headers.get("location"), "/");
+    const setc = ok.headers.getSetCookie();
+    assert.equal(setc.length, 1);
+    const cookie = setc[0]?.split(";")[0] ?? "";
+    assert.match(cookie, /^amraam_session=/);
+
+    // Cookie 付き API → 200、改竄 Cookie → 401
+    assert.equal((await fetch(`${srv.url}/api/assessments`, { headers: { cookie } })).status, 200);
+    assert.equal((await fetch(`${srv.url}/api/assessments`, { headers: { cookie: "amraam_session=1.deadbeef" }, redirect: "manual" })).status, 401);
+  } finally {
+    await srv.close();
+    rmSync(runsDir, { recursive: true, force: true });
+  }
+});
+
 test("control endpoints: pause/resume, exclude screen, resolve handoff (§8.3)", async () => {
   const runsDir = mkdtempSync(join(tmpdir(), "veritas-srv-"));
   const store = seed(runsDir, "a-3");

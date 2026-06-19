@@ -13,7 +13,7 @@ export function StatusBar({
   const c = view.coverage;
   return (
     <header className="statusbar">
-      <span className="brand">AMRAAM</span>
+      <a className="brand" href="?" title="Back to projects">AMRAAM</a>
       <span>
         phase: <b>{view.phase}</b>
       </span>

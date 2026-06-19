@@ -14,32 +14,9 @@ export async function postControl(path: string): Promise<void> {
   }
 }
 
-/** ?id= があれば固定。無ければ /api/assessments(サーバは直近書込順)の先頭を 3 秒ごとに追従。
- *  → serve を起動したまま pilot/assess を後から始めても、最新の実行中アセスメントが自動で映る。 */
+/** ?id= があればそのアセスメントを表示。無ければ null → App は一覧(Index)を表示する。 */
 export function useAssessmentId(): string | null {
-  const pinned = new URLSearchParams(window.location.search).get("id");
-  const [id, setId] = useState<string | null>(pinned);
-  useEffect(() => {
-    if (pinned) return;
-    let alive = true;
-    const poll = (): void => {
-      fetch("/api/assessments")
-        .then((r) => r.json())
-        .then((list: Array<{ id: string }>) => {
-          if (alive && list[0]) setId(list[0].id);
-        })
-        .catch(() => {
-          /* server 未起動など */
-        });
-    };
-    poll();
-    const t = window.setInterval(poll, 3000);
-    return () => {
-      alive = false;
-      window.clearInterval(t);
-    };
-  }, [pinned]);
-  return id;
+  return new URLSearchParams(window.location.search).get("id");
 }
 
 export function useStateView(id: string | null): { view: StateView | null; conn: ConnState } {

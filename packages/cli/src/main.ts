@@ -36,65 +36,67 @@ const RUNS_DIR_DEFAULT = "runs";
 const USAGE = `veritas <command> [options]
 
 commands:
-  manifest [--out <file.json>] [--force]   (別名: init)
-            対話型 scope-manifest ジェネレータ: 質問に答えると pilot/assess が読む JSON を生成
-            (target / in・out-of-scope hosts・path / rate / crawl / model / 認証ロール。password はエコー伏字)
+  manifest [--out <file.json>] [--force]   (alias: init)
+            interactive scope-manifest generator: answer the prompts to produce the JSON pilot/assess read
+            (target / in·out-of-scope hosts·path / rate / crawl / model / auth roles. password echo is masked)
   pilot   --manifest <file.json> | --url <url> [--model <m>] [--fast-model <m>] [--max-turns <n>] [--rate <ms>] [--headed] [--browser-path <bin>] [--no-sandbox] [--out <dir>]
-            ★Claude 主導: Claude がツール(browser/http/login/record)を操縦して自律的に探索・検証・記録
-            manifest の auth.roles を login(role) ツールで使う。決定論パイプラインより柔軟(従量API無し/Maxサブスク)
-            --fast-model 指定でモデル使い分け: survey/methodology/login と低価値画面を fast、高価値画面の診断だけ --model(例 --model opus --fast-model sonnet)
+            ★Claude-led: Claude drives the tools (browser/http/login/record) to autonomously explore, verify, and record
+            uses the manifest's auth.roles via the login(role) tool. more flexible than the deterministic pipeline (no metered API / Max subscription)
+            --fast-model enables model tiering: survey/methodology/login and low-value screens on fast, only high-value screen diagnosis on --model (e.g. --model opus --fast-model sonnet)
   pilot --survey-only --manifest <file.json> | --url <url> [...]
-            調査のみ: 画面マップ+スクショ+API 抽出だけ実行し、診断/finding はしない(安い recon。後で --resume で診断)
-            ※ 既定では survey 中にモデルが低価値な CMS コンテンツ木などを ignore_paths で動的に間引く(frontier 爆発の抑制)。
-              [--exhaustive] を付けると間引きを無効化し全画面を抽出(=画面調査の全量モード)。
+            survey only: maps screens + screenshots + API extraction only, no diagnosis/findings (cheap recon. diagnose later with --resume)
+            ※ by default, during survey the model dynamically prunes low-value CMS content trees etc. via ignore_paths (curbs frontier explosion).
+              add [--exhaustive] to disable pruning and extract every screen (= full survey mode).
   pilot --resume --id <id> [--manifest <file.json>] [--browser-path <bin>] [--no-sandbox] [--out <dir>]
-            既存 run の続きから: survey/methodology を飛ばし、未診断(queued)画面だけ診断(落ちた run の仕上げ)
+            continue an existing run: skip survey/methodology, diagnose only undiagnosed (queued) screens (finish a crashed run)
   pilot --attended[ a,b,c] (--manifest <file.json> | --url <url>) [--login-url <u>] [--keepalive-min <n>] [...]
-            手動マルチセッション認証(headed 必須): ロールごとに永続コンテキストを開き、人手でログイン(CAPTCHA/MFA/Arkose 突破)
-            → Enter 確認 → 生きたセッションで調査・診断。診断はロール別ライブ Cookie を使い、合間にセッションを維持(失効時は再ログイン要求)
-            ロールは --attended admin,userA,userB でCLI直指定も可(manifest 不要・上書き)。単体 --attended は manifest の auth.roles を使用
-            ※ Burp 連携(基本は env、引数で上書き): [--burp-proxy [url]] 全通信を Burp 経由(値なしなら env BURP_PROXY)。
-              [--burp-scan [--burp-api url]] 診断後に同じ run へ Burp 能動スキャンも実施→結果マージ(接続は env BURP_API/BURP_API_KEY/BURP_RESOURCE_POOL)。どちらも既定オフ。
+            manual multi-session auth (headed required): opens a persistent context per role for a human to log in (clear CAPTCHA/MFA/Arkose)
+            → Enter to confirm → explore/diagnose on the live session. diagnosis uses per-role live cookies and keeps sessions warm between screens (re-login requested on expiry)
+            roles can be given inline via --attended admin,userA,userB (no manifest needed / overrides). bare --attended uses the manifest's auth.roles
+            ※ Burp integration (env by default, overridable by args): [--burp-proxy [url]] route all traffic through Burp (env BURP_PROXY if no value).
+              [--burp-scan [--burp-api url]] after diagnosis, also run a Burp active scan against the same run → merge results (connection via env BURP_API/BURP_API_KEY/BURP_RESOURCE_POOL). both off by default.
   burp-scan --id <id> [--burp-api <url>] [--api-key <key>] [--config "<named config>"]... [--resource-pool <name>] [--manifest <m.json>] [--max-min <n>] [--poll <sec>] [--out <dir>]
-            Burp Pro の REST API で能動スキャンを起動→完了までポーリング→issue を取り込む(XML export 不要)。接続は env(BURP_API/BURP_API_KEY/BURP_RESOURCE_POOL)→引数で上書き。
-            対象URL = その run の AI がマップした in-scope 画面(=対象は AI が決める)。検査内容/速度 = Burp の named config。
-            --config は複数指定可(クロール速度 + 監査内容を重ねる)。スキャン速度は Burp のクロール戦略プリセットで決まる:
-              例) --config "Crawl strategy - fastest" --config "Audit checks - critical issues only"  (速い)
-                  --config "Crawl strategy - most complete" --config "Audit checks - all except time-based detection methods"  (網羅・遅い)
-              無指定なら "Audit checks - all except time-based detection methods"。
-            速度/throttle = Burp の Resource pool(最大同時リクエスト数・リクエスト間ディレイ)。REST は ms を数値で持てず名前参照のみ。
-              既定は "250ms" プールを使う(Burp で要作成: Settings → Resource pool → Add → 同時1/Delay 250ms)。
-              無ければ Burp 既定プールで自動続行(作り方を案内)。--resource-pool <name> で上書き、--resource-pool "" で Burp 既定。
-            --manifest の資格情報を渡すと認証スキャン。API キーは --api-key か環境変数 BURP_API_KEY。Burp Pro 側で REST API 有効化が必要。
+            launch a Burp Pro active scan via its REST API → poll to completion → import issues (no XML export needed). connection via env (BURP_API/BURP_API_KEY/BURP_RESOURCE_POOL) → overridable by args.
+            target URLs = the in-scope screens the AI mapped for that run (= the AI decides the targets). checks/speed = Burp's named config.
+            --config can be given multiple times (stack crawl speed + audit checks). scan speed is set by Burp's crawl strategy preset:
+              e.g.) --config "Crawl strategy - fastest" --config "Audit checks - critical issues only"  (fast)
+                  --config "Crawl strategy - most complete" --config "Audit checks - all except time-based detection methods"  (thorough, slow)
+              defaults to "Audit checks - all except time-based detection methods".
+            speed/throttle = Burp's Resource pool (max concurrent requests · inter-request delay). REST can't hold ms as a number, only references pools by name.
+              defaults to the "250ms" pool (create it in Burp: Settings → Resource pool → Add → concurrency 1 / Delay 250ms).
+              if absent, auto-continues on Burp's default pool (prints how to create one). override with --resource-pool <name>, --resource-pool "" for Burp's default.
+            pass --manifest credentials for an authenticated scan. API key via --api-key or env BURP_API_KEY. Burp Pro's REST API must be enabled.
   burp-import --id <id> --report <burp.xml> [--out <dir>]
-            Burp Pro の XML レポートを取り込み、既存 finding と重複しない net-new だけ追加(連携はフラグ式・任意)
+            import a Burp Pro XML report, adding only net-new issues that don't duplicate existing findings (integration is flag-driven / optional)
   assess  --manifest <file.json> | --url <url> [--login-url <u>] [--login-wait <s>] [--no-label] [--no-logic] [--no-explore] [--browser-path <bin>] [--no-sandbox] [--model <m>] [--out <dir>]
-            一括起動(決定論パイプライン): crawl → label → scan → logic → report を 1 コマンドで実行
-            --login-url 指定で headed ブラウザを開きログイン待ち(パスワードは人手入力、注入しない)
+            one-shot run (deterministic pipeline): crawl → label → scan → logic → report in a single command
+            --login-url opens a headed browser and waits for login (password entered by hand, never injected)
   run     --url <url> [--follow] [--max-depth <n>] [--out <dir>]
-            認可済みターゲットの空アセスメントを生成し runs/<id>/state.sqlite を書く
+            create an empty assessment for an authorized target and write runs/<id>/state.sqlite
   crawl   --url <url> | --id <id> [--follow] [--max-depth <n>] [--headed] [--login-url <u>] [--login-wait <s>] [--out <dir>]
-            Phase1: Playwright でクロール+傍受 → screen_inventory.json + カバレッジ台帳
+            Phase1: crawl + intercept with Playwright → screen_inventory.json + coverage ledger
   label   --id <id> [--model <model>] [--out <dir>]
-            Phase1 ラベリング: 各画面を LLM で分類(claude サブスク認証、従量 API なし)
+            Phase1 labeling: classify each screen with the LLM (claude subscription auth, no metered API)
   scan    --id <id> [--rate <ms>] [--out <dir>]
-            Phase2: 汎用 validator + 証拠規律(neg+2replay)。confirmed を findings に
+            Phase2: generic validators + evidence discipline (neg+2replay). confirmed → findings
   logic   --id <id> [--screen <sid>] [--model <model>] [--rate <ms>] [--out <dir>]
-            Phase2 ビジネスロジック: 仮説生成(LLM)→ IDOR 等を証拠規律で検証
-  serve   [--port <n>] [--host <h>] [--out <dir>] [--web-root <dir>] [--no-web]
-            観測 WebUI + 状態API/WS を起動(既定 127.0.0.1:4317。LAN 公開は --host 0.0.0.0)
+            Phase2 business logic: hypothesis generation (LLM) → verify IDOR etc. with evidence discipline
+  serve   [--port <n>] [--host <h>] [--out <dir>] [--web-root <dir>] [--no-web] [--password <pw>] [--no-auth] [--no-launch]
+            start the observability WebUI + state API/WS (default 127.0.0.1:4317. expose to LAN with --host 0.0.0.0)
+            --password or env AMRAAM_WEB_PASSWORD gates the WebUI/API/WS behind a single password (/login + signed cookie). --no-auth disables it
+            the WebUI "+ New" launches pilot/assess by spawning the CLI as a child; --no-launch disables run launching
   report  --id <id> [--out <dir>]
-            findings から report.md を生成(重大度順 + 再現 + 証拠 + スコープ根拠)
+            generate report.md from findings (by severity + repro + evidence + scope basis)
   shots   --id <id> [--headed] [--browser-path <bin>] [--no-sandbox] [--out <dir>]
-            既存 run の各画面を撮り直し WebUI 用スクショを backfill(run の認証済プロファイル再利用・ナビゲートのみ)
+            re-shoot each screen of an existing run to backfill WebUI screenshots (reuses the run's authed profile, navigate-only)
   header-audit --id <id> [--headers csp,hsts,xfo,xcto,refpol,permpol] [--rate <ms>] [--out <dir>]
-            Info系: 各画面のレスポンスヘッダを監査し欠落ヘッダ毎に finding(deterministic/トグル=走らせる走らせない)
+            Info-level: audit each screen's response headers and record a finding per missing header (deterministic / toggle = run it or not)
   status  --id <assessment-id> [--out <dir>]
-            フェーズ・カバレッジ・findings を表示
+            show phase, coverage, and findings
   list    [--out <dir>]
-            runs/ 配下のアセスメント一覧
+            list the assessments under runs/
 
-注意: スコープ外は禁止。--url は同一オリジン + 配下が既定スコープ(DESIGN §4.2 / §5)。
+note: out-of-scope is denied. --url's default scope is same-origin + path-prefix (DESIGN §4.2 / §5).
 `;
 
 function fail(msg: string): never {
@@ -301,9 +303,9 @@ async function cmdCrawl(args: string[]): Promise<void> {
   try {
     if (loginUrl) {
       const waitSec = values["login-wait"] ? Number.parseInt(values["login-wait"], 10) : 60;
-      console.log(`🔐 ログイン待ち: 開いたブラウザで ${loginUrl} にログインしてください(${waitSec}s)…`);
+      console.log(`🔐 waiting for login: log in to ${loginUrl} in the opened browser (${waitSec}s)…`);
       await driver.interactiveLogin(loginUrl, waitSec * 1000);
-      console.log("   続行(認証状態は browser-profile に保持)");
+      console.log("   continuing (auth state kept in browser-profile)");
     }
     const result = await crawl(
       {
@@ -469,6 +471,7 @@ async function cmdAssess(args: string[]): Promise<void> {
     options: {
       manifest: { type: "string" },
       url: { type: "string" },
+      id: { type: "string" },
       out: { type: "string" },
       model: { type: "string" },
       "browser-path": { type: "string" },
@@ -495,7 +498,7 @@ async function cmdAssess(args: string[]): Promise<void> {
   const model = values.model ?? manifest?.model ?? "claude-sonnet-4-6";
   const rate = values.rate ? Number.parseInt(values.rate, 10) : 250;
 
-  const id = newAssessmentId();
+  const id = values.id ?? newAssessmentId(); // server-spawned runs supply --id; otherwise generate
   mkdirSync(join(runsDir, id), { recursive: true });
   const store = AssessmentStore.open(dbPathFor(runsDir, id));
   store.createAssessment({ id, target: { kind: "single_url", url: seedUrl, followLinks, maxDepth }, scope });
@@ -503,7 +506,7 @@ async function cmdAssess(args: string[]): Promise<void> {
   console.log(`▶ assessment ${id}`);
   console.log(`  target ${seedUrl} | scope hosts=[${scope.inScopeHosts.join(",")}] | rate ${rate}ms`);
   if (manifest?.auth?.roles?.length) {
-    console.log(`  auth roles: ${manifest.auth.roles.map((r) => r.name).join(", ")} (auth-diff 用 / state には保存しない)`);
+    console.log(`  auth roles: ${manifest.auth.roles.map((r) => r.name).join(", ")} (for auth-diff / not persisted to state)`);
   }
 
   const screensNow = () => store.loadAssessment(id)?.screens ?? [];
@@ -554,7 +557,7 @@ async function cmdAssess(args: string[]): Promise<void> {
       const loginScreenUrl = screensNow().find((s) => s.screenType === "auth")?.observedUrls[0];
       let loggedIn = false;
       if (primaryCreds) {
-        console.log("② login (資格情報でログイン画面/項目を自動発見) …");
+        console.log("② login (auto-discover login screen/fields from credentials) …");
         const r = await smartLogin(driver, claude, primaryCreds, {
           targetUrl: seedUrl,
           ...(loginScreenUrl ? { loginScreenUrl } : {}),
@@ -565,16 +568,16 @@ async function cmdAssess(args: string[]): Promise<void> {
           loggedIn = true;
         } else if (r.needsHuman && headed) {
           const u = interactiveUrl ?? r.loginUrl ?? seedUrl;
-          console.log(`🔐 ${r.reason} → 人手ログインに切替: ${u}(${waitSec}s)…`);
+          console.log(`🔐 ${r.reason} → switching to manual login: ${u} (${waitSec}s)…`);
           await driver.interactiveLogin(u, waitSec * 1000);
           loggedIn = true;
         } else if (r.needsHuman) {
-          console.log(`   ${r.reason} — MFA/CAPTCHA は表示環境で --headed を付けて再実行(未認証で続行)`);
+          console.log(`   ${r.reason} — for MFA/CAPTCHA, re-run with --headed in a display environment (continuing unauthenticated)`);
         } else {
-          console.log(`   自動ログイン不可: ${r.reason}(未認証で続行)`);
+          console.log(`   auto-login failed: ${r.reason} (continuing unauthenticated)`);
         }
       } else if (interactiveUrl) {
-        console.log(`🔐 ログイン待ち: ${interactiveUrl}(${waitSec}s)…`);
+        console.log(`🔐 waiting for login: ${interactiveUrl} (${waitSec}s)…`);
         await driver.interactiveLogin(interactiveUrl, waitSec * 1000);
         loggedIn = true;
       }
@@ -600,7 +603,7 @@ async function cmdAssess(args: string[]): Promise<void> {
 
     // ⑤(前半)各 role でログインしてセッション cookie を取得
     if (roleCredsList.length >= 2) {
-      console.log("⑤ auth-diff: 各 role でログインしてセッション取得 …");
+      console.log("⑤ auth-diff: log in as each role to capture sessions …");
       for (const rc of roleCredsList) {
         await driver.clearSession();
         const r = await smartLogin(driver, claude, rc.creds, { targetUrl: seedUrl, model });
@@ -625,7 +628,7 @@ async function cmdAssess(args: string[]): Promise<void> {
   }
 
   // ③ scan
-  console.log("③ scan (validators + 証拠規律) …");
+  console.log("③ scan (validators + evidence discipline) …");
   const sr = await scanInventory(screensNow(), http, evidence, { store, assessmentId: id });
   console.log(`   ${sr.confirmed} confirmed`);
 
@@ -673,7 +676,7 @@ async function cmdAssess(args: string[]): Promise<void> {
   if (finalState) writeFileSync(join(runsDir, id, "report.md"), buildReport(finalState));
   store.close();
   console.log(`⑥ report → ${join(runsDir, id, "report.md")}`);
-  console.log(`\n✓ done. 観測: serve 済みなら http://127.0.0.1:4317/?id=${id}`);
+  console.log(`\n✓ done. observe: if serve is running, http://127.0.0.1:4317/?id=${id}`);
 }
 
 /** `--attended admin,userA,userB` のインライン CSV を切り出す前処理。
@@ -761,7 +764,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
   });
   // --burp-proxy: 指定時のみ有効。アドレスは引数値 → env BURP_PROXY。
   const burpProxy = bp.present ? (bp.value ?? process.env.BURP_PROXY) : undefined;
-  if (bp.present && !burpProxy) console.log("⚠ --burp-proxy が指定されましたが値も BURP_PROXY env もありません(プロキシ無効で続行)");
+  if (bp.present && !burpProxy) console.log("⚠ --burp-proxy was given but neither a value nor BURP_PROXY env is set (continuing without a proxy)");
   const runsDir = values.out ?? RUNS_DIR_DEFAULT;
   const manifest = values.manifest ? loadManifest(values.manifest) : null;
   const model = values.model ?? manifest?.model ?? "claude-sonnet-4-6";
@@ -769,7 +772,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
   const maxTurns = values["max-turns"] ? Number.parseInt(values["max-turns"], 10) : 80;
   const attended = !!values.attended; // 手動マルチセッション認証(必ず headed)
   const headed = attended || (!values.headless && !!values.headed);
-  if (attended && values.headless) console.log("⚠ --attended は手動ログインのため headed 必須です(--headless は無視)");
+  if (attended && values.headless) console.log("⚠ --attended needs a headed browser for manual login (--headless ignored)");
   const browserPath = values["browser-path"] ?? process.env.VERITAS_BROWSER_PATH;
   const resume = !!values.resume;
   const surveyOnly = !!values["survey-only"];
@@ -796,7 +799,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
     seedUrl = manifest?.target ?? values.url ?? "";
     if (!seedUrl) fail("pilot requires --manifest <file.json> or --url <url> (or --resume --id <id>)");
     scope = { ...deriveScopeFromSingleUrl(seedUrl), ...(manifest?.scope ?? {}) };
-    id = newAssessmentId();
+    id = values.id ?? newAssessmentId(); // server-spawned runs supply --id; otherwise generate
     mkdirSync(join(runsDir, id), { recursive: true });
     store = AssessmentStore.open(dbPathFor(runsDir, id));
     store.createAssessment({
@@ -815,8 +818,8 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
   const roleDescriptions = new Map<string, string>();
   for (const rc of manifestRoleDescriptions(manifest)) roleDescriptions.set(rc.name, rc.description);
 
-  const mode = `${surveyOnly ? " · survey-only" : resume ? " · resume" : ""}${attended ? " · attended(手動マルチセッション)" : ""}`;
-  console.log(`▶ pilot ${id}  (Claude 主導${mode})`);
+  const mode = `${surveyOnly ? " · survey-only" : resume ? " · resume" : ""}${attended ? " · attended (manual multi-session)" : ""}`;
+  console.log(`▶ pilot ${id}  (Claude-led${mode})`);
   console.log(`  target ${seedUrl} | scope hosts=[${scope.inScopeHosts.join(",")}] | model ${model}${values["fast-model"] ? ` (deep) / ${values["fast-model"]} (fast)` : ""} | rate ${rate}ms`);
   // attended で窓を開くロール: インライン CSV(--attended a,b,c)が最優先、無ければ manifest の全ロール名
   // (creds/cookie が無い純手動ロールも含む)。一覧表示にも使う。
@@ -827,7 +830,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
     const d = roleDescriptions.get(r);
     return d ? `${kind} — ${d}` : kind;
   };
-  console.log(`  roles: ${allRoles.map(roleLabel).join(", ") || "none"} | max-turns ${maxTurns}${surveyOnly ? " | 調査のみ(診断なし)" : resume ? " | 未診断画面だけ再開" : ""}\n`);
+  console.log(`  roles: ${allRoles.map(roleLabel).join(", ") || "none"} | max-turns ${maxTurns}${surveyOnly ? " | survey only (no diagnosis)" : resume ? " | resuming undiagnosed screens only" : ""}\n`);
 
   // attended の人手操作待ち: メッセージを出して Enter で解決する(手動ログイン/再ログインの同期点)。
   const { createInterface } = await import("node:readline");
@@ -896,7 +899,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
     console.log(`\n=== ${res.findings.length} finding(s) in ${res.turns} turns · ${tk} tokens${res.costUsd > 0 ? ` · ~$${res.costUsd.toFixed(2)}` : ""} ===`);
     for (const f of res.findings) console.log(`  - [${f.severity}] ${f.title}`);
     console.log(`\nreport → ${join(runsDir, id, "report.md")}`);
-    console.log(`観測: serve 済みなら http://127.0.0.1:4317/?id=${id}`);
+    console.log(`observe: if serve is running, http://127.0.0.1:4317/?id=${id}`);
   } finally {
     rl?.close();
     store.close();
@@ -1024,6 +1027,9 @@ async function cmdServe(args: string[]): Promise<void> {
       host: { type: "string" },
       "web-root": { type: "string" },
       "no-web": { type: "boolean" },
+      password: { type: "string" },
+      "no-auth": { type: "boolean" },
+      "no-launch": { type: "boolean" },
     },
   });
   const runsDir = values.out ?? RUNS_DIR_DEFAULT;
@@ -1033,17 +1039,31 @@ async function cmdServe(args: string[]): Promise<void> {
   if (!values["no-web"] && !webRoot) {
     console.error("warning: webui dist not found (build @veritas/webui first); serving API/WS only");
   }
+  // WebUI 認証: --password / env AMRAAM_WEB_PASSWORD(.env 自動ロード)。--no-auth で明示的に無効化。
+  const authPassword = values["no-auth"] ? undefined : (values.password ?? process.env.AMRAAM_WEB_PASSWORD);
+  // WebUI からの run 起動/停止/再開(server が CLI を子プロセスで spawn)。--no-launch で無効化。
+  // ビルド済み CLI(dist/main.js)からの起動が前提(tsx dev では spawn 不可)。
+  const cliPath = process.argv[1] ?? "";
+  const canLaunch = !values["no-launch"] && cliPath.endsWith(".js");
+  const runLauncher = canLaunch
+    ? { runsDir, cliPath, nodePath: process.execPath, onLog: (m: string) => console.log(`  ${m}`) }
+    : undefined;
 
   const srv = await startServer({
     runsDir,
     port,
     host,
     ...(webRoot ? { webRoot } : {}),
+    ...(authPassword ? { authPassword } : {}),
+    ...(runLauncher ? { runLauncher } : {}),
     onLog: (m) => console.log(`  ${m}`),
   });
-  console.log(`veritas server: http://${host}:${srv.port}  (runs: ${runsDir}${webRoot ? "" : ", API/WS only"})`);
+  console.log(
+    `veritas server: http://${host}:${srv.port}  (runs: ${runsDir}${webRoot ? "" : ", API/WS only"}${authPassword ? ", 🔒 auth on" : ""}${runLauncher ? ", ▶ launch on" : ""})`,
+  );
   if (host === "0.0.0.0") {
-    console.log("  ⚠ 全インターフェースで待受中。LAN からは http://<this-machine-ip>:" + srv.port + "/");
+    console.log("  ⚠ listening on all interfaces. from the LAN: http://<this-machine-ip>:" + srv.port + "/");
+    if (!authPassword) console.log("  ⚠ exposed without auth. gate the WebUI with --password <pw> or env AMRAAM_WEB_PASSWORD.");
   }
   console.log("Ctrl-C to stop");
   let stopping = false;
@@ -1088,7 +1108,7 @@ async function cmdShots(args: string[]): Promise<void> {
 
   const browserPath = values["browser-path"] ?? process.env.VERITAS_BROWSER_PATH;
   const artifactsDir = join(runsDir, id, "artifacts");
-  console.log(`▶ shots ${id}: ${state.screens.length} screens (run の browser-profile を再利用)`);
+  console.log(`▶ shots ${id}: ${state.screens.length} screens (reusing the run's browser-profile)`);
   const driver = await PlaywrightDriver.launch({
     userDataDir: join(runsDir, id, "browser-profile"),
     headless: !values.headed,
@@ -1191,7 +1211,7 @@ async function cmdHeaderAudit(args: string[]): Promise<void> {
     console.log(`  + h-${e.rule.key} [${e.rule.severity}] ${e.rule.title} (${e.urls.length} pages)`);
   }
   store.close();
-  console.log(`\n${missing.size} header finding(s) recorded → reload the WebUI (severity フィルタで info を出し入れ可)`);
+  console.log(`\n${missing.size} header finding(s) recorded → reload the WebUI (toggle info via the severity filter)`);
 }
 
 // Burp issue(XML or REST 由来)を run にマージ。既存 finding と (粗カテゴリ × 正規化エンドポイント) で
@@ -1329,11 +1349,11 @@ async function runBurpScanOnRun(
   }
   const urls = [...seeds].slice(0, 300);
   if (urls.length === 0) {
-    console.log("⚠ burp-scan: in-scope URL が無いのでスキップ(先に survey/pilot を)");
+    console.log("⚠ burp-scan: no in-scope URLs, skipping (run survey/pilot first)");
     return 0;
   }
   console.log(`▶ burp-scan ${id} → ${base}`);
-  console.log(`  config: ${o.configs.join(" + ")}${usePool ? ` | pool: ${resourcePool}` : " | pool: (Burp 既定)"} | seeds: ${urls.length}${o.logins.length ? ` | auth: ${o.logins.length}` : ""}`);
+  console.log(`  config: ${o.configs.join(" + ")}${usePool ? ` | pool: ${resourcePool}` : " | pool: (Burp default)"} | seeds: ${urls.length}${o.logins.length ? ` | auth: ${o.logins.length}` : ""}`);
 
   const startScan = (pool: string | undefined): Promise<string> =>
     startBurpScan({ base, ...(apiKey ? { apiKey } : {}), urls, configs: o.configs, ...(pool ? { resourcePool: pool } : {}), ...(o.logins.length ? { logins: o.logins } : {}) });
@@ -1343,15 +1363,15 @@ async function runBurpScanOnRun(
     taskId = await startScan(usePool ? resourcePool : undefined);
   } catch (e) {
     if (usePool && /resource pool/i.test(String(e))) {
-      console.log(`⚠ resource pool "${resourcePool}" が Burp に無いため既定プールで続行(同時1/Delay 250ms のプールを作ると throttle されます)。`);
+      console.log(`⚠ resource pool "${resourcePool}" not found in Burp, continuing on the default pool (create a concurrency 1 / Delay 250ms pool to throttle).`);
       try {
         taskId = await startScan(undefined);
       } catch (e2) {
-        console.log(`⚠ burp-scan start failed: ${String(e2).slice(0, 160)} — スキップ`);
+        console.log(`⚠ burp-scan start failed: ${String(e2).slice(0, 160)} — skipping`);
         return 0;
       }
     } else {
-      console.log(`⚠ burp-scan start failed: ${String(e).slice(0, 160)}\n  → Burp Pro REST 有効? base=${base} / key? — スキップ`);
+      console.log(`⚠ burp-scan start failed: ${String(e).slice(0, 160)}\n  → Burp Pro REST enabled? base=${base} / key? — skipping`);
       return 0;
     }
   }
@@ -1371,10 +1391,10 @@ async function runBurpScanOnRun(
     if (last.status === "succeeded" || last.status === "failed") break;
   }
   if (!last) {
-    console.log("⚠ burp-scan: scan status 取得できず(timeout) — スキップ");
+    console.log("⚠ burp-scan: couldn't get scan status (timeout) — skipping");
     return 0;
   }
-  if (last.status !== "succeeded") console.log(`⚠ scan ended status=${last.status} — 現時点の issue を取り込みます`);
+  if (last.status !== "succeeded") console.log(`⚠ scan ended status=${last.status} — importing the issues found so far`);
 
   const { added, skipped, oos } = mergeBurpIssues(store, id, state, runsDir, last.issues, "bs");
   if (added > 0) {
@@ -1493,53 +1513,53 @@ async function cmdManifest(args: string[]): Promise<void> {
 
   try {
     console.log("\n=== AMRAAM scope-manifest generator ===");
-    console.log("認可済みターゲットのみ。各項目は Enter で既定値。\n");
+    console.log("authorized targets only. press Enter for the default at each prompt.\n");
 
     let target = "";
     while (!target) {
-      target = await ask("Target seed URL (例 https://app.example.com/)");
+      target = await ask("Target seed URL (e.g. https://app.example.com/)");
       try {
         new URL(target);
       } catch {
-        console.log("  ↳ 有効な URL を入力してください");
+        console.log("  ↳ please enter a valid URL");
         target = "";
       }
     }
     const host = new URL(target).host;
 
-    console.log(`\n--- スコープ(既定 in-scope: ${host}) ---`);
-    const extraHosts = await askList("追加 in-scope hosts (カンマ区切り, 任意)");
+    console.log(`\n--- scope (default in-scope: ${host}) ---`);
+    const extraHosts = await askList("additional in-scope hosts (comma-separated, optional)");
     const inScopeHosts = [...new Set([host, ...extraHosts])];
-    const outOfScopeHosts = await askList("Out-of-scope hosts (任意)");
-    const outOfScopePathPrefixes = await askList("Out-of-scope path prefixes (例 /logout,/signout)");
-    const approvalPathPrefixes = await askList("承認が要る path prefixes (機微領域。例 /admin)");
+    const outOfScopeHosts = await askList("Out-of-scope hosts (optional)");
+    const outOfScopePathPrefixes = await askList("Out-of-scope path prefixes (e.g. /logout,/signout)");
+    const approvalPathPrefixes = await askList("path prefixes that need approval (sensitive areas. e.g. /admin)");
     const requestsPerMinute = await askInt("Rate: requests / minute", 30);
     const maxConcurrent = await askInt("Rate: max concurrent", 2);
 
-    console.log("\n--- クロール ---");
-    const followLinks = await askBool("リンクを辿る?", true);
-    const maxDepth = await askInt("最大深さ", 8);
+    console.log("\n--- crawl ---");
+    const followLinks = await askBool("follow links?", true);
+    const maxDepth = await askInt("max depth", 8);
 
     const model = await ask("\nModel", "claude-sonnet-4-6");
 
-    console.log("\n--- 認証ロール(名前を空 Enter で終了) ---");
-    console.log("  資格情報 か 事前取得 Cookie ファイルのどちらか。[0]=主ログイン、複数指定で auth-diff。");
+    console.log("\n--- auth roles (empty name + Enter to finish) ---");
+    console.log("  either credentials or a pre-captured cookie file. [0]=primary login, multiple = auth-diff.");
     const roles: Role[] = [];
     for (;;) {
-      const name = await ask(`\nRole #${roles.length + 1} name (空で終了)`);
+      const name = await ask(`\nRole #${roles.length + 1} name (empty to finish)`);
       if (!name) break;
       // 権限レベルの説明(任意)。auth-diff で「どれが高権限/低権限か」をエージェントが判断する材料。
-      const description = await ask("  説明/権限 (任意。例: 全権管理者 / 一般ユーザ(読取のみ))");
-      const kind = (await ask("  種別: (c)資格情報 / (k)Cookie ファイル", "c")).toLowerCase();
+      const description = await ask("  description/privilege (optional. e.g. full admin / regular user (read-only))");
+      const kind = (await ask("  type: (c)credentials / (k)cookie file", "c")).toLowerCase();
       if (kind.startsWith("k")) {
-        const cookieFile = await ask("  cookie ファイルのパス");
+        const cookieFile = await ask("  path to cookie file");
         if (cookieFile) roles.push({ name, ...(description ? { description } : {}), cookieFile });
-        else console.log("  ↳ パス未入力のためスキップ");
+        else console.log("  ↳ no path entered, skipping");
       } else {
-        const username = await ask("  username (空なら role 名を使用)");
+        const username = await ask("  username (empty to use the role name)");
         const password = await askSecret("  password");
         if (password) roles.push({ name, ...(description ? { description } : {}), ...(username ? { username } : {}), password });
-        else console.log("  ↳ password 未入力のためスキップ");
+        else console.log("  ↳ no password entered, skipping");
       }
     }
 
@@ -1560,17 +1580,17 @@ async function cmdManifest(args: string[]): Promise<void> {
     if (roles.length) manifest.auth = { roles };
 
     const safeHost = host.replace(/[^a-zA-Z0-9._-]/g, "_");
-    const outPath = values.out ?? (await ask("\n出力ファイル", `scope_manifest_${safeHost}.json`));
+    const outPath = values.out ?? (await ask("\noutput file", `scope_manifest_${safeHost}.json`));
     if (existsSync(outPath) && !values.force) {
-      if (!(await askBool(`${outPath} は既に存在します。上書きしますか?`, false))) {
-        console.log("中止しました。");
+      if (!(await askBool(`${outPath} already exists. overwrite?`, false))) {
+        console.log("aborted.");
         return;
       }
     }
     writeFileSync(outPath, `${JSON.stringify(manifest, null, 2)}\n`);
-    console.log(`\n✓ 書き出しました: ${outPath}`);
+    console.log(`\n✓ written: ${outPath}`);
     if (roles.length) {
-      console.log("⚠ 資格情報/Cookie を含む = 秘密ファイル。gitignore 済みパターン scope_manifest_*.json に一致させてください。");
+      console.log("⚠ contains credentials/cookies = a secret file. make sure it matches the gitignored pattern scope_manifest_*.json.");
     }
     console.log(`\nCommand:\n  node packages/cli/dist/main.js pilot --manifest ${outPath} --model ${model}\n`);
   } finally {

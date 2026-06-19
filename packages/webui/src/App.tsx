@@ -8,6 +8,7 @@ import { Findings } from "./components/Findings";
 import { ScreenView } from "./components/ScreenView";
 import { ApiList } from "./components/ApiList";
 import { Log } from "./components/Log";
+import { Index } from "./components/Index";
 
 type Tab = "screen" | "findings" | "log" | "apis";
 
@@ -19,11 +20,7 @@ export function App() {
   const [tab, setTab] = useState<Tab>("screen");
 
   if (!id) {
-    return (
-      <div className="empty">
-        No assessment found. Run an assessment, then open with <code>?id=&lt;id&gt;</code>.
-      </div>
-    );
+    return <Index />;
   }
   if (!view) {
     return <div className="empty">Connecting to {id} … ({conn})</div>;
@@ -58,7 +55,7 @@ export function App() {
               APIs
             </button>
             <button type="button" className={tab === "log" ? "active" : ""} onClick={() => setTab("log")}>
-              診断ログ ({view.events.length})
+              Log ({view.events.length})
             </button>
           </div>
           <div className="tabbody">

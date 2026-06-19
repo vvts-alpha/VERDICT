@@ -160,7 +160,7 @@ node packages/cli/dist/main.js manifest --out m.json
 | `pilot --resume --id <id>` | 既存 run の**未診断(queued)画面だけ**診断(落ちた run の仕上げ / survey-only の続き) |
 | `pilot --attended` | **手動マルチセッション認証**(headed 必須)。ロールごとに永続コンテキストを開き、人手でログイン(CAPTCHA/MFA/Arkose 突破)→ Enter 確認 → 生きたセッションで調査・診断。`login(role)` は再ログインせず**そのロールのライブセッションへ切替**。合間に全ロールを keepalive(失効=ログイン画面に戻されたら再ログインを要求)。`--login-url <u>`(手動ログインの入口、既定 target)/ `--keepalive-min <n>`(既定 1 分)。自動ログイン/Cookie ファイルで越えられない壁向け |
 | `assess` | 決定論パイプライン一括: crawl → label → scan → logic → report |
-| `serve` | 観測 WebUI + 状態 API/WS(既定 `127.0.0.1:4317`、LAN 公開は `--host 0.0.0.0`) |
+| `serve` | 観測 WebUI + 状態 API/WS(既定 `127.0.0.1:4317`、LAN 公開は `--host 0.0.0.0`、`--password`/`AMRAAM_WEB_PASSWORD` でゲート) |
 | `report` / `status` / `list` | report.md 生成 / phase・coverage・stop 判定 / `runs/` 一覧 |
 | `shots --id <id>` | 既存 run の各画面スクショを backfill(run の認証済プロファイル再利用・ナビゲートのみ) |
 | `header-audit --id <id>` | Info 系: レスポンスヘッダ監査(CSP/HSTS/XFO/…)。`--headers csp,hsts,…` で絞る。トグル=走らせる/走らせない |
@@ -250,6 +250,26 @@ node packages/cli/dist/main.js header-audit --id <run-id> --headers csp,hsts
 
 最小操作: pause/resume、画面 exclude、handoff resolve(WS push で即反映)。
 
+### WebUI から起動・操作(`/` プロジェクト一覧)
+
+`/`(`?id=` なし)は**プロジェクト一覧**(対象/フェーズ/画面数/findings/更新日時/ID、行クリックで開く)。ここから run を**起動〜操作まで完結**できる:
+
+- **「+ New」** — フル manifest エディタ(target / scope の in·out host·path / crawl / model・rate 等 / 認証ロール)で **pilot か assess を起動**。server が CLI を**子プロセスで spawn**(CLI=実行エンジン / WebUI=制御面)、新 run が一覧にライブ出現。
+- 各行の **Stop / Resume** — 実行中プロセスを停止(SIGTERM→SIGKILL)/ `pilot --resume` で再開。実行中は ● インジケータ。
+
+CLI はそのまま残る(ヘッドレス/自動化/attended の経路)。`serve --no-launch` で起動機能を無効化。※ `attended`(手動ログイン)は対話ターミナルが要るため WebUI からは出さない(CLI 専用)。起動系は POST `/api/*` なので**認証ゲートの内側**(下記)。
+
+### 認証(`--password` / `AMRAAM_WEB_PASSWORD`)
+
+既定は無認証(ローカル `127.0.0.1` 前提)。**`--host 0.0.0.0` で LAN/リモート公開するときは必ずゲートする**:
+
+```bash
+node packages/cli/dist/main.js serve --host 0.0.0.0 --password '<pw>'
+# or: .env に AMRAAM_WEB_PASSWORD=<pw>(自動ロード) → node ... serve --host 0.0.0.0
+```
+
+単一パスワードで **WebUI / `/api` / WebSocket をまとめてゲート**(`/login` フォーム → 署名セッション Cookie、有効7日、`/logout` で失効)。依存なし(`node:crypto` の HMAC)。`--no-auth` で明示的に無効化。0.0.0.0 公開かつ未設定だと起動時に警告。Cookie/入力の暗号化はアプリ層では行わないので、リモートは TLS/トンネル併用を推奨。
+
 ---
 
 ## パッケージ構成
@@ -277,4 +297,4 @@ node packages/cli/dist/main.js header-audit --id <run-id> --headers csp,hsts
 - **認証 = operator 供給の資格情報 OR 事前 Cookie ファイル**(`smartLogin` / `loadCookieFile`)。エージェントは Cookie を捏造/盗まない。MFA/CAPTCHA で Cookie も無ければ `detectStuck` → 非ブロッキング HumanHandoff(headed で人手)。
 - **状態は append-only + 再生可能**。UI は純投影(`buildStateView` / `buildSiteTree`)。
 
-> 状態: ステージ型 Claude 主導 pilot(調査→方法論→診断)+ 決定論 assess、WebUI 観測、Burp 連携(proxy / REST 能動スキャン `burp-scan` / XML import、`.env` 自動ロード)、header 監査、survey-only/resume/attended(手動マルチセッション)モード、survey の動的間引き(`ignore_paths`/`--exhaustive`) — すべて実装・実機検証済み。`pnpm -r test` は緑。
+> 状態: ステージ型 Claude 主導 pilot(調査→方法論→診断)+ 決定論 assess、WebUI 観測(`--password`/`AMRAAM_WEB_PASSWORD` でゲート可)、Burp 連携(proxy / REST 能動スキャン `burp-scan` / XML import、`.env` 自動ロード)、header 監査、survey-only/resume/attended(手動マルチセッション)モード、survey の動的間引き(`ignore_paths`/`--exhaustive`) — すべて実装・実機検証済み。`pnpm -r test` は緑。
