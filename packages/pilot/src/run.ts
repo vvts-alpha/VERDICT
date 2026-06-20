@@ -9,12 +9,13 @@ import type { HookCallback } from "@anthropic-ai/claude-agent-sdk";
 import type { AssessmentStore, Screen, ScopePolicy } from "@veritas/core";
 import { isInScope, recordTokens } from "@veritas/core";
 import type { LoginCreds } from "@veritas/crawler";
-import { InventoryBuilder, PlaywrightDriver } from "@veritas/crawler";
+import { InventoryBuilder, PlaywrightDriver, smartLogin } from "@veritas/crawler";
 import { ClaudeCliClient } from "@veritas/llm";
 import { EvidenceStore, FetchHttpClient } from "@veritas/scanner";
 import { join } from "node:path";
 import { buildTools, STAGE_TOOLS, dedupKey, loadCookieFile, sessionLooksDead } from "./tools.js";
 import type { PilotSession, RoleSession } from "./tools.js";
+import { LiveControl } from "./live-control.js";
 import { DIAGNOSE_PROMPT, METHODOLOGY_PROMPT, SURVEY_PROMPT } from "./system.js";
 
 export interface RunPilotOptions {
@@ -67,8 +68,11 @@ export interface RunPilotOptions {
   /** attended で各ロール窓を最初に開く URL(手動ログインの入口)。未指定なら targetUrl。 */
   loginUrl?: string;
   /** attended の人手操作待ち: メッセージを表示し、operator が Enter を押したら解決する。
-   *  CLI が readline で供給(pilot パッケージは TTY を仮定しない)。attended では必須。 */
+   *  CLI が readline で供給(pilot パッケージは TTY を仮定しない)。attended では必須(controlUrl 指定時は不要)。 */
   promptOperator?: (message: string) => Promise<void>;
+  /** attended×LiveHands: serve に逆接続して role セッションを WebUI に screencast する。
+   *  指定時は headless で起動し、手動ログイン完了は操作者の「Done」で解決(ターミナル Enter 不要)。 */
+  controlUrl?: string;
   onText?: (text: string) => void;
   onTool?: (name: string, input: unknown) => void;
 }
@@ -170,8 +174,10 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
   let roleSessions: Map<string, RoleSession> | undefined;
   let primaryRole = "";
   let primaryCookie = "";
+  let liveControl: LiveControl | undefined;
   if (opts.attended) {
-    if (!opts.promptOperator) throw new Error("attended mode requires promptOperator (Enter-confirm callback)");
+    if (!opts.promptOperator && !opts.controlUrl)
+      throw new Error("attended mode requires promptOperator (Enter-confirm) or controlUrl (WebUI login)");
     // 窓を開くロール: 明示の attendedRoles を最優先(純手動ロールも含む)。無ければ creds/cookie のキーから。
     const roles = [
       ...new Set([...(opts.attendedRoles ?? []), ...opts.roleCreds.keys(), ...(opts.roleCookieFiles?.keys() ?? [])]),
@@ -179,12 +185,24 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     if (roles.length === 0) roles.push("primary"); // ロール未設定でも単一の手動セッションは張れる
     const baseDir = opts.attendedProfilesDir ?? join(opts.profileDir, "..", "profiles");
     roleSessions = new Map();
-    opts.onText?.(`👤 attended: launching ${roles.length} headed session(s) per role (manual login)`);
+    // controlUrl 指定時は WebUI でログインするので headless(サーバに画面不要)。
+    const viaWeb = !!opts.controlUrl;
+    if (viaWeb) liveControl = new LiveControl(opts.controlUrl!, opts.onText);
+    opts.onText?.(
+      viaWeb
+        ? `👤 attended (WebUI): ${roles.length} session(s) — log in via the Sessions tab`
+        : `👤 attended: launching ${roles.length} headed session(s) per role (manual login)`,
+    );
+    // 各 role を起動し認証を解決する。cookie→注入 / creds→smartLogin(失敗時 manual へ) / 無材料→manual。
+    // viaWeb の manual は後でまとめて登録し Done を並行待ち(N タブ同時)。CLI(非 viaWeb)は従来どおり順次 Enter。
+    const manual: Array<{ role: string; driver: PlaywrightDriver }> = [];
+    const earlyLlm = viaWeb ? new ClaudeCliClient({ defaultModel: opts.fastModel ?? "claude-sonnet-4-6" }) : undefined;
     for (const role of roles) {
-      const d = await PlaywrightDriver.launch({ ...launchBase, userDataDir: join(baseDir, role), headless: false });
+      const d = await PlaywrightDriver.launch({ ...launchBase, userDataDir: join(baseDir, role), headless: viaWeb });
       const cookieFile = opts.roleCookieFiles?.get(role);
+      const creds = opts.roleCreds.get(role);
+      let deferred = false;
       if (cookieFile) {
-        // Cookie ファイルのロールは手動ログイン不要 — 注入だけ。
         try {
           const { browserCookies } = loadCookieFile(cookieFile, opts.targetUrl);
           await d.clearSession();
@@ -194,13 +212,51 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         } catch (e) {
           opts.onText?.(`⚠ role '${role}' cookie file error: ${String(e).slice(0, 120)}`);
         }
-      } else {
+      } else if (viaWeb && creds && earlyLlm) {
+        // 資格情報あり → 自動ログイン。失敗(CAPTCHA/MFA)時は manual タブにフォールバック。
         await d.gotoUrl(opts.loginUrl ?? opts.targetUrl);
-        await opts.promptOperator(`▶ Please log in manually in the browser window for role ${roleLabel(role, opts.roleDescriptions)} (clear CAPTCHA/MFA too). Press Enter when done…`);
+        let ok = false;
+        try {
+          await d.clearSession();
+          const r = await smartLogin(d, earlyLlm, creds, { targetUrl: opts.targetUrl, ...(opts.model ? { model: opts.model } : {}) });
+          ok = r.ok;
+          opts.onText?.(
+            ok
+              ? `🔑 role ${roleLabel(role, opts.roleDescriptions)}: auto-logged in`
+              : `↪ role ${roleLabel(role, opts.roleDescriptions)}: auto-login failed (${r.reason}) → manual`,
+          );
+        } catch (e) {
+          opts.onText?.(`↪ role ${roleLabel(role, opts.roleDescriptions)}: auto-login error → manual (${String(e).slice(0, 80)})`);
+        }
+        if (!ok) {
+          manual.push({ role, driver: d });
+          deferred = true;
+        }
+      } else if (viaWeb) {
+        await d.gotoUrl(opts.loginUrl ?? opts.targetUrl);
+        manual.push({ role, driver: d });
+        deferred = true;
+      } else {
+        // CLI attended: 従来どおり 1 ロールずつ Enter で確認。
+        await d.gotoUrl(opts.loginUrl ?? opts.targetUrl);
+        await opts.promptOperator!(`▶ Please log in manually in the browser window for role ${roleLabel(role, opts.roleDescriptions)} (clear CAPTCHA/MFA too). Press Enter when done…`);
       }
-      const cookie = await d.sessionCookieHeader();
-      roleSessions.set(role, { driver: d, cookie });
-      opts.onText?.(`✅ role ${roleLabel(role, opts.roleDescriptions)} session established (cookie ${cookie ? "present" : "absent"})`);
+      if (!deferred) {
+        const cookie = await d.sessionCookieHeader();
+        roleSessions.set(role, { driver: d, cookie });
+        opts.onText?.(`✅ role ${roleLabel(role, opts.roleDescriptions)} session established (cookie ${cookie ? "present" : "absent"})`);
+      }
+    }
+    // viaWeb の manual ロールを全部登録 → Done を**並行**待ち(N タブが一斉に出る) → セッション確定。
+    if (liveControl && manual.length > 0) {
+      opts.onText?.(`🖥 ${manual.length} session(s) need manual login — open the Sessions tab, log in each, then press Done.`);
+      for (const m of manual) await liveControl.register(m.role, m.driver);
+      await Promise.all(manual.map((m) => liveControl!.waitForDone(m.role)));
+      for (const m of manual) {
+        const cookie = await m.driver.sessionCookieHeader();
+        roleSessions.set(m.role, { driver: m.driver, cookie });
+        opts.onText?.(`✅ role ${roleLabel(m.role, opts.roleDescriptions)} session established (cookie ${cookie ? "present" : "absent"})`);
+      }
     }
     primaryRole = roles[0]!;
     const prim = roleSessions.get(primaryRole)!;
@@ -521,6 +577,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       });
     }
   } finally {
+    liveControl?.close();
     if (roleSessions) {
       // attended は各ロールのコンテキストを閉じる(primary は roleSessions に含まれるので二重 close しない)。
       for (const rs of roleSessions.values()) await rs.driver.close().catch(() => {});

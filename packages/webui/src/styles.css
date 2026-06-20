@@ -82,13 +82,26 @@ body { background: var(--bg); color: var(--fg); font-size: 13px; }
 .nf-field.nf-inline input { width: 80px; }
 .nf-section { margin: 10px 0; border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; background: var(--panel); }
 .nf-section > summary { cursor: pointer; color: var(--accent); font-size: 12px; }
-.nf-role { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr auto; gap: 8px; margin: 8px 0; }
+.nf-role { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; align-items: center; }
+.nf-role input { flex: 1 1 130px; min-width: 110px; }
+.nf-role select { background: #0d0f13; color: var(--fg); border: 1px solid var(--line); border-radius: 6px; padding: 7px 9px; font: inherit; }
 .nf-addrole { margin-top: 6px; }
 .nf-actions { margin-top: 20px; }
 .nf-launch { background: #1d3a4f; border-color: #2f6f8f; color: #cfe; padding: 8px 18px; font-weight: 700; }
 .nf-launch:hover { background: #244a63; }
 .nf-launch:disabled { opacity: 0.5; cursor: default; }
 .nf-err { color: var(--err); font-size: 12px; margin: 10px 0 0; }
+
+/* attended×LiveHands Sessions タブ */
+.sess { display: flex; flex-direction: column; gap: 10px; }
+.sess-tabs { display: flex; align-items: center; gap: 6px; }
+.sess-tabs button { background: #2b3340; }
+.sess-tabs button.active { background: #2b3340; border-color: var(--accent); color: #fff; }
+.sess-stat { margin-left: 8px; color: var(--muted); font-size: 12px; }
+.sess-done { margin-left: auto; background: #1d3a2a; border-color: #2f6f4f; color: #cfe; font-weight: 700; }
+.sess-done:hover { background: #244a34; }
+.sess-wrap { display: flex; justify-content: center; background: #000; border: 1px solid var(--line); border-radius: 8px; }
+.sess-canvas { cursor: crosshair; max-width: 100%; outline: none; }
 
 .statusbar {
   display: flex; gap: 1.25rem; align-items: center;

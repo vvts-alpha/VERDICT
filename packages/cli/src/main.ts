@@ -760,6 +760,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       "burp-scan": { type: "boolean" },
       "burp-api": { type: "string" },
       "keepalive-min": { type: "string" },
+      "control-url": { type: "string" }, // attended×LiveHands: serve への逆接続先(supervisor が付与)
     },
   });
   // --burp-proxy: 指定時のみ有効。アドレスは引数値 → env BURP_PROXY。
@@ -867,6 +868,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
           }
         : {}),
       ...(values["login-url"] ? { loginUrl: values["login-url"] } : {}),
+      ...(values["control-url"] ? { controlUrl: values["control-url"] } : {}),
       ...(values["max-screens"] ? { maxScreens: Number.parseInt(values["max-screens"], 10) } : {}),
       ...(roleCookieFiles.size ? { roleCookieFiles } : {}),
       ...(roleDescriptions.size ? { roleDescriptions } : {}),

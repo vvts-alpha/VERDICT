@@ -11,6 +11,7 @@ import { AssessmentStore, buildStateView } from "@veritas/core";
 import type { TargetInput, WsMessage } from "@veritas/core";
 import { handleAuthSubmit, handleLogout, isAuthedReq, loginPageHtml } from "./auth.js";
 import { Supervisor, type RunLauncherConfig, type StartRunInput } from "./supervisor.js";
+import { Relay } from "./relay.js";
 
 export interface ServerOptions {
   runsDir: string;
@@ -219,7 +220,7 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
   sendJson(res, 404, { error: "unknown control endpoint" });
 }
 
-function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptions, supervisor?: Supervisor): void {
+function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptions, supervisor?: Supervisor, relay?: Relay): void {
   const url = req.url ?? "/";
   // 認証ゲート(authPassword 設定時のみ)。/login と POST /auth は素通し、それ以外は Cookie 必須。
   const secret = opts.authPassword;
@@ -255,6 +256,12 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptio
   if (url === "/api/assessments") {
     const rows = listAssessments(opts.runsDir).map((r) => ({ ...r, running: supervisor?.isRunning(r.id) ?? false }));
     sendJson(res, 200, rows);
+    return;
+  }
+  // attended×LiveHands: その run に逆接続中の子(agent)が持つ role セッション一覧。
+  const sess = url.match(/^\/api\/assessments\/([^/?]+)\/sessions$/);
+  if (sess) {
+    sendJson(res, 200, relay?.rolesFor(decodeURIComponent(sess[1] ?? "")) ?? []);
     return;
   }
   // 画面スクショ: runs/<id>/artifacts/screens/<screenId>.png を配信(WebUI 表示用)。
@@ -423,26 +430,51 @@ function handleWsConnection(ws: WebSocket, req: IncomingMessage, opts: ServerOpt
 export async function startServer(opts: ServerOptions): Promise<RunningServer> {
   const host = opts.host ?? "127.0.0.1";
   const pollMs = opts.pollMs ?? 1000;
-  const supervisor = opts.runLauncher ? new Supervisor(opts.runLauncher) : undefined;
-  const httpServer = createServer((req, res) => handleHttp(req, res, opts, supervisor));
-  // authPassword 設定時は WS upgrade も Cookie で弾く(verifyClient)。
-  const wss = new WebSocketServer({
-    server: httpServer,
-    path: "/ws",
-    ...(opts.authPassword
-      ? { verifyClient: (info: { req: IncomingMessage }) => isAuthedReq(info.req, opts.authPassword as string, Date.now()) }
-      : {}),
-  });
+  const log = opts.onLog ?? ((): void => {});
+  const relay = opts.runLauncher ? new Relay() : undefined;
+  const supervisor = opts.runLauncher ? new Supervisor(opts.runLauncher, relay) : undefined;
+  const httpServer = createServer((req, res) => handleHttp(req, res, opts, supervisor, relay));
+
+  // 複数 WS パスを同一サーバに載せるため noServer + 手動 upgrade ルーティング。
+  //   /ws         状態投影(Cookie 認証)   /ws/session  操作者の attended ログイン(Cookie 認証)
+  //   /ws/agent   子(pilot)の逆接続(token 認証 = relay 内)
+  const wss = new WebSocketServer({ noServer: true });
+  const agentWss = relay ? new WebSocketServer({ noServer: true }) : null;
+  const sessionWss = relay ? new WebSocketServer({ noServer: true }) : null;
   const sockets = new Set<WebSocket>();
   wss.on("connection", (ws, req) => {
     sockets.add(ws);
     ws.on("close", () => sockets.delete(ws));
     handleWsConnection(ws, req, { ...opts, pollMs });
   });
+  if (relay && agentWss) agentWss.on("connection", (ws, req) => relay.handleAgent(ws, req, log));
+  if (relay && sessionWss)
+    sessionWss.on("connection", (ws, req) => {
+      sockets.add(ws);
+      ws.on("close", () => sockets.delete(ws));
+      relay.handleSession(ws, req);
+    });
+  httpServer.on("upgrade", (req, socket, head) => {
+    const pathname = (req.url ?? "").split("?")[0] ?? "";
+    const secret = opts.authPassword;
+    const cookieOk = !secret || isAuthedReq(req, secret, Date.now());
+    if (pathname === "/ws") {
+      if (!cookieOk) return void socket.destroy();
+      wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+    } else if (sessionWss && pathname === "/ws/session") {
+      if (!cookieOk) return void socket.destroy(); // 操作者は Cookie 必須
+      sessionWss.handleUpgrade(req, socket, head, (ws) => sessionWss.emit("connection", ws, req));
+    } else if (agentWss && pathname === "/ws/agent") {
+      agentWss.handleUpgrade(req, socket, head, (ws) => agentWss.emit("connection", ws, req)); // token は relay 内で検証
+    } else {
+      socket.destroy();
+    }
+  });
 
   await new Promise<void>((resolve) => httpServer.listen(opts.port ?? 0, host, resolve));
   const addr = httpServer.address();
   const port = typeof addr === "object" && addr ? addr.port : (opts.port ?? 0);
+  supervisor?.setControlBase(`ws://127.0.0.1:${port}`); // 子はローカルに逆接続する
 
   let closing = false;
   return {
@@ -451,6 +483,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
     async close() {
       if (closing) return;
       closing = true;
+      relay?.closeAll();
       await supervisor?.closeAll(); // 子の run を停止
       // 開いている WS / keep-alive 接続を強制クローズ(そうしないと httpServer.close が完走しない)。
       for (const ws of sockets) {
@@ -461,6 +494,8 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
         }
       }
       await new Promise<void>((resolve) => wss.close(() => resolve()));
+      if (agentWss) await new Promise<void>((resolve) => agentWss.close(() => resolve()));
+      if (sessionWss) await new Promise<void>((resolve) => sessionWss.close(() => resolve()));
       (httpServer as unknown as { closeAllConnections?: () => void }).closeAllConnections?.();
       await new Promise<void>((resolve) => httpServer.close(() => resolve()));
     },

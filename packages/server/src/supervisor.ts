@@ -2,9 +2,11 @@
 // server は CLI を import せず **子プロセスとして spawn** する(CLI = 実行エンジン / server = 制御面)。
 // 子が runs/<id>/state.sqlite を書く → 既存の WS 投影がそのまま進捗をライブ配信する。docs/LIVE_TAKEOVER.md の Phase-1 制御面。
 import { spawn, type ChildProcess } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { newAssessmentId } from "@veritas/core";
+import type { Relay } from "./relay.js";
 
 export interface RunLauncherConfig {
   runsDir: string;
@@ -46,8 +48,17 @@ interface RunProc {
 
 export class Supervisor {
   private readonly procs = new Map<string, RunProc>();
+  private controlBase = ""; // ws://127.0.0.1:<port>(listen 後に設定)。attended 時に子へ渡す。
 
-  constructor(private readonly cfg: RunLauncherConfig) {}
+  constructor(
+    private readonly cfg: RunLauncherConfig,
+    private readonly relay?: Relay,
+  ) {}
+
+  /** serve の listen 後に呼ぶ。子(pilot)が逆接続する先。 */
+  setControlBase(base: string): void {
+    this.controlBase = base;
+  }
 
   /** manifest を保存し、`<cli> <command> --manifest <f> --id <id> --out <runs>` を spawn。新 id を返す。 */
   start(input: StartRunInput): { id: string } {
@@ -69,6 +80,12 @@ export class Supervisor {
     if (o.attended) args.push("--attended");
     if (input.command === "pilot" && o.burpScan) args.push("--burp-scan");
     if (input.command === "pilot" && o.burpProxy) args.push("--burp-proxy");
+    // attended×LiveHands: 子は serve に逆接続して role セッションを screencast する(token 認証)。
+    if (input.command === "pilot" && o.attended && this.relay && this.controlBase) {
+      const token = randomBytes(16).toString("hex");
+      this.relay.issueToken(id, token);
+      args.push("--control-url", `${this.controlBase}/ws/agent?id=${id}&token=${token}`);
+    }
     this.spawnChild(id, input.command, args);
     return { id };
   }
@@ -121,6 +138,7 @@ export class Supervisor {
     child.on("exit", (code) => {
       rec.status = "exited";
       rec.exitCode = code;
+      this.relay?.revokeToken(id);
       log(`◼ ${command} ${id} exited (code ${code ?? "?"})`);
     });
   }

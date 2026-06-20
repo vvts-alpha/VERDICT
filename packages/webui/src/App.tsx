@@ -9,8 +9,9 @@ import { ScreenView } from "./components/ScreenView";
 import { ApiList } from "./components/ApiList";
 import { Log } from "./components/Log";
 import { Index } from "./components/Index";
+import { Sessions } from "./components/Sessions";
 
-type Tab = "screen" | "findings" | "log" | "apis";
+type Tab = "screen" | "findings" | "log" | "apis" | "sessions";
 
 // DESIGN §8 — 左 SITE TREE(ナビ)+ 進捗バー、右はタブ: Screen / Findings / 診断ログ / APIs。
 export function App() {
@@ -57,6 +58,9 @@ export function App() {
             <button type="button" className={tab === "log" ? "active" : ""} onClick={() => setTab("log")}>
               Log ({view.events.length})
             </button>
+            <button type="button" className={tab === "sessions" ? "active" : ""} onClick={() => setTab("sessions")}>
+              🖥 Sessions
+            </button>
           </div>
           <div className="tabbody">
             {tab === "screen" ? (
@@ -69,6 +73,7 @@ export function App() {
             {tab === "findings" ? <Findings view={view} onJump={onSelect} /> : null}
             {tab === "apis" ? <ApiList view={view} onJump={onSelect} /> : null}
             {tab === "log" ? <Log events={view.events} /> : null}
+            {tab === "sessions" ? <Sessions id={view.id} /> : null}
           </div>
         </main>
       </div>

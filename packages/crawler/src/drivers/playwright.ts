@@ -4,7 +4,7 @@
 // in-page で実行されるコールバックは (globalThis as any) 経由で DOM へ触れる
 // → DOM lib を引かず Node 型と衝突させない。
 
-import type { BrowserContext, Page } from "playwright-core";
+import type { BrowserContext, CDPSession, Page } from "playwright-core";
 import type { CapturedExchange, Driver, FormObservation, Observation } from "../types.js";
 import { detectStuck } from "../auth.js";
 
@@ -475,6 +475,12 @@ export class PlaywrightDriver implements Driver {
   /** 現在ページの URL(ログイン後の着地点 = 認証済み再クロールの起点に使う)。 */
   currentUrl(): string {
     return this.page.url();
+  }
+
+  /** ライブ遠隔ログイン(attended×LiveHands)用に現在ページの CDP セッションを返す
+   *  (Page.startScreencast + Input.dispatch*)。認証状態は永続 userDataDir に宿る。 */
+  async cdpSession(): Promise<CDPSession> {
+    return this.context.newCDPSession(this.page);
   }
 
   /** 傍受バッファを取り出してクリア(操作で発火した API を回収する。能動探索用)。 */

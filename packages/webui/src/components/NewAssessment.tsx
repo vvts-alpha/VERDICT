@@ -2,8 +2,10 @@
 // Builds an AssessManifest JSON (target / scope / crawl / auth.roles) + run options.
 import { useState } from "react";
 
+type AuthMethod = "manual" | "credentials" | "cookie";
 interface Role {
   name: string;
+  method: AuthMethod;
   password: string;
   description: string;
   cookieFile: string;
@@ -30,7 +32,7 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
   const [exhaustive, setExhaustive] = useState(false);
   const [burpScan, setBurpScan] = useState(false);
   const [burpProxy, setBurpProxy] = useState(false);
-  // attended (manual login) は対話ターミナルが要るため WebUI からは出さない(CLI 専用)。
+  // attended は per-role の method=manual から導出する(下の Auth roles)。
   // scope overrides (blank = derive from target on the server)
   const [inHosts, setInHosts] = useState("");
   const [outHosts, setOutHosts] = useState("");
@@ -47,7 +49,7 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
 
   const setRole = (i: number, patch: Partial<Role>): void =>
     setRoles((rs) => rs.map((r, j) => (j === i ? { ...r, ...patch } : r)));
-  const addRole = (): void => setRoles((rs) => [...rs, { name: "", password: "", description: "", cookieFile: "" }]);
+  const addRole = (): void => setRoles((rs) => [...rs, { name: "", method: "manual", password: "", description: "", cookieFile: "" }]);
   const rmRole = (i: number): void => setRoles((rs) => rs.filter((_, j) => j !== i));
 
   const submit = async (): Promise<void> => {
@@ -64,14 +66,15 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
     if (lines(inPaths).length) scope.inScopePathPrefixes = lines(inPaths);
     if (lines(outPaths).length) scope.outOfScopePathPrefixes = lines(outPaths);
 
-    const authRoles = roles
-      .filter((r) => r.name.trim())
-      .map((r) => ({
-        name: r.name.trim(),
-        ...(r.password ? { pass: r.password } : {}),
-        ...(r.description ? { description: r.description } : {}),
-        ...(r.cookieFile ? { cookieFile: r.cookieFile } : {}),
-      }));
+    const named = roles.filter((r) => r.name.trim());
+    const authRoles = named.map((r) => {
+      const base = { name: r.name.trim(), ...(r.description ? { description: r.description } : {}) };
+      if (r.method === "credentials") return { ...base, ...(r.password ? { pass: r.password } : {}) };
+      if (r.method === "cookie") return { ...base, ...(r.cookieFile ? { cookieFile: r.cookieFile } : {}) };
+      return base; // manual: name(+description) only → logged in via the Sessions tab
+    });
+    // manual ロールが1つでもあれば attended(= WebUI ログイン用の制御チャネルを張る)。
+    const anyManual = named.some((r) => r.method === "manual");
 
     const manifest: Record<string, unknown> = { target: target.trim() };
     if (Object.keys(scope).length) manifest.scope = scope;
@@ -90,6 +93,7 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
     if (command === "pilot" && exhaustive) options.exhaustive = true;
     if (command === "pilot" && burpScan) options.burpScan = true;
     if (command === "pilot" && burpProxy) options.burpProxy = true;
+    if (command === "pilot" && anyManual) options.attended = true;
 
     try {
       const res = await fetch("/api/run", {
@@ -213,13 +217,22 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
       </details>
 
       <details className="nf-section">
-        <summary>Auth roles ({roles.length})</summary>
+        <summary>Auth roles ({roles.length}) — a “manual” role makes the run attended (log in via the Sessions tab)</summary>
         {roles.map((r, i) => (
           <div className="nf-role" key={i}>
             <input placeholder="name" value={r.name} onChange={(e) => setRole(i, { name: e.target.value })} />
-            <input placeholder="password" type="password" value={r.password} onChange={(e) => setRole(i, { password: e.target.value })} />
+            <select value={r.method} onChange={(e) => setRole(i, { method: e.target.value as AuthMethod })}>
+              <option value="manual">manual (Sessions tab)</option>
+              <option value="credentials">credentials</option>
+              <option value="cookie">cookie file</option>
+            </select>
+            {r.method === "credentials" ? (
+              <input placeholder="password" type="password" value={r.password} onChange={(e) => setRole(i, { password: e.target.value })} />
+            ) : null}
+            {r.method === "cookie" ? (
+              <input placeholder="cookieFile path" value={r.cookieFile} onChange={(e) => setRole(i, { cookieFile: e.target.value })} />
+            ) : null}
             <input placeholder="description (e.g. admin)" value={r.description} onChange={(e) => setRole(i, { description: e.target.value })} />
-            <input placeholder="cookieFile (instead of pw)" value={r.cookieFile} onChange={(e) => setRole(i, { cookieFile: e.target.value })} />
             <button type="button" onClick={() => rmRole(i)}>
               ✕
             </button>
