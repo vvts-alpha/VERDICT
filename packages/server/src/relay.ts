@@ -9,7 +9,8 @@ import type { WebSocket } from "ws";
 
 interface AgentConn {
   ws: WebSocket;
-  roles: Map<string, { url: string }>;
+  /** done=false は「ログイン待ち(operator の入力が必要)」。operator の {t:"done"} で true になる。 */
+  roles: Map<string, { url: string; done: boolean }>;
   viewers: Map<string, Set<WebSocket>>;
 }
 
@@ -29,11 +30,12 @@ export class Relay {
     this.tokens.delete(id);
   }
 
-  /** その run に子(agent)が接続済みで利用可能な role 一覧(WebUI が Sessions タブを出す判断に使う)。 */
-  rolesFor(id: string): Array<{ role: string; url: string }> {
+  /** その run に子(agent)が接続済みで利用可能な role 一覧(WebUI が Sessions タブを出す判断に使う)。
+   *  awaiting=true は「ログイン待ち(operator 入力が必要)」→ WebUI は Sessions タブを強調する。 */
+  rolesFor(id: string): Array<{ role: string; url: string; awaiting: boolean }> {
     const a = this.agents.get(id);
     if (!a) return [];
-    return [...a.roles.entries()].map(([role, v]) => ({ role, url: v.url }));
+    return [...a.roles.entries()].map(([role, v]) => ({ role, url: v.url, awaiting: !v.done }));
   }
 
   /** 子(pilot)の逆接続 /ws/agent?id=&token= */
@@ -56,7 +58,7 @@ export class Relay {
         return;
       }
       if (m.t === "sessions") {
-        conn.roles = new Map((m.roles ?? []).map((r) => [r.role, { url: r.url ?? "" }]));
+        conn.roles = new Map((m.roles ?? []).map((r) => [r.role, { url: r.url ?? "", done: false }])); // 登録直後は全員ログイン待ち
       } else if (m.role && (m.t === "frame" || m.t === "url" || m.t === "copied")) {
         if (m.t === "url") {
           const e = conn.roles.get(m.role);
@@ -99,6 +101,10 @@ export class Relay {
         msg = JSON.parse(String(raw)) as Record<string, unknown>;
       } catch {
         return;
+      }
+      if (msg.t === "done") {
+        const e = conn.roles.get(role); // operator がログイン完了 → ログイン待ち解除(Sessions タブの強調を消す)
+        if (e) e.done = true;
       }
       if (conn.ws.readyState === 1) conn.ws.send(JSON.stringify({ t: "input", role, msg }));
     });

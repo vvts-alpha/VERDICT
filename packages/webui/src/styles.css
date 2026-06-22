@@ -236,6 +236,10 @@ button:hover { background: #353d4a; }
 .tabs { display: flex; gap: 2px; padding: 8px 14px 0; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--bg); z-index: 5; }
 .tabs button { background: transparent; border: 1px solid transparent; border-bottom: none; border-radius: 6px 6px 0 0; color: var(--muted); padding: 6px 14px; }
 .tabs button.active { color: #fff; background: var(--panel); border-color: var(--line); }
+/* ログイン待ちセッションがある時の Sessions タブ強調(operator の入力を促す) */
+.tabs button.needs-input { color: #fff; background: #3a1f22; border-color: var(--err); animation: needs-input-pulse 1.2s ease-in-out infinite; }
+@keyframes needs-input-pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(229, 83, 75, .55); } 50% { box-shadow: 0 0 0 5px rgba(229, 83, 75, 0); } }
+.sess-tabs button.needs-input { border-color: var(--err); color: #fff; }
 .tabbody { padding: 14px; }
 .tabbody > .findings-tab > h2 { font-size: 12px; letter-spacing: 1px; color: var(--accent); margin: 0 0 12px; text-transform: uppercase; }
 

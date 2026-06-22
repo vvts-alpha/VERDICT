@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { postControl, useAssessmentId, useStateView } from "./api";
 import { StatusBar } from "./components/StatusBar";
 import { HandoffBar } from "./components/HandoffBar";
@@ -19,6 +19,27 @@ export function App() {
   const { view, conn } = useStateView(id);
   const [selected, setSelected] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>("screen");
+
+  // ログイン待ち(awaiting)セッション数をポーリング → Sessions タブを強調する(operator の入力が必要なサイン)。
+  const [awaitingSessions, setAwaitingSessions] = useState(0);
+  useEffect(() => {
+    if (!id) return;
+    let alive = true;
+    const poll = (): void => {
+      fetch(`/api/assessments/${encodeURIComponent(id)}/sessions`)
+        .then((r) => r.json())
+        .then((rs: Array<{ awaiting?: boolean }>) => {
+          if (alive) setAwaitingSessions(Array.isArray(rs) ? rs.filter((s) => s.awaiting).length : 0);
+        })
+        .catch(() => {});
+    };
+    poll();
+    const t = window.setInterval(poll, 3000);
+    return () => {
+      alive = false;
+      window.clearInterval(t);
+    };
+  }, [id]);
 
   if (!id) {
     return <Index />;
@@ -58,8 +79,13 @@ export function App() {
             <button type="button" className={tab === "log" ? "active" : ""} onClick={() => setTab("log")}>
               Log ({view.events.length})
             </button>
-            <button type="button" className={tab === "sessions" ? "active" : ""} onClick={() => setTab("sessions")}>
-              🖥 Sessions
+            <button
+              type="button"
+              className={`${tab === "sessions" ? "active" : ""}${awaitingSessions > 0 ? " needs-input" : ""}`}
+              onClick={() => setTab("sessions")}
+              title={awaitingSessions > 0 ? `${awaitingSessions} session(s) waiting for login` : undefined}
+            >
+              🖥 Sessions{awaitingSessions > 0 ? ` 🔴 ${awaitingSessions}` : ""}
             </button>
           </div>
           <div className="tabbody">

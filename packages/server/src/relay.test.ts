@@ -34,7 +34,7 @@ test("relay: agent registers, viewer relays frames in, input out", () => {
   const agent = new FakeWs();
   relay.handleAgent(ws(agent), req("/ws/agent?id=a-1&token=tok"), () => {});
   agent.recv({ t: "sessions", roles: [{ role: "primary", url: "https://x/login" }] });
-  assert.deepEqual(relay.rolesFor("a-1"), [{ role: "primary", url: "https://x/login" }]);
+  assert.deepEqual(relay.rolesFor("a-1"), [{ role: "primary", url: "https://x/login", awaiting: true }]); // 登録直後はログイン待ち
 
   // 操作者がタブを開く → agent に start が飛ぶ + 現在 URL を受け取る
   const viewer = new FakeWs();
@@ -49,6 +49,8 @@ test("relay: agent registers, viewer relays frames in, input out", () => {
   // 操作者の入力(done 等)が agent に転送される
   viewer.recv({ t: "done" });
   assert.deepEqual(agent.last(), { t: "input", role: "primary", msg: { t: "done" } });
+  // done でログイン待ちが解除される(Sessions タブの強調が消える)
+  assert.deepEqual(relay.rolesFor("a-1"), [{ role: "primary", url: "https://x/login", awaiting: false }]);
 
   // viewer が閉じると stop が agent に飛ぶ
   viewer.close();

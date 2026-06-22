@@ -5,6 +5,7 @@ import { useEffect, useRef, useState, type KeyboardEvent, type MouseEvent, type 
 interface RoleSession {
   role: string;
   url: string;
+  awaiting?: boolean; // true = ログイン待ち(operator 入力が必要)
 }
 
 function mods(e: { altKey: boolean; ctrlKey: boolean; metaKey: boolean; shiftKey: boolean }): number {
@@ -88,8 +89,14 @@ export function Sessions({ id }: { id: string }) {
         <>
           <div className="sess-tabs">
             {roles.map((r) => (
-              <button key={r.role} type="button" className={active === r.role ? "active" : ""} onClick={() => setActive(r.role)}>
-                {r.role}
+              <button
+                key={r.role}
+                type="button"
+                className={`${active === r.role ? "active" : ""}${r.awaiting ? " needs-input" : ""}`}
+                onClick={() => setActive(r.role)}
+                title={r.awaiting ? "waiting for login" : "logged in"}
+              >
+                {r.awaiting ? "🔴 " : ""}{r.role}
               </button>
             ))}
             <span className="sess-stat">{status}</span>
