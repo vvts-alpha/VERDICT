@@ -49,6 +49,13 @@ export interface PilotSession {
   accessVerdicts: Map<string, AccessVerdict>;
   /** record_finding 呼び出し回数(新規+マージ)。画面の verdict 判定に使う。 */
   recordCalls: number;
+  // ── 認証壁サーキットブレーカ用の http 統計(診断プローブの応答) ──
+  /** 診断プローブの総数。 */
+  httpProbes: number;
+  /** うち 401(認証壁)で弾かれた数。 */
+  httpAuthWall: number;
+  /** うち 2xx(認証を抜けて通った)数。 */
+  httpThrough: number;
   done: boolean;
   doneSummary: string;
   model: string | undefined;
@@ -351,6 +358,22 @@ export function frontierLinks(
   return out;
 }
 
+/** 診断プローブの応答ステータスを集計(認証壁サーキットブレーカ用)。401=壁、2xx=通過。 */
+function bumpHttp(s: PilotSession, status: number): void {
+  s.httpProbes += 1;
+  if (status === 401) s.httpAuthWall += 1;
+  else if (status >= 200 && status < 300) s.httpThrough += 1;
+}
+
+/** 認証壁サーキットブレーカ判定(純粋): 十分なサンプルがあり、何も通らず(2xx ゼロ)、finding ゼロで、
+ *  ほぼ全部 401 なら true。診断ループはこれが立ったら以降の画面を止めて handoff を上げる。 */
+export function isAuthWalled(
+  s: { findings: { length: number }; httpProbes: number; httpThrough: number; httpAuthWall: number },
+  minSample = 12,
+): boolean {
+  return s.findings.length === 0 && s.httpProbes >= minSample && s.httpThrough === 0 && s.httpAuthWall / s.httpProbes >= 0.85;
+}
+
 /** 観測 1 件を screens に永続化(自動でカバレッジ台帳 queued 登録)し、frontier を更新。 */
 function recordObservation(s: PilotSession, o: Observation): { screen: Screen; isNew: boolean } {
   const authState = s.currentRole ? "post-login" : "unauth";
@@ -593,6 +616,7 @@ export function buildTools(s: PilotSession) {
         let res: HttpResponse;
         try {
           res = await s.http.send(req);
+          bumpHttp(s, res.status);
         } catch (e) {
           return txt(`ERROR: ${String(e).slice(0, 200)}`);
         }
@@ -801,6 +825,7 @@ export function buildTools(s: PilotSession) {
         let base: HttpResponse;
         try {
           base = await s.http.send({ method: "GET", url, headers: cookieHeader(s), body: null });
+          bumpHttp(s, base.status);
         } catch (e) {
           return txt(`ERROR baseline: ${String(e).slice(0, 150)}`);
         }
@@ -903,6 +928,7 @@ export function buildTools(s: PilotSession) {
         let rUnauth: HttpResponse;
         try {
           rUnauth = await s.http.send({ method: "GET", url, headers: {}, body: null });
+          bumpHttp(s, rUnauth.status);
         } catch (e) {
           return txt(`ERROR (unauth): ${String(e).slice(0, 150)}`);
         }
@@ -910,6 +936,7 @@ export function buildTools(s: PilotSession) {
         if (s.currentCookie) {
           try {
             rAuth = await s.http.send({ method: "GET", url, headers: { cookie: s.currentCookie }, body: null });
+            bumpHttp(s, rAuth.status);
           } catch {
             rAuth = null;
           }

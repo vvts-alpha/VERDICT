@@ -13,7 +13,7 @@ import { InventoryBuilder, PlaywrightDriver, smartLogin } from "@veritas/crawler
 import { ClaudeCliClient } from "@veritas/llm";
 import { EvidenceStore, FetchHttpClient } from "@veritas/scanner";
 import { join } from "node:path";
-import { buildTools, STAGE_TOOLS, dedupKey, loadCookieFile, sessionLooksDead, stripHash } from "./tools.js";
+import { buildTools, STAGE_TOOLS, dedupKey, isAuthWalled, loadCookieFile, sessionLooksDead, stripHash } from "./tools.js";
 import type { PilotSession, RoleSession } from "./tools.js";
 import { LiveControl } from "./live-control.js";
 import { DIAGNOSE_PROMPT, METHODOLOGY_PROMPT, SURVEY_PROMPT } from "./system.js";
@@ -312,6 +312,9 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     findingsByKey: new Map(),
     accessVerdicts: new Map(),
     recordCalls: 0,
+    httpProbes: 0,
+    httpAuthWall: 0,
+    httpThrough: 0,
     done: false,
     doneSummary: "",
     model: fastModel, // login ツール(smartLogin)は機械的 → fast モデル
@@ -591,6 +594,26 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         // 台帳は実際に finding を記録(新規 or マージ)できたかで terminal を決める。
         const found = session.recordCalls > recordsBefore;
         opts.store.setScreenScanStatus(opts.assessmentId, sc.screenId, found ? "finding" : "clean");
+
+        // ── 認証壁サーキットブレーカ ── 全プローブが 401 で何も通らない(2xx ゼロ・finding ゼロ)なら、
+        //    これ以上画面を回しても無駄。止めて operator に認証設定(httpBasic/creds/cookie)を促す。
+        if (isAuthWalled(session)) {
+          const msg = `🛑 auth wall: ${session.httpAuthWall}/${session.httpProbes} probes returned 401 and 0 got through — stopping. Set auth (httpBasic / credentials / cookie) and resume.`;
+          opts.onText?.(msg);
+          opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: msg } });
+          opts.store.upsertHandoff(opts.assessmentId, {
+            id: "ho-authwall",
+            reason: "auth",
+            url: opts.targetUrl,
+            message: `Diagnosis is fully behind an auth wall (${session.httpAuthWall}/${session.httpProbes} probes 401, none authenticated). Configure site auth (httpBasic / credentials / cookie) and resume.`,
+            status: "pending",
+            createdAt: new Date().toISOString(),
+            resolvedAt: null,
+          });
+          session.done = true;
+          session.doneSummary = msg;
+          break;
+        }
       }
       session.currentScreenId = null;
     }
