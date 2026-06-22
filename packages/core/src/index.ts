@@ -7,6 +7,7 @@ export type {
   PolicyDecision,
   RateLimit,
   ScopePolicy,
+  ScopeMode,
   BudgetLimits,
   BudgetState,
   StopReason,
@@ -42,7 +43,10 @@ export { AssessmentStore } from "./store.js";
 export type { CreateAssessmentParams } from "./store.js";
 
 // 初期状態ファクトリ
-export { newAssessmentId, defaultBudget, deriveScopeFromSingleUrl } from "./factories.js";
+export { newAssessmentId, defaultBudget, deriveScopeFromSingleUrl, deriveScopeFromUrls } from "./factories.js";
+
+// 登録可能ドメイン(eTLD+1)算出(scope mode="etld" 用)
+export { registrableDomain } from "./etld.js";
 
 // カバレッジ台帳の派生ビュー / 優先度付け(純粋関数)
 export {
@@ -66,4 +70,7 @@ export type { StateView, WsMessage } from "./view.js";
 // 予算・停止条件 / レポート(M7)
 export { recordRequests, recordTokens, elapsedMs, evaluateStop } from "./budget-guard.js";
 export type { StopDecision, StopOptions } from "./budget-guard.js";
-export { buildReport } from "./report.js";
+export { buildReport, renderMarkdown } from "./report.js";
+export { buildReportModel, SEVERITY_ORDER } from "./report-model.js";
+export type { ReportModel, ReportFindingRow, ReportScreenRow } from "./report-model.js";
+export { renderReportHtml, renderFindingsCsv, renderScreensCsv, renderInventoryHtml } from "./report-formats.js";

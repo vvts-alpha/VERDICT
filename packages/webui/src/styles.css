@@ -330,3 +330,13 @@ button:hover { background: #353d4a; }
 .statuspill.st-clean { background: #26402f; color: var(--ok); }
 .statuspill.st-scanning { background: #243a52; color: var(--accent); }
 .statuspill.st-error, .statuspill.st-blocked { background: #3a1f22; color: var(--err); }
+
+/* Export(report/inventory)ダウンロードメニュー */
+.dl { position: relative; }
+.dl > summary { list-style: none; cursor: pointer; font-size: 11px; padding: 2px 8px; border-radius: 4px; background: #2b3340; color: var(--muted); white-space: nowrap; }
+.dl > summary::-webkit-details-marker { display: none; }
+.dl[open] > summary { background: #243a52; color: var(--accent); }
+.dl-menu { position: absolute; right: 0; top: 22px; z-index: 30; display: flex; flex-direction: column; min-width: 150px; background: #1c2530; border: 1px solid #2b3340; border-radius: 6px; padding: 4px; box-shadow: 0 6px 18px rgba(0,0,0,.4); }
+.dl-menu .dl-h { font-size: 9px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); padding: 6px 8px 2px; }
+.dl-menu a { font-size: 12px; color: var(--fg); text-decoration: none; padding: 5px 8px; border-radius: 4px; }
+.dl-menu a:hover { background: #243a52; color: var(--accent); }

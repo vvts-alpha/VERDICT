@@ -7,6 +7,7 @@ import type { ScopePolicy } from "./types/index.js";
 /** ホストが許可パターンに合致(完全一致 or `*.suffix`)。 */
 export function hostMatches(host: string, patterns: string[]): boolean {
   return patterns.some((p) => {
+    if (p === "*") return true; // "unrestricted" モードのワイルドカード(全ホスト一致)
     if (p === host) return true;
     if (p.startsWith("*.")) return host === p.slice(2) || host.endsWith(p.slice(1));
     return false;

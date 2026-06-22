@@ -63,6 +63,9 @@ export interface PilotSession {
   ignorePaths: string[];
   /** 全量抽出モード(--exhaustive)。true なら ignore_paths は無効(全画面マップ)。 */
   exhaustive: boolean;
+  /** URL リストのハードロック。true なら recordObservation で発見リンクを frontier に積まない
+   *  (横断クロールせず、シード URL だけをマップする)。 */
+  lockToSeeds: boolean;
   /** screenId → 方法論(攻撃計画)。 */
   plans: Map<string, string>;
   /** 診断中の screenId(record_finding / http_request evidence の紐付け先)。 */
@@ -93,7 +96,7 @@ function pick(h: Record<string, string>, keys: string[]): Record<string, string>
   return o;
 }
 
-function stripHash(u: string): string {
+export function stripHash(u: string): string {
   const i = u.indexOf("#");
   return i >= 0 ? u.slice(0, i) : u;
 }
@@ -324,14 +327,15 @@ export function classifyAccess(
   return { verdict: "needs_judgment", reason: "unauth returned 200 & non-login; judge whether it IS the protected content" };
 }
 
-/** 観測 1 件を screens に永続化(自動でカバレッジ台帳 queued 登録)し、frontier を更新。 */
-function recordObservation(s: PilotSession, o: Observation): { screen: Screen; isNew: boolean } {
-  const authState = s.currentRole ? "post-login" : "unauth";
-  const { screen, isNew } = s.inv.ingest(o, authState);
-  s.store.upsertScreen(s.assessmentId, screen);
-  const here = stripHash(o.finalUrl);
-  s.visited.add(here);
-  s.frontier.delete(here);
+/** 観測リンクから frontier に積むべき in-scope URL を返す(純粋)。
+ *  ハードロック(URL リスト固定)では空 = 発見リンクを辿らない(横断クロールしない)。
+ *  out-of-scope / logout 系 / ignore_paths / 訪問済みは除外。 */
+export function frontierLinks(
+  o: Pick<Observation, "finalUrl" | "links">,
+  s: Pick<PilotSession, "scope" | "lockToSeeds" | "visited" | "ignorePaths" | "targetUrl">,
+): string[] {
+  if (s.lockToSeeds) return [];
+  const out: string[] = [];
   for (const link of o.links) {
     let abs: string;
     try {
@@ -342,8 +346,21 @@ function recordObservation(s: PilotSession, o: Observation): { screen: Screen; i
     if (!isInScope(abs, s.scope)) continue;
     if (isSessionDestroyingPath(abs)) continue; // logout/signout リンクは frontier に積まない(踏むと自滅)
     if (pathIsIgnored(abs, s.ignorePaths, s.targetUrl)) continue; // モデルが間引いた低価値パスは積まない
-    if (!s.visited.has(abs)) s.frontier.add(abs);
+    if (!s.visited.has(abs)) out.push(abs);
   }
+  return out;
+}
+
+/** 観測 1 件を screens に永続化(自動でカバレッジ台帳 queued 登録)し、frontier を更新。 */
+function recordObservation(s: PilotSession, o: Observation): { screen: Screen; isNew: boolean } {
+  const authState = s.currentRole ? "post-login" : "unauth";
+  const { screen, isNew } = s.inv.ingest(o, authState);
+  s.store.upsertScreen(s.assessmentId, screen);
+  const here = stripHash(o.finalUrl);
+  s.visited.add(here);
+  s.frontier.delete(here);
+  // 画面 + その API は記録済み(上の ingest)。ハードロックなら発見リンクは積まない(frontierLinks が [])。
+  for (const abs of frontierLinks(o, s)) s.frontier.add(abs);
   return { screen, isNew };
 }
 

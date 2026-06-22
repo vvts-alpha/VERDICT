@@ -13,6 +13,14 @@ export interface RateLimit {
   maxConcurrent: number;
 }
 
+/**
+ * スコープ広さ(in-scope ホスト許可集合の作り方)。シード URL からの導出モード。
+ * - "same-origin": シードと同一ホスト(exact)のみ。最も厳格。別サブドメイン(api.*)は弾く。
+ * - "etld": シードの登録可能ドメイン配下(`*.example.com`)。同一プログラムの API サブドメインを含む。
+ * - "unrestricted": ホスト制限なし(`*`)。authorized-targets 原則に反するので明示オプトイン向け。
+ */
+export type ScopeMode = "same-origin" | "etld" | "unrestricted";
+
 export interface ScopePolicy {
   /** in-scope ホスト(完全一致 or グロブ。M0 は完全一致想定) */
   inScopeHosts: string[];

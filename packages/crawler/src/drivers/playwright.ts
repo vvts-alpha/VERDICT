@@ -51,6 +51,9 @@ export interface PlaywrightDriverOptions {
   /** 上流 HTTP プロキシ(例 Burp http://127.0.0.1:8080)。指定時のみブラウザ通信を経由 + TLS 検証無視。
    *  未指定なら従来通り(挙動不変)。 */
   proxy?: string;
+  /** サイト全体を覆う HTTP Basic/Digest 認証の資格情報(operator 提供)。指定すると Playwright が
+   *  401 WWW-Authenticate を毎ナビ/リダイレクトで自動応答する(Basic/Digest 両対応・CORS 影響なし)。 */
+  httpCredentials?: { username: string; password: string };
   navTimeoutMs?: number;
   settleMs?: number;
   maxBodySample?: number;
@@ -173,6 +176,7 @@ export class PlaywrightDriver implements Driver {
       ...(options.channel ? { channel: options.channel } : {}),
       ...(options.args ? { args: options.args } : {}),
       ...(options.proxy ? { proxy: { server: options.proxy }, ignoreHTTPSErrors: true } : {}), // Burp 経由(指定時のみ)
+      ...(options.httpCredentials ? { httpCredentials: options.httpCredentials } : {}), // サイト全体の Basic/Digest(指定時のみ)
     });
     const page = context.pages()[0] ?? (await context.newPage());
     const driver = new PlaywrightDriver(context, page, {

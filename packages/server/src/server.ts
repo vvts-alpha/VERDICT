@@ -7,8 +7,9 @@ import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
 
-import { AssessmentStore, buildStateView } from "@veritas/core";
+import { AssessmentStore, buildReport, buildReportModel, buildStateView, renderFindingsCsv, renderInventoryHtml, renderReportHtml, renderScreensCsv } from "@veritas/core";
 import type { TargetInput, WsMessage } from "@veritas/core";
+import { htmlToPdf } from "@veritas/crawler";
 import { handleAuthSubmit, handleLogout, isAuthedReq, loginPageHtml } from "./auth.js";
 import { Supervisor, type RunLauncherConfig, type StartRunInput } from "./supervisor.js";
 import { Relay } from "./relay.js";
@@ -340,6 +341,13 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptio
     });
     return;
   }
+  // レポート / 画面一覧のダウンロード(その場で最新を生成)。md/html/pdf/csv。
+  const rep = url.match(/^\/api\/assessments\/([^/?]+)\/(report|inventory)(?:\?|$)/);
+  if (rep) {
+    const fmt = new URL(url, "http://localhost").searchParams.get("format");
+    void serveReport(res, opts.runsDir, decodeURIComponent(rep[1] ?? ""), rep[2] as "report" | "inventory", fmt);
+    return;
+  }
   const m = url.match(/^\/api\/assessments\/([^/?]+)/);
   const id = m?.[1];
   if (id) {
@@ -367,6 +375,83 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptio
     return;
   }
   sendJson(res, 200, { service: "amraam-server", runsDir: opts.runsDir });
+}
+
+const REPORT_ALLOWED: Record<"report" | "inventory", string[]> = {
+  report: ["md", "html", "pdf", "csv"],
+  inventory: ["csv", "html"],
+};
+
+/** レポート/画面一覧を要求フォーマットで生成して配信(その場で最新を描画)。pdf は Chromium 印刷。 */
+async function serveReport(res: ServerResponse, runsDir: string, id: string, kind: "report" | "inventory", formatRaw: string | null): Promise<void> {
+  if (!/^[a-z0-9_-]+$/i.test(id)) {
+    sendJson(res, 400, { error: "bad id" });
+    return;
+  }
+  const fmt = (formatRaw ?? (kind === "report" ? "html" : "html")).toLowerCase();
+  if (!REPORT_ALLOWED[kind].includes(fmt)) {
+    sendJson(res, 400, { error: `unknown format '${fmt}' (allowed: ${REPORT_ALLOWED[kind].join(",")})` });
+    return;
+  }
+  const dbPath = join(runsDir, id, "state.sqlite");
+  if (!existsSync(dbPath)) {
+    sendJson(res, 404, { error: "assessment not found" });
+    return;
+  }
+  const store = AssessmentStore.open(dbPath);
+  const state = store.loadAssessment(id);
+  store.close();
+  if (!state) {
+    sendJson(res, 404, { error: "assessment not found" });
+    return;
+  }
+  const model = buildReportModel(state);
+
+  // {body, type, filename, inline}. inline = ブラウザ内プレビュー(html/pdf)、それ以外は添付 DL。
+  let body: string | Buffer;
+  let type: string;
+  let filename: string;
+  let inline = false;
+  try {
+    if (kind === "report" && fmt === "md") {
+      body = buildReport(state);
+      type = "text/markdown; charset=utf-8";
+      filename = "report.md";
+    } else if (kind === "report" && fmt === "html") {
+      body = renderReportHtml(model);
+      type = "text/html; charset=utf-8";
+      filename = "report.html";
+      inline = true;
+    } else if (kind === "report" && fmt === "csv") {
+      body = renderFindingsCsv(model);
+      type = "text/csv; charset=utf-8";
+      filename = "findings.csv";
+    } else if (kind === "report" && fmt === "pdf") {
+      body = await htmlToPdf(renderReportHtml(model), { ...(process.env.VERITAS_BROWSER_PATH ? { executablePath: process.env.VERITAS_BROWSER_PATH } : {}), noSandbox: true });
+      type = "application/pdf";
+      filename = "report.pdf";
+      inline = true;
+    } else if (kind === "inventory" && fmt === "csv") {
+      body = renderScreensCsv(model);
+      type = "text/csv; charset=utf-8";
+      filename = "screens.csv";
+    } else {
+      body = renderInventoryHtml(model);
+      type = "text/html; charset=utf-8";
+      filename = "inventory.html";
+      inline = true;
+    }
+  } catch (e) {
+    sendJson(res, 500, { error: `render failed: ${String(e).slice(0, 200)}` });
+    return;
+  }
+  res.writeHead(200, {
+    "content-type": type,
+    "content-disposition": `${inline ? "inline" : "attachment"}; filename="${id}-${filename}"`,
+    "cache-control": "no-store",
+    "access-control-allow-origin": "*",
+  });
+  res.end(body);
 }
 
 function handleWsConnection(ws: WebSocket, req: IncomingMessage, opts: ServerOptions): void {

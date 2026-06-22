@@ -2,7 +2,7 @@
 
 export type { TargetInput } from "./input.js";
 export type { Phase } from "./phase.js";
-export type { PolicyDecision, RateLimit, ScopePolicy } from "./scope.js";
+export type { PolicyDecision, RateLimit, ScopePolicy, ScopeMode } from "./scope.js";
 export type { BudgetLimits, BudgetState, StopReason } from "./budget.js";
 export type {
   AuthState,

@@ -11,16 +11,23 @@ import { dirname, join } from "node:path";
 import {
   AssessmentStore,
   buildReport,
+  buildReportModel,
+  renderReportHtml,
+  renderFindingsCsv,
+  renderScreensCsv,
+  renderInventoryHtml,
   coverage,
   deriveScopeFromSingleUrl,
+  deriveScopeFromUrls,
   evaluateStop,
   isInScope,
   newAssessmentId,
   type AssessmentState,
+  type ScopeMode,
   type ScopePolicy,
   type TargetInput,
 } from "@veritas/core";
-import { PlaywrightDriver, buildInventory, crawl, exploreScreen, labelInventory, normalizePath, smartLogin, writeScreenInventory } from "@veritas/crawler";
+import { PlaywrightDriver, buildInventory, crawl, exploreScreen, htmlToPdf, labelInventory, normalizePath, smartLogin, writeScreenInventory } from "@veritas/crawler";
 import type { LoginCreds } from "@veritas/crawler";
 import { ClaudeCliClient } from "@veritas/llm";
 import { EvidenceStore, FetchHttpClient, SECURITY_HEADERS, auditHeaders, coarseCategory, parseBurpReport, burpSeverity, scanInventory, startBurpScan, getBurpScan } from "@veritas/scanner";
@@ -85,8 +92,11 @@ commands:
             start the observability WebUI + state API/WS (default 127.0.0.1:4317. expose to LAN with --host 0.0.0.0)
             --password or env AMRAAM_WEB_PASSWORD gates the WebUI/API/WS behind a single password (/login + signed cookie). --no-auth disables it
             the WebUI "+ New" launches pilot/assess by spawning the CLI as a child; --no-launch disables run launching
-  report  --id <id> [--out <dir>]
-            generate report.md from findings (by severity + repro + evidence + scope basis)
+  report  --id <id> [--format md,html,pdf,csv] [--browser-path <bin>] [--no-sandbox] [--out <dir>]
+            generate the diagnosis report from findings (by severity + repro + evidence + scope basis).
+            default md,html. pdf = HTML printed via Chromium (reuses the browser; needs a chromium binary). csv = findings.csv
+  inventory --id <id> [--format csv,html] [--out <dir>]
+            export the screen inventory (survey result / 画面一覧): screens.csv + inventory.html (with screenshots)
   shots   --id <id> [--headed] [--browser-path <bin>] [--no-sandbox] [--out <dir>]
             re-shoot each screen of an existing run to backfill WebUI screenshots (reuses the run's authed profile, navigate-only)
   header-audit --id <id> [--headers csp,hsts,xfo,xcto,refpol,permpol] [--rate <ms>] [--out <dir>]
@@ -192,8 +202,28 @@ function cmdStatus(args: string[]): void {
   console.log(`  stop:     ${stop.stop ? `${stop.reason} (${stop.detail})` : "continue"}`);
 }
 
-function cmdReport(args: string[]): void {
-  const { values } = parseArgs({ args, options: { id: { type: "string" }, out: { type: "string" } } });
+const REPORT_FORMATS = ["md", "html", "pdf", "csv"] as const;
+type ReportFormat = (typeof REPORT_FORMATS)[number];
+
+/** "md,html" のような CSV を妥当な ReportFormat[] に。空/不正は fail。 */
+function parseFormats(spec: string | undefined, fallback: ReportFormat[], allowed: readonly ReportFormat[]): ReportFormat[] {
+  const want = (spec ?? "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  const fmts = want.length ? want : fallback;
+  for (const f of fmts) if (!allowed.includes(f as ReportFormat)) fail(`unknown format '${f}' (allowed: ${allowed.join(",")})`);
+  return [...new Set(fmts)] as ReportFormat[];
+}
+
+async function cmdReport(args: string[]): Promise<void> {
+  const { values } = parseArgs({
+    args,
+    options: {
+      id: { type: "string" },
+      out: { type: "string" },
+      format: { type: "string" },
+      "browser-path": { type: "string" },
+      "no-sandbox": { type: "boolean" },
+    },
+  });
   if (!values.id) fail("report requires --id <assessment-id>");
   const runsDir = values.out ?? RUNS_DIR_DEFAULT;
   const dbPath = dbPathFor(runsDir, values.id);
@@ -204,10 +234,75 @@ function cmdReport(args: string[]): void {
   store.close();
   if (!state) fail(`assessment ${values.id} not found`);
 
-  const path = join(runsDir, values.id, "report.md");
-  writeFileSync(path, buildReport(state));
-  console.log(`report written: ${path}`);
+  const formats = parseFormats(values.format, ["md", "html"], REPORT_FORMATS);
+  const model = buildReportModel(state);
+  const dir = join(runsDir, values.id);
+  const written: string[] = [];
+
+  if (formats.includes("md")) {
+    const p = join(dir, "report.md");
+    writeFileSync(p, buildReport(state));
+    written.push(p);
+  }
+  let html: string | null = null;
+  if (formats.includes("html") || formats.includes("pdf")) html = renderReportHtml(model);
+  if (formats.includes("html")) {
+    const p = join(dir, "report.html");
+    writeFileSync(p, html!);
+    written.push(p);
+  }
+  if (formats.includes("csv")) {
+    const p = join(dir, "findings.csv");
+    writeFileSync(p, renderFindingsCsv(model));
+    written.push(p);
+  }
+  if (formats.includes("pdf")) {
+    const browserPath = values["browser-path"] ?? process.env.VERITAS_BROWSER_PATH;
+    const pdf = await htmlToPdf(html!, {
+      ...(browserPath ? { executablePath: browserPath } : {}),
+      ...(values["no-sandbox"] ? { noSandbox: true } : {}),
+    });
+    const p = join(dir, "report.pdf");
+    writeFileSync(p, pdf);
+    written.push(p);
+  }
+
+  console.log(`report written (${formats.join(", ")}):`);
+  for (const p of written) console.log(`  ${p}`);
   console.log(`  ${state.findings.length} finding(s), phase ${state.phase}`);
+}
+
+const INVENTORY_FORMATS = ["csv", "html"] as const;
+
+/** 画面一覧(survey 結果)を単体エクスポート: screens.csv / inventory.html。 */
+function cmdInventory(args: string[]): void {
+  const { values } = parseArgs({ args, options: { id: { type: "string" }, out: { type: "string" }, format: { type: "string" } } });
+  if (!values.id) fail("inventory requires --id <assessment-id>");
+  const runsDir = values.out ?? RUNS_DIR_DEFAULT;
+  const dbPath = dbPathFor(runsDir, values.id);
+  if (!existsSync(dbPath)) fail(`no state.sqlite at ${dbPath}`);
+
+  const store = AssessmentStore.open(dbPath);
+  const state = store.loadAssessment(values.id);
+  store.close();
+  if (!state) fail(`assessment ${values.id} not found`);
+
+  const formats = parseFormats(values.format, ["csv", "html"], INVENTORY_FORMATS as readonly ReportFormat[]);
+  const model = buildReportModel(state);
+  const dir = join(runsDir, values.id);
+  const written: string[] = [];
+  if (formats.includes("csv")) {
+    const p = join(dir, "screens.csv");
+    writeFileSync(p, renderScreensCsv(model));
+    written.push(p);
+  }
+  if (formats.includes("html")) {
+    const p = join(dir, "inventory.html");
+    writeFileSync(p, renderInventoryHtml(model));
+    written.push(p);
+  }
+  console.log(`inventory written (${formats.join(", ")}): ${model.screens.length} screen(s)`);
+  for (const p of written) console.log(`  ${p}`);
 }
 
 function cmdList(args: string[]): void {
@@ -386,7 +481,15 @@ async function cmdLabel(args: string[]): Promise<void> {
 interface AssessManifest {
   /** 起点(seed)URL。必須 */
   target: string;
-  /** 明示スコープ(部分指定可。未指定フィールドは target から導出した既定で補完) */
+  /** 追加の診断対象 URL(複数シード)。指定時は target と併せてスコープ算出 + survey の起点に使う。 */
+  targets?: string[];
+  /** URL リストのハードロック: true なら survey は target+targets だけをマップし、横断クロールしない
+   *  (診断はそのリスト + 各画面が叩く API に限定)。「診断対象がガッチガチに URL で決まってる」用。 */
+  lockToTargets?: boolean;
+  /** スコープ広さ(ホスト許可集合の作り方)。"same-origin"(既定) | "etld" | "unrestricted"。
+   *  URL リスト固定の診断では "etld" 推奨(シード画面が叩く同一プログラムの API サブドメインを含む)。 */
+  scopeMode?: ScopeMode;
+  /** 明示スコープ(部分指定可。未指定フィールドは target/scopeMode から導出した既定で補完) */
   scope?: Partial<ScopePolicy>;
   crawl?: { followLinks?: boolean; maxDepth?: number };
   model?: string;
@@ -394,6 +497,9 @@ interface AssessManifest {
    *  state.sqlite には書かれない。manifest は gitignore。 */
   auth?: {
     note?: string;
+    /** サイト全体を覆う HTTP Basic/Digest 認証(operator 提供)。アプリのログインフォーム以前の壁向け。
+     *  ブラウザは httpCredentials で 401 を自動応答(Basic/Digest)、raw http には Authorization: Basic を注入。 */
+    httpBasic?: { user: string; pass: string };
     /** 主ログインの資格情報(任意。roles[0] でも可) */
     login?: { username?: string; password: string };
     /** ロール(name=ユーザー名, pass/password=パスワード)。[0]=主ログイン, 全部=auth-diff */
@@ -412,6 +518,17 @@ interface AssessManifest {
       headers?: Record<string, string>;
     }>;
   };
+}
+
+/** サイト全体の HTTP Basic/Digest 資格情報(あれば)。user/pass 両方そろって初めて有効。 */
+function manifestHttpBasic(m: AssessManifest | null): { user: string; pass: string } | null {
+  const b = m?.auth?.httpBasic;
+  return b && b.user && b.pass ? { user: b.user, pass: b.pass } : null;
+}
+
+/** raw http(FetchHttpClient)用の Authorization: Basic ヘッダ(null なら空オブジェクト)。 */
+function basicHeader(b: { user: string; pass: string } | null): Record<string, string> {
+  return b ? { authorization: `Basic ${Buffer.from(`${b.user}:${b.pass}`, "utf8").toString("base64")}` } : {};
 }
 
 function manifestPrimaryCreds(m: AssessManifest | null): LoginCreds | null {
@@ -492,7 +609,8 @@ async function cmdAssess(args: string[]): Promise<void> {
   const seedUrl = manifest?.target ?? values.url;
   if (!seedUrl) fail("assess requires --manifest <file.json> or --url <url>");
 
-  const scope: ScopePolicy = { ...deriveScopeFromSingleUrl(seedUrl), ...(manifest?.scope ?? {}) };
+  const seeds = [seedUrl, ...(manifest?.targets ?? [])];
+  const scope: ScopePolicy = { ...deriveScopeFromUrls(seeds, manifest?.scopeMode ?? "same-origin"), ...(manifest?.scope ?? {}) };
   const followLinks = manifest?.crawl?.followLinks ?? true;
   const maxDepth = manifest?.crawl?.maxDepth ?? (values["max-depth"] ? Number.parseInt(values["max-depth"], 10) : 3);
   const model = values.model ?? manifest?.model ?? "claude-sonnet-4-6";
@@ -510,8 +628,9 @@ async function cmdAssess(args: string[]): Promise<void> {
   }
 
   const screensNow = () => store.loadAssessment(id)?.screens ?? [];
+  const httpBasic = manifestHttpBasic(manifest); // サイト全体の Basic/Digest(あれば)
   const claude = new ClaudeCliClient({ defaultModel: model });
-  const http = new FetchHttpClient({ allow: (u) => isInScope(u, scope), minDelayMs: rate });
+  const http = new FetchHttpClient({ allow: (u) => isInScope(u, scope), minDelayMs: rate, ...(httpBasic ? { headers: basicHeader(httpBasic) } : {}) });
   const evidence = new EvidenceStore(join(runsDir, id, "artifacts"));
 
   // ① unauth crawl → ② login(資格情報 or 人手)→ ③ post-login crawl →(⑤ role セッション取得)
@@ -532,6 +651,7 @@ async function cmdAssess(args: string[]): Promise<void> {
     headless: !headed,
     executablePath: values["browser-path"] ?? process.env.VERITAS_BROWSER_PATH,
     args: values["no-sandbox"] ? ["--no-sandbox"] : undefined,
+    ...(httpBasic ? { httpCredentials: { username: httpBasic.user, password: httpBasic.pass } } : {}),
   });
 
   // 能動探索フック(完全自動): 各新規画面でブラウザを操作し、発火 API/新 URL を引き出す(§7.2)
@@ -636,7 +756,7 @@ async function cmdAssess(args: string[]): Promise<void> {
   if (!values["no-logic"]) {
     console.log("④ logic (business logic) …");
     const logicHttp = primaryCookie
-      ? new FetchHttpClient({ allow: (url) => isInScope(url, scope), minDelayMs: rate, headers: { cookie: primaryCookie } })
+      ? new FetchHttpClient({ allow: (url) => isInScope(url, scope), minDelayMs: rate, headers: { cookie: primaryCookie, ...basicHeader(httpBasic) } })
       : http;
     const lr = await assessLogicInventory(screensNow(), claude, logicHttp, evidence, { store, assessmentId: id }, { model });
     console.log(`   ${lr.hypotheses} hypotheses, ${lr.confirmed} confirmed`);
@@ -782,6 +902,8 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
   let store: AssessmentStore;
   let scope: ScopePolicy;
   let seedUrl: string;
+  let seedUrls: string[] = []; // 複数シード(target + manifest.targets)。survey の起点。
+  const lockToTargets = manifest?.lockToTargets === true; // URL リスト固定(横断クロールしない)
 
   if (resume) {
     if (!values.id) fail("pilot --resume requires --id <assessment-id>");
@@ -796,16 +918,19 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
     }
     scope = state.scope;
     seedUrl = "url" in state.target ? state.target.url : "";
+    seedUrls = [seedUrl];
   } else {
     seedUrl = manifest?.target ?? values.url ?? "";
     if (!seedUrl) fail("pilot requires --manifest <file.json> or --url <url> (or --resume --id <id>)");
-    scope = { ...deriveScopeFromSingleUrl(seedUrl), ...(manifest?.scope ?? {}) };
+    seedUrls = [...new Set([seedUrl, ...(manifest?.targets ?? [])])];
+    scope = { ...deriveScopeFromUrls(seedUrls, manifest?.scopeMode ?? "same-origin"), ...(manifest?.scope ?? {}) };
     id = values.id ?? newAssessmentId(); // server-spawned runs supply --id; otherwise generate
     mkdirSync(join(runsDir, id), { recursive: true });
     store = AssessmentStore.open(dbPathFor(runsDir, id));
     store.createAssessment({
       id,
-      target: { kind: "single_url", url: seedUrl, followLinks: true, maxDepth: manifest?.crawl?.maxDepth ?? 6 },
+      // ハードロック時はリンク追従しない(survey はシードだけマップ)。
+      target: { kind: "single_url", url: seedUrl, followLinks: !lockToTargets, maxDepth: manifest?.crawl?.maxDepth ?? 6 },
       scope,
     });
   }
@@ -818,6 +943,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
   for (const rc of manifestRoleCookies(manifest)) roleCookieFiles.set(rc.name, rc.file);
   const roleDescriptions = new Map<string, string>();
   for (const rc of manifestRoleDescriptions(manifest)) roleDescriptions.set(rc.name, rc.description);
+  const httpBasic = manifestHttpBasic(manifest); // サイト全体の Basic/Digest(あれば)
 
   const mode = `${surveyOnly ? " · survey-only" : resume ? " · resume" : ""}${attended ? " · attended (manual multi-session)" : ""}`;
   console.log(`▶ pilot ${id}  (Claude-led${mode})`);
@@ -848,6 +974,9 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       assessmentId: id,
       targetUrl: seedUrl,
       scope,
+      ...(seedUrls.length > 1 ? { seedUrls } : {}),
+      ...(lockToTargets ? { lockToSeeds: true } : {}),
+      ...(httpBasic ? { httpBasic } : {}),
       profileDir: join(runsDir, id, "browser-profile"),
       artifactsDir: join(runsDir, id, "artifacts"),
       roleCreds,
@@ -1635,7 +1764,10 @@ async function main(): Promise<void> {
       await cmdServe(rest);
       return;
     case "report":
-      cmdReport(rest);
+      await cmdReport(rest);
+      return;
+    case "inventory":
+      cmdInventory(rest);
       return;
     case "shots":
       await cmdShots(rest);

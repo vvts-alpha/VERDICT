@@ -11,8 +11,12 @@ interface Role {
   cookieFile: string;
 }
 
-// 選択できるモデル。今のところ Sonnet のみ(リストは将来の追加用)。
-const MODELS = [{ id: "claude-sonnet-4-6", label: "Sonnet 4.6" }];
+// 選択できるモデル。deep(高価値画面) / fast(survey・低価値画面) の tiering に使う。
+const MODELS = [
+  { id: "claude-opus-4-8", label: "Opus 4.8" },
+  { id: "claude-sonnet-4-6", label: "Sonnet 4.6" },
+  { id: "claude-haiku-4-5-20251001", label: "Haiku 4.5" },
+];
 
 function lines(s: string): string[] {
   return s
@@ -24,7 +28,8 @@ function lines(s: string): string[] {
 export function NewAssessment({ onCancel }: { onCancel: () => void }) {
   const [command, setCommand] = useState<"pilot" | "assess">("pilot");
   const [target, setTarget] = useState("");
-  const [model, setModel] = useState("claude-sonnet-4-6");
+  const [model, setModel] = useState("claude-sonnet-4-6"); // deep: 高価値画面の診断
+  const [fastModel, setFastModel] = useState(""); // fast: survey/methodology/低価値画面。空 = tiering なし
   const [rate, setRate] = useState("250");
   const [maxTurns, setMaxTurns] = useState("");
   const [headed, setHeaded] = useState(false);
@@ -33,6 +38,10 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
   const [burpScan, setBurpScan] = useState(false);
   const [burpProxy, setBurpProxy] = useState(false);
   // attended は per-role の method=manual から導出する(下の Auth roles)。
+  // scope breadth mode (host allow-set の作り方) + 複数シード(ハードリスト)
+  const [scopeMode, setScopeMode] = useState<"same-origin" | "etld" | "unrestricted">("etld");
+  const [targetUrls, setTargetUrls] = useState("");
+  const [lockToTargets, setLockToTargets] = useState(false); // URL リスト固定(横断クロールしない)
   // scope overrides (blank = derive from target on the server)
   const [inHosts, setInHosts] = useState("");
   const [outHosts, setOutHosts] = useState("");
@@ -43,6 +52,9 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
   const [maxDepth, setMaxDepth] = useState("");
   // auth roles
   const [roles, setRoles] = useState<Role[]>([]);
+  // サイト全体を覆う HTTP Basic/Digest(アプリのログイン以前の壁)
+  const [basicUser, setBasicUser] = useState("");
+  const [basicPass, setBasicPass] = useState("");
 
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -77,15 +89,23 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
     const anyManual = named.some((r) => r.method === "manual");
 
     const manifest: Record<string, unknown> = { target: target.trim() };
+    manifest.scopeMode = scopeMode; // host allow-set の広さ(same-origin / etld / unrestricted)
+    const extraTargets = lines(targetUrls).filter((u) => u !== target.trim());
+    if (extraTargets.length) manifest.targets = extraTargets; // 追加シード(複数 URL のハードリスト)
+    if (command === "pilot" && lockToTargets) manifest.lockToTargets = true; // 横断クロールせずリストだけ診断
     if (Object.keys(scope).length) manifest.scope = scope;
     const crawl: Record<string, unknown> = {};
     if (!followLinks) crawl.followLinks = false;
     if (maxDepth) crawl.maxDepth = Number.parseInt(maxDepth, 10);
     if (Object.keys(crawl).length) manifest.crawl = crawl;
-    if (authRoles.length) manifest.auth = { roles: authRoles };
+    const auth: Record<string, unknown> = {};
+    if (authRoles.length) auth.roles = authRoles;
+    if (basicUser.trim() && basicPass) auth.httpBasic = { user: basicUser.trim(), pass: basicPass }; // site-wide Basic/Digest
+    if (Object.keys(auth).length) manifest.auth = auth;
 
     const options: Record<string, unknown> = {};
     if (model) options.model = model;
+    if (command === "pilot" && fastModel && fastModel !== model) options.fastModel = fastModel; // model tiering
     if (rate) options.rate = Number.parseInt(rate, 10);
     if (command === "pilot" && maxTurns) options.maxTurns = Number.parseInt(maxTurns, 10);
     if (headed) options.headed = true;
@@ -136,9 +156,18 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
         <input value={target} onChange={(e) => setTarget(e.target.value)} placeholder="https://app.example.com/" />
       </label>
 
+      <label className="nf-field">
+        <span>Scope mode</span>
+        <select value={scopeMode} onChange={(e) => setScopeMode(e.target.value as "same-origin" | "etld" | "unrestricted")}>
+          <option value="etld">eTLD+1 — seed domain + subdomains (incl. its APIs)</option>
+          <option value="same-origin">same-origin — exact host only (APIs on other subdomains blocked)</option>
+          <option value="unrestricted">unrestricted — any host (⚠ may leave the program)</option>
+        </select>
+      </label>
+
       <div className="nf-grid">
         <label className="nf-field">
-          <span>Model</span>
+          <span>{command === "pilot" ? "Model (deep)" : "Model"}</span>
           <select value={model} onChange={(e) => setModel(e.target.value)}>
             {MODELS.map((m) => (
               <option key={m.id} value={m.id}>
@@ -147,6 +176,19 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
             ))}
           </select>
         </label>
+        {command === "pilot" ? (
+          <label className="nf-field" title="model tiering: high-value screens use the deep model, survey/methodology/low-value screens use this fast model">
+            <span>Fast model</span>
+            <select value={fastModel} onChange={(e) => setFastModel(e.target.value)}>
+              <option value="">— none (single model)</option>
+              {MODELS.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.label}
+                </option>
+              ))}
+            </select>
+          </label>
+        ) : null}
         <label className="nf-field">
           <span>Rate (ms)</span>
           <input value={rate} onChange={(e) => setRate(e.target.value)} inputMode="numeric" />
@@ -182,7 +224,22 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
       </div>
 
       <details className="nf-section">
-        <summary>Scope (optional — blank derives from target)</summary>
+        <summary>Scope (optional — blank derives from target + scope mode)</summary>
+        <label className="nf-field">
+          <span>Target URLs — extra seeds, one per line (URL-list diagnosis)</span>
+          <textarea
+            value={targetUrls}
+            onChange={(e) => setTargetUrls(e.target.value)}
+            placeholder={"https://app.example.com/a\nhttps://api.example.com/v1/x"}
+          />
+        </label>
+        {command === "pilot" ? (
+          <div className="nf-checks">
+            <label title="survey maps only the target + these URLs (no link-following); diagnosis is limited to the list + the APIs each screen calls">
+              <input type="checkbox" checked={lockToTargets} onChange={(e) => setLockToTargets(e.target.checked)} /> 🔒 lock to target URLs (no crawl — diagnose only the list + their APIs)
+            </label>
+          </div>
+        ) : null}
         <div className="nf-grid">
           <label className="nf-field">
             <span>In-scope hosts</span>
@@ -212,6 +269,20 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
           <label className="nf-field nf-inline">
             <span>max depth</span>
             <input value={maxDepth} onChange={(e) => setMaxDepth(e.target.value)} placeholder="3" inputMode="numeric" />
+          </label>
+        </div>
+      </details>
+
+      <details className="nf-section">
+        <summary>HTTP Basic auth (site-wide — the browser 401 dialog, before the app login)</summary>
+        <div className="nf-grid">
+          <label className="nf-field">
+            <span>Basic user</span>
+            <input value={basicUser} onChange={(e) => setBasicUser(e.target.value)} placeholder="(leave blank if none)" autoComplete="off" />
+          </label>
+          <label className="nf-field">
+            <span>Basic password</span>
+            <input type="password" value={basicPass} onChange={(e) => setBasicPass(e.target.value)} autoComplete="off" />
           </label>
         </div>
       </details>

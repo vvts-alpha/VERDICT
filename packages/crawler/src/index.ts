@@ -82,3 +82,7 @@ export { FakeDriver } from "./drivers/fake.js";
 export type { FakeSite } from "./drivers/fake.js";
 export { PlaywrightDriver } from "./drivers/playwright.js";
 export type { PlaywrightDriverOptions, AutoLoginOptions, CookieInfo } from "./drivers/playwright.js";
+
+// HTML → PDF(レポート PDF 出力。playwright-core 再利用・新規依存なし)
+export { htmlToPdf } from "./pdf.js";
+export type { HtmlToPdfOptions } from "./pdf.js";

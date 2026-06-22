@@ -23,6 +23,7 @@
   },
   "dependencies": {
     "@veritas/core": "workspace:*",
+    "@veritas/crawler": "workspace:*",
     "ws": "^8.18.0"
   },
   "devDependencies": {

@@ -1,7 +1,11 @@
 // 初期状態を組み立てる純粋ヘルパ。PolicyEngine/BudgetGuard 本体は後続マイルストン。
 
 import type { BudgetState } from "./types/budget.js";
-import type { ScopePolicy } from "./types/scope.js";
+import type { ScopeMode, ScopePolicy } from "./types/scope.js";
+import { registrableDomain } from "./etld.js";
+
+/** "unrestricted" モードが inScopeHosts に置くワイルドカード(hostMatches が全一致扱い)。 */
+const UNRESTRICTED_HOST = "*";
 
 /** runs/<assessment_id>/ に使える、ソート可能で人に優しい id */
 export function newAssessmentId(now: Date = new Date()): string {
@@ -27,13 +31,22 @@ export function defaultBudget(now: Date = new Date()): BudgetState {
 }
 
 /**
- * 単一 URL から同一オリジン + 起点配下を既定スコープとして導出(DESIGN §4.2/§5)。
- * M0 は最小シード。精緻な判定は PolicyEngine(後続)が担う。
+ * シード URL 群 + モードから既定スコープを導出(DESIGN §4.2/§5)。
+ * - "same-origin": 各シードと同一ホスト(exact, ポート込み)
+ * - "etld":        各シードの登録可能ドメイン配下(`*.example.com`)。同一プログラムの API サブドメインを含む
+ * - "unrestricted": ホスト制限なし(`*`)
+ * パス接頭辞は常に "/"(ホスト粒度のゲート)。URL の path で絞らないのは従来挙動どおり。
  */
-export function deriveScopeFromSingleUrl(rawUrl: string): ScopePolicy {
-  const u = new URL(rawUrl);
+export function deriveScopeFromUrls(rawUrls: string[], mode: ScopeMode = "same-origin"): ScopePolicy {
+  const hosts = new Set<string>();
+  for (const raw of rawUrls) {
+    const u = new URL(raw);
+    if (mode === "unrestricted") hosts.add(UNRESTRICTED_HOST);
+    else if (mode === "etld") hosts.add(`*.${registrableDomain(u.hostname)}`);
+    else hosts.add(u.host);
+  }
   return {
-    inScopeHosts: [u.host],
+    inScopeHosts: [...hosts],
     outOfScopeHosts: [],
     inScopePathPrefixes: ["/"],
     outOfScopePathPrefixes: [],
@@ -41,4 +54,12 @@ export function deriveScopeFromSingleUrl(rawUrl: string): ScopePolicy {
     approvalMethods: ["DELETE", "PUT", "PATCH"], // 破壊的 → REQUIRES_APPROVAL(DESIGN §4.5)
     rate: { requestsPerMinute: 30, maxConcurrent: 2 }, // WAF 教訓: 保守的(DESIGN §2.2)
   };
+}
+
+/**
+ * 単一 URL から同一オリジン + 起点配下を既定スコープとして導出(DESIGN §4.2/§5)。
+ * 後方互換の薄いラッパ(= deriveScopeFromUrls([url], "same-origin"))。
+ */
+export function deriveScopeFromSingleUrl(rawUrl: string): ScopePolicy {
+  return deriveScopeFromUrls([rawUrl], "same-origin");
 }

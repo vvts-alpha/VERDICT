@@ -13,7 +13,7 @@ import { InventoryBuilder, PlaywrightDriver, smartLogin } from "@veritas/crawler
 import { ClaudeCliClient } from "@veritas/llm";
 import { EvidenceStore, FetchHttpClient } from "@veritas/scanner";
 import { join } from "node:path";
-import { buildTools, STAGE_TOOLS, dedupKey, loadCookieFile, sessionLooksDead } from "./tools.js";
+import { buildTools, STAGE_TOOLS, dedupKey, loadCookieFile, sessionLooksDead, stripHash } from "./tools.js";
 import type { PilotSession, RoleSession } from "./tools.js";
 import { LiveControl } from "./live-control.js";
 import { DIAGNOSE_PROMPT, METHODOLOGY_PROMPT, SURVEY_PROMPT } from "./system.js";
@@ -23,6 +23,14 @@ export interface RunPilotOptions {
   assessmentId: string;
   targetUrl: string;
   scope: ScopePolicy;
+  /** 複数シード(診断対象 URL のリスト)。survey はこれら全てを起点にする。未指定なら [targetUrl] 相当。 */
+  seedUrls?: string[];
+  /** URL リストのハードロック: survey はシードだけをマップし、発見リンクを辿らない(横断クロールしない)。
+   *  診断はマップされた画面 = シード + 各画面が叩く API に限定される。「対象がガッチガチに URL 固定」用。 */
+  lockToSeeds?: boolean;
+  /** サイト全体を覆う HTTP Basic/Digest 認証(operator 提供)。ブラウザは httpCredentials で自動応答、
+   *  raw http(FetchHttpClient)には Authorization: Basic を注入(Digest はブラウザ経路のみ)。 */
+  httpBasic?: { user: string; pass: string };
   profileDir: string;
   artifactsDir: string;
   roleCreds: Map<string, LoginCreds>;
@@ -166,6 +174,8 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     ...(opts.browserPath ? { executablePath: opts.browserPath } : {}),
     ...(opts.noSandbox ? { args: ["--no-sandbox"] } : {}),
     ...(opts.burpProxy ? { proxy: opts.burpProxy } : {}),
+    // サイト全体の Basic/Digest: Playwright が 401 を自動応答(全 driver 起動=attended ロール窓含む)。
+    ...(opts.httpBasic ? { httpCredentials: { username: opts.httpBasic.user, password: opts.httpBasic.pass } } : {}),
   };
 
   // ── attended: ロールごとに headed 永続コンテキストを 1 つ起動し、人手でログインさせる ──
@@ -269,7 +279,11 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
   const http = new FetchHttpClient({
     allow: (u) => isInScope(u, opts.scope),
     minDelayMs: opts.rateMs ?? 250,
-    headers: { "x-amraam": "assessment" },
+    headers: {
+      "x-amraam": "assessment",
+      // サイト全体の Basic: raw http 経路にも Authorization を注入(Digest はブラウザ経路のみ対応)。
+      ...(opts.httpBasic ? { authorization: `Basic ${Buffer.from(`${opts.httpBasic.user}:${opts.httpBasic.pass}`, "utf8").toString("base64")}` } : {}),
+    },
     ...(opts.burpProxy ? { proxy: opts.burpProxy } : {}),
   });
 
@@ -306,6 +320,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     frontier: new Set(),
     ignorePaths: [],
     exhaustive: !!opts.exhaustiveSurvey,
+    lockToSeeds: !!opts.lockToSeeds,
     plans: new Map(),
     currentScreenId: null,
     screenVerdict: null,
@@ -314,6 +329,13 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     screenDone: false,
     ...(roleSessions ? { roleSessions } : {}),
   };
+
+  // 複数シード: target 以外のシード URL を frontier に積んで survey の起点にする
+  // (ハードロックでも初期シードは積む。以降の発見リンク拡張だけ recordObservation が抑止する)。
+  const seedList = [...new Set([opts.targetUrl, ...(opts.seedUrls ?? [])])];
+  for (const u of seedList) {
+    if (stripHash(u) !== stripHash(opts.targetUrl)) session.frontier.add(stripHash(u));
+  }
 
   const server = createSdkMcpServer({ name: "veritas", version: "1.0.0", tools: buildTools(session) });
   const rolesLine =
@@ -451,9 +473,16 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       // ── STAGE 1: 調査(写像のみ) ── resume で survey 未完なら既存 screens を seed したまま継続。
       if (opts.resume) opts.onText?.("↻ survey was incomplete, resuming from recon");
       opts.store.setPhase(opts.assessmentId, "phase1_recon");
+      const surveyGoal = opts.lockToSeeds
+        ? // URL リスト固定: シードだけをマップし、横断クロールしない。
+          `URL-list mode — LOCKED. Diagnose ONLY these exact URLs; do NOT follow links or explore beyond this list:\n${seedList.map((u, i) => `  ${i + 1}. ${u}`).join("\n")}\nFor EACH url: browser_navigate to it (its screen and the APIs it calls are recorded automatically). Log in as needed — roles for login(): ${rolesLine}. When survey_status shows the frontier empty (all ${seedList.length} mapped), call survey_done.`
+        : seedList.length > 1
+          ? // 複数シード(横断あり): 各シードを起点にスコープ面をマップ。
+            `Map the in-scope surface starting from these ${seedList.length} seed URLs:\n${seedList.map((u) => `  - ${u}`).join("\n")}\nIn-scope hosts: ${opts.scope.inScopeHosts.join(", ")}. Roles for login(): ${rolesLine}. Visit each seed, follow links, log in as each role, and keep going until survey_status shows the frontier empty. Then survey_done.`
+          : `Map the entire in-scope surface of ${opts.targetUrl}. In-scope hosts: ${opts.scope.inScopeHosts.join(", ")}. Roles for login(): ${rolesLine}. Start at the target, follow links, log in as each role, and keep going until survey_status shows the frontier empty. Then survey_done.`;
       turns += await runStage({
         system: SURVEY_PROMPT,
-        goal: `Map the entire in-scope surface of ${opts.targetUrl}. In-scope hosts: ${opts.scope.inScopeHosts.join(", ")}. Roles for login(): ${rolesLine}. Start at the target, follow links, log in as each role, and keep going until survey_status shows the frontier empty. Then survey_done.`,
+        goal: surveyGoal,
         allowed: STAGE_TOOLS.survey,
         maxTurns,
         model: fastModel, // 調査は機械的 → fast
