@@ -40,7 +40,8 @@ test("buildReport renders findings, repro, evidence, scope", () => {
     const store = seedWithFinding(dir);
     const md = buildReport(store.loadAssessment("a-1")!);
     store.close();
-    assert.match(md, /# AMRAAM Assessment Report/);
+    assert.match(md, /# AMRAAM Security Assessment Report/);
+    assert.match(md, /## Assessment Information/);
     assert.match(md, /1 finding\(s\): 1 high/);
     assert.match(md, /\[HIGH\] Exposed sensitive file/);
     assert.match(md, /GET \/\.git\/config/);

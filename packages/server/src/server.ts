@@ -7,7 +7,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
 
-import { AssessmentStore, buildReport, buildReportModel, buildStateView, renderFindingsCsv, renderInventoryHtml, renderReportHtml, renderScreensCsv } from "@veritas/core";
+import { AssessmentStore, buildReportModel, buildStateView, renderFindingsCsv, renderInventoryHtml, renderMarkdown, renderReportHtml, renderScreensCsv } from "@veritas/core";
 import type { TargetInput, WsMessage } from "@veritas/core";
 import { htmlToPdf } from "@veritas/crawler";
 import { handleAuthSubmit, handleLogout, isAuthedReq, loginPageHtml } from "./auth.js";
@@ -382,6 +382,36 @@ const REPORT_ALLOWED: Record<"report" | "inventory", string[]> = {
   inventory: ["csv", "html"],
 };
 
+/** artifacts/<screen>/<evId>/ から生 HTTP req/resp を読む(レポート埋め込み用)。evId は一意なので全 screen を探索。 */
+function loadEvidenceArtifact(artifactsDir: string, evId: string, maxResponseBytes = 16384): { request: string | null; response: string | null; truncated: boolean } | null {
+  if (!existsSync(artifactsDir)) return null;
+  let dir: string | null = null;
+  for (const ent of readdirSync(artifactsDir, { withFileTypes: true })) {
+    if (!ent.isDirectory()) continue;
+    const cand = join(artifactsDir, ent.name, evId);
+    if (existsSync(cand) && statSync(cand).isDirectory()) {
+      dir = cand;
+      break;
+    }
+  }
+  if (!dir) return null;
+  const read = (f: string): string | null => {
+    try {
+      return readFileSync(join(dir as string, f), "utf8");
+    } catch {
+      return null;
+    }
+  };
+  const request = read("request.http.txt");
+  let response = read("response.http.txt");
+  let truncated = false;
+  if (response && response.length > maxResponseBytes) {
+    response = response.slice(0, maxResponseBytes);
+    truncated = true;
+  }
+  return { request, response, truncated };
+}
+
 /** レポート/画面一覧を要求フォーマットで生成して配信(その場で最新を描画)。pdf は Chromium 印刷。 */
 async function serveReport(res: ServerResponse, runsDir: string, id: string, kind: "report" | "inventory", formatRaw: string | null): Promise<void> {
   if (!/^[a-z0-9_-]+$/i.test(id)) {
@@ -405,7 +435,8 @@ async function serveReport(res: ServerResponse, runsDir: string, id: string, kin
     sendJson(res, 404, { error: "assessment not found" });
     return;
   }
-  const model = buildReportModel(state);
+  const artifactsDir = join(runsDir, id, "artifacts");
+  const model = buildReportModel(state, new Date(), { loadEvidence: (evId) => loadEvidenceArtifact(artifactsDir, evId) });
 
   // {body, type, filename, inline}. inline = ブラウザ内プレビュー(html/pdf)、それ以外は添付 DL。
   let body: string | Buffer;
@@ -414,7 +445,7 @@ async function serveReport(res: ServerResponse, runsDir: string, id: string, kin
   let inline = false;
   try {
     if (kind === "report" && fmt === "md") {
-      body = buildReport(state);
+      body = renderMarkdown(model);
       type = "text/markdown; charset=utf-8";
       filename = "report.md";
     } else if (kind === "report" && fmt === "html") {

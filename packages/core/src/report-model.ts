@@ -7,6 +7,15 @@ import { coverage } from "./coverage.js";
 
 export const SEVERITY_ORDER: Record<Severity, number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
 
+/** finding が引用する証拠 1 件。本文(req/resp)は loadEvidence が供給した時のみ入る。 */
+export interface ReportEvidence {
+  evidenceId: string;
+  path: string; // artifacts/<screenId|_>/<evidenceId>/
+  request: string | null; // 生 HTTP リクエスト(redacted 済)
+  response: string | null; // 生 HTTP レスポンス(redacted 済・切り詰めあり)
+  truncated: boolean;
+}
+
 export interface ReportFindingRow {
   index: number; // 1-based
   title: string;
@@ -17,7 +26,14 @@ export interface ReportFindingRow {
   scopeBasis: string;
   description: string;
   reproSteps: string;
-  evidencePaths: string[]; // artifacts/<screenId|_>/<evidenceId>/
+  evidence: ReportEvidence[]; // 本文込み(loadEvidence 指定時)。未指定なら path のみ
+}
+
+/** evidenceId → 生 req/resp を返すローダ(impure な fs 読みは呼び出し側=cli/server が注入)。core は純粋を保つ。 */
+export type EvidenceLoader = (evidenceId: string) => { request: string | null; response: string | null; truncated?: boolean } | null;
+
+export interface BuildReportOptions {
+  loadEvidence?: EvidenceLoader;
 }
 
 /** survey が検出した1画面(画面一覧の1行)。 */
@@ -38,6 +54,7 @@ export interface ReportModel {
   brand: string;
   target: string;
   phase: Phase;
+  startedAt: string; // ISO(budget.startedAt = run 開始)
   generatedAt: string; // ISO
   scope: ScopePolicy;
   stats: {
@@ -49,8 +66,9 @@ export interface ReportModel {
   screens: ReportScreenRow[]; // screenId 昇順
 }
 
-/** AssessmentState → ReportModel(純粋)。全レンダラの単一の入力。 */
-export function buildReportModel(state: AssessmentState, now: Date = new Date()): ReportModel {
+/** AssessmentState → ReportModel(純粋)。全レンダラの単一の入力。
+ *  opts.loadEvidence を渡すと各証拠の req/resp 本文を取り込む(fs 読みは呼び出し側が注入)。 */
+export function buildReportModel(state: AssessmentState, now: Date = new Date(), opts: BuildReportOptions = {}): ReportModel {
   const cov = coverage(state);
   const sorted = [...state.findings].sort((a, b) => SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity]);
   const target = state.target.kind === "single_url" ? state.target.url : `scope_manifest ${state.target.path}`;
@@ -72,7 +90,16 @@ export function buildReportModel(state: AssessmentState, now: Date = new Date())
     scopeBasis: f.scopeBasis,
     description: f.description,
     reproSteps: f.reproSteps,
-    evidencePaths: f.evidenceIds.map((e) => `artifacts/${f.screenId ?? "_"}/${e}/`),
+    evidence: f.evidenceIds.map((e): ReportEvidence => {
+      const loaded = opts.loadEvidence?.(e) ?? null;
+      return {
+        evidenceId: e,
+        path: `artifacts/${f.screenId ?? "_"}/${e}/`,
+        request: loaded?.request ?? null,
+        response: loaded?.response ?? null,
+        truncated: loaded?.truncated ?? false,
+      };
+    }),
   }));
 
   const screens: ReportScreenRow[] = [...state.screens]
@@ -94,6 +121,7 @@ export function buildReportModel(state: AssessmentState, now: Date = new Date())
     brand: "AMRAAM",
     target,
     phase: state.phase,
+    startedAt: state.budget.startedAt,
     generatedAt: now.toISOString(),
     scope: state.scope,
     stats: {

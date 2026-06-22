@@ -1,9 +1,51 @@
 // DESIGN §4.3 — EvidenceStore。req/resp 対を artifacts/<screen_id>/<evidence_id>/ に保存。
 // 認証ヘッダ(Authorization/Cookie 等)は値をマスクして保存(§6.2 の原則)。
 
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { HttpRequest, HttpResponse } from "./http.js";
+
+export interface EvidenceArtifact {
+  /** 生 HTTP リクエスト全体(秘匿ヘッダは redacted 済)。 */
+  request: string | null;
+  /** 生 HTTP レスポンス全体(headers + body, redacted 済。maxResponseBytes で切り詰め)。 */
+  response: string | null;
+  /** response が maxResponseBytes を超えて切り詰められたか。 */
+  truncated: boolean;
+}
+
+/**
+ * artifacts/<screenId>/<evidenceId>/ を探して raw HTTP request/response を読む(レポート埋め込み用)。
+ * evidenceId は一意なので screen をまたいで探索する。見つからなければ null。
+ */
+export function readEvidenceArtifact(artifactsDir: string, evidenceId: string, maxResponseBytes = 16384): EvidenceArtifact | null {
+  if (!existsSync(artifactsDir)) return null;
+  let dir: string | null = null;
+  for (const ent of readdirSync(artifactsDir, { withFileTypes: true })) {
+    if (!ent.isDirectory()) continue;
+    const cand = join(artifactsDir, ent.name, evidenceId);
+    if (existsSync(cand) && statSync(cand).isDirectory()) {
+      dir = cand;
+      break;
+    }
+  }
+  if (!dir) return null;
+  const read = (f: string): string | null => {
+    try {
+      return readFileSync(join(dir as string, f), "utf8");
+    } catch {
+      return null;
+    }
+  };
+  const request = read("request.http.txt");
+  let response = read("response.http.txt");
+  let truncated = false;
+  if (response && response.length > maxResponseBytes) {
+    response = response.slice(0, maxResponseBytes);
+    truncated = true;
+  }
+  return { request, response, truncated };
+}
 
 export type EvidenceKind = "negative_control" | "positive_replay";
 

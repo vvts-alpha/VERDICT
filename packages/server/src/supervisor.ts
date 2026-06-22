@@ -3,7 +3,7 @@
 // 子が runs/<id>/state.sqlite を書く → 既存の WS 投影がそのまま進捗をライブ配信する。docs/LIVE_TAKEOVER.md の Phase-1 制御面。
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { newAssessmentId } from "@veritas/core";
 import type { Relay } from "./relay.js";
@@ -67,6 +67,8 @@ export class Supervisor {
     mkdirSync(dir, { recursive: true });
     const manifestPath = join(dir, "manifest.json");
     writeFileSync(manifestPath, `${JSON.stringify(input.manifest, null, 2)}\n`);
+    // resume が開始時の設定(attended/model/burp 等)を復元できるよう options も永続化する。
+    writeFileSync(join(dir, "run.json"), `${JSON.stringify({ command: input.command, options: input.options ?? {} }, null, 2)}\n`);
 
     const args = [this.cfg.cliPath, input.command, "--manifest", manifestPath, "--id", id, "--out", this.cfg.runsDir];
     const o = input.options ?? {};
@@ -90,9 +92,29 @@ export class Supervisor {
     return { id };
   }
 
-  /** 既存 run の診断を再開(survey/methodology はスキップ)。 */
+  /** 既存 run の診断を再開(survey/methodology はスキップ)。開始時の manifest/options を復元して
+   *  認証材料(roleCreds/cookie/httpBasic/attended)を取り戻す(これが無いと resume 後 unauth で 401 連発)。 */
   resume(id: string): void {
+    const dir = join(this.cfg.runsDir, id);
     const args = [this.cfg.cliPath, "pilot", "--resume", "--id", id, "--out", this.cfg.runsDir];
+    const manifestPath = join(dir, "manifest.json");
+    if (existsSync(manifestPath)) args.push("--manifest", manifestPath);
+    let o: NonNullable<StartRunInput["options"]> = {};
+    try {
+      o = (JSON.parse(readFileSync(join(dir, "run.json"), "utf8")).options ?? {}) as NonNullable<StartRunInput["options"]>;
+    } catch {
+      /* run.json 無し(古い run) → 既定で続行 */
+    }
+    if (o.model) args.push("--model", o.model);
+    if (o.fastModel) args.push("--fast-model", o.fastModel);
+    if (o.burpProxy) args.push("--burp-proxy"); // 値なしフラグ(BURP_PROXY env から読む)
+    // attended は新しい control チャネル(token)を発行して窓を WebUI に再オープンさせる。
+    if (o.attended && this.relay && this.controlBase) {
+      args.push("--attended");
+      const token = randomBytes(16).toString("hex");
+      this.relay.issueToken(id, token);
+      args.push("--control-url", `${this.controlBase}/ws/agent?id=${id}&token=${token}`);
+    }
     this.spawnChild(id, "pilot --resume", args);
   }
 

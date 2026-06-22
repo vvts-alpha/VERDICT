@@ -12,11 +12,13 @@ import {
   AssessmentStore,
   buildReport,
   buildReportModel,
+  renderMarkdown,
   renderReportHtml,
   renderFindingsCsv,
   renderScreensCsv,
   renderInventoryHtml,
   coverage,
+  type EvidenceLoader,
   deriveScopeFromSingleUrl,
   deriveScopeFromUrls,
   evaluateStop,
@@ -30,7 +32,7 @@ import {
 import { PlaywrightDriver, buildInventory, crawl, exploreScreen, htmlToPdf, labelInventory, normalizePath, smartLogin, writeScreenInventory } from "@veritas/crawler";
 import type { LoginCreds } from "@veritas/crawler";
 import { ClaudeCliClient } from "@veritas/llm";
-import { EvidenceStore, FetchHttpClient, SECURITY_HEADERS, auditHeaders, coarseCategory, parseBurpReport, burpSeverity, scanInventory, startBurpScan, getBurpScan } from "@veritas/scanner";
+import { EvidenceStore, FetchHttpClient, SECURITY_HEADERS, auditHeaders, coarseCategory, parseBurpReport, burpSeverity, readEvidenceArtifact, scanInventory, startBurpScan, getBurpScan } from "@veritas/scanner";
 import type { BurpIssue } from "@veritas/scanner";
 import { assessLogicInventory, assessScreenLogic, authDiffScreen } from "@veritas/agent";
 import type { RoleContext } from "@veritas/agent";
@@ -202,6 +204,12 @@ function cmdStatus(args: string[]): void {
   console.log(`  stop:     ${stop.stop ? `${stop.reason} (${stop.detail})` : "continue"}`);
 }
 
+/** runs/<id>/artifacts から証拠 req/resp を読むローダ(レポート埋め込み用)。 */
+function evidenceLoaderFor(runsDir: string, id: string): EvidenceLoader {
+  const artifactsDir = join(runsDir, id, "artifacts");
+  return (evId) => readEvidenceArtifact(artifactsDir, evId);
+}
+
 const REPORT_FORMATS = ["md", "html", "pdf", "csv"] as const;
 type ReportFormat = (typeof REPORT_FORMATS)[number];
 
@@ -235,13 +243,13 @@ async function cmdReport(args: string[]): Promise<void> {
   if (!state) fail(`assessment ${values.id} not found`);
 
   const formats = parseFormats(values.format, ["md", "html"], REPORT_FORMATS);
-  const model = buildReportModel(state);
+  const model = buildReportModel(state, new Date(), { loadEvidence: evidenceLoaderFor(runsDir, values.id) });
   const dir = join(runsDir, values.id);
   const written: string[] = [];
 
   if (formats.includes("md")) {
     const p = join(dir, "report.md");
-    writeFileSync(p, buildReport(state));
+    writeFileSync(p, renderMarkdown(model));
     written.push(p);
   }
   let html: string | null = null;
@@ -520,6 +528,11 @@ interface AssessManifest {
   };
 }
 
+/** 資格情報も cookie ファイルも持たない「純手動」ロールが1つでもあるか(= attended が必要)。 */
+function manifestHasManualRole(m: AssessManifest | null): boolean {
+  return (m?.auth?.roles ?? []).some((r) => !(r.password ?? r.pass) && !(r.cookieFile ?? r.cookie_file ?? r.cookie_file_path));
+}
+
 /** サイト全体の HTTP Basic/Digest 資格情報(あれば)。user/pass 両方そろって初めて有効。 */
 function manifestHttpBasic(m: AssessManifest | null): { user: string; pass: string } | null {
   const b = m?.auth?.httpBasic;
@@ -793,7 +806,7 @@ async function cmdAssess(args: string[]): Promise<void> {
 
   // ⑥ report
   const finalState = store.loadAssessment(id);
-  if (finalState) writeFileSync(join(runsDir, id, "report.md"), buildReport(finalState));
+  if (finalState) writeFileSync(join(runsDir, id, "report.md"), buildReport(finalState, new Date(), { loadEvidence: evidenceLoaderFor(runsDir, id) }));
   store.close();
   console.log(`⑥ report → ${join(runsDir, id, "report.md")}`);
   console.log(`\n✓ done. observe: if serve is running, http://127.0.0.1:4317/?id=${id}`);
@@ -887,15 +900,23 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
   const burpProxy = bp.present ? (bp.value ?? process.env.BURP_PROXY) : undefined;
   if (bp.present && !burpProxy) console.log("⚠ --burp-proxy was given but neither a value nor BURP_PROXY env is set (continuing without a proxy)");
   const runsDir = values.out ?? RUNS_DIR_DEFAULT;
-  const manifest = values.manifest ? loadManifest(values.manifest) : null;
+  const resume = !!values.resume;
+  // resume は survey/methodology をスキップして診断だけ再開する。--manifest 未指定でも、開始時に
+  // 永続化した runs/<id>/manifest.json を読み戻して認証材料(roleCreds/cookie/httpBasic/attended)を復元する。
+  // ※これが無いと resume 後は全部 unauth になり、認証壁の裏が一律 401 で診断不能になる。
+  const manifest = values.manifest
+    ? loadManifest(values.manifest)
+    : resume && values.id && existsSync(join(runsDir, values.id, "manifest.json"))
+      ? loadManifest(join(runsDir, values.id, "manifest.json"))
+      : null;
   const model = values.model ?? manifest?.model ?? "claude-sonnet-4-6";
   const rate = values.rate ? Number.parseInt(values.rate, 10) : 250;
   const maxTurns = values["max-turns"] ? Number.parseInt(values["max-turns"], 10) : 80;
-  const attended = !!values.attended; // 手動マルチセッション認証(必ず headed)
+  // resume では attended を manifest の手動ロール(creds も cookie も無い)から再導出する。
+  const attended = !!values.attended || (resume && manifestHasManualRole(manifest)); // 手動マルチセッション認証(必ず headed)
   const headed = attended || (!values.headless && !!values.headed);
   if (attended && values.headless) console.log("⚠ --attended needs a headed browser for manual login (--headless ignored)");
   const browserPath = values["browser-path"] ?? process.env.VERITAS_BROWSER_PATH;
-  const resume = !!values.resume;
   const surveyOnly = !!values["survey-only"];
 
   let id: string;
@@ -944,6 +965,10 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
   const roleDescriptions = new Map<string, string>();
   for (const rc of manifestRoleDescriptions(manifest)) roleDescriptions.set(rc.name, rc.description);
   const httpBasic = manifestHttpBasic(manifest); // サイト全体の Basic/Digest(あれば)
+  if (resume)
+    console.log(
+      `  ↻ resume: restored config from manifest — httpBasic ${httpBasic ? "✓" : "—"}, creds ${roleCreds.size}, cookies ${roleCookieFiles.size}, attended ${attended ? "✓" : "—"}`,
+    );
 
   const mode = `${surveyOnly ? " · survey-only" : resume ? " · resume" : ""}${attended ? " · attended (manual multi-session)" : ""}`;
   console.log(`▶ pilot ${id}  (Claude-led${mode})`);
@@ -1025,7 +1050,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       }
     }
     const finalState = store.loadAssessment(id);
-    if (finalState) writeFileSync(join(runsDir, id, "report.md"), buildReport(finalState));
+    if (finalState) writeFileSync(join(runsDir, id, "report.md"), buildReport(finalState, new Date(), { loadEvidence: evidenceLoaderFor(runsDir, id) }));
     const tk = res.tokensUsed >= 1000 ? `${(res.tokensUsed / 1000).toFixed(1)}k` : `${res.tokensUsed}`;
     console.log(`\n=== ${res.findings.length} finding(s) in ${res.turns} turns · ${tk} tokens${res.costUsd > 0 ? ` · ~$${res.costUsd.toFixed(2)}` : ""} ===`);
     for (const f of res.findings) console.log(`  - [${f.severity}] ${f.title}`);
@@ -1530,7 +1555,7 @@ async function runBurpScanOnRun(
   const { added, skipped, oos } = mergeBurpIssues(store, id, state, runsDir, last.issues, "bs");
   if (added > 0) {
     const fs2 = store.loadAssessment(id);
-    if (fs2) writeFileSync(join(runsDir, id, "report.md"), buildReport(fs2));
+    if (fs2) writeFileSync(join(runsDir, id, "report.md"), buildReport(fs2, new Date(), { loadEvidence: evidenceLoaderFor(runsDir, id) }));
   }
   console.log(`\nburp-scan ${id}: ${last.issues.length} issue(s) → +${added} net-new(dup ${skipped} / out-of-scope ${oos})`);
   return added;

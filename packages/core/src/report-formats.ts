@@ -42,9 +42,14 @@ pre{background:#f6f8fa;border:1px solid #e3e6ea;border-radius:6px;padding:10px;o
 table{border-collapse:collapse;width:100%;font-size:13px}
 th,td{border:1px solid #e3e6ea;padding:6px 8px;text-align:left;vertical-align:top}
 th{background:#f6f8fa}
+table.info td:first-child{width:170px;color:#555;font-weight:600;background:#fafbfc}
 .muted{color:#888}
 img.shot{max-width:220px;max-height:140px;border:1px solid #ddd;border-radius:4px}
-@media print{body{padding:0}.f{break-inside:avoid}}
+.ev{margin:10px 0 0;border-left:3px solid #cdd5dd;padding-left:10px}
+.ev .evh{font-size:12px;color:#555;margin:0 0 4px}
+.ev .lbl{font-size:11px;font-weight:700;letter-spacing:.4px;color:#5f7d8c;margin:6px 0 2px}
+.ev pre{margin:0;max-height:420px}
+@media print{body{padding:0}.f{break-inside:avoid}.ev pre{max-height:none}}
 `;
 
 function docHtml(title: string, body: string): string {
@@ -56,47 +61,77 @@ ${body}
 </body></html>`;
 }
 
-/** 診断レポート(findings + stats + scope)を自己完結 HTML で。PDF はこれを Chromium で印刷。 */
+function row(k: string, v: string): string {
+  return `<tr><td>${esc(k)}</td><td>${v}</td></tr>`;
+}
+
+function evidenceHtml(e: ReportModel["findings"][number]["evidence"][number]): string {
+  const parts: string[] = [`<div class="ev"><div class="evh">Evidence <code>${esc(e.evidenceId)}</code> — <code>${esc(e.path)}</code></div>`];
+  if (e.request) parts.push(`<div class="lbl">REQUEST</div><pre>${esc(e.request.trimEnd())}</pre>`);
+  if (e.response) parts.push(`<div class="lbl">RESPONSE${e.truncated ? " (truncated)" : ""}</div><pre>${esc(e.response.trimEnd())}</pre>`);
+  parts.push(`</div>`);
+  return parts.join("");
+}
+
+/** 診断レポート(対象情報 + scope + findings + req/resp 証拠)を自己完結 HTML で。PDF はこれを Chromium で印刷。 */
 export function renderReportHtml(m: ReportModel): string {
   const out: string[] = [];
-  out.push(`<h1>${esc(m.brand)} Assessment Report</h1>`);
-  out.push(`<p class="meta"><code>${esc(m.id)}</code></p>`);
-  out.push(`<p class="meta">Target: <code>${esc(m.target)}</code> · Phase: ${esc(m.phase)} · Generated: ${esc(m.generatedAt)}</p>`);
-  out.push(
-    `<p class="meta">Screens: ${m.stats.screens.total} (scanned ${m.stats.screens.scanned}, remaining ${m.stats.screens.remaining}) · ` +
-      `Hypotheses: ${m.stats.hypotheses.total} (confirmed ${m.stats.hypotheses.confirmed}) · Findings: ${m.stats.findings.total}</p>`,
-  );
+  out.push(`<h1>${esc(m.brand)} Security Assessment Report</h1>`);
 
+  // 対象情報
+  out.push(`<h2>Assessment Information</h2><table class="info">`);
+  out.push(row("Assessment ID", `<code>${esc(m.id)}</code>`));
+  out.push(row("Target", `<code>${esc(m.target)}</code>`));
+  out.push(row("Started", esc(m.startedAt)));
+  out.push(row("Generated", esc(m.generatedAt)));
+  out.push(row("Phase", esc(m.phase)));
+  out.push(row("Screens", `${m.stats.screens.total} mapped · ${m.stats.screens.scanned} scanned · ${m.stats.screens.remaining} remaining`));
+  out.push(row("Hypotheses", `${m.stats.hypotheses.total} (${m.stats.hypotheses.confirmed} confirmed)`));
+  out.push(row("Findings", String(m.stats.findings.total)));
+  out.push(row("Tooling", esc(m.brand)));
+  out.push(`</table>`);
+
+  // スコープ
+  const s = m.scope;
+  const hostList = (xs: string[]): string => (xs.length ? xs.map((h) => `<code>${esc(h)}</code>`).join(", ") : "&mdash;");
+  out.push(`<h2>Scope</h2><table class="info">`);
+  out.push(row("In-scope hosts", hostList(s.inScopeHosts)));
+  out.push(row("Out-of-scope hosts", hostList(s.outOfScopeHosts)));
+  out.push(row("In-scope paths", hostList(s.inScopePathPrefixes)));
+  out.push(row("Out-of-scope paths", hostList(s.outOfScopePathPrefixes)));
+  out.push(row("Rate", `${s.rate.requestsPerMinute} req/min, max ${s.rate.maxConcurrent} concurrent`));
+  out.push(`</table>`);
+
+  // サマリ
   out.push(`<h2>Summary</h2>`);
   if (m.findings.length === 0) {
     out.push(`<p class="muted"><em>No confirmed findings.</em></p>`);
   } else {
     const tags = (Object.entries(m.stats.findings.bySeverity) as [Severity, number][])
       .filter(([, n]) => n > 0)
-      .map(([s, n]) => `<span><b style="color:${SEV_COLOR[s]}">${n}</b> ${s}</span>`)
+      .map(([sev, n]) => `<span><b style="color:${SEV_COLOR[sev]}">${n}</b> ${sev}</span>`)
       .join("");
     out.push(`<p>${m.findings.length} finding(s)</p><p class="sumtags">${tags}</p>`);
   }
 
+  // findings(req/resp 全文)
   if (m.findings.length > 0) {
     out.push(`<h2>Findings</h2>`);
     for (const f of m.findings) {
       out.push(`<div class="f">`);
-      out.push(
-        `<h3><span class="badge" style="background:${SEV_COLOR[f.severity]}">${f.severity.toUpperCase()}</span> ${f.index}. ${esc(f.title)}</h3>`,
-      );
+      out.push(`<h3><span class="badge" style="background:${SEV_COLOR[f.severity]}">${f.severity.toUpperCase()}</span> ${f.index}. ${esc(f.title)}</h3>`);
       out.push(`<div class="kv">Screen: <code>${esc(f.screenId ?? "(cross-screen)")}</code></div>`);
       out.push(`<div class="kv">Source: ${f.sourceKind} <code>${esc(f.sourceName)}</code></div>`);
       out.push(`<div class="kv">Scope basis: ${esc(f.scopeBasis)}</div>`);
       out.push(`<div class="desc">${esc(f.description)}</div>`);
       out.push(`<div><b>Reproduction</b></div><pre>${esc(f.reproSteps)}</pre>`);
-      const ev = f.evidencePaths.length ? f.evidencePaths.map((p) => `<code>${esc(p)}</code>`).join(", ") : "&mdash;";
-      out.push(`<div class="kv"><b>Evidence:</b> ${ev}</div>`);
+      out.push(`<div><b>Evidence</b></div>`);
+      if (f.evidence.length === 0) out.push(`<p class="muted">(none recorded)</p>`);
+      else for (const e of f.evidence) out.push(evidenceHtml(e));
       out.push(`</div>`);
     }
   }
 
-  out.push(`<h2>Scope</h2><pre>${esc(JSON.stringify(m.scope, null, 2))}</pre>`);
   return docHtml(`${m.brand} Report ${m.id}`, out.join("\n"));
 }
 
@@ -110,7 +145,7 @@ export function renderFindingsCsv(m: ReportModel): string {
     f.screenId ?? "(cross-screen)",
     `${f.sourceKind}:${f.sourceName}`,
     f.scopeBasis,
-    f.evidencePaths.join(" | "),
+    f.evidence.map((e) => e.path).join(" | "),
     f.reproSteps,
   ]);
   return csvRows([header, ...rows]);

@@ -6,7 +6,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { AssessmentStore, deriveScopeFromSingleUrl, buildReportModel, renderReportHtml, renderFindingsCsv, renderScreensCsv, renderInventoryHtml } from "./index.js";
+import { AssessmentStore, deriveScopeFromSingleUrl, buildReportModel, renderMarkdown, renderReportHtml, renderFindingsCsv, renderScreensCsv, renderInventoryHtml } from "./index.js";
 import type { Finding, Screen } from "./index.js";
 
 function screen(id: string, urlTemplate: string): Screen {
@@ -45,12 +45,39 @@ test("buildReportModel projects stats, findings, and screen inventory", () => {
     assert.equal(m.stats.findings.total, 1);
     assert.equal(m.stats.findings.bySeverity.high, 1);
     assert.equal(m.findings[0]!.sourceName, "exposed_file");
-    assert.deepEqual(m.findings[0]!.evidencePaths, ["artifacts/s-0001/ev-1/", "artifacts/s-0001/ev-2/"]);
+    assert.deepEqual(m.findings[0]!.evidence.map((e) => e.path), ["artifacts/s-0001/ev-1/", "artifacts/s-0001/ev-2/"]);
+    assert.equal(m.findings[0]!.evidence[0]!.request, null); // no loader → path only
     // 画面一覧: 2 screens, sorted, with scan status mapped
     assert.equal(m.screens.length, 2);
     assert.equal(m.screens[0]!.screenId, "s-0001");
     assert.equal(m.screens[0]!.scanStatus, "finding");
     assert.equal(m.screens[1]!.scanStatus, "queued"); // s-0002 enrolled but not yet diagnosed
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("loadEvidence embeds full request/response in markdown + html", () => {
+  const dir = mkdtempSync(join(tmpdir(), "veritas-ev-"));
+  try {
+    const store = seed(dir);
+    const state = store.loadAssessment("a-1")!;
+    store.close();
+    const loader = (evId: string) => ({
+      request: `GET /.git/config HTTP/1.1\nHost: shop.test\n[evid ${evId}]`,
+      response: `HTTP/1.1 200 OK\nContent-Type: text/plain\n\n[core]\nrepositoryformatversion = 0`,
+      truncated: false,
+    });
+    const m = buildReportModel(state, new Date(), { loadEvidence: loader });
+    assert.match(m.findings[0]!.evidence[0]!.request!, /GET \/\.git\/config/);
+    const md = renderMarkdown(m);
+    assert.match(md, /Request:/);
+    assert.match(md, /Response:/);
+    assert.match(md, /repositoryformatversion = 0/);
+    const html = renderReportHtml(m);
+    assert.match(html, /REQUEST<\/div>/);
+    assert.match(html, /RESPONSE<\/div>/);
+    assert.match(html, /repositoryformatversion = 0/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

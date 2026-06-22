@@ -1,27 +1,52 @@
-// DESIGN §7.6 — findings レポート(report.md)。重大度順 + 再現手順 + 証拠 + スコープ根拠。純粋。
-// 構造化モデル(report-model.ts)を markdown に描画する。buildReport は後方互換のラッパ。
+// DESIGN §7.6 — 診断レポート(report.md)。対象情報 + スコープ + findings(重大度順・再現手順・
+// リクエスト/レスポンス全文の証拠)。構造化モデル(report-model.ts)から markdown を描画。純粋。
 
 import type { AssessmentState, Severity } from "./types/index.js";
-import type { ReportModel } from "./report-model.js";
+import type { BuildReportOptions, ReportEvidence, ReportModel } from "./report-model.js";
 import { buildReportModel } from "./report-model.js";
+
+function evidenceMd(e: ReportEvidence): string[] {
+  const out: string[] = [`- Evidence \`${e.evidenceId}\` — \`${e.path}\``];
+  if (e.request) out.push("", "Request:", "", "```http", e.request.trimEnd(), "```");
+  if (e.response) out.push("", `Response${e.truncated ? " (truncated)" : ""}:`, "", "```http", e.response.trimEnd(), "```");
+  return out;
+}
 
 /** ReportModel → Markdown(report.md の本文)。 */
 export function renderMarkdown(m: ReportModel): string {
   const out: string[] = [];
-  out.push(`# ${m.brand} Assessment Report — \`${m.id}\``, "");
-  out.push(`- **Target**: ${m.target}`);
-  out.push(`- **Phase**: ${m.phase}`);
-  out.push(`- **Screens**: ${m.stats.screens.total} (scanned ${m.stats.screens.scanned}, remaining ${m.stats.screens.remaining})`);
-  out.push(`- **Hypotheses**: ${m.stats.hypotheses.total} (confirmed ${m.stats.hypotheses.confirmed})`);
-  out.push(`- **Findings**: ${m.stats.findings.total}`);
-  out.push(`- **Generated**: ${m.generatedAt}`, "");
+  out.push(`# ${m.brand} Security Assessment Report`, "");
 
+  // ── 対象情報 ──
+  out.push("## Assessment Information", "");
+  out.push(`| | |`, `|---|---|`);
+  out.push(`| Assessment ID | \`${m.id}\` |`);
+  out.push(`| Target | ${m.target} |`);
+  out.push(`| Started | ${m.startedAt} |`);
+  out.push(`| Generated | ${m.generatedAt} |`);
+  out.push(`| Phase | ${m.phase} |`);
+  out.push(`| Screens | ${m.stats.screens.total} mapped · ${m.stats.screens.scanned} scanned · ${m.stats.screens.remaining} remaining |`);
+  out.push(`| Hypotheses | ${m.stats.hypotheses.total} (${m.stats.hypotheses.confirmed} confirmed) |`);
+  out.push(`| Findings | ${m.stats.findings.total} |`);
+  out.push(`| Tooling | ${m.brand} |`, "");
+
+  // ── スコープ(整形) ──
+  const s = m.scope;
+  out.push("## Scope", "");
+  out.push(`- **In-scope hosts**: ${s.inScopeHosts.length ? s.inScopeHosts.map((h) => `\`${h}\``).join(", ") : "—"}`);
+  out.push(`- **Out-of-scope hosts**: ${s.outOfScopeHosts.length ? s.outOfScopeHosts.map((h) => `\`${h}\``).join(", ") : "—"}`);
+  out.push(`- **In-scope paths**: ${s.inScopePathPrefixes.length ? s.inScopePathPrefixes.map((p) => `\`${p}\``).join(", ") : "—"}`);
+  out.push(`- **Out-of-scope paths**: ${s.outOfScopePathPrefixes.length ? s.outOfScopePathPrefixes.map((p) => `\`${p}\``).join(", ") : "—"}`);
+  out.push(`- **Rate**: ${s.rate.requestsPerMinute} req/min, max ${s.rate.maxConcurrent} concurrent`, "");
+
+  // ── サマリ ──
   const summary = (Object.entries(m.stats.findings.bySeverity) as [Severity, number][])
     .filter(([, n]) => n > 0)
-    .map(([s, n]) => `${n} ${s}`)
+    .map(([sev, n]) => `${n} ${sev}`)
     .join(", ");
   out.push("## Summary", "", m.findings.length === 0 ? "_No confirmed findings._" : `${m.findings.length} finding(s): ${summary}`, "");
 
+  // ── findings(証拠は req/resp 全文) ──
   if (m.findings.length > 0) {
     out.push("## Findings", "");
     for (const f of m.findings) {
@@ -31,16 +56,16 @@ export function renderMarkdown(m: ReportModel): string {
       out.push(`- Scope basis: ${f.scopeBasis}`, "");
       out.push(f.description, "");
       out.push("**Reproduction**", "", "```", f.reproSteps, "```", "");
-      const evidence = f.evidencePaths.length ? f.evidencePaths.map((p) => `\`${p}\``).join(", ") : "—";
-      out.push(`**Evidence**: ${evidence}`, "");
+      out.push("**Evidence**", "");
+      if (f.evidence.length === 0) out.push("_(none recorded)_", "");
+      else for (const e of f.evidence) out.push(...evidenceMd(e), "");
     }
   }
 
-  out.push("## Scope", "", "```json", JSON.stringify(m.scope, null, 2), "```", "");
   return out.join("\n");
 }
 
-/** AssessmentState → report.md(後方互換)。 */
-export function buildReport(state: AssessmentState, now: Date = new Date()): string {
-  return renderMarkdown(buildReportModel(state, now));
+/** AssessmentState → report.md。opts.loadEvidence で証拠本文(req/resp)を取り込める。 */
+export function buildReport(state: AssessmentState, now: Date = new Date(), opts: BuildReportOptions = {}): string {
+  return renderMarkdown(buildReportModel(state, now, opts));
 }

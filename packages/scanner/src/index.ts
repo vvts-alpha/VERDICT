@@ -3,8 +3,8 @@
 export type { HttpClient, HttpRequest, HttpResponse, FetchHttpClientOptions, FakeResponder } from "./http.js";
 export { FetchHttpClient, FakeHttpClient } from "./http.js";
 
-export { EvidenceStore } from "./evidence.js";
-export type { EvidenceInput, EvidenceRecord, EvidenceKind } from "./evidence.js";
+export { EvidenceStore, readEvidenceArtifact } from "./evidence.js";
+export type { EvidenceInput, EvidenceRecord, EvidenceKind, EvidenceArtifact } from "./evidence.js";
 
 export { runValidator, makeTarget, concretizeApiUrl } from "./validator.js";
 export type {
