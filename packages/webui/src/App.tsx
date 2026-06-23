@@ -10,8 +10,9 @@ import { ApiList } from "./components/ApiList";
 import { Log } from "./components/Log";
 import { Index } from "./components/Index";
 import { Sessions } from "./components/Sessions";
+import { Chat } from "./components/Chat";
 
-type Tab = "screen" | "findings" | "log" | "apis" | "sessions";
+type Tab = "screen" | "findings" | "log" | "apis" | "sessions" | "ask";
 
 // DESIGN §8 — 左 SITE TREE(ナビ)+ 進捗バー、右はタブ: Screen / Findings / 診断ログ / APIs。
 export function App() {
@@ -87,6 +88,9 @@ export function App() {
             >
               🖥 Sessions{awaitingSessions > 0 ? ` 🔴 ${awaitingSessions}` : ""}
             </button>
+            <button type="button" className={tab === "ask" ? "active" : ""} onClick={() => setTab("ask")}>
+              💬 Ask
+            </button>
           </div>
           <div className="tabbody">
             {tab === "screen" ? (
@@ -100,6 +104,7 @@ export function App() {
             {tab === "apis" ? <ApiList view={view} onJump={onSelect} /> : null}
             {tab === "log" ? <Log events={view.events} /> : null}
             {tab === "sessions" ? <Sessions id={view.id} /> : null}
+            {tab === "ask" ? <Chat id={view.id} /> : null}
           </div>
         </main>
       </div>

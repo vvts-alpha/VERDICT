@@ -10,6 +10,8 @@ import { WebSocket, WebSocketServer } from "ws";
 import { AssessmentStore, buildReportModel, buildStateView, renderFindingsCsv, renderInventoryHtml, renderMarkdown, renderReportHtml, renderScreensCsv } from "@veritas/core";
 import type { TargetInput, WsMessage } from "@veritas/core";
 import { htmlToPdf } from "@veritas/crawler";
+import { ClaudeCliClient } from "@veritas/llm";
+import type { AssessmentState } from "@veritas/core";
 import { handleAuthSubmit, handleLogout, isAuthedReq, loginPageHtml } from "./auth.js";
 import { Supervisor, type RunLauncherConfig, type StartRunInput } from "./supervisor.js";
 import { Relay } from "./relay.js";
@@ -176,6 +178,34 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
     if (supervisor.isRunning(id)) return sendJson(res, 409, { error: "already running" });
     supervisor.resume(id);
     return sendJson(res, 200, { ok: true });
+  }
+
+  // 💬 Ask: その assessment の findings/screens/scope を文脈に Claude へ質問する(読み取り Q&A)。
+  const chat = url.match(/^\/api\/assessments\/([^/]+)\/chat$/);
+  if (chat) {
+    const id = decodeURIComponent(chat[1] ?? "");
+    let body = "";
+    let tooBig = false;
+    req.on("data", (c) => {
+      body += c;
+      if (body.length > 256 * 1024) {
+        tooBig = true;
+        req.destroy();
+      }
+    });
+    req.on("end", () => {
+      if (tooBig) return sendJson(res, 413, { error: "too large" });
+      let parsed: { messages?: Array<{ role?: string; content?: string }> };
+      try {
+        parsed = JSON.parse(body) as typeof parsed;
+      } catch {
+        return sendJson(res, 400, { error: "invalid JSON body" });
+      }
+      const messages = (parsed.messages ?? []).filter((m) => typeof m.content === "string" && m.content.trim());
+      if (!messages.length) return sendJson(res, 400, { error: "messages required" });
+      void serveChat(res, opts.runsDir, id, messages as Array<{ role: string; content: string }>);
+    });
+    return;
   }
 
   const openStore = (id: string): AssessmentStore | null => {
@@ -375,6 +405,64 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptio
     return;
   }
   sendJson(res, 200, { service: "amraam-server", runsDir: opts.runsDir });
+}
+
+const CHAT_SYSTEM = `You are a security-assessment assistant embedded in AMRAAM's web UI. Answer the operator's questions about THIS assessment using ONLY the assessment data provided below (findings, screens, scope, stats). Cite finding ids (e.g. f-003) and screen ids when relevant. Be concise and concrete. If something is not in the data, say so plainly — do NOT invent vulnerabilities, severities, or facts. For risk/impact or remediation you may reason generally, but ground claims in the recorded evidence.`;
+
+/** assessment state を Claude への文脈テキストに整形(findings 本体 + 画面一覧 + scope)。 */
+function buildChatContext(state: AssessmentState): string {
+  const target = state.target.kind === "single_url" ? state.target.url : `scope_manifest ${state.target.path}`;
+  const scanByScreen = new Map(state.screenScans.map((s) => [s.screenId, s.status]));
+  const out: string[] = [];
+  out.push(`Target: ${target} | Phase: ${state.phase} | Screens: ${state.screens.length} | Findings: ${state.findings.length}`);
+  out.push(`Scope: in-hosts=[${state.scope.inScopeHosts.join(", ")}] out-hosts=[${state.scope.outOfScopeHosts.join(", ")}] in-paths=[${state.scope.inScopePathPrefixes.join(", ")}] out-paths=[${state.scope.outOfScopePathPrefixes.join(", ")}]`);
+  out.push("", "## Findings");
+  if (!state.findings.length) out.push("(none confirmed)");
+  for (const f of state.findings) {
+    const src = f.source.kind === "validator" ? `validator ${f.source.validatorName}` : `hypothesis ${f.source.hypothesisId}`;
+    out.push(`### ${f.id} [${f.severity.toUpperCase()}] ${f.title}`);
+    out.push(`screen=${f.screenId ?? "(cross-screen)"} | source=${src} | evidence=${f.evidenceIds.length}`);
+    out.push(f.description);
+    out.push(`Repro: ${f.reproSteps}`);
+  }
+  out.push("", "## Screens (id — url — type — auth — scan)");
+  for (const s of state.screens.slice(0, 80)) {
+    out.push(`- ${s.screenId} — ${s.urlTemplate} — ${s.screenType} — ${s.authState} — ${scanByScreen.get(s.screenId) ?? "queued"}`);
+  }
+  if (state.screens.length > 80) out.push(`… (${state.screens.length - 80} more screens)`);
+  return out.join("\n");
+}
+
+/** 💬 Ask の本体: state を文脈に会話履歴を渡して Claude に答えさせる(claude CLI サブスク)。 */
+async function serveChat(res: ServerResponse, runsDir: string, id: string, messages: Array<{ role: string; content: string }>): Promise<void> {
+  if (!/^[a-z0-9_-]+$/i.test(id)) {
+    sendJson(res, 400, { error: "bad id" });
+    return;
+  }
+  const dbPath = join(runsDir, id, "state.sqlite");
+  if (!existsSync(dbPath)) {
+    sendJson(res, 404, { error: "assessment not found" });
+    return;
+  }
+  const store = AssessmentStore.open(dbPath);
+  const state = store.loadAssessment(id);
+  store.close();
+  if (!state) {
+    sendJson(res, 404, { error: "assessment not found" });
+    return;
+  }
+  const transcript = messages.map((m) => `${m.role === "assistant" ? "Assistant" : "User"}: ${m.content}`).join("\n\n");
+  try {
+    const llm = new ClaudeCliClient({ defaultModel: "claude-sonnet-4-6" });
+    const r = await llm.complete({
+      system: `${CHAT_SYSTEM}\n\n# Assessment data\n${buildChatContext(state)}`,
+      prompt: `${transcript}\n\nAssistant:`,
+      timeoutMs: 120_000,
+    });
+    sendJson(res, 200, { answer: r.text, model: r.model });
+  } catch (e) {
+    sendJson(res, 500, { error: `chat failed: ${String(e).slice(0, 200)}` });
+  }
 }
 
 const REPORT_ALLOWED: Record<"report" | "inventory", string[]> = {

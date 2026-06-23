@@ -177,6 +177,9 @@ importers:
       '@veritas/crawler':
         specifier: workspace:*
         version: link:../crawler
+      '@veritas/llm':
+        specifier: workspace:*
+        version: link:../llm
       ws:
         specifier: ^8.18.0
         version: 8.21.0
