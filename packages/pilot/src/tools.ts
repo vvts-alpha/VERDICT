@@ -92,7 +92,7 @@ export interface PilotSession {
 export const STAGE_TOOLS = {
   survey: ["browser_navigate", "browser_fill", "browser_click", "login", "probe_paths", "ignore_paths", "survey_status", "survey_done"],
   methodology: ["get_inventory", "record_methodology", "methodology_done"],
-  diagnose: ["get_screen", "login", "http_request", "probe_params", "analyze_session", "verify_access", "browser_navigate", "browser_fill", "browser_click", "record_finding", "screen_done"],
+  diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_logic", "analyze_session", "verify_access", "browser_navigate", "browser_fill", "browser_click", "record_finding", "screen_done"],
 } as const;
 
 const txt = (s: string): { content: { type: "text"; text: string }[] } => ({ content: [{ type: "text", text: s }] });
@@ -103,9 +103,13 @@ function pick(h: Record<string, string>, keys: string[]): Record<string, string>
   return o;
 }
 
+/** frontier/visited の正準キー。SPA ルート(#/foo, #!/foo)は別画面の識別子として残し、
+ *  ページ内アンカー(#, #section, 空の #/)は捨てる。これで hash ルーティングの SPA(Angular 等)が
+ *  系統的にマップされる。画面レベルの重複は domSkeletonHash が別途担保するので過剰増殖はしない。 */
 export function stripHash(u: string): string {
   const i = u.indexOf("#");
-  return i >= 0 ? u.slice(0, i) : u;
+  if (i < 0) return u;
+  return /^#!?\/.+/.test(u.slice(i)) ? u : u.slice(0, i);
 }
 
 const SEV_ORDER: Severity[] = ["info", "low", "medium", "high", "critical"];
@@ -172,8 +176,17 @@ export const CATEGORIES = [
   "misconfig",
   "rate-limit",
   "headers",
+  // A04 ビジネスロジック(差分テスト verifier = probe_logic で確証)
+  "price-tampering",
+  "qty-tampering",
+  "workflow-bypass",
+  "mass-assignment",
+  "race-condition",
   "other",
 ] as const;
+
+/** ビジネスロジック系(probe_logic の差分テスト + record_finding のマーカーベース確証を使う)。 */
+export const BUSINESS_LOGIC_CATEGORIES = new Set<string>(["price-tampering", "qty-tampering", "workflow-bypass", "mass-assignment"]);
 
 /** probe_paths の「簡単なディレクトリリスト」= 未リンク endpoint を踏むための厳選ワードリスト。
  *  ※ logout/signout 系は **入れない**。認証済みセッションで GET するとサーバ側セッションが破棄され、
@@ -338,12 +351,14 @@ export function classifyAccess(
  *  ハードロック(URL リスト固定)では空 = 発見リンクを辿らない(横断クロールしない)。
  *  out-of-scope / logout 系 / ignore_paths / 訪問済みは除外。 */
 export function frontierLinks(
-  o: Pick<Observation, "finalUrl" | "links">,
+  o: Pick<Observation, "finalUrl" | "links"> & { virtualRoutes?: string[] },
   s: Pick<PilotSession, "scope" | "lockToSeeds" | "visited" | "ignorePaths" | "targetUrl">,
 ): string[] {
   if (s.lockToSeeds) return [];
-  const out: string[] = [];
-  for (const link of o.links) {
+  const out = new Set<string>();
+  // 通常のリンクに加え、driver が pushState/hashchange で採取した SPA 仮想ルートも frontier に積む
+  // (hash ルーティングの SPA は href が collapse しがちなので、実際に踏んだルートを起点に補う)。
+  for (const link of [...o.links, ...(o.virtualRoutes ?? [])]) {
     let abs: string;
     try {
       abs = stripHash(new URL(link, o.finalUrl).toString());
@@ -353,9 +368,9 @@ export function frontierLinks(
     if (!isInScope(abs, s.scope)) continue;
     if (isSessionDestroyingPath(abs)) continue; // logout/signout リンクは frontier に積まない(踏むと自滅)
     if (pathIsIgnored(abs, s.ignorePaths, s.targetUrl)) continue; // モデルが間引いた低価値パスは積まない
-    if (!s.visited.has(abs)) out.push(abs);
+    if (!s.visited.has(abs)) out.add(abs);
   }
-  return out;
+  return [...out];
 }
 
 /** 診断プローブの応答ステータスを集計(認証壁サーキットブレーカ用)。401=壁、2xx=通過。 */
@@ -379,6 +394,21 @@ export function checkEvidenceDiscipline(
   if (!stable) return { ok: false, reason: "the positive replays disagree (status or body length differ) — unstable / not reproducible" };
   const differs = neg.status !== p0.status || Math.abs(neg.bodyLen - p0.bodyLen) > 64;
   if (!differs) return { ok: false, reason: "the negative control is indistinguishable from the positives (same status & body length) — catch-all / no real effect" };
+  return { ok: true };
+}
+
+/** ビジネスロジックの証拠規律(純粋・マーカーベース)。長さ差分ではなく「操作が効いた印(effectMarker)」で判定する:
+ *  改変リクエスト(positive)で marker が出て、正規リクエスト(control)では出ず、positive が ≥2 で安定&受理(<400)なら ok。
+ *  price=1 が通る/role=admin が反映される 等、status/長さがほぼ同じでも意味的差分を捉える。 */
+export function checkLogicEvidence(
+  control: { status: number; hasMarker: boolean },
+  positives: ReadonlyArray<{ status: number; hasMarker: boolean }>,
+): { ok: true } | { ok: false; reason: string } {
+  if (positives.length < 2) return { ok: false, reason: "need >=2 positive replays of the manipulated request" };
+  if (control.hasMarker) return { ok: false, reason: "the effectMarker is ALSO present in the legitimate baseline — pick a marker that only appears when the manipulation takes effect" };
+  if (!positives.every((p) => p.hasMarker)) return { ok: false, reason: "the effectMarker is absent in a manipulated replay — the manipulation was not accepted (not confirmed)" };
+  if (!positives.every((p) => p.status < 400)) return { ok: false, reason: "a manipulated replay was rejected (status >=400) — not accepted" };
+  if (!positives.every((p) => p.status === positives[0]!.status)) return { ok: false, reason: "manipulated replays disagree (unstable)" };
   return { ok: true };
 }
 
@@ -713,6 +743,64 @@ export function buildTools(s: PilotSession) {
       },
     ),
     tool(
+      "probe_logic",
+      'Confirm a BUSINESS-LOGIC flaw by differential test: sends a BASELINE (legitimate) request once and a MUTATED (manipulated) request twice, and checks whether the server ACCEPTED the manipulation via `effectMarker` — a string that appears in the response ONLY when the manipulation took effect (e.g. the injected price/total, "role":"admin", an out-of-order step succeeding). Use for price/quantity tampering, mass-assignment (extra role/isAdmin field in the body), workflow/step skipping. Returns evidenceIds (baseline=negativeControl, mutated=positiveReplays) ready for record_finding.',
+      {
+        baseline: z.object({ method: z.string(), url: z.string(), headers: z.record(z.string()).optional(), body: z.string().nullable().optional() }),
+        mutated: z.object({ method: z.string(), url: z.string(), headers: z.record(z.string()).optional(), body: z.string().nullable().optional() }),
+        effectMarker: z.string(),
+        note: z.string().optional(),
+      },
+      async ({ baseline, mutated, effectMarker, note }) => {
+        for (const u of [baseline.url, mutated.url]) if (!isInScope(u, s.scope)) return txt(`BLOCKED: ${u} is out of scope`);
+        const mkReq = (r: { method: string; url: string; headers?: Record<string, string>; body?: string | null }): HttpRequest => ({
+          method: r.method.toUpperCase(),
+          url: r.url,
+          headers: { ...cookieHeader(s), ...(r.headers ?? {}) },
+          body: r.body ?? null,
+        });
+        const fire = async (req: HttpRequest, kind: "negative_control" | "positive_replay", tag: string) => {
+          const res = await s.http.send(req);
+          bumpHttp(s, res.status);
+          const ev = s.evidence.record({
+            screenId: s.currentScreenId ?? "pilot",
+            validator: "claude-pilot-logic",
+            kind,
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
+            response: res,
+            note: note ? `${note} (${tag})` : tag,
+          });
+          return { evId: ev.id, status: res.status, len: res.body.length, hasMarker: res.body.includes(effectMarker) };
+        };
+        let baseO: Awaited<ReturnType<typeof fire>>;
+        let mut1: Awaited<ReturnType<typeof fire>>;
+        let mut2: Awaited<ReturnType<typeof fire>>;
+        try {
+          baseO = await fire(mkReq(baseline), "negative_control", "baseline (legit)");
+          mut1 = await fire(mkReq(mutated), "positive_replay", "mutated #1");
+          mut2 = await fire(mkReq(mutated), "positive_replay", "mutated #2");
+        } catch (e) {
+          return txt(`ERROR: ${String(e).slice(0, 150)}`);
+        }
+        const verdict = checkLogicEvidence(
+          { status: baseO.status, hasMarker: baseO.hasMarker },
+          [mut1, mut2].map((m) => ({ status: m.status, hasMarker: m.hasMarker })),
+        );
+        return txt(
+          JSON.stringify({
+            negativeControl: baseO.evId,
+            positiveReplays: [mut1.evId, mut2.evId],
+            baseline: { status: baseO.status, len: baseO.len, marker: baseO.hasMarker },
+            mutated: [
+              { status: mut1.status, len: mut1.len, marker: mut1.hasMarker },
+              { status: mut2.status, len: mut2.len, marker: mut2.hasMarker },
+            ],
+            verdict: verdict.ok ? "MANIPULATION ACCEPTED — record_finding with these evidenceIds + effectMarker" : `not confirmed: ${(verdict as { reason: string }).reason}`,
+          }),
+        );
+      },
+    ),
+    tool(
       "record_finding",
       "Record a CONFIRMED vulnerability. Requires evidence discipline: cite ONE `negativeControl` evidenceId (a request that should FAIL — the bug absent) and >=2 `positiveReplays` evidenceIds (the bug reproduced, stable). Use evidenceIds returned by http_request / verify_access THIS run. The control must be distinguishable from the positives (different status/length) or it is rejected as a catch-all. Pick the canonical `category`, and pass the vulnerable `endpoint` (URL or path template, e.g. /search or /orders/{id}) and `param` (e.g. q) — findings are DEDUPED by (category, endpoint, param).",
       {
@@ -725,8 +813,9 @@ export function buildTools(s: PilotSession) {
         reproSteps: z.string(),
         negativeControl: z.string(),
         positiveReplays: z.array(z.string()).min(2),
+        effectMarker: z.string().optional(),
       },
-      async ({ title, severity, category, endpoint, param, description, reproSteps, negativeControl, positiveReplays }) => {
+      async ({ title, severity, category, endpoint, param, description, reproSteps, negativeControl, positiveReplays, effectMarker }) => {
         // auth-bypass は verify_access の機械判定を通った時だけ記録できる(CRM の 302/401 誤検知を硬く封じる)。
         if (category === "auth-bypass") {
           const av = s.accessVerdicts.get(normEndpoint(endpoint, s.targetUrl));
@@ -740,8 +829,17 @@ export function buildTools(s: PilotSession) {
         const posRecs = positiveReplays.map((eid) => findEv(eid));
         const missing = [negativeControl, ...positiveReplays].filter((eid) => !findEv(eid));
         if (!negRec || posRecs.some((r) => !r))
-          return txt(`REJECTED: unknown evidenceId(s) ${missing.join(", ")}. Cite ids returned by http_request / verify_access in THIS run (1 negativeControl + >=2 positiveReplays).`);
-        if (category !== "auth-bypass") {
+          return txt(`REJECTED: unknown evidenceId(s) ${missing.join(", ")}. Cite ids returned by http_request / verify_access / probe_logic in THIS run (1 negativeControl + >=2 positiveReplays).`);
+        if (BUSINESS_LOGIC_CATEGORIES.has(category)) {
+          // ビジネスロジックは長さ差分でなく「操作が効いた印(effectMarker)」で確証する(probe_logic 経由)。
+          if (!effectMarker)
+            return txt(`REJECTED: ${category} requires effectMarker (the string that appears only when the manipulation took effect). Run probe_logic and cite its evidenceIds + the marker.`);
+          const verdict = checkLogicEvidence(
+            { status: negRec.response.status, hasMarker: negRec.response.body.includes(effectMarker) },
+            posRecs.map((r) => ({ status: r!.response.status, hasMarker: r!.response.body.includes(effectMarker) })),
+          );
+          if (!verdict.ok) return txt(`REJECTED (logic evidence): ${verdict.reason}.`);
+        } else if (category !== "auth-bypass") {
           const verdict = checkEvidenceDiscipline(
             { status: negRec.response.status, bodyLen: negRec.response.body.length },
             posRecs.map((r) => ({ status: r!.response.status, bodyLen: r!.response.body.length })),

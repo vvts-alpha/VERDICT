@@ -3,7 +3,7 @@
 
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { frontierLinks } from "./tools.js";
+import { frontierLinks, stripHash } from "./tools.js";
 import { deriveScopeFromUrls } from "@veritas/core";
 
 const scope = deriveScopeFromUrls(["https://app.example.com/"], "etld");
@@ -49,4 +49,29 @@ test("locked stays empty even with brand-new in-scope links", () => {
   const s = sess({ lockToSeeds: true });
   const fresh = { finalUrl: "https://app.example.com/a", links: ["https://app.example.com/b", "https://app.example.com/c"] };
   assert.deepEqual(frontierLinks(fresh, s), []);
+});
+
+// ── SPA hash ルーティング ──
+test("stripHash keeps SPA routes (#/.., #!/..) but drops plain fragments", () => {
+  assert.equal(stripHash("https://x/#/search"), "https://x/#/search"); // route kept
+  assert.equal(stripHash("https://x/#!/login"), "https://x/#!/login"); // hashbang route kept
+  assert.equal(stripHash("https://x/page#section"), "https://x/page"); // in-page anchor dropped
+  assert.equal(stripHash("https://x/page#"), "https://x/page"); // empty fragment dropped
+  assert.equal(stripHash("https://x/#/"), "https://x/"); // empty route → base
+  assert.equal(stripHash("https://x/dash"), "https://x/dash"); // no hash untouched
+});
+
+test("frontier enqueues distinct hash routes (links + captured virtualRoutes)", () => {
+  const s = sess();
+  const spa = {
+    finalUrl: "https://app.example.com/#/",
+    links: ["#/search", "#/login", "#top"], // hash-route links + an in-page anchor
+    virtualRoutes: ["https://app.example.com/#/basket", "https://app.example.com/#/administration"],
+  };
+  const got = new Set(frontierLinks(spa, s));
+  assert.ok(got.has("https://app.example.com/#/search")); // route link kept distinct
+  assert.ok(got.has("https://app.example.com/#/login"));
+  assert.ok(got.has("https://app.example.com/#/basket")); // from virtualRoutes
+  assert.ok(got.has("https://app.example.com/#/administration"));
+  assert.ok(![...got].some((u) => u.includes("#top"))); // plain fragment collapses to base (already visited target? no) — at least not a #top entry
 });
