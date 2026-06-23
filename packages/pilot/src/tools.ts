@@ -365,6 +365,23 @@ function bumpHttp(s: PilotSession, status: number): void {
   else if (status >= 200 && status < 300) s.httpThrough += 1;
 }
 
+/** 証拠規律の構造チェック(純粋・カテゴリ非依存)。runValidator と同じ規律を pilot finding に強制する:
+ *  (1) positive replay が ≥2 で互いに安定(status 一致・本文長が ±64 以内)= 再現性、
+ *  (2) negative control が positive と区別できる(status 違い or 本文長差 >64)= catch-all でない実差分。
+ *  これを満たさない record_finding は reject する(幻/弱い finding の主要 FP モードを封じる)。 */
+export function checkEvidenceDiscipline(
+  neg: { status: number; bodyLen: number },
+  positives: ReadonlyArray<{ status: number; bodyLen: number }>,
+): { ok: true } | { ok: false; reason: string } {
+  if (positives.length < 2) return { ok: false, reason: "need >=2 positive replays" };
+  const p0 = positives[0]!;
+  const stable = positives.every((p) => p.status === p0.status && Math.abs(p.bodyLen - p0.bodyLen) <= 64);
+  if (!stable) return { ok: false, reason: "the positive replays disagree (status or body length differ) — unstable / not reproducible" };
+  const differs = neg.status !== p0.status || Math.abs(neg.bodyLen - p0.bodyLen) > 64;
+  if (!differs) return { ok: false, reason: "the negative control is indistinguishable from the positives (same status & body length) — catch-all / no real effect" };
+  return { ok: true };
+}
+
 /** 認証壁サーキットブレーカ判定(純粋): 十分なサンプルがあり、何も通らず(2xx ゼロ)、finding ゼロで、
  *  ほぼ全部 401 なら true。診断ループはこれが立ったら以降の画面を止めて handoff を上げる。 */
 export function isAuthWalled(
@@ -697,7 +714,7 @@ export function buildTools(s: PilotSession) {
     ),
     tool(
       "record_finding",
-      "Record a CONFIRMED vulnerability. Only after evidence discipline (a negative control that fails + >=2 positive replays that succeed). Cite the evidenceIds. Pick the canonical `category`, and pass the vulnerable `endpoint` (URL or path template, e.g. /search or /orders/{id}) and `param` (e.g. q) — findings are DEDUPED by (category, endpoint, param): re-confirming the same hole MERGES into the existing finding instead of creating a duplicate.",
+      "Record a CONFIRMED vulnerability. Requires evidence discipline: cite ONE `negativeControl` evidenceId (a request that should FAIL — the bug absent) and >=2 `positiveReplays` evidenceIds (the bug reproduced, stable). Use evidenceIds returned by http_request / verify_access THIS run. The control must be distinguishable from the positives (different status/length) or it is rejected as a catch-all. Pick the canonical `category`, and pass the vulnerable `endpoint` (URL or path template, e.g. /search or /orders/{id}) and `param` (e.g. q) — findings are DEDUPED by (category, endpoint, param).",
       {
         title: z.string(),
         severity: z.enum(["info", "low", "medium", "high", "critical"]),
@@ -706,9 +723,10 @@ export function buildTools(s: PilotSession) {
         param: z.string().optional(),
         description: z.string(),
         reproSteps: z.string(),
-        evidenceIds: z.array(z.string()).min(1),
+        negativeControl: z.string(),
+        positiveReplays: z.array(z.string()).min(2),
       },
-      async ({ title, severity, category, endpoint, param, description, reproSteps, evidenceIds }) => {
+      async ({ title, severity, category, endpoint, param, description, reproSteps, negativeControl, positiveReplays }) => {
         // auth-bypass は verify_access の機械判定を通った時だけ記録できる(CRM の 302/401 誤検知を硬く封じる)。
         if (category === "auth-bypass") {
           const av = s.accessVerdicts.get(normEndpoint(endpoint, s.targetUrl));
@@ -716,6 +734,22 @@ export function buildTools(s: PilotSession) {
             return txt(`REJECTED: verify_access on ${endpoint} returned 'not_bypass' (redirect→login / 401 / 403 = auth is enforced). Mechanical veto, cannot record.`);
           if (!av) return txt(`REQUIRED: run verify_access(${endpoint}) before recording auth-bypass (302→login / 401 / 403 is not a bypass).`);
         }
+        // ── 証拠規律の構造強制 ── 引用 evidenceId が実在し、ネガコンが positive と区別でき、positive 同士が安定であること。
+        const findEv = (eid: string) => s.evidence.records.find((r) => r.id === eid);
+        const negRec = findEv(negativeControl);
+        const posRecs = positiveReplays.map((eid) => findEv(eid));
+        const missing = [negativeControl, ...positiveReplays].filter((eid) => !findEv(eid));
+        if (!negRec || posRecs.some((r) => !r))
+          return txt(`REJECTED: unknown evidenceId(s) ${missing.join(", ")}. Cite ids returned by http_request / verify_access in THIS run (1 negativeControl + >=2 positiveReplays).`);
+        if (category !== "auth-bypass") {
+          const verdict = checkEvidenceDiscipline(
+            { status: negRec.response.status, bodyLen: negRec.response.body.length },
+            posRecs.map((r) => ({ status: r!.response.status, bodyLen: r!.response.body.length })),
+          );
+          if (!verdict.ok)
+            return txt(`REJECTED (evidence discipline): ${verdict.reason}. Get a negative control that fails + >=2 stable positive replays, then record.`);
+        }
+        const evidenceIds = [...new Set([negativeControl, ...positiveReplays])];
         s.recordCalls += 1;
         s.screenVerdict = "finding";
         const key = dedupKey(category, endpoint, param, s.targetUrl);
