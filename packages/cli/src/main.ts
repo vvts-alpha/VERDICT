@@ -32,7 +32,7 @@ import {
 import { PlaywrightDriver, buildInventory, crawl, exploreScreen, htmlToPdf, labelInventory, normalizePath, smartLogin, writeScreenInventory } from "@veritas/crawler";
 import type { LoginCreds } from "@veritas/crawler";
 import { ClaudeCliClient } from "@veritas/llm";
-import { EvidenceStore, FetchHttpClient, SECURITY_HEADERS, auditHeaders, coarseCategory, parseBurpReport, burpSeverity, readEvidenceArtifact, scanInventory, startBurpScan, getBurpScan } from "@veritas/scanner";
+import { EvidenceStore, FetchHttpClient, SECURITY_HEADERS, auditHeaders, coarseCategory, parseBurpReport, burpSeverity, pickBurpConfigs, readEvidenceArtifact, scanInventory, startBurpScan, getBurpScan } from "@veritas/scanner";
 import type { BurpIssue } from "@veritas/scanner";
 import { assessLogicInventory, assessScreenLogic, authDiffScreen } from "@veritas/agent";
 import type { RoleContext } from "@veritas/agent";
@@ -70,7 +70,8 @@ commands:
             --config can be given multiple times (stack crawl speed + audit checks). scan speed is set by Burp's crawl strategy preset:
               e.g.) --config "Crawl strategy - fastest" --config "Audit checks - critical issues only"  (fast)
                   --config "Crawl strategy - most complete" --config "Audit checks - all except time-based detection methods"  (thorough, slow)
-              defaults to "Audit checks - all except time-based detection methods".
+              with NO --config, the profile is auto-selected from the mapped surface (size → crawl strategy, scale → audit depth);
+              --config overrides it. the integrated --burp-scan flag (pilot/assess, WebUI) also auto-selects.
             speed/throttle = Burp's Resource pool (max concurrent requests · inter-request delay). REST can't hold ms as a number, only references pools by name.
               defaults to the "250ms" pool (create it in Burp: Settings → Resource pool → Add → concurrency 1 / Delay 250ms).
               if absent, auto-continues on Burp's default pool (prints how to create one). override with --resource-pool <name>, --resource-pool "" for Burp's default.
@@ -1040,9 +1041,11 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       const burpState = store.loadAssessment(id);
       if (burpState) {
         const burpLogins = manifestRoleCreds(manifest).map((rc) => ({ username: rc.creds.username, password: rc.creds.password }));
+        const auto = pickBurpConfigs(burpState); // surface に応じて最適な named config を自動選択
         await runBurpScanOnRun(store, id, burpState, runsDir, {
           conn: resolveBurpRest({ ...(values["burp-api"] ? { "burp-api": values["burp-api"] } : {}) }),
-          configs: ["Audit checks - all except time-based detection methods"],
+          configs: auto.configs,
+          configReason: `auto: ${auto.reason}`,
           logins: burpLogins,
           pollSec: 10,
           maxMin: 30,
@@ -1492,7 +1495,7 @@ async function runBurpScanOnRun(
   id: string,
   state: AssessmentState,
   runsDir: string,
-  o: { conn: BurpRestConn; configs: string[]; logins: Array<{ username: string; password: string }>; pollSec: number; maxMin: number },
+  o: { conn: BurpRestConn; configs: string[]; configReason?: string; logins: Array<{ username: string; password: string }>; pollSec: number; maxMin: number },
 ): Promise<number> {
   const { base, apiKey, resourcePool } = o.conn;
   const usePool = resourcePool !== "";
@@ -1509,7 +1512,7 @@ async function runBurpScanOnRun(
     return 0;
   }
   console.log(`▶ burp-scan ${id} → ${base}`);
-  console.log(`  config: ${o.configs.join(" + ")}${usePool ? ` | pool: ${resourcePool}` : " | pool: (Burp default)"} | seeds: ${urls.length}${o.logins.length ? ` | auth: ${o.logins.length}` : ""}`);
+  console.log(`  config: ${o.configs.join(" + ")}${o.configReason ? ` (${o.configReason})` : ""}${usePool ? ` | pool: ${resourcePool}` : " | pool: (Burp default)"} | seeds: ${urls.length}${o.logins.length ? ` | auth: ${o.logins.length}` : ""}`);
 
   const startScan = (pool: string | undefined): Promise<string> =>
     startBurpScan({ base, ...(apiKey ? { apiKey } : {}), urls, configs: o.configs, ...(pool ? { resourcePool: pool } : {}), ...(o.logins.length ? { logins: o.logins } : {}) });
@@ -1592,8 +1595,10 @@ async function cmdBurpScan(args: string[]): Promise<void> {
   }
 
   const conn = resolveBurpRest(values);
-  // --config は複数指定可(クロール速度 + 監査内容を別プリセットで重ねる)。無指定なら時間ベース除く全 audit。
-  const configs = values.config?.length ? values.config : ["Audit checks - all except time-based detection methods"];
+  // --config は複数指定可(クロール速度 + 監査内容を別プリセットで重ねる)。無指定なら surface から自動選択。
+  const auto = values.config?.length ? null : pickBurpConfigs(state);
+  const configs = auto ? auto.configs : values.config!;
+  const configReason = auto ? `auto: ${auto.reason}` : "manual --config";
   const pollSec = values.poll ? Number.parseInt(values.poll, 10) : 10;
   const maxMin = values["max-min"] ? Number.parseInt(values["max-min"], 10) : 30;
   // 認証スキャン(任意): manifest の資格情報を Burp の application_logins に渡す。
@@ -1601,7 +1606,7 @@ async function cmdBurpScan(args: string[]): Promise<void> {
   const logins = manifestRoleCreds(manifest).map((rc) => ({ username: rc.creds.username, password: rc.creds.password }));
 
   try {
-    await runBurpScanOnRun(store, id, state, runsDir, { conn, configs, logins, pollSec, maxMin });
+    await runBurpScanOnRun(store, id, state, runsDir, { conn, configs, configReason, logins, pollSec, maxMin });
   } finally {
     store.close();
   }

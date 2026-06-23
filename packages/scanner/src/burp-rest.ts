@@ -4,6 +4,37 @@
 
 import type { BurpIssue } from "./burp.js";
 
+/**
+ * survey でマップした surface から最適な Burp スキャン構成(named config)を選ぶ(ヒューリスティック)。
+ * クロール戦略は面の広さで、監査深度は規模で決める。--config を明示した時はこれを使わず上書きする。
+ * 名前は Burp ビルトインの既定構成(操作者が保存したカスタム構成名でも可。その場合は --config で指定)。
+ * 構造的型: screens を持つもの(AssessmentState 互換)なら何でも渡せる(core 依存を避ける)。
+ */
+export function pickBurpConfigs(state: { screens: ReadonlyArray<{ apis: ReadonlyArray<unknown> }> }): { configs: string[]; reason: string } {
+  const screens = state.screens.length;
+  const apis = state.screens.reduce((n, s) => n + s.apis.length, 0);
+  const configs: string[] = [];
+  let crawl: string;
+  if (screens > 40) {
+    configs.push("Crawl strategy - fastest");
+    crawl = "large surface → fastest crawl";
+  } else if (screens <= 8) {
+    configs.push("Crawl strategy - most complete");
+    crawl = "small surface → most complete crawl";
+  } else {
+    crawl = "medium surface → Burp default crawl";
+  }
+  let audit: string;
+  if (screens > 80) {
+    configs.push("Audit checks - critical issues only");
+    audit = "very large → critical-issues-only audit (bound time)";
+  } else {
+    configs.push("Audit checks - all except time-based detection methods");
+    audit = "full audit (skips slow time-based checks)";
+  }
+  return { configs, reason: `${screens} screens / ${apis} APIs — ${crawl}; ${audit}` };
+}
+
 export interface BurpScanRequest {
   /** Burp REST のベース。例 http://127.0.0.1:1337 */
   base: string;
