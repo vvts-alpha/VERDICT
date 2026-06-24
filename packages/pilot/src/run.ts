@@ -89,7 +89,7 @@ export interface RunPilotOptions {
   /** 診断/シナリオの後、**セッションを保ったまま**実行する追加スキャンのフック(Burp 能動スキャン等)。
    *  指定時のみ phase2_burpscan を report の前に挟む。keepWarm() を定期的に呼べば authed セッションを維持できる
    *  (長い Burp スキャン中にトークン/Cookie が stale 化しないように)。driver はこの時点でまだ生きている。 */
-  onBurpScanPhase?: (ctx: { keepWarm: () => Promise<void> }) => Promise<void>;
+  onBurpScanPhase?: (ctx: { keepWarm: () => Promise<void>; cookie: string; bearer: string }) => Promise<void>;
 }
 
 export interface PilotResult {
@@ -667,7 +667,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         }
       };
       try {
-        await opts.onBurpScanPhase({ keepWarm });
+        await opts.onBurpScanPhase({ keepWarm, cookie: session.currentCookie, bearer: session.currentBearer });
       } catch (e) {
         const m = String(e instanceof Error ? e.message : e).slice(0, 160);
         opts.onText?.(`⚠ burp scan phase error: ${m}`);

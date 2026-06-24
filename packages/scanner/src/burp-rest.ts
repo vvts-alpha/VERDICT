@@ -35,6 +35,25 @@ export function pickBurpConfigs(state: { screens: ReadonlyArray<{ apis: Readonly
   return { configs, reason: `${screens} screens / ${apis} APIs — ${crawl}; ${audit}` };
 }
 
+/** Burp の seed URL を「パス + クエリ param 名の集合」で畳む。値違い(/login?next=A と ?next=B)を1本に
+ *  まとめ、同一エンドポイントへの大量スキャン生成を防ぐ。最初に出た具体 URL を代表に残す(値は Burp が fuzz する)。
+ *  ※ hash(#/route)は呼び出し側で除去済み — SPA のルート差は別 URL のまま分けて渡す。 */
+export function dedupSeedUrls(urls: ReadonlyArray<string>): string[] {
+  const byKey = new Map<string, string>();
+  for (const raw of urls) {
+    let key: string;
+    try {
+      const u = new URL(raw);
+      const names = [...new Set([...u.searchParams.keys()].map((k) => k.toLowerCase()))].sort();
+      key = `${u.origin}${u.pathname.toLowerCase()}?${names.join(",")}`;
+    } catch {
+      key = raw;
+    }
+    if (!byKey.has(key)) byKey.set(key, raw);
+  }
+  return [...byKey.values()];
+}
+
 export interface BurpScanRequest {
   /** Burp REST のベース。例 http://127.0.0.1:1337 */
   base: string;
@@ -51,6 +70,11 @@ export interface BurpScanRequest {
   resourcePool?: string;
   /** 認証スキャン用の資格情報(任意。Burp がログインフォームを学習して認証下を監査)。 */
   logins?: Array<{ username: string; password: string }>;
+  /** operator 提供の CustomConfiguration(JSON 文字列)を named config に重ねる(後勝ち)。
+   *  例: 普段使う scan policy(監査ポリシー)/ セッション注入の session-handling rule。
+   *  スキーマはバージョン依存なので AMRAAM は生成せず、Burp から export した設定をそのまま渡す
+   *  (値は呼び出し側で {{COOKIE}}/{{BEARER}} を差し込み済み)。 */
+  customConfigs?: string[];
 }
 
 function apiUrl(base: string, apiKey: string | undefined, path: string): string {
@@ -67,7 +91,10 @@ export function parseTaskId(location: string): string | null {
 /** 能動スキャンを開始 → task_id を返す。Location ヘッダ(無ければ body)から id を拾う。 */
 export async function startBurpScan(req: BurpScanRequest): Promise<string> {
   const body: Record<string, unknown> = { urls: req.urls };
-  if (req.configs?.length) body.scan_configurations = req.configs.map((name) => ({ type: "NamedConfiguration", name }));
+  const scanConfigs: Array<Record<string, unknown>> = (req.configs ?? []).map((name) => ({ type: "NamedConfiguration", name }));
+  // operator の CustomConfiguration は named config の後に重ねる(後勝ち。policy/session rule を最後に効かせる)。
+  for (const cfg of req.customConfigs ?? []) scanConfigs.push({ type: "CustomConfiguration", config: cfg });
+  if (scanConfigs.length) body.scan_configurations = scanConfigs;
   if (req.resourcePool) body.resource_pool = req.resourcePool;
   if (req.logins?.length) body.application_logins = req.logins;
   const res = await fetch(apiUrl(req.base, req.apiKey, "/v0.1/scan"), {

@@ -2,7 +2,7 @@
 
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { restIssuesToBurpIssues, parseTaskId } from "./burp-rest.js";
+import { restIssuesToBurpIssues, parseTaskId, dedupSeedUrls } from "./burp-rest.js";
 
 const b64 = (s: string): string => Buffer.from(s, "utf8").toString("base64");
 
@@ -58,4 +58,44 @@ test("issue_found 以外と名前無しは除外", () => {
   assert.equal(out.length, 1);
   assert.equal(out[0]?.name, "Reflected XSS");
   assert.equal(out[0]?.request, ""); // 証拠なしは空文字
+});
+
+test("dedupSeedUrls collapses same path + same query-param NAMES (value differences)", () => {
+  const out = dedupSeedUrls([
+    "https://x.test/login?next=/a",
+    "https://x.test/login?next=/b",
+    "https://x.test/login?next=/c",
+  ]);
+  assert.deepEqual(out, ["https://x.test/login?next=/a"]); // 代表 1 本
+});
+
+test("dedupSeedUrls keeps distinct paths and distinct param-name sets", () => {
+  const out = dedupSeedUrls([
+    "https://x.test/login?next=/a",
+    "https://x.test/login?next=/a&debug=1", // param 名集合が違う → 残す
+    "https://x.test/search?q=x",
+    "https://x.test/search?q=y", // 値違い → 落ちる
+    "https://x.test/products/1",
+    "https://x.test/products/2", // パスが違う → 残す
+  ]);
+  assert.deepEqual(new Set(out), new Set([
+    "https://x.test/login?next=/a",
+    "https://x.test/login?next=/a&debug=1",
+    "https://x.test/search?q=x",
+    "https://x.test/products/1",
+    "https://x.test/products/2",
+  ]));
+});
+
+test("dedupSeedUrls: key は param 順・大文字小文字に非依存", () => {
+  const out = dedupSeedUrls([
+    "https://x.test/p?a=1&b=2",
+    "https://x.test/p?b=9&a=8", // 名集合 {a,b} 同じ → 落ちる
+    "https://x.test/P?a=1&b=2", // パス case-insensitive → 落ちる
+  ]);
+  assert.equal(out.length, 1);
+});
+
+test("dedupSeedUrls: 非 URL はそのまま(重複だけ排除)", () => {
+  assert.deepEqual(dedupSeedUrls(["not a url", "not a url", "also"]), ["not a url", "also"]);
 });

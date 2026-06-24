@@ -33,7 +33,7 @@ import {
 import { PlaywrightDriver, buildInventory, crawl, exploreScreen, htmlToPdf, labelInventory, normalizePath, smartLogin, writeScreenInventory } from "@veritas/crawler";
 import type { LoginCreds } from "@veritas/crawler";
 import { ClaudeCliClient } from "@veritas/llm";
-import { EvidenceStore, FetchHttpClient, SECURITY_HEADERS, auditHeaders, parseBurpReport, pickBurpConfigs, readEvidenceArtifact, scanInventory, startBurpScan, getBurpScan, mergeBurpIssues as scannerMergeBurpIssues } from "@veritas/scanner";
+import { EvidenceStore, FetchHttpClient, SECURITY_HEADERS, auditHeaders, parseBurpReport, pickBurpConfigs, readEvidenceArtifact, scanInventory, startBurpScan, getBurpScan, dedupSeedUrls, mergeBurpIssues as scannerMergeBurpIssues } from "@veritas/scanner";
 import type { BurpIssue } from "@veritas/scanner";
 import { assessLogicInventory, assessScreenLogic, authDiffScreen } from "@veritas/agent";
 import type { RoleContext } from "@veritas/agent";
@@ -1088,11 +1088,12 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       // → 取り込み → High+ 再検証を実施。keepWarm を poll 間に呼んでトークン/Cookie を維持する。失敗しても run は落とさない。
       ...(values["burp-scan"] && !surveyOnly
         ? {
-            onBurpScanPhase: async ({ keepWarm }: { keepWarm: () => Promise<void> }): Promise<void> => {
+            onBurpScanPhase: async ({ keepWarm, cookie, bearer }: { keepWarm: () => Promise<void>; cookie: string; bearer: string }): Promise<void> => {
               const burpState = store.loadAssessment(id);
               if (!burpState) return;
               const burpLogins = manifestRoleCreds(manifest).map((rc) => ({ username: rc.creds.username, password: rc.creds.password }));
-              const auto = pickBurpConfigs(burpState); // surface に応じて最適な named config を自動選択
+              const auto = pickBurpConfigs(burpState); // surface に応じて最適な named config を自動選択(crawl 戦略等)
+              const customConfigs = buildBurpCustomConfigs(cookie, bearer); // 君の scan policy + session 注入(env)
               await runBurpScanOnRun(store, id, burpState, runsDir, {
                 conn: resolveBurpRest({ ...(values["burp-api"] ? { "burp-api": values["burp-api"] } : {}) }),
                 configs: auto.configs,
@@ -1103,6 +1104,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
                 verify: !values["no-burp-verify"], // 既定: 取り込んだ High+ を AI 再検証
                 verifyModel: model, // 検証は深掘り(adversarial)なので deep model
                 httpBasic,
+                ...(customConfigs.length ? { customConfigs } : {}),
                 onPoll: keepWarm, // セッション維持
               });
             },
@@ -1506,6 +1508,46 @@ function resolveBurpRest(v: { "burp-api"?: string; "api-key"?: string; "resource
   return { base, ...(apiKey ? { apiKey } : {}), resourcePool };
 }
 
+// operator 提供の Burp CustomConfiguration を読み込んで重ねる(named config の後勝ち)。スキーマはバージョン
+// 依存なので AMRAAM は生成せず、Burp から export した JSON をそのまま渡す。値は {{COOKIE}}/{{BEARER}} を live
+// セッションで差し替える(置換後に JSON 妥当性チェック)。
+//   - BURP_SCAN_CONFIG_FILE: 普段使う scan policy(監査ポリシー = ScanPolicy.json 等)
+//   - BURP_SESSION_CONFIG_FILE: セッション注入の session-handling rule(認証下スキャン)
+function loadBurpCustomConfig(file: string | undefined, label: string, cookie: string, bearer: string): string | null {
+  if (!file) return null;
+  if (!existsSync(file)) {
+    console.log(`  ⚠ ${label} not found: ${file} — skipping that config`);
+    return null;
+  }
+  try {
+    const tpl = readFileSync(file, "utf8").replaceAll("{{COOKIE}}", cookie).replaceAll("{{BEARER}}", bearer);
+    JSON.parse(tpl); // 壊れた JSON を Burp に送らない
+    return tpl;
+  } catch (e) {
+    console.log(`  ⚠ ${label} invalid JSON after substitution (${String(e).slice(0, 120)}) — skipping that config`);
+    return null;
+  }
+}
+
+function buildBurpCustomConfigs(cookie: string, bearer: string): string[] {
+  const out: string[] = [];
+  const scan = loadBurpCustomConfig(process.env.BURP_SCAN_CONFIG_FILE, "BURP_SCAN_CONFIG_FILE", cookie, bearer);
+  if (scan) {
+    out.push(scan);
+    console.log("  ⚙ using your scan policy from BURP_SCAN_CONFIG_FILE");
+  }
+  const sess = loadBurpCustomConfig(process.env.BURP_SESSION_CONFIG_FILE, "BURP_SESSION_CONFIG_FILE", cookie, bearer);
+  if (sess) {
+    out.push(sess);
+    console.log(`  🔐 session injection via BURP_SESSION_CONFIG_FILE (cookie ${cookie ? "✓" : "—"} / bearer ${bearer ? "✓" : "—"})`);
+  } else if ((cookie || bearer) && !process.env.BURP_SESSION_CONFIG_FILE) {
+    console.log("  ℹ session present but BURP_SESSION_CONFIG_FILE unset → Burp scans UNAUTHENTICATED.");
+    console.log("    Build a Burp session-handling rule with 'Set a specific cookie/header', export it,");
+    console.log("    put {{COOKIE}} / {{BEARER}} where the value goes, and set BURP_SESSION_CONFIG_FILE.");
+  }
+  return out;
+}
+
 // Burp 能動スキャンを 1 つの run に対して実行(start→poll→merge→report)。store の open/close は呼び出し側が管理。
 // 非致命: Burp が無い/失敗しても例外で run を落とさず、ログして added=0 を返す(pilot --burp-scan から呼ぶため)。
 async function runBurpScanOnRun(
@@ -1513,18 +1555,20 @@ async function runBurpScanOnRun(
   id: string,
   state: AssessmentState,
   runsDir: string,
-  o: { conn: BurpRestConn; configs: string[]; configReason?: string; logins: Array<{ username: string; password: string }>; pollSec: number; maxMin: number; verify?: boolean; verifyModel?: string; httpBasic?: { user: string; pass: string } | null; onPoll?: () => Promise<void> },
+  o: { conn: BurpRestConn; configs: string[]; configReason?: string; logins: Array<{ username: string; password: string }>; pollSec: number; maxMin: number; verify?: boolean; verifyModel?: string; httpBasic?: { user: string; pass: string } | null; onPoll?: () => Promise<void>; customConfigs?: string[] },
 ): Promise<number> {
   const { base, apiKey, resourcePool } = o.conn;
   const usePool = resourcePool !== "";
-  const seeds = new Set<string>();
-  if ("url" in state.target && state.target.url) seeds.add(state.target.url);
+  const candidates: string[] = [];
+  if ("url" in state.target && state.target.url) candidates.push(state.target.url);
   for (const sc of state.screens) {
     for (const u of sc.observedUrls ?? []) {
-      if (isInScope(u, state.scope)) seeds.add(u.split("#")[0] ?? u);
+      const u0 = u.split("#")[0] ?? u;
+      if (isInScope(u0, state.scope)) candidates.push(u0);
     }
   }
-  const urls = [...seeds].slice(0, 300);
+  // 同一エンドポイント(パス + クエリ param 名)の値違いを1本に畳む(/login?next=… の大量スキャン生成を防ぐ)。
+  const urls = dedupSeedUrls(candidates).slice(0, 300);
   if (urls.length === 0) {
     console.log("⚠ burp-scan: no in-scope URLs, skipping (run survey/pilot first)");
     return 0;
@@ -1532,23 +1576,44 @@ async function runBurpScanOnRun(
   console.log(`▶ burp-scan ${id} → ${base}`);
   console.log(`  config: ${o.configs.join(" + ")}${o.configReason ? ` (${o.configReason})` : ""}${usePool ? ` | pool: ${resourcePool}` : " | pool: (Burp default)"} | seeds: ${urls.length}${o.logins.length ? ` | auth: ${o.logins.length}` : ""}`);
 
-  const startScan = (pool: string | undefined): Promise<string> =>
-    startBurpScan({ base, ...(apiKey ? { apiKey } : {}), urls, configs: o.configs, ...(pool ? { resourcePool: pool } : {}), ...(o.logins.length ? { logins: o.logins } : {}) });
+  const startScan = (pool: string | undefined, customs: string[] | undefined): Promise<string> =>
+    startBurpScan({ base, ...(apiKey ? { apiKey } : {}), urls, configs: o.configs, ...(pool ? { resourcePool: pool } : {}), ...(o.logins.length ? { logins: o.logins } : {}), ...(customs && customs.length ? { customConfigs: customs } : {}) });
 
+  const pool0 = usePool ? resourcePool : undefined;
+  const customs0 = o.customConfigs && o.customConfigs.length ? o.customConfigs : undefined;
   let taskId: string;
   try {
-    taskId = await startScan(usePool ? resourcePool : undefined);
+    taskId = await startScan(pool0, customs0);
   } catch (e) {
-    if (usePool && /resource pool/i.test(String(e))) {
+    const msg = String(e);
+    if (customs0) {
+      // operator の CustomConfiguration(scan policy / session 注入)が弾かれた可能性 → 無しで再試行(スキャン自体は走らせる)。
+      console.log(`⚠ scan start with your CustomConfiguration failed (${msg.slice(0, 120)}); retrying WITHOUT it (auto config / UNAUTHENTICATED). Check BURP_SCAN_CONFIG_FILE / BURP_SESSION_CONFIG_FILE against your Burp.`);
+      try {
+        taskId = await startScan(pool0, undefined);
+      } catch (e2) {
+        if (usePool && /resource pool/i.test(String(e2))) {
+          try {
+            taskId = await startScan(undefined, undefined);
+          } catch (e3) {
+            console.log(`⚠ burp-scan start failed: ${String(e3).slice(0, 160)} — skipping`);
+            return 0;
+          }
+        } else {
+          console.log(`⚠ burp-scan start failed: ${String(e2).slice(0, 160)} — skipping`);
+          return 0;
+        }
+      }
+    } else if (usePool && /resource pool/i.test(msg)) {
       console.log(`⚠ resource pool "${resourcePool}" not found in Burp, continuing on the default pool (create a concurrency 1 / Delay 250ms pool to throttle).`);
       try {
-        taskId = await startScan(undefined);
+        taskId = await startScan(undefined, undefined);
       } catch (e2) {
         console.log(`⚠ burp-scan start failed: ${String(e2).slice(0, 160)} — skipping`);
         return 0;
       }
     } else {
-      console.log(`⚠ burp-scan start failed: ${String(e).slice(0, 160)}\n  → Burp Pro REST enabled? base=${base} / key? — skipping`);
+      console.log(`⚠ burp-scan start failed: ${msg.slice(0, 160)}\n  → Burp Pro REST enabled? base=${base} / key? — skipping`);
       return 0;
     }
   }

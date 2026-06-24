@@ -1,0 +1,194 @@
+openapi: 3.0.3
+info:
+  title: AMRAAM Audit REST — Burp 拡張 API
+  version: 0.1.0
+  description: >
+    Burp Suite Professional の Montoya 拡張が立てる REST API。認証済みの生 HTTP リクエストを
+    1 件ずつ Scanner の Audit に投入する(GUI の「Audit selected items」相当)。セッションは
+    リクエスト内に内包されるため、Burp 標準 REST(1337)の「セッションを渡せない」制約を回避する。
+    拡張ソース: tools/burp-audit-ext/ 。
+servers:
+  - url: http://127.0.0.1:1338
+    description: 既定(拡張は 127.0.0.1 固定、ポートは SCAN_API_PORT で変更可)
+security:
+  - {}                      # 既定は認証なし
+  - ScanToken: []           # AUTH_TOKEN 設定時は X-Scan-Token 必須
+components:
+  securitySchemes:
+    ScanToken:
+      type: apiKey
+      in: header
+      name: X-Scan-Token
+      description: 拡張側で AUTH_TOKEN を設定した場合のみ必須。
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+      required: [error]
+    ScanRequest:
+      type: object
+      required: [host, port, request]
+      properties:
+        host:
+          type: string
+          description: 接続先ホスト(ドメイン/IP)。名前解決は Burp が行う。
+          example: 192.168.74.148
+        port:
+          type: integer
+          example: 8000
+        secure:
+          type: boolean
+          default: false
+          description: TLS 有無
+        audit_mode:
+          type: string
+          enum: [active, passive]
+          default: active
+          description: 監査チェックの組み込みプロファイル(Montoya は active/passive の2択のみ)。
+        request:
+          type: string
+          description: >
+            CRLF(\r\n)区切りの生 HTTP リクエスト。Cookie/ヘッダ/body を含む完成品。
+            Content-Length は呼び出し側で正しく設定する。
+          example: "GET /account HTTP/1.1\r\nHost: 192.168.74.148:8000\r\nCookie: session=abc\r\n\r\n"
+    ScanResponse:
+      type: object
+      properties:
+        status: { type: string, example: queued }
+        host: { type: string, description: "Audit キー(host:port)", example: "192.168.74.148:8000" }
+        audit_mode: { type: string, enum: [active, passive] }
+    HostStatus:
+      type: object
+      properties:
+        host: { type: string, example: "192.168.74.148:8000" }
+        audit_mode: { type: string, enum: [active, passive] }
+        status: { type: string, description: "Audit.statusMessage()", example: auditing }
+        requests_made: { type: integer, description: "Audit.requestCount()" }
+        errors: { type: integer, description: "Audit.errorCount()" }
+        insertion_points: { type: integer, description: "Audit.insertionPointCount()(GET /status/{host} のみ)" }
+    Issue:
+      type: object
+      properties:
+        found_at: { type: integer, format: int64, description: "捕捉時刻(epoch ms)。since の対象" }
+        name: { type: string, example: "Cross-site scripting (reflected)" }
+        severity: { type: string, enum: [HIGH, MEDIUM, LOW, INFORMATION, FALSE_POSITIVE] }
+        confidence: { type: string, enum: [CERTAIN, FIRM, TENTATIVE] }
+        url: { type: string, example: "http://192.168.74.148:8000/support" }
+        detail: { type: string, nullable: true }
+        evidence:
+          type: array
+          description: "evidence=true の時のみ。各 req/resp を base64 で格納。"
+          items:
+            type: object
+            properties:
+              request_b64: { type: string }
+              response_b64: { type: string }
+paths:
+  /scan:
+    post:
+      summary: 認証済み生リクエストを Audit に投入
+      description: 同じ host:port は 1 つの Audit に集約される。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ScanRequest' }
+      responses:
+        '200':
+          description: 投入受理
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScanResponse' }
+        '400': { description: 欠落/不正/解釈不能, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '401': { description: X-Scan-Token 不正/欠落, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '405': { description: POST 以外, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /status:
+    get:
+      summary: 全ホストの Audit 進捗
+      responses:
+        '200':
+          description: 一覧
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  hosts:
+                    type: array
+                    items: { $ref: '#/components/schemas/HostStatus' }
+  /status/{host}:
+    get:
+      summary: 指定ホストの Audit 進捗
+      parameters:
+        - name: host
+          in: path
+          required: true
+          schema: { type: string }
+          description: "host:port(例: 192.168.74.148:8000)"
+      responses:
+        '200':
+          description: 進捗
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HostStatus' }
+        '404': { description: 未投入, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /issues:
+    get:
+      summary: 捕捉済み Issue を JSON で取得
+      parameters:
+        - name: since
+          in: query
+          schema: { type: integer, format: int64 }
+          description: epoch ms。これより後に捕捉された Issue のみ(run 差分)。
+        - name: host
+          in: query
+          schema: { type: string }
+          description: "host:port 指定でそのホストのみ"
+        - name: evidence
+          in: query
+          schema: { type: boolean, default: false }
+          description: true で各 Issue に req/resp(base64)を含める
+      responses:
+        '200':
+          description: Issue 一覧
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  issues:
+                    type: array
+                    items: { $ref: '#/components/schemas/Issue' }
+  /report:
+    get:
+      summary: ネイティブ Burp レポート(req/resp 入り)を生成
+      parameters:
+        - name: format
+          in: query
+          schema: { type: string, enum: [xml, html], default: xml }
+        - name: since
+          in: query
+          schema: { type: integer, format: int64 }
+        - name: host
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: レポート本体
+          content:
+            application/xml: { schema: { type: string } }
+            text/html: { schema: { type: string } }
+  /reset:
+    post:
+      summary: 捕捉済み Issue の蓄積をクリア
+      description: 本拡張の蓄積のみをクリア(Burp の SiteMap や進行中 Audit は消さない)。
+      responses:
+        '200':
+          description: クリア完了
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: cleared }

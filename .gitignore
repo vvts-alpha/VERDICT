@@ -40,6 +40,8 @@ cookies/
 # Burp レポート XML(生 req/resp を含む秘匿。burp-import で取り込む作業ファイル)
 burp-result.xml
 *.burp.xml
+# 持ち込みの Burp 作業ファイル(scan policy 等。operator 個別 → コミットしない)
+ScanPolicy.json
 
 # misc
 .DS_Store
