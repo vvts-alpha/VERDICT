@@ -78,6 +78,7 @@ public final class ApiServer {
         } else if (path.equals("/reset")) {
             if (!method.equals("POST")) { sendError(resp, 405, "POST only"); return; }
             store.clear();
+            registry.clear(); // 既存 Audit も破棄 → 次の run は新規 Audit で再スキャンできる
             JsonObject o = new JsonObject();
             o.addProperty("status", "cleared");
             sendJson(resp, 200, o);

@@ -57,4 +57,18 @@ public final class AuditRegistry {
     public Map<String, Audit> all() {
         return audits;
     }
+
+    /** 既存の Audit を全て破棄してレジストリを空に(/reset 用)。次の run が host:port ごとに新規 Audit で
+     *  再スキャンできるようにする(finished な Audit に addRequest しても再走しないため)。 */
+    public synchronized void clear() {
+        for (Audit a : audits.values()) {
+            try {
+                a.delete();
+            } catch (Exception ignored) {
+                /* already gone */
+            }
+        }
+        audits.clear();
+        modes.clear();
+    }
 }

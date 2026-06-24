@@ -148,6 +148,9 @@ export class AssessmentStore {
 
   constructor(db: DatabaseSync) {
     this.db = db;
+    // server と spawn された pilot が同じ state.sqlite を同時に開く。busy_timeout を最初に設定して、
+    // WAL 設定/スキーマ適用/書き込みがロックに当たっても即エラーせず待つ(= "database is locked" 回避)。
+    this.db.exec("PRAGMA busy_timeout = 5000;");
     this.db.exec("PRAGMA journal_mode = WAL;");
     this.db.exec("PRAGMA foreign_keys = ON;");
     this.db.exec(SCHEMA);
