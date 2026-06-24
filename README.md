@@ -1,318 +1,203 @@
-# AMRAAM — autonomous web/API pentest agent
+<div align="center">
 
-Claude 主導の自律 Web/API ペネトレーションテスト・エージェント。TypeScript の pnpm モノレポ。設計の源泉は [`DESIGN.md`](./DESIGN.md)。
+# AMRAAM 🚀
 
-> ⚠️ **認可済みターゲット専用。** すべてのネットワーク操作は scope ゲート(`isInScope`)を通り、スコープ外は拒否される。`--url` は同一オリジン + 配下を既定スコープに導出。manifest で明示スコープを与える。
+### Autonomous web / API pentest agent
 
----
+**AI drives · evidence proves · scans _behind_ login.**
 
-## これは何か
+A Claude-led agent that maps your target, hunts vulns with strict evidence discipline,
+drives Burp for breadth, and reaches the authenticated surface other tools miss.
 
-2 つの実行モードが 1 つの基盤(`@veritas/core` の状態ストア)を共有する:
+![Node](https://img.shields.io/badge/Node-%E2%89%A5%2024-339933?logo=nodedotjs&logoColor=white)
+![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)
+![LLM](https://img.shields.io/badge/LLM-Claude%20(CLI%20sub)-D97757?logo=anthropic&logoColor=white)
+![Playwright](https://img.shields.io/badge/Browser-Playwright%20chromium-2EAD33?logo=playwright&logoColor=white)
+![tests](https://img.shields.io/badge/tests-passing-success)
+![status](https://img.shields.io/badge/status-active-blue)
 
-- **`pilot`(Claude 主導・推奨)** — Claude が tool-use ループでツール(browser / http / login / record …)を操縦し、自律的に **調査 → 方法論 → 診断** の 3 ステージで回す。
-  - **調査**: 画面を巡回してマップ(screens + スクショ + API 抽出)。frontier を消し切るまで + 各 role でログイン。
-  - **方法論**: 全画面の一覧から、画面ごとに「どの脆弱性クラスをどう試すか」を立てる。
-  - **診断**: **1 画面ずつ**バウンドした文脈で検証。カバレッジ台帳が全画面を潰し切る(取りこぼし防止)。
-  - **証拠規律**: confirmed = 陰性コントロール(失敗すべき要求が失敗)+ 2 回以上の positive replay。catch-all 200 / 0-byte / ログインリダイレクトは成功扱いしない。
-  - finding は `(カテゴリ × エンドポイント × param)` で**重複排除**(横断エンドポイントの過剰報告を束ねる)。
-- **`assess`(決定論・一括)** — crawl → label → scan → logic → report を固定パイプラインで実行。粒度が細かく検査しやすい。
+[Quickstart](#-quickstart) · [How it works](#-how-it-works) · [Why AMRAAM](#-why-amraam) · [Burp](#-burp-integration) · [WebUI](#-webui)
 
-LLM は **`claude` CLI(Max サブスク認証)**を使う。従量 API キーは不要。
-
----
-
-## 動作フロー
-
-```
-manifest (scope + 認証)
-   │
-   ├── pilot   ── Claude 主導 ── survey → methodology → diagnosis → report
-   └── assess  ── 決定論一括   ── crawl → label → scan → logic → report
-```
-
-`pilot` の中身(各ステージ = 1 回の `query()`。Claude が下のツールを操縦する):
-
-```
-pilot --manifest scope_manifest.json
-│
-├─ 0. 起動
-│     └─ manifest 読込 → scope ゲート構築(isInScope)→ 状態ストア(state.sqlite)初期化
-│
-├─ 1. 調査  survey ……………… 1× query()  〔fast-model〕
-│     ├─ browser_navigate / fill / click … 画面を巡回してマップ
-│     ├─ login(role) ……………………… 資格情報→smartLogin / cookieFile→注入
-│     ├─ probe_paths ………………………… 既知パス当て
-│     └─ survey_done ………………………… frontier(未訪問)が空で確定
-│           └─▶ Screen[] + スクショ + API 抽出 を永続化
-│
-├─ 2. 方法論  methodology …… 1× query()  〔fast-model〕
-│     ├─ get_inventory ……………………… 全画面の一覧
-│     └─ record_methodology ………… 画面ごとに「どのクラスをどう試すか」立案
-│           └─▶ plan を各 screen に紐付け
-│
-├─ 3. 診断  diagnosis ………… 1 画面 = 1× query()  〔高価値画面のみ deep-model〕
-│     │     ※ 画面の合間に keepalive(トップへ navigate + cookie 再同期)
-│     ├─ get_screen ………………………… 詳細 + plan を取得
-│     ├─ http_request / probe_params … 検証トラフィック
-│     ├─ verify_access ………………………… auth-bypass の機械 veto(302/401/403/login body は HARD veto)
-│     ├─ analyze_session …………………… cookie の構造・予測可能性を解析
-│     └─ record_finding ─────────┐
-│           証拠規律: 陰性コントロール失敗 + 2× positive replay でのみ confirmed
-│           catch-all / 0-byte-200 / login-redirect は refuted
-│           (カテゴリ × エンドポイント × param)で dedup
-│           └─▶ EvidenceStore に req/resp 全体(request.http.txt)を保存
-│
-└─ 4. レポート
-      └─ buildReport → runs/<id>/report.md
-
-   （全工程を通して WebUI が events ログを購読し、SITE TREE / 進捗 / findings をライブ投影）
-```
-
-モード差分:
-- `--survey-only` … **1 で停止**(map だけ。診断/finding なし)。後で `--resume` に繋ぐ。
-- `--resume --id <id>` … **1・2 をスキップ**し、3 を未診断(非 terminal)画面だけで再開。
-- `--burp-proxy <url>` … 全 HTTP+ブラウザ通信を Burp 経由(off で挙動不変)。スキャン後 `burp-import` で net-new を merge。
+</div>
 
 ---
 
-## 前提・セットアップ
+> ⚠️ **Authorized testing only.** Every network action passes a scope gate; out-of-scope is denied, not attempted.
 
-- **Node.js >= 24**(状態ストアに組み込み `node:sqlite` を使用。native 依存なし)。`nvm use 24`。
-- **pnpm**(corepack): `corepack enable pnpm`(pin `pnpm@9.15.4`)。
-- **Chromium**(Playwright 用): `npx playwright install chromium`、または `--browser-path <bin>` / 環境変数 `VERITAS_BROWSER_PATH` で既存バイナリを指定。コンテナ/root では `--no-sandbox`。
+AMRAAM runs a real browser and a scoped HTTP client through tools that **Claude operates** — survey → methodology → diagnosis → (multi-step logic) → (Burp) → report. It is **staged on purpose** so the model can't "skim and skip", and **evidence-disciplined** so a finding is `confirmed` only when it actually reproduces. Everything streams to a live WebUI.
+
+## ✨ Features
+
+- 🧠 **Claude-led, staged** — survey → methodology → per-screen diagnosis. Bounded queries stop the model from eliding work.
+- 🔬 **Evidence discipline** — `confirmed` requires a negative control that fails **+ ≥2 stable positive replays**. Catch-all 200s / flaky responses are auto-refuted. FP reduced *by construction*.
+- 🔐 **Scans behind login** — Bearer-JWT propagation + a Burp extension that takes the **authenticated request itself**, so the auth surface (the crown jewels) actually gets tested.
+- 🧩 **A04 multi-step logic** — a dedicated scenario stage chains requests across endpoints (coupon stacking, negative-qty checkout, mass-assignment) with a differential oracle.
+- 🤝 **AI depth × Burp breadth** — the agent owns IDOR / authz / business-logic; Burp owns injection breadth. Imports are de-duped and **AI re-verified**.
+- ✅ **Coverage gate** — `screen_done` must account for every planned attack class — no "find one, move on".
+- 🛰 **Confirmation oracles** — `probe_xss` / `probe_redirect` / `probe_jwt` (alg:none) turn "looks suspicious" into evidence.
+- 🖥 **Observe + launch UI** — a 3-pane React app projects an append-only event log: SITE TREE, screenshots, findings, evidence viewer, live diagnostic log. Launch & control runs from the browser.
+- 🧾 **Reports** — Markdown / HTML / PDF / CSV + a screen inventory + an OpenAPI spec of everything it discovered.
+- 🛡 **Safe by design** — operator-provided auth only (never fabricated), never auto-hits logout, secrets redacted in evidence, LLM on a subscription (no metered API).
+
+## 🚀 Quickstart
 
 ```bash
-cd NewAgent
-pnpm install
-pnpm -r build        # 全パッケージを依存順にビルド(webui の Vite ビルド含む)
-pnpm -r test         # node:test(外部ネット/LLM 不要、Fake で完結)
+# requirements: Node >= 24 (builtin node:sqlite), pnpm via corepack, a chromium binary
+corepack enable pnpm
+pnpm install && pnpm -r build
+npx playwright install chromium          # or pass --browser-path <bin>
+
+# 1) observability UI (separate terminal) → http://127.0.0.1:4317
+node packages/cli/dist/main.js serve
+
+# 2) a Claude-led assessment from a single URL …
+node packages/cli/dist/main.js pilot --url https://app.example.com/
+
+# … or from a scope + auth manifest (recommended)
+node packages/cli/dist/main.js pilot --manifest scope.json
 ```
 
-> ブラウザパスは一度 `export VERITAS_BROWSER_PATH=/path/to/chrome` しておけば、各コマンドで `--browser-path` を省略できる。`--no-sandbox` はサンドボックスが通らない環境(コンテナ/root)でだけ付ける。
->
-> **環境変数は cwd の `.env` から自動ロード**される(任意のキー。例 `VERITAS_BROWSER_PATH` / `BURP_API` / `BURP_PROXY` / `BURP_API_KEY` / `BURP_RESOURCE_POOL` / `BURP_AUDIT_API` / `BURP_AUDIT_TOKEN`)。shell の `export` が優先・未設定キーだけ `.env` で埋める。`.env` は gitignore 済み。詳細は §ワークフロー D(Burp 連携)。
+Generate a manifest interactively with `node packages/cli/dist/main.js init`. Findings, screenshots, APIs and the diagnostic log fill the WebUI live; `runs/<id>/report.md` is written at the end.
 
----
+> 🧪 Dev mode (no build): `pnpm --filter @veritas/cli dev <command>` resolves `src` directly.
 
-## クイックスタート
+## 🔍 How it works
+
+Two phases joined by one contract (`screen_inventory.json`): **recon + labeling** writes it, **scan + logic** and the WebUI read it.
+
+```mermaid
+flowchart LR
+    A[🗺 Survey<br/>map screens + APIs<br/>incl. HTML form POSTs] --> B[📋 Methodology<br/>per-screen attack plan]
+    B --> C[🔬 Diagnosis<br/>1 screen = 1 bounded query<br/>coverage gate]
+    C --> D[🧩 Scenario A04<br/>multi-step logic abuse]
+    D --> E[🐝 Burp scan<br/>authenticated · de-dup · re-verify]
+    E --> F[📄 Report<br/>md · html · pdf · csv · openapi]
+    C -.evidence discipline.-> C
+```
+
+Each stage is a **single `query()`** with a tool allow-list, so the model works one bounded context at a time. Model tiering routes high-value screens to a deep model (e.g. Opus) and survey / static screens to a fast one (e.g. Sonnet). `--survey-only` / `--resume` / `--attended` adjust the flow.
+
+## 🧠 Why AMRAAM
+
+| | What others do | What AMRAAM does |
+|---|---|---|
+| **Coverage** | "scan the site" → the model skims and skips | Stages + a coverage gate make completeness a *contract*, not luck |
+| **False positives** | a pile of maybe-bugs to triage | `confirmed` is only set after a failing control + ≥2 stable replays |
+| **Authenticated surface** | scanner can't carry the session → 401s | session **in the request** (Burp Audit REST) + Bearer propagation |
+| **Breadth vs depth** | one tool, one tradeoff | AI depth (IDOR/authz/logic) × Burp breadth (injection), merged + re-verified |
+| **Ground truth** | rely on Burp's lossy auto-discovery | AMRAAM holds the auth + every param and **declares** them (OpenAPI / raw requests) |
+| **Overfitting** | hardcoded heuristics | standard techniques + LLM judgement — no app-specific vocabulary baked in |
+
+## 🛠 Commands
 
 ```bash
-# 1) 観測 WebUI を起動(別ターミナル)
-node packages/cli/dist/main.js serve --host 0.0.0.0
-#    → http://127.0.0.1:4317/ をブラウザで開く(?id 無しなら最新 run を自動追従)
-
-# 2) Claude 主導アセスメント(manifest に scope + 認証)
-node packages/cli/dist/main.js pilot --manifest scope_manifest.json --model claude-sonnet-4-6
+node packages/cli/dist/main.js <command> [options]      # after pnpm -r build
 ```
 
-WebUI で **SITE TREE / Screen(スクショ+API+findings)/ Findings / APIs / 診断ログ**がリアルタイムに埋まる。終了後 `runs/<id>/report.md` が生成される。
+| Command | Purpose |
+|---|---|
+| **`pilot`** | Claude-led assessment. `--manifest`/`--url`, `--model` (+ `--fast-model` tiering), `--max-turns`, `--max-screens`, `--rate`, `--headed`, `--burp-proxy [url]`, `--burp-scan`, `--login-url`, `--keepalive-min <n>` |
+| `pilot --survey-only` | Map only (screens + screenshots + APIs); diagnose later with `--resume`. |
+| `pilot --resume --id <id>` | Continue an existing run (diagnose the still-queued screens). |
+| `pilot --attended[ a,b,c]` | Manual multi-session login (MFA/CAPTCHA): a headed window per role, log in by hand, diagnose on the live session. |
+| `assess` | Deterministic one-shot: crawl → label → scan → logic → report. |
+| `serve` | Observability WebUI + state API/WS (`127.0.0.1:4317`; `--host 0.0.0.0` + `--password` to expose). |
+| `init` / `manifest` | Interactive scope-manifest generator. |
+| `report` / `inventory` / `openapi` | Export report (md/html/pdf/csv) / screen inventory / OpenAPI of the discovered surface. |
+| `burp-scan` / `burp-import` | Active Burp scan via REST → merge net-new / import a Burp XML report. |
+| `header-audit` | Info-level security-header checks. |
 
----
+## 🎛 Scope & auth (manifest)
 
-## manifest(scope + 認証)
-
-手書きするなら `scope_manifest.example.json` を参照。対話型で作るなら:
-
-```bash
-node packages/cli/dist/main.js manifest          # 質問に答えると scope_manifest_<host>.json を生成
-node packages/cli/dist/main.js manifest --out m.json
-```
-
-資格情報を含む実ファイルは gitignore すること(生成名 `scope_manifest_*.json` は既に対象)。
-
-```json
+```jsonc
 {
   "target": "https://app.example.com/",
-  "scope": {
-    "inScopeHosts": ["app.example.com"],
-    "outOfScopePathPrefixes": ["/logout"],
-    "rate": { "requestsPerMinute": 30, "maxConcurrent": 2 }
-  },
-  "crawl": { "followLinks": true, "maxDepth": 8 },
-  "model": "claude-sonnet-4-6",
+  "scopeMode": "etld",                 // same-origin | etld | unrestricted
+  "scope": { "outOfScopePathPrefixes": ["/logout"] },
+  "http":  { "headers": { "X-Forwarded-For": "127.0.0.1" } },  // WAF bypass / required headers
   "auth": {
+    "httpBasic": { "user": "u", "pass": "p" },                 // site-wide Basic/Digest
     "roles": [
-      { "name": "alice", "pass": "...", "description": "全権管理者" },
-      { "name": "bob",   "pass": "...", "description": "一般ユーザ(読取のみ)" },
-      { "name": "carol", "cookieFile": "carol.cookies" }
+      { "name": "admin", "pass": "…", "description": "full admin" },
+      { "name": "alice", "cookieFile": "alice.cookies" }       // pre-captured session (MFA walls)
     ]
   }
 }
 ```
 
-- **認証は資格情報だけでよい** — ログイン URL・フォーム項目はエージェントが自動発見(`smartLogin`)。`auth.roles[0]` = 主ログイン、複数 role = クロスユーザ/auth-diff のソース。
-- **`description`(任意)で権限レベルを添える** — 例 `"全権管理者"` / `"一般ユーザ(読取のみ)"`。エージェントの `login`/`get_screen` に渡り、auth-diff で「どれが高権限/低権限か(=境界越えの方向)」を判断する材料になる。秘密ではないが state には永続しない。
-- **事前取得 Cookie でもよい** — 自動ログインできない壁(Arkose/MFA 等)向けに、role に `cookieFile`(または `cookie_file_path`)を指定できる。中身は **生 `Cookie:` ヘッダ(`sid=…; foo=…`)** か **Playwright `storageState` JSON** のどちらでも可(自動判別)。`login(role)` がそれを **ブラウザ + http セッションに注入**してログインを省く。**Cookie ファイルはセッション秘密 → 必ず gitignore(`*.cookies` 等)。** エージェントが Cookie を捏造/盗むのではなく、operator が供給する点は不変。
-- MFA/CAPTCHA で Cookie も無ければ headed ブラウザで人手フォールバック(`detectStuck` が非ブロッキングで起票)。
-- `auth.roles[0]` = 主ログイン、複数 role = クロスユーザ/auth-diff のソース。
-- `--url <url>` で manifest 無し起動も可(scope は同一オリジン導出、認証なし)。
+**Auth = operator-provided material only.** Credentials → `smartLogin` auto-discovers the form. A cookie file → injected as-is (for walls the agent can't auto-login). MFA/CAPTCHA without a cookie file → `--attended` (human logs into a live headed session). **The agent never fabricates or steals cookies**, and **never auto-hits logout** (it would kill the session). `roles[0]` is primary; multiple roles drive multi-role authz diff.
 
----
+## 🐝 Burp integration
 
-## コマンド
+Opt-in and additive — with the flags off, behaviour is byte-identical. Connection via `.env` (auto-loaded) or args.
 
-| コマンド | 用途 |
-|---|---|
-| `manifest`(別名 `init`) | **対話型 scope-manifest ジェネレータ**: 質問に答えるだけで manifest JSON を生成(target / in・out-of-scope hosts・path / rate / crawl / model / 認証ロール)。`--out <file>` で出力先指定、password はエコー伏字。生成名 `scope_manifest_<host>.json` は gitignore 済み |
-| **`pilot`** | Claude 主導アセスメント(full)。`--manifest` / `--url`、`--model`、`--max-turns`、`--rate`、`--headed`、`--browser-path`、`--no-sandbox`、`--burp-proxy [url]`(全通信を Burp 経由。値なしなら env `BURP_PROXY`)、`--burp-scan`(診断後に Burp 能動スキャンも実施→マージ)、`--keepalive-min <n>`(認証セッション維持: 画面の合間にトップへ navigate して cookie 再同期。既定 4 分、`0` で無効) |
-| `pilot --survey-only` | **調査のみ**: 画面マップ+スクショ+API だけ。診断/finding はしない(安い recon、後で `--resume`) |
-| `pilot --resume --id <id>` | 既存 run の**未診断(queued)画面だけ**診断(落ちた run の仕上げ / survey-only の続き) |
-| `pilot --attended` | **手動マルチセッション認証**(headed 必須)。ロールごとに永続コンテキストを開き、人手でログイン(CAPTCHA/MFA/Arkose 突破)→ Enter 確認 → 生きたセッションで調査・診断。`login(role)` は再ログインせず**そのロールのライブセッションへ切替**。合間に全ロールを keepalive(失効=ログイン画面に戻されたら再ログインを要求)。`--login-url <u>`(手動ログインの入口、既定 target)/ `--keepalive-min <n>`(既定 1 分)。自動ログイン/Cookie ファイルで越えられない壁向け |
-| `assess` | 決定論パイプライン一括: crawl → label → scan → logic → report |
-| `serve` | 観測 WebUI + 状態 API/WS(既定 `127.0.0.1:4317`、LAN 公開は `--host 0.0.0.0`、`--password`/`AMRAAM_WEB_PASSWORD` でゲート) |
-| `report` / `status` / `list` | report.md 生成 / phase・coverage・stop 判定 / `runs/` 一覧 |
-| `shots --id <id>` | 既存 run の各画面スクショを backfill(run の認証済プロファイル再利用・ナビゲートのみ) |
-| `header-audit --id <id>` | Info 系: レスポンスヘッダ監査(CSP/HSTS/XFO/…)。`--headers csp,hsts,…` で絞る。トグル=走らせる/走らせない |
-| `burp-scan --id <id>` | **Burp Pro の REST API で能動スキャンを起動**→完了までポーリング→issue を net-new だけマージ(XML export 不要)。対象URLは run の AI がマップした in-scope 面。`--config "<名前>"`(複数可・速度/監査プリセット)、`--resource-pool <名>`(throttle)、`--manifest`(認証)、`--burp-api`/`--api-key`。接続は env(`BURP_API` 等)既定 |
-| `burp-import --id <id> --report <xml>` | Burp Pro の XML レポートを取り込み、既存と重複しない net-new だけ finding 追加 |
-| `run` / `crawl` / `label` / `scan` / `logic` | 決定論パイプラインの個別ステップ(`assess` の中身) |
-
-`node packages/cli/dist/main.js <command>`(ビルド済)または `pnpm --filter @veritas/cli dev <command>`(tsx、src 解決)。全コマンドは `--out <dir>`(既定 `runs`)を取る。
-
----
-
-## ワークフロー
-
-**A. ふつうのアセスメント**
 ```bash
-node packages/cli/dist/main.js serve --host 0.0.0.0          # 観測
-node packages/cli/dist/main.js pilot --manifest m.json       # 別ターミナルで診断
-```
-
-**B. map now / diagnose later**(安い recon → 後で診断)
-```bash
-node packages/cli/dist/main.js pilot --survey-only --manifest m.json   # ① 全面マップだけ
-#   WebUI で SITE TREE / スクショ / API を眺めて判断
-node packages/cli/dist/main.js pilot --resume --id <run-id> --manifest m.json   # ② queued だけ診断
-```
-
-**C. 手動マルチセッション認証(attended)** — CAPTCHA/MFA/Arkose・絶対TTL 失効など 自動ログインで越えられない壁向け
-```bash
-# ロールごとに headed の窓が開く → 各窓で人手ログイン → ターミナルで Enter
-node packages/cli/dist/main.js pilot --attended --manifest m.json
-#   --login-url <u> で手動ログインの入口を指定(既定 target)。--keepalive-min n で維持間隔(既定 1 分)。
-#   診断中に login(role) すると、再ログインせず そのロールのライブセッションへ切替。
-#   セッションが切れた(ログイン画面に戻された)ら、その窓で再ログインして Enter。
-```
-
-**D. Burp Suite 連携(任意・フラグ式)** — `--burp-proxy` / `--burp-scan` を付けない限り挙動は不変
-
-接続情報は **env(cwd の `.env` を起動時に自動ロード)→ 引数で上書き**。`.env` は gitignore 済み:
-```bash
-# .env(リポジトリ直下。実行時に自動読込。shell の export が優先。任意のキーを反映)
-VERITAS_BROWSER_PATH=/path/to/chrome
-BURP_API=http://127.0.0.1:1337        # 標準 REST API(キー無しなら BURP_API_KEY 不要)
-BURP_PROXY=http://127.0.0.1:8080      # Proxy リスナ(WSL→Windows は All interfaces に bind)
-BURP_RESOURCE_POOL=250ms              # throttle 用 Resource pool 名(既定)
-BURP_AUDIT_API=http://127.0.0.1:1338  # AMRAAM Audit REST 拡張(設定すると --burp-scan が認証下スキャンに切替)
-BURP_AUDIT_TOKEN=<secret>             # 拡張の X-Scan-Token(0.0.0.0 公開時は必須)
-```
-
-使い方は 3 つ:
-```bash
-# ① プロキシ経由 — 全 HTTP+ブラウザ通信を Burp に流す(認証済みトラフィックも蓄積)
+# proxy — route all traffic through Burp (auth'd traffic accumulates in Burp)
 node packages/cli/dist/main.js pilot --manifest m.json --burp-proxy
-#   値なし=env BURP_PROXY / 値で上書き: --burp-proxy http://別:8080。TLS 検証スキップ(Burp CA 不要)
 
-# ② Burp 能動スキャンも実施 — 診断後に in-scope 面をスキャン→net-new をマージ→High+ を AI 再検証
-node packages/cli/dist/main.js pilot --manifest m.json --burp-scan
-#   既定: 標準 REST(1337)で crawl+audit。要 Burp Pro → Settings → Misc → REST API 有効化。
-#   既存 run に単体実行 + 速度/監査プリセット(複数 --config を重ねる):
-node packages/cli/dist/main.js burp-scan --id <run-id> \
-  --config "Crawl strategy - fastest" --config "Audit checks - critical issues only"
+# active scan after diagnosis → merge net-new → AI re-verify High+
+node packages/cli/dist/main.js pilot --manifest m.json --burp-scan       # standard REST (1337), unauth crawl+audit
 
-# ②' 認証下を Burp で能動スキャン(推奨)— AMRAAM Audit REST 拡張(別ポート 1338)経由
-export BURP_AUDIT_API=http://127.0.0.1:1338   # ← これを設定すると --burp-scan がこの経路に切替
-export BURP_AUDIT_TOKEN=<secret>
-node packages/cli/dist/main.js pilot --manifest m.json --burp-scan
-#   AMRAAM が live Cookie/Bearer を載せた「認証済みの生リクエスト」を投入 → Burp が認証下を監査。
-#   セッションがリクエストに内包されるので、標準 REST の「セッションを渡せない」制約を回避。
-#   crawl しない(投入面だけ監査)= /login?next=… のクロール爆発も起きない。
-#   拡張のビルド/ロード: tools/burp-audit-ext/(Montoya, gradle shadowJar)。詳細は同 README。
-
-# ③ 手動 Burp スキャンの XML を取り込み — net-new(ヘッダ/脆弱JS/バージョン開示 等)だけ merge
-node packages/cli/dist/main.js burp-import --id <run-id> --report burp.xml
+# 🔐 authenticated active scan (recommended) — AMRAAM Audit REST extension (port 1338)
+export BURP_AUDIT_API=http://127.0.0.1:1338 BURP_AUDIT_TOKEN=<secret>
+node packages/cli/dist/main.js pilot --manifest m.json --burp-scan       # → routes through the extension automatically
 ```
 
-> **認証下を Burp で能動スキャンしたいなら ②'(Audit REST 拡張)**。`BURP_AUDIT_API` を設定すれば
-> `--burp-scan` が自動でこの経路になり、attended の手動ログイン(CAPTCHA/MFA)で得た live セッションも
-> リクエストに内包して投入できる。設定が無ければ標準 REST(1337)= 未認証 crawl+audit にフォールバック。
-> 速度/throttle は Burp の **Resource pool**(標準 REST は `--resource-pool`/`BURP_RESOURCE_POOL`、
-> Audit REST は Burp の Default pool を起動時 config で調整。Montoya は pool 指定不可)。
+The standard REST API can't pass a session to a scan. The **[`tools/burp-audit-ext/`](tools/burp-audit-ext/) Montoya extension** sidesteps that: AMRAAM submits the **authenticated raw request itself** (cookie + Bearer baked in), so Burp audits *behind login*, with no crawl explosion. `BURP_AUDIT_API` flips `--burp-scan` onto this path; otherwise it falls back to the standard REST. Build it with `gradle shadowJar` and load the jar in Burp.
 
-役割分担: **エージェント = 創発的ロジック**(IDOR 連鎖・マスアサイン・business logic)/ **Burp = 注入系の機械網羅(A03 SQLi/XSS 等)+ パッシブ**。重複は `burp-scan`/`burp-import` が排除する。
+> **Division of labour:** the agent = emergent logic (IDOR chains, mass-assignment, business logic); Burp = mechanical injection breadth (A03 SQLi/XSS) + passive. Overlap is de-duped; imported High+ findings are re-tested by the agent.
 
-**E. Info 系を足す(Burp 無しの軽量版)**
-```bash
-node packages/cli/dist/main.js header-audit --id <run-id>            # 既定リスト
-node packages/cli/dist/main.js header-audit --id <run-id> --headers csp,hsts
-```
+## 🖥 WebUI
 
----
+One target = one page. Left: **SITE TREE** (URL hierarchy + scan badges). Top: progress bar. Right tabs: **Screen** (screenshot + APIs + findings), **Findings** (filter + inline evidence viewer), **APIs**, **Diagnostic log** (live), **💬 Ask** (read-only Q&A over the assessment).
 
-## WebUI(`serve`)
+From `/` (the **projects list**) you can **launch and control runs**: **+ New** opens a full manifest editor — target, scope mode, model tiering, **custom headers** (name/value), **login URL**, **target-URL list import** (CSV / one-per-line), **max screens**, HTTP Basic, auth roles — and the server spawns the CLI as a child process. Stop / Resume per run. Expose with `--host 0.0.0.0` **and** `--password` / `AMRAAM_WEB_PASSWORD`.
 
-ターゲット 1 つ = 1 ページで完結。左 **SITE TREE**(URL 階層 + スキャン状態バッジ)、上部 **進捗バー**(scan 内訳 + 今診断中の画面)、右はタブ:
+## 🎯 Detection coverage
 
-- **Screen** — ツリーで選んだ 1 画面: 大スクショ → 概要 → APIs/params → その画面の findings。
-- **Findings** — 全 finding(severity フィルタ + screenId クリックで画面ジャンプ)。各 finding の **evidence をクリックで req/resp を展開**(headers マスク済)。
-- **APIs** — 全画面の API を横断集約(method+endpoint+auth+参照画面)。
-- **診断ログ** — Claude の思考 / probe / plan / FINDING / phase 遷移を新しい順に live 表示。
+OWASP-mapped: **A01** access control (IDOR/BOLA, auth-bypass) · **A03** injection (SQLi, reflected XSS, path-traversal) · **A04** business logic (price/qty tampering, mass-assignment, workflow bypass) · **A07** auth (JWT alg:none / claim tampering, predictable cookies) · **A10** SSRF / open-redirect · plus info-disclosure and header audit. Deep payload breadth (XSS variants, SSTI, desync) is delegated to **Burp**; AMRAAM imports and re-verifies.
 
-最小操作: pause/resume、画面 exclude、handoff resolve(WS push で即反映)。
+## ⚙️ Setup & requirements
 
-### WebUI から起動・操作(`/` プロジェクト一覧)
-
-`/`(`?id=` なし)は**プロジェクト一覧**(対象/フェーズ/画面数/findings/更新日時/ID、行クリックで開く)。ここから run を**起動〜操作まで完結**できる:
-
-- **「+ New」** — フル manifest エディタで **pilot か assess を起動**。target / scope mode(same-origin・eTLD・unrestricted)/ scope の in·out host·path / crawl / model(deep+fast tiering)・rate・**max screens** / 認証ロール に加え:
-  - **Custom headers**(name/値を別入力・複数)— WAF 回避や案件指定の必須ヘッダ。in-scope の同一オリジン要求にだけ付与(CORS 安全)+ raw http にも。
-  - **Login URL** — 手動ログイン(attended)の入口 URL。
-  - **Target URLs ⬆import** — URL リストをファイル(CSV 先頭列 / 1行1URL)から読込。URL リスト固定診断用。
-  - **HTTP Basic** — サイト全体の Basic/Digest。
-
-  server が CLI を**子プロセスで spawn**(CLI=実行エンジン / WebUI=制御面)、新 run が一覧にライブ出現。
-- 各行の **Stop / Resume** — 実行中プロセスを停止(SIGTERM→SIGKILL)/ `pilot --resume` で再開。実行中は ● インジケータ。
-
-CLI はそのまま残る(ヘッドレス/自動化/attended の経路)。`serve --no-launch` で起動機能を無効化。※ `attended`(手動ログイン)は対話ターミナルが要るため WebUI からは出さない(CLI 専用)。起動系は POST `/api/*` なので**認証ゲートの内側**(下記)。
-
-### 認証(`--password` / `AMRAAM_WEB_PASSWORD`)
-
-既定は無認証(ローカル `127.0.0.1` 前提)。**`--host 0.0.0.0` で LAN/リモート公開するときは必ずゲートする**:
+- **Node.js ≥ 24** (mandatory — the state store uses builtin `node:sqlite`). `nvm use 24`.
+- **pnpm** via corepack (`corepack enable pnpm`).
+- **Chromium** for Playwright: `npx playwright install chromium`, or `--browser-path <bin>` / `VERITAS_BROWSER_PATH`. In containers add `--no-sandbox`.
+- **LLM = the `claude` CLI** (subscription auth) — no `ANTHROPIC_API_KEY`, no metered billing.
 
 ```bash
-node packages/cli/dist/main.js serve --host 0.0.0.0 --password '<pw>'
-# or: .env に AMRAAM_WEB_PASSWORD=<pw>(自動ロード) → node ... serve --host 0.0.0.0
+pnpm install
+pnpm -r build        # tsc per package (+ Vite for webui)
+pnpm -r test         # node:test via tsx (FakeDriver / FakeHttpClient / FakeLlmClient — no network/LLM)
 ```
 
-単一パスワードで **WebUI / `/api` / WebSocket をまとめてゲート**(`/login` フォーム → 署名セッション Cookie、有効7日、`/logout` で失効)。依存なし(`node:crypto` の HMAC)。`--no-auth` で明示的に無効化。0.0.0.0 公開かつ未設定だと起動時に警告。Cookie/入力の暗号化はアプリ層では行わないので、リモートは TLS/トンネル併用を推奨。
+`.env` (repo root, auto-loaded; shell `export` wins; gitignored): `VERITAS_BROWSER_PATH`, `BURP_API`, `BURP_PROXY`, `BURP_RESOURCE_POOL`, `BURP_AUDIT_API`, `BURP_AUDIT_TOKEN`.
+
+## 🧩 Architecture
+
+TypeScript monorepo; dependencies flow downward; contract types live only in `@veritas/core`.
+
+```
+cli ── orchestrates everything
+pilot ─ agent ─ scanner ─┐
+crawler ─ llm ───────────┤
+server   webui ──────────┴── core   (types · SQLite store · scope gate · evidence discipline · projections · OpenAPI)
+```
+
+`AssessmentStore` (`state.sqlite`) is the agent's working memory **and** the WebUI's data source: normalized tables + an **append-only event log** the server polls to push WS diffs. The WebUI is a pure projection. `tools/burp-audit-ext/` is a standalone Java/Montoya Burp extension.
+
+## 🛡 Safety & invariants
+
+- **Scope gate on every network action** — `isInScope(url, scope)` is deny-first; out-of-scope returns blocked, not an exception.
+- **Evidence discipline** — confirmed needs a failing control + ≥2 stable replays; nothing is marked confirmed by hand.
+- **Auth is operator-provided** — creds or a cookie file; never fabricated or stolen; cookie files are secrets (gitignored).
+- **Never auto-logout** — the agent must not hit logout/signout (it destroys the session).
+- **Append-only, replayable state** — every transition appends an event in the same transaction.
+- **LLM = `claude` CLI subscription**, not the metered API.
 
 ---
 
-## パッケージ構成
+<div align="center">
 
-依存は下方向に流れる。共有契約型は `@veritas/core` のみに集約する(内部パッケージ名は `@veritas/*` のまま)。
+**AMRAAM** — autonomous · evidence-disciplined · authenticated-deep web/API pentest.
 
-| パッケージ | 役割 |
-|---|---|
-| `@veritas/core` | 契約型 + SQLite ストア(作業記憶 = UI データソース)+ カバレッジ台帳 + ツリー/状態投影 + scope + 予算/停止 + `buildReport` |
-| `@veritas/crawler` | Playwright ドライバ(永続コンテキスト/傍受/プロキシ)+ 純パイプライン(正規化/dedup/ラベリング/`smartLogin`/`detectStuck`) |
-| `@veritas/llm` | `ClaudeCliClient`(サブスク認証 `claude -p`)+ Fake + zod 構造化出力 |
-| `@veritas/scanner` | `EvidenceStore` / `FetchHttpClient`(scope ゲート+プロキシ)/ 証拠規律 / validator カタログ / header 監査 / Burp レポート解析 |
-| `@veritas/agent` | ビジネスロジック: 仮説生成 + IDOR 検証 + auth-diff(マルチロール) |
-| `@veritas/pilot` | **Claude 主導ループ**(Agent SDK の in-process MCP ツール + 3 ステージ・オーケストレータ) |
-| `@veritas/server` / `@veritas/webui` | 状態 API + WebSocket / React 観測 UI(core は型のみ import) |
-| `@veritas/cli` | 全コマンドのオーケストレーション |
-
----
-
-## 不変条件(壊さないこと)
-
-- **scope ゲートは全ネットワーク操作に**。out-of-scope は例外でなくブロック。
-- **証拠規律**: confirmed = 陰性コントロール + 2 positive replays。catch-all / 0-byte-200 / 不安定は refuted。手で confirmed にしない。
-- **LLM = `claude` CLI サブスク**(従量 API 不使用)。テストは `FakeLlmClient`。
-- **認証 = operator 供給の資格情報 OR 事前 Cookie ファイル**(`smartLogin` / `loadCookieFile`)。エージェントは Cookie を捏造/盗まない。MFA/CAPTCHA で Cookie も無ければ `detectStuck` → 非ブロッキング HumanHandoff(headed で人手)。
-- **状態は append-only + 再生可能**。UI は純投影(`buildStateView` / `buildSiteTree`)。
-
-> 状態: ステージ型 Claude 主導 pilot(調査→方法論→診断)+ 決定論 assess、WebUI 観測(`--password`/`AMRAAM_WEB_PASSWORD` でゲート可)、Burp 連携(proxy / REST 能動スキャン `burp-scan` / XML import、`.env` 自動ロード)、header 監査、survey-only/resume/attended(手動マルチセッション)モード、survey の動的間引き(`ignore_paths`/`--exhaustive`) — すべて実装・実機検証済み。`pnpm -r test` は緑。
+</div>
