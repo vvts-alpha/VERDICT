@@ -91,7 +91,7 @@ pnpm -r test         # node:test(外部ネット/LLM 不要、Fake で完結)
 
 > ブラウザパスは一度 `export VERITAS_BROWSER_PATH=/path/to/chrome` しておけば、各コマンドで `--browser-path` を省略できる。`--no-sandbox` はサンドボックスが通らない環境(コンテナ/root)でだけ付ける。
 >
-> **環境変数は cwd の `.env` から自動ロード**される(`VERITAS_BROWSER_PATH` / `BURP_API` / `BURP_PROXY` / `BURP_API_KEY` / `BURP_RESOURCE_POOL`)。shell の `export` が優先・未設定キーだけ `.env` で埋める。`.env` は gitignore 済み。詳細は §ワークフロー D(Burp 連携)。
+> **環境変数は cwd の `.env` から自動ロード**される(任意のキー。例 `VERITAS_BROWSER_PATH` / `BURP_API` / `BURP_PROXY` / `BURP_API_KEY` / `BURP_RESOURCE_POOL` / `BURP_AUDIT_API` / `BURP_AUDIT_TOKEN`)。shell の `export` が優先・未設定キーだけ `.env` で埋める。`.env` は gitignore 済み。詳細は §ワークフロー D(Burp 連携)。
 
 ---
 
@@ -200,11 +200,13 @@ node packages/cli/dist/main.js pilot --attended --manifest m.json
 
 接続情報は **env(cwd の `.env` を起動時に自動ロード)→ 引数で上書き**。`.env` は gitignore 済み:
 ```bash
-# .env(リポジトリ直下。実行時に自動読込。shell の export が優先)
+# .env(リポジトリ直下。実行時に自動読込。shell の export が優先。任意のキーを反映)
 VERITAS_BROWSER_PATH=/path/to/chrome
-BURP_API=http://127.0.0.1:1337        # REST API(キー無しなら BURP_API_KEY 不要)
+BURP_API=http://127.0.0.1:1337        # 標準 REST API(キー無しなら BURP_API_KEY 不要)
 BURP_PROXY=http://127.0.0.1:8080      # Proxy リスナ(WSL→Windows は All interfaces に bind)
 BURP_RESOURCE_POOL=250ms              # throttle 用 Resource pool 名(既定)
+BURP_AUDIT_API=http://127.0.0.1:1338  # AMRAAM Audit REST 拡張(設定すると --burp-scan が認証下スキャンに切替)
+BURP_AUDIT_TOKEN=<secret>             # 拡張の X-Scan-Token(0.0.0.0 公開時は必須)
 ```
 
 使い方は 3 つ:
@@ -213,21 +215,31 @@ BURP_RESOURCE_POOL=250ms              # throttle 用 Resource pool 名(既定)
 node packages/cli/dist/main.js pilot --manifest m.json --burp-proxy
 #   値なし=env BURP_PROXY / 値で上書き: --burp-proxy http://別:8080。TLS 検証スキップ(Burp CA 不要)
 
-# ② Burp 能動スキャンも実施 — REST API で起動→診断後に in-scope 面をスキャン→net-new をマージ
+# ② Burp 能動スキャンも実施 — 診断後に in-scope 面をスキャン→net-new をマージ→High+ を AI 再検証
 node packages/cli/dist/main.js pilot --manifest m.json --burp-scan
-#   要: Burp Pro → Settings → Misc → REST API を有効化(既定 127.0.0.1:1337)
+#   既定: 標準 REST(1337)で crawl+audit。要 Burp Pro → Settings → Misc → REST API 有効化。
 #   既存 run に単体実行 + 速度/監査プリセット(複数 --config を重ねる):
 node packages/cli/dist/main.js burp-scan --id <run-id> \
   --config "Crawl strategy - fastest" --config "Audit checks - critical issues only"
+
+# ②' 認証下を Burp で能動スキャン(推奨)— AMRAAM Audit REST 拡張(別ポート 1338)経由
+export BURP_AUDIT_API=http://127.0.0.1:1338   # ← これを設定すると --burp-scan がこの経路に切替
+export BURP_AUDIT_TOKEN=<secret>
+node packages/cli/dist/main.js pilot --manifest m.json --burp-scan
+#   AMRAAM が live Cookie/Bearer を載せた「認証済みの生リクエスト」を投入 → Burp が認証下を監査。
+#   セッションがリクエストに内包されるので、標準 REST の「セッションを渡せない」制約を回避。
+#   crawl しない(投入面だけ監査)= /login?next=… のクロール爆発も起きない。
+#   拡張のビルド/ロード: tools/burp-audit-ext/(Montoya, gradle shadowJar)。詳細は同 README。
 
 # ③ 手動 Burp スキャンの XML を取り込み — net-new(ヘッダ/脆弱JS/バージョン開示 等)だけ merge
 node packages/cli/dist/main.js burp-import --id <run-id> --report burp.xml
 ```
 
-> **attended と組み合わせるとき**は **`--burp-proxy` を使う**。手動ログイン(CAPTCHA/MFA)の
-> 生きたセッションを Burp REST(`--burp-scan`)は引き継げず未認証スキャンになるため。認証下を Burp で
-> 能動スキャンしたいなら、proxy で認証済み通信を溜め → Burp UI で Active scan か `burp-import`。
-> 速度/throttle は Burp の **Resource pool**(`--resource-pool` / `BURP_RESOURCE_POOL`、既定 `250ms`)。
+> **認証下を Burp で能動スキャンしたいなら ②'(Audit REST 拡張)**。`BURP_AUDIT_API` を設定すれば
+> `--burp-scan` が自動でこの経路になり、attended の手動ログイン(CAPTCHA/MFA)で得た live セッションも
+> リクエストに内包して投入できる。設定が無ければ標準 REST(1337)= 未認証 crawl+audit にフォールバック。
+> 速度/throttle は Burp の **Resource pool**(標準 REST は `--resource-pool`/`BURP_RESOURCE_POOL`、
+> Audit REST は Burp の Default pool を起動時 config で調整。Montoya は pool 指定不可)。
 
 役割分担: **エージェント = 創発的ロジック**(IDOR 連鎖・マスアサイン・business logic)/ **Burp = 注入系の機械網羅(A03 SQLi/XSS 等)+ パッシブ**。重複は `burp-scan`/`burp-import` が排除する。
 
@@ -254,7 +266,13 @@ node packages/cli/dist/main.js header-audit --id <run-id> --headers csp,hsts
 
 `/`(`?id=` なし)は**プロジェクト一覧**(対象/フェーズ/画面数/findings/更新日時/ID、行クリックで開く)。ここから run を**起動〜操作まで完結**できる:
 
-- **「+ New」** — フル manifest エディタ(target / scope の in·out host·path / crawl / model・rate 等 / 認証ロール)で **pilot か assess を起動**。server が CLI を**子プロセスで spawn**(CLI=実行エンジン / WebUI=制御面)、新 run が一覧にライブ出現。
+- **「+ New」** — フル manifest エディタで **pilot か assess を起動**。target / scope mode(same-origin・eTLD・unrestricted)/ scope の in·out host·path / crawl / model(deep+fast tiering)・rate・**max screens** / 認証ロール に加え:
+  - **Custom headers**(name/値を別入力・複数)— WAF 回避や案件指定の必須ヘッダ。in-scope の同一オリジン要求にだけ付与(CORS 安全)+ raw http にも。
+  - **Login URL** — 手動ログイン(attended)の入口 URL。
+  - **Target URLs ⬆import** — URL リストをファイル(CSV 先頭列 / 1行1URL)から読込。URL リスト固定診断用。
+  - **HTTP Basic** — サイト全体の Basic/Digest。
+
+  server が CLI を**子プロセスで spawn**(CLI=実行エンジン / WebUI=制御面)、新 run が一覧にライブ出現。
 - 各行の **Stop / Resume** — 実行中プロセスを停止(SIGTERM→SIGKILL)/ `pilot --resume` で再開。実行中は ● インジケータ。
 
 CLI はそのまま残る(ヘッドレス/自動化/attended の経路)。`serve --no-launch` で起動機能を無効化。※ `attended`(手動ログイン)は対話ターミナルが要るため WebUI からは出さない(CLI 専用)。起動系は POST `/api/*` なので**認証ゲートの内側**(下記)。
