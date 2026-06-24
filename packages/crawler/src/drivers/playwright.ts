@@ -427,6 +427,43 @@ export class PlaywrightDriver implements Driver {
     return cookies.map((c) => `${c.name}=${c.value}`).join("; ");
   }
 
+  /** SPA がブラウザ側に保持する Bearer JWT を回収する(local/sessionStorage の慣用キーを走査)。
+   *  Juice Shop 等は cookie ではなく `Authorization: Bearer <localStorage.token>` で XHR/API 認証するため、
+   *  これを拾って http_request/probe_logic に載せないと write 系 API が全部 401 になる。生のトークン文字列を返す。 */
+  async bearerToken(): Promise<string | null> {
+    const raw = await this.page
+      .evaluate(() => {
+        const g = globalThis as any;
+        const stores = [g.localStorage, g.sessionStorage].filter(Boolean);
+        const keys = ["token", "access_token", "accessToken", "authToken", "auth_token", "jwt", "id_token", "idToken", "bearer"];
+        for (const st of stores) {
+          for (const k of keys) {
+            const v = st.getItem?.(k);
+            if (typeof v === "string" && v.length > 20) return v;
+          }
+          // 値が JSON で {token:...}/{accessToken:...} に包まれているケースも拾う。
+          for (let i = 0; i < (st.length ?? 0); i++) {
+            const k = st.key?.(i);
+            const v = k ? st.getItem(k) : null;
+            if (typeof v === "string" && v.startsWith("{")) {
+              try {
+                const o = JSON.parse(v);
+                for (const kk of keys) if (typeof o?.[kk] === "string" && o[kk].length > 20) return o[kk];
+              } catch {
+                /* not json */
+              }
+            }
+          }
+        }
+        return null;
+      })
+      .catch(() => null);
+    if (!raw) return null;
+    // "Bearer xxx" 形式で入っていることがあるので素のトークンに正規化。JWT らしさ(2つの '.')も軽く確認。
+    const tok = raw.replace(/^Bearer\s+/i, "").trim();
+    return tok.length > 20 ? tok : null;
+  }
+
   /** 現在ページのスクリーンショットを path に保存(WebUI 表示用)。親ディレクトリは自動作成。
    *  真っ白スクショ対策: 撮る前に描画が落ち着くのを待つ(networkidle → フォント ready → 小休止)。
    *  settleMs で追加の固定待ちを調整可(既定 700ms)。 */

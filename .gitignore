@@ -37,6 +37,10 @@ cookies/
 *cookie*.txt
 *_cookie*.json
 
+# Burp レポート XML(生 req/resp を含む秘匿。burp-import で取り込む作業ファイル)
+burp-result.xml
+*.burp.xml
+
 # misc
 .DS_Store
 *.log

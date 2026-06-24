@@ -42,8 +42,11 @@ export function deriveScopeFromUrls(rawUrls: string[], mode: ScopeMode = "same-o
   for (const raw of rawUrls) {
     const u = new URL(raw);
     if (mode === "unrestricted") hosts.add(UNRESTRICTED_HOST);
-    else if (mode === "etld") hosts.add(`*.${registrableDomain(u.hostname)}`);
-    else hosts.add(u.host);
+    else if (mode === "etld") {
+      const reg = registrableDomain(u.hostname);
+      // IP / localhost 等(サブドメインの概念が無い)は `*.` を付けず exact host(ポート込み)にフォールバック。
+      hosts.add(reg.includes(".") && !/^[0-9.]+$/.test(reg) ? `*.${reg}` : u.host);
+    } else hosts.add(u.host);
   }
   return {
     inScopeHosts: [...hosts],

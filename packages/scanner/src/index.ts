@@ -32,3 +32,5 @@ export { parseBurpReport, burpSeverity, coarseCategory } from "./burp.js";
 export type { BurpIssue } from "./burp.js";
 export { startBurpScan, getBurpScan, restIssuesToBurpIssues, pickBurpConfigs } from "./burp-rest.js";
 export type { BurpScanRequest, BurpScanStatus } from "./burp-rest.js";
+export { mergeBurpIssues } from "./burp-merge.js";
+export type { MergeBurpOptions, MergeBurpResult } from "./burp-merge.js";

@@ -3,7 +3,7 @@
 // events.seq でポーリングし、新規イベントを差分 push する(in-process イベントが無いため)。
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
 
@@ -180,6 +180,18 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
     return sendJson(res, 200, { ok: true });
   }
 
+  // 既存 run に対して Burp 能動スキャン(REST)を起動 → 完了時に自動取り込み(XML export 不要)。
+  // 子プロセス(burp-scan CLI)が runs/<id>/state.sqlite に findings を upsert → WS 投影で WebUI に反映。
+  const burpCtl = url.match(/^\/api\/run\/([^/]+)\/burp-scan$/);
+  if (burpCtl) {
+    if (!supervisor) return sendJson(res, 400, { error: "run launcher disabled" });
+    const id = decodeURIComponent(burpCtl[1] ?? "");
+    if (!existsSync(join(opts.runsDir, id, "state.sqlite"))) return sendJson(res, 404, { error: "assessment not found" });
+    if (supervisor.isRunning(id)) return sendJson(res, 409, { error: "a run is already active for this assessment" });
+    supervisor.burpScan(id);
+    return sendJson(res, 200, { ok: true });
+  }
+
   // 💬 Ask: その assessment の findings/screens/scope を文脈に Claude へ質問する(読み取り Q&A)。
   const chat = url.match(/^\/api\/assessments\/([^/]+)\/chat$/);
   if (chat) {
@@ -204,6 +216,41 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
       const messages = (parsed.messages ?? []).filter((m) => typeof m.content === "string" && m.content.trim());
       if (!messages.length) return sendJson(res, 400, { error: "messages required" });
       void serveChat(res, opts.runsDir, id, messages as Array<{ role: string; content: string }>);
+    });
+    return;
+  }
+
+  // Burp Pro の XML レポートをアップロード → 既存 run に取り込み → High+ を AI 再検証。
+  // server は in-process でマージせず、XML を保存して CLI(burp-import)を spawn する(取り込み + 検証は
+  // CLI 側に集約 / server = 制御面)。findings は子が upsert → WS 投影で WebUI に反映。body = 生 XML(大)。
+  const burpImp = url.match(/^\/api\/assessments\/([^/]+)\/burp-import$/);
+  if (burpImp) {
+    if (!supervisor) return sendJson(res, 400, { error: "run launcher disabled" });
+    const id = decodeURIComponent(burpImp[1] ?? "");
+    if (!existsSync(join(opts.runsDir, id, "state.sqlite"))) return sendJson(res, 404, { error: "assessment not found" });
+    if (supervisor.isRunning(id)) return sendJson(res, 409, { error: "a run is already active for this assessment" });
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let tooBig = false;
+    req.on("data", (c: Buffer) => {
+      size += c.length;
+      if (size > 128 * 1024 * 1024) {
+        tooBig = true;
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on("end", () => {
+      if (tooBig) return sendJson(res, 413, { error: "report too large (>128MB)" });
+      const reportPath = join(opts.runsDir, id, "burp-upload.xml");
+      try {
+        writeFileSync(reportPath, Buffer.concat(chunks));
+      } catch (e) {
+        return sendJson(res, 500, { error: `failed to save upload: ${String(e).slice(0, 160)}` });
+      }
+      supervisor.burpImport(id, reportPath);
+      sendJson(res, 200, { ok: true });
     });
     return;
   }

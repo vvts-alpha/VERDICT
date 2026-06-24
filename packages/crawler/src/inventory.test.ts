@@ -106,3 +106,36 @@ test("buildScreenFromObservation surfaces APIs from scripts + form actions (serv
   assert.ok(keys.includes("POST /api/cart"), "axios API surfaced");
   assert.ok(keys.includes("GET /search"), "form action endpoint surfaced");
 });
+
+test("a plain HTML form POST becomes a first-class API with reqSchema from its fields (not just XHR)", () => {
+  const built = buildScreenFromObservation(
+    obs({
+      finalUrl: "https://shop.test/login",
+      forms: [
+        {
+          action: "/sessions",
+          method: "post",
+          fields: [
+            { name: "email", type: "email" },
+            { name: "password", type: "password" },
+            { name: "remember", type: "checkbox" },
+            { name: "attempts", type: "number" },
+          ],
+        },
+        // GET フォームはボディ無し(項目は query)→ reqSchema は付けない
+        { action: "/search", method: "get", fields: [{ name: "q", type: "text" }] },
+      ],
+    }),
+  );
+  const post = built.screen.apis.find((a) => a.method === "POST" && a.urlTemplate === "/sessions");
+  assert.ok(post, "form POST endpoint is an ApiCall");
+  assert.equal(post!.reqSchema?.type, "object");
+  const fields = post!.reqSchema?.type === "object" ? post!.reqSchema.fields : {};
+  assert.equal(fields.email?.type, "string");
+  assert.equal(fields.password?.type, "string");
+  assert.equal(fields.remember?.type, "boolean"); // checkbox → boolean
+  assert.equal(fields.attempts?.type, "number"); // number → number
+  // GET フォームはボディスキーマ無し
+  const get = built.screen.apis.find((a) => a.method === "GET" && a.urlTemplate === "/search");
+  assert.equal(get!.reqSchema, null);
+});

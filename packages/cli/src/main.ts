@@ -12,6 +12,7 @@ import {
   AssessmentStore,
   buildReport,
   buildReportModel,
+  buildOpenApi,
   renderMarkdown,
   renderReportHtml,
   renderFindingsCsv,
@@ -32,11 +33,11 @@ import {
 import { PlaywrightDriver, buildInventory, crawl, exploreScreen, htmlToPdf, labelInventory, normalizePath, smartLogin, writeScreenInventory } from "@veritas/crawler";
 import type { LoginCreds } from "@veritas/crawler";
 import { ClaudeCliClient } from "@veritas/llm";
-import { EvidenceStore, FetchHttpClient, SECURITY_HEADERS, auditHeaders, coarseCategory, parseBurpReport, burpSeverity, pickBurpConfigs, readEvidenceArtifact, scanInventory, startBurpScan, getBurpScan } from "@veritas/scanner";
+import { EvidenceStore, FetchHttpClient, SECURITY_HEADERS, auditHeaders, parseBurpReport, pickBurpConfigs, readEvidenceArtifact, scanInventory, startBurpScan, getBurpScan, mergeBurpIssues as scannerMergeBurpIssues } from "@veritas/scanner";
 import type { BurpIssue } from "@veritas/scanner";
 import { assessLogicInventory, assessScreenLogic, authDiffScreen } from "@veritas/agent";
 import type { RoleContext } from "@veritas/agent";
-import { runPilot } from "@veritas/pilot";
+import { runPilot, verifyBurpFindings } from "@veritas/pilot";
 import { startServer } from "@veritas/server";
 import { loadDotEnv } from "./dotenv.js";
 
@@ -52,6 +53,7 @@ commands:
             ★Claude-led: Claude drives the tools (browser/http/login/record) to autonomously explore, verify, and record
             uses the manifest's auth.roles via the login(role) tool. more flexible than the deterministic pipeline (no metered API / Max subscription)
             --fast-model enables model tiering: survey/methodology/login and low-value screens on fast, only high-value screen diagnosis on --model (e.g. --model opus --fast-model sonnet)
+            after per-screen diagnosis, a SCENARIO stage (deep model) hunts multi-step A04 business-logic abuse across endpoints (coupon/price/qty tampering, step-skip, mass-assignment) — auto-skipped if no transactional surface. [--no-scenario] disables it.
   pilot --survey-only --manifest <file.json> | --url <url> [...]
             survey only: maps screens + screenshots + API extraction only, no diagnosis/findings (cheap recon. diagnose later with --resume)
             ※ by default, during survey the model dynamically prunes low-value CMS content trees etc. via ignore_paths (curbs frontier explosion).
@@ -63,9 +65,9 @@ commands:
             → Enter to confirm → explore/diagnose on the live session. diagnosis uses per-role live cookies and keeps sessions warm between screens (re-login requested on expiry)
             roles can be given inline via --attended admin,userA,userB (no manifest needed / overrides). bare --attended uses the manifest's auth.roles
             ※ Burp integration (env by default, overridable by args): [--burp-proxy [url]] route all traffic through Burp (env BURP_PROXY if no value).
-              [--burp-scan [--burp-api url]] after diagnosis, also run a Burp active scan against the same run → merge results (connection via env BURP_API/BURP_API_KEY/BURP_RESOURCE_POOL). both off by default.
-  burp-scan --id <id> [--burp-api <url>] [--api-key <key>] [--config "<named config>"]... [--resource-pool <name>] [--manifest <m.json>] [--max-min <n>] [--poll <sec>] [--out <dir>]
-            launch a Burp Pro active scan via its REST API → poll to completion → import issues (no XML export needed). connection via env (BURP_API/BURP_API_KEY/BURP_RESOURCE_POOL) → overridable by args.
+              [--burp-scan [--burp-api url]] after diagnosis, also run a Burp active scan against the same run → merge results → AI re-verifies the High+ imports (connection via env BURP_API/BURP_API_KEY/BURP_RESOURCE_POOL). both off by default. [--no-burp-verify] skips the verify phase.
+  burp-scan --id <id> [--burp-api <url>] [--api-key <key>] [--config "<named config>"]... [--resource-pool <name>] [--manifest <m.json>] [--max-min <n>] [--poll <sec>] [--no-burp-verify] [--model <m>] [--out <dir>]
+            launch a Burp Pro active scan via its REST API → poll to completion → import issues (no XML export needed) → AI re-verifies the High+ imports. connection via env (BURP_API/BURP_API_KEY/BURP_RESOURCE_POOL) → overridable by args.
             target URLs = the in-scope screens the AI mapped for that run (= the AI decides the targets). checks/speed = Burp's named config.
             --config can be given multiple times (stack crawl speed + audit checks). scan speed is set by Burp's crawl strategy preset:
               e.g.) --config "Crawl strategy - fastest" --config "Audit checks - critical issues only"  (fast)
@@ -76,8 +78,8 @@ commands:
               defaults to the "250ms" pool (create it in Burp: Settings → Resource pool → Add → concurrency 1 / Delay 250ms).
               if absent, auto-continues on Burp's default pool (prints how to create one). override with --resource-pool <name>, --resource-pool "" for Burp's default.
             pass --manifest credentials for an authenticated scan. API key via --api-key or env BURP_API_KEY. Burp Pro's REST API must be enabled.
-  burp-import --id <id> --report <burp.xml> [--out <dir>]
-            import a Burp Pro XML report, adding only net-new issues that don't duplicate existing findings (integration is flag-driven / optional)
+  burp-import --id <id> --report <burp.xml> [--manifest <m.json>] [--no-burp-verify] [--model <m>] [--out <dir>]
+            import a Burp Pro XML report, adding only net-new issues that don't duplicate existing findings, then AI re-verifies the High+ imports (--no-burp-verify to skip). integration is flag-driven / optional.
   assess  --manifest <file.json> | --url <url> [--login-url <u>] [--login-wait <s>] [--no-label] [--no-logic] [--no-explore] [--browser-path <bin>] [--no-sandbox] [--model <m>] [--out <dir>]
             one-shot run (deterministic pipeline): crawl → label → scan → logic → report in a single command
             --login-url opens a headed browser and waits for login (password entered by hand, never injected)
@@ -100,6 +102,8 @@ commands:
             default md,html. pdf = HTML printed via Chromium (reuses the browser; needs a chromium binary). csv = findings.csv
   inventory --id <id> [--format csv,html] [--out <dir>]
             export the screen inventory (survey result / 画面一覧): screens.csv + inventory.html (with screenshots)
+  openapi --id <id> [--out <dir>]
+            emit the discovered API surface (XHR/fetch + HTML form POSTs, with body/query params) as openapi.json — feed it to Burp's API scan
   shots   --id <id> [--headed] [--browser-path <bin>] [--no-sandbox] [--out <dir>]
             re-shoot each screen of an existing run to backfill WebUI screenshots (reuses the run's authed profile, navigate-only)
   header-audit --id <id> [--headers csp,hsts,xfo,xcto,refpol,permpol] [--rate <ms>] [--out <dir>]
@@ -312,6 +316,49 @@ function cmdInventory(args: string[]): void {
   }
   console.log(`inventory written (${formats.join(", ")}): ${model.screens.length} screen(s)`);
   for (const p of written) console.log(`  ${p}`);
+}
+
+// 画面インベントリ(XHR/fetch ∪ HTMLフォームPOST)を OpenAPI 3.0 定義として書き出す(Burp の API scan へ渡す土台)。
+function cmdOpenApi(args: string[]): void {
+  const { values } = parseArgs({ args, options: { id: { type: "string" }, out: { type: "string" } } });
+  if (!values.id) fail("openapi requires --id <assessment-id>");
+  const runsDir = values.out ?? RUNS_DIR_DEFAULT;
+  const dbPath = dbPathFor(runsDir, values.id);
+  if (!existsSync(dbPath)) fail(`no state.sqlite at ${dbPath}`);
+  const store = AssessmentStore.open(dbPath);
+  const state = store.loadAssessment(values.id);
+  store.close();
+  if (!state) fail(`assessment ${values.id} not found`);
+
+  // servers の基底 = target.url → 画面の観測URL → scope host の順で決める。
+  const deriveBaseUrl = (): string => {
+    if ("url" in state.target && state.target.url) {
+      try {
+        const u = new URL(state.target.url);
+        return `${u.protocol}//${u.host}`;
+      } catch {
+        /* fall through */
+      }
+    }
+    for (const sc of state.screens) {
+      for (const ou of sc.observedUrls) {
+        try {
+          const u = new URL(ou);
+          return `${u.protocol}//${u.host}`;
+        } catch {
+          /* next */
+        }
+      }
+    }
+    const h = state.scope.inScopeHosts.find((x) => x !== "*" && !x.startsWith("*."));
+    return h ? `https://${h}` : "https://localhost";
+  };
+
+  const doc = buildOpenApi(state.screens, { baseUrl: deriveBaseUrl() });
+  const p = join(runsDir, values.id, "openapi.json");
+  writeFileSync(p, `${JSON.stringify(doc, null, 2)}\n`);
+  const ops = Object.values(doc.paths as Record<string, Record<string, unknown>>).reduce((n, m) => n + Object.keys(m).length, 0);
+  console.log(`openapi written: ${ops} operation(s) across ${Object.keys(doc.paths as object).length} path(s) → ${p}`);
 }
 
 function cmdList(args: string[]): void {
@@ -891,8 +938,10 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       rate: { type: "string" },
       "max-turns": { type: "string" },
       "max-screens": { type: "string" },
+      "no-scenario": { type: "boolean" }, // 既定で診断後に A04 シナリオ(横断ロジック)を実行。立てるとスキップ
       "burp-scan": { type: "boolean" },
       "burp-api": { type: "string" },
+      "no-burp-verify": { type: "boolean" }, // 既定で Burp High+ を AI 再検証。立てると検証フェーズをスキップ
       "keepalive-min": { type: "string" },
       "control-url": { type: "string" }, // attended×LiveHands: serve への逆接続先(supervisor が付与)
     },
@@ -1028,30 +1077,38 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       ...(roleCookieFiles.size ? { roleCookieFiles } : {}),
       ...(roleDescriptions.size ? { roleDescriptions } : {}),
       ...(values["fast-model"] ? { fastModel: values["fast-model"] } : {}),
+      ...(values["no-scenario"] ? { scenarioPass: false } : {}), // 既定 ON。立てると A04 シナリオを省く
       ...(burpProxy ? { burpProxy } : {}),
       ...(values["keepalive-min"] ? { keepAliveMinutes: Number.parseInt(values["keepalive-min"], 10) } : {}),
       ...(browserPath ? { browserPath } : {}),
       ...(values["no-sandbox"] ? { noSandbox: true } : {}),
       onText: (t) => console.log(`\n${t}`),
       onTool: (n, i) => console.log(`  ⚙ ${n.replace("mcp__veritas__", "")} ${JSON.stringify(i).slice(0, 160)}`),
+      // --burp-scan: 診断/シナリオの後、**セッション生存中の phase2_burpscan フェーズ**として Burp 能動スキャン
+      // → 取り込み → High+ 再検証を実施。keepWarm を poll 間に呼んでトークン/Cookie を維持する。失敗しても run は落とさない。
+      ...(values["burp-scan"] && !surveyOnly
+        ? {
+            onBurpScanPhase: async ({ keepWarm }: { keepWarm: () => Promise<void> }): Promise<void> => {
+              const burpState = store.loadAssessment(id);
+              if (!burpState) return;
+              const burpLogins = manifestRoleCreds(manifest).map((rc) => ({ username: rc.creds.username, password: rc.creds.password }));
+              const auto = pickBurpConfigs(burpState); // surface に応じて最適な named config を自動選択
+              await runBurpScanOnRun(store, id, burpState, runsDir, {
+                conn: resolveBurpRest({ ...(values["burp-api"] ? { "burp-api": values["burp-api"] } : {}) }),
+                configs: auto.configs,
+                configReason: `auto: ${auto.reason}`,
+                logins: burpLogins,
+                pollSec: 10,
+                maxMin: 30,
+                verify: !values["no-burp-verify"], // 既定: 取り込んだ High+ を AI 再検証
+                verifyModel: model, // 検証は深掘り(adversarial)なので deep model
+                httpBasic,
+                onPoll: keepWarm, // セッション維持
+              });
+            },
+          }
+        : {}),
     });
-    // --burp-scan: pilot のスキャンが終わったら、同じ run の in-scope 面に対して Burp 能動スキャンも実施。
-    // 接続は env(BURP_API/BURP_API_KEY/BURP_RESOURCE_POOL)→ 既定、--burp-api で上書き。失敗しても run は落とさない。
-    if (values["burp-scan"] && !surveyOnly) {
-      const burpState = store.loadAssessment(id);
-      if (burpState) {
-        const burpLogins = manifestRoleCreds(manifest).map((rc) => ({ username: rc.creds.username, password: rc.creds.password }));
-        const auto = pickBurpConfigs(burpState); // surface に応じて最適な named config を自動選択
-        await runBurpScanOnRun(store, id, burpState, runsDir, {
-          conn: resolveBurpRest({ ...(values["burp-api"] ? { "burp-api": values["burp-api"] } : {}) }),
-          configs: auto.configs,
-          configReason: `auto: ${auto.reason}`,
-          logins: burpLogins,
-          pollSec: 10,
-          maxMin: 30,
-        });
-      }
-    }
     const finalState = store.loadAssessment(id);
     if (finalState) writeFileSync(join(runsDir, id, "report.md"), buildReport(finalState, new Date(), { loadEvidence: evidenceLoaderFor(runsDir, id) }));
     const tk = res.tokensUsed >= 1000 ? `${(res.tokensUsed / 1000).toFixed(1)}k` : `${res.tokensUsed}`;
@@ -1375,6 +1432,8 @@ async function cmdHeaderAudit(args: string[]): Promise<void> {
 
 // Burp issue(XML or REST 由来)を run にマージ。既存 finding と (粗カテゴリ × 正規化エンドポイント) で
 // 重複排除し、スコープ外は捨てる。burp-import / burp-scan の両方が使う共通ロジック。
+// scanner の共通マージへ委譲(エンドポイント正規化だけ crawler の normalizePath を注入)。
+// 取り込んだ件数のログだけ CLI 側で出す(server は WS 経由で WebUI が反映)。
 function mergeBurpIssues(
   store: AssessmentStore,
   id: string,
@@ -1383,68 +1442,13 @@ function mergeBurpIssues(
   issues: ReadonlyArray<BurpIssue>,
   prefix = "b",
 ): { added: number; skipped: number; oos: number } {
-  const evidence = new EvidenceStore(join(runsDir, id, "artifacts"));
-  const keyOf = (cat: string, path: string): string => {
-    try {
-      return `${cat}::${normalizePath(path).template}`;
-    } catch {
-      return `${cat}::${path}`;
-    }
-  };
-  const existing = new Set<string>();
-  for (const f of state.findings) {
-    const ep = /(\/[A-Za-z0-9_{}/.-]+)/.exec(f.title)?.[1] ?? "/";
-    existing.add(keyOf(coarseCategory(f.title), ep));
-  }
-  let added = 0;
-  let skipped = 0;
-  let oos = 0;
-  for (const issue of issues) {
-    let url: string;
-    try {
-      url = new URL(issue.path || "/", issue.host).toString();
-    } catch {
-      url = issue.host;
-    }
-    if (!isInScope(url, state.scope)) {
-      oos += 1;
-      continue;
-    }
-    let path: string;
-    try {
-      path = new URL(url).pathname;
-    } catch {
-      path = issue.path || "/";
-    }
-    const key = keyOf(coarseCategory(issue.name), path);
-    if (existing.has(key)) {
-      skipped += 1;
-      continue;
-    }
-    existing.add(key);
-    added += 1;
-    const ev = evidence.record({
-      screenId: "burp",
-      validator: "burp",
-      kind: "positive_replay",
-      request: { method: "GET", url, headers: {}, body: issue.request || null },
-      response: { status: 0, finalUrl: url, durationMs: 0, headers: {}, body: issue.response },
-      note: issue.name,
-    });
-    store.upsertFinding(id, {
-      id: `${prefix}-${String(added).padStart(3, "0")}`,
-      screenId: null,
-      title: `[burp] ${issue.name}`,
-      severity: burpSeverity(issue.severity),
-      source: { kind: "validator", validatorName: "burp" },
-      description: `${(issue.detail || issue.background).slice(0, 600)} @ ${url}`,
-      reproSteps: "Burp が検出。証拠に request/response(Cookie/Authorization は伏字)。",
-      evidenceIds: [ev.id],
-      scopeBasis: "burp scan (in-scope)",
-    });
-    console.log(`  + ${prefix}-${String(added).padStart(3, "0")} [${burpSeverity(issue.severity)}] ${issue.name}`);
-  }
-  return { added, skipped, oos };
+  const before = store.loadAssessment(id)?.findings.length ?? state.findings.length;
+  const res = scannerMergeBurpIssues(store, id, state, join(runsDir, id, "artifacts"), issues, {
+    prefix,
+    pathTemplate: (p) => normalizePath(p).template,
+  });
+  if (res.added) console.log(`  + ${res.added} net-new finding(s) merged (from ${before} existing)`);
+  return res;
 }
 
 // Burp Pro の XML レポートを取り込み、既存 finding と重複しない net-new だけを追加する。
@@ -1453,7 +1457,14 @@ function mergeBurpIssues(
 async function cmdBurpImport(args: string[]): Promise<void> {
   const { values } = parseArgs({
     args,
-    options: { id: { type: "string" }, report: { type: "string" }, out: { type: "string" } },
+    options: {
+      id: { type: "string" },
+      report: { type: "string" },
+      out: { type: "string" },
+      manifest: { type: "string" }, // 認証下 finding の再検証に Basic 資格を渡す(任意)
+      "no-burp-verify": { type: "boolean" },
+      model: { type: "string" },
+    },
   });
   if (!values.id) fail("burp-import requires --id <assessment-id>");
   if (!values.report) fail("burp-import requires --report <burp-report.xml>");
@@ -1471,8 +1482,15 @@ async function cmdBurpImport(args: string[]): Promise<void> {
 
   const issues = parseBurpReport(readFileSync(values.report, "utf8"));
   const { added, skipped, oos } = mergeBurpIssues(store, id, state, runsDir, issues);
-  store.close();
   console.log(`\nburp-import ${id}: ${issues.length} issue(s) → +${added} net-new(dup ${skipped} / out-of-scope ${oos})`);
+  // 取り込んだ Burp 由来 High+ を AI が能動再検証(REST 経路と同じフェーズ)。--no-burp-verify で無効。
+  if (added > 0 && !values["no-burp-verify"]) {
+    const httpBasic = manifestHttpBasic(values.manifest ? loadManifest(values.manifest) : null);
+    await verifyImportedBurp(store, id, runsDir, { ...(values.model ? { model: values.model } : {}), httpBasic });
+    const fs2 = store.loadAssessment(id);
+    if (fs2) writeFileSync(join(runsDir, id, "report.md"), buildReport(fs2, new Date(), { loadEvidence: evidenceLoaderFor(runsDir, id) }));
+  }
+  store.close();
 }
 
 // Burp REST 接続情報を「引数 → env → 既定」で解決する。env: BURP_API / BURP_API_KEY / BURP_RESOURCE_POOL。
@@ -1495,7 +1513,7 @@ async function runBurpScanOnRun(
   id: string,
   state: AssessmentState,
   runsDir: string,
-  o: { conn: BurpRestConn; configs: string[]; configReason?: string; logins: Array<{ username: string; password: string }>; pollSec: number; maxMin: number },
+  o: { conn: BurpRestConn; configs: string[]; configReason?: string; logins: Array<{ username: string; password: string }>; pollSec: number; maxMin: number; verify?: boolean; verifyModel?: string; httpBasic?: { user: string; pass: string } | null; onPoll?: () => Promise<void> },
 ): Promise<number> {
   const { base, apiKey, resourcePool } = o.conn;
   const usePool = resourcePool !== "";
@@ -1540,6 +1558,7 @@ async function runBurpScanOnRun(
   let last: Awaited<ReturnType<typeof getBurpScan>> | null = null;
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, o.pollSec * 1000));
+    await o.onPoll?.(); // セッション維持(authed Burp スキャン中に Cookie/トークンを stale 化させない)
     try {
       last = await getBurpScan(base, apiKey, taskId);
     } catch (e) {
@@ -1556,12 +1575,47 @@ async function runBurpScanOnRun(
   if (last.status !== "succeeded") console.log(`⚠ scan ended status=${last.status} — importing the issues found so far`);
 
   const { added, skipped, oos } = mergeBurpIssues(store, id, state, runsDir, last.issues, "bs");
+  console.log(`\nburp-scan ${id}: ${last.issues.length} issue(s) → +${added} net-new(dup ${skipped} / out-of-scope ${oos})`);
   if (added > 0) {
+    if (o.verify !== false) await verifyImportedBurp(store, id, runsDir, { ...(o.verifyModel ? { model: o.verifyModel } : {}), httpBasic: o.httpBasic ?? null });
     const fs2 = store.loadAssessment(id);
     if (fs2) writeFileSync(join(runsDir, id, "report.md"), buildReport(fs2, new Date(), { loadEvidence: evidenceLoaderFor(runsDir, id) }));
   }
-  console.log(`\nburp-scan ${id}: ${last.issues.length} issue(s) → +${added} net-new(dup ${skipped} / out-of-scope ${oos})`);
   return added;
+}
+
+// Burp 取り込み後の検証フェーズ: 取り込んだ Burp 由来 High+ を AI が能動再テスト(verifyBurpFindings)。
+// REST(burp-scan)・XML(burp-import)両方の取り込み経路から呼ぶ共通ヘルパ。非致命(失敗しても run は継続)。
+async function verifyImportedBurp(
+  store: AssessmentStore,
+  id: string,
+  runsDir: string,
+  o: { model?: string; httpBasic?: { user: string; pass: string } | null },
+): Promise<void> {
+  const st = store.loadAssessment(id);
+  if (!st) return;
+  const scope = st.scope;
+  const rpm = scope.rate?.requestsPerMinute ?? 30;
+  const minDelayMs = Math.max(0, Math.floor(60_000 / Math.max(1, rpm)));
+  const artifactsDir = join(runsDir, id, "artifacts");
+  const http = new FetchHttpClient({ allow: (u) => isInScope(u, scope), minDelayMs, ...(o.httpBasic ? { headers: basicHeader(o.httpBasic) } : {}) });
+  const evidence = new EvidenceStore(artifactsDir);
+  try {
+    const res = await verifyBurpFindings({
+      store,
+      assessmentId: id,
+      scope,
+      http,
+      evidence,
+      artifactsDir,
+      ...(o.model ? { model: o.model } : {}),
+      onText: (t) => console.log(`  🔎 ${t.slice(0, 200)}`),
+      onTool: (n, i) => console.log(`    ⚙ ${n.replace("mcp__veritas__", "")} ${JSON.stringify(i).slice(0, 120)}`),
+    });
+    if (res.checked > 0) console.log(`▶ burp-verify ${id}: ${res.checked} High+ re-tested → ${res.confirmed} confirmed ✓ / ${res.refuted} not reproduced ?`);
+  } catch (e) {
+    console.log(`⚠ burp-verify skipped: ${String(e).slice(0, 160)}`);
+  }
 }
 
 // Burp Pro の REST API を叩いて能動スキャンを起動 → 完了までポーリング → issue を取り込む(XML export 不要のライブ版)。
@@ -1580,6 +1634,8 @@ async function cmdBurpScan(args: string[]): Promise<void> {
       manifest: { type: "string" },
       "max-min": { type: "string" },
       poll: { type: "string" },
+      "no-burp-verify": { type: "boolean" },
+      model: { type: "string" }, // 検証に使うモデル(任意)
     },
   });
   if (!values.id) fail("burp-scan requires --id <assessment-id>");
@@ -1604,9 +1660,20 @@ async function cmdBurpScan(args: string[]): Promise<void> {
   // 認証スキャン(任意): manifest の資格情報を Burp の application_logins に渡す。
   const manifest = values.manifest ? loadManifest(values.manifest) : null;
   const logins = manifestRoleCreds(manifest).map((rc) => ({ username: rc.creds.username, password: rc.creds.password }));
+  const httpBasic = manifestHttpBasic(manifest);
 
   try {
-    await runBurpScanOnRun(store, id, state, runsDir, { conn, configs, configReason, logins, pollSec, maxMin });
+    await runBurpScanOnRun(store, id, state, runsDir, {
+      conn,
+      configs,
+      configReason,
+      logins,
+      pollSec,
+      maxMin,
+      verify: !values["no-burp-verify"],
+      ...(values.model ? { verifyModel: values.model } : {}),
+      httpBasic,
+    });
   } finally {
     store.close();
   }
@@ -1798,6 +1865,9 @@ async function main(): Promise<void> {
       return;
     case "inventory":
       cmdInventory(rest);
+      return;
+    case "openapi":
+      cmdOpenApi(rest);
       return;
     case "shots":
       await cmdShots(rest);

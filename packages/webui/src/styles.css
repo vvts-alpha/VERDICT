@@ -344,6 +344,14 @@ button:hover { background: #353d4a; }
 .dl-menu .dl-h { font-size: 9px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); padding: 6px 8px 2px; }
 .dl-menu a { font-size: 12px; color: var(--fg); text-decoration: none; padding: 5px 8px; border-radius: 4px; }
 .dl-menu a:hover { background: #243a52; color: var(--accent); }
+.dl-menu .dl-imp { font-size: 12px; color: var(--fg); background: none; border: none; text-align: left; cursor: pointer; padding: 5px 8px; border-radius: 4px; }
+.dl-menu .dl-imp:hover { background: #243a52; color: var(--accent); }
+.dl-menu .dl-status { font-size: 10px; color: var(--muted); padding: 2px 8px 4px; white-space: normal; word-break: break-word; }
+.burpscan { display: inline-flex; align-items: center; gap: 6px; }
+.burpscan-btn { font-size: 11px; padding: 2px 8px; border-radius: 4px; background: #2b3340; color: var(--muted); border: none; cursor: pointer; white-space: nowrap; }
+.burpscan-btn:hover:not(:disabled) { background: #243a52; color: var(--accent); }
+.burpscan-btn:disabled { opacity: .5; cursor: default; }
+.burpscan-status { font-size: 10px; color: var(--muted); max-width: 280px; white-space: normal; }
 
 /* 💬 Ask — assessment への読み取り Q&A チャット */
 .chat { display: flex; flex-direction: column; height: 100%; min-height: 0; }

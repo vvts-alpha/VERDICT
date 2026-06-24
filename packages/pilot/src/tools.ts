@@ -40,6 +40,9 @@ export interface PilotSession {
   roleDescriptions: Map<string, string>;
   loginLlm: LlmClient;
   currentCookie: string;
+  /** SPA が保持する Bearer JWT(localStorage 等)。cookie 認証でない API(Juice Shop 等)向けに
+   *  http_request / probe_logic が `Authorization: Bearer` として載せる。login() が各ロールで更新。 */
+  currentBearer: string;
   currentRole: string;
   findings: Finding[];
   findCounter: number;
@@ -56,6 +59,9 @@ export interface PilotSession {
   httpAuthWall: number;
   /** うち 2xx(認証を抜けて通った)数。 */
   httpThrough: number;
+  /** 現在の画面で撃った診断プローブ数(画面開始でリセット)。screen_done のカバレッジ・ゲートの裏取りに使う
+   *  (「全部 clean」と自己申告しつつ実は1回も probe してない、を弾く)。 */
+  screenProbes: number;
   done: boolean;
   doneSummary: string;
   model: string | undefined;
@@ -83,6 +89,8 @@ export interface PilotSession {
   surveyDone: boolean;
   methodologyDone: boolean;
   screenDone: boolean;
+  /** シナリオ(A04 横断ロジック)ステージの完了シグナル。 */
+  scenarioDone: boolean;
   // ── attended(手動マルチセッション認証)──
   /** 手動ログイン済みのロール別ライブセッション。未指定 = 通常(単一コンテキスト)モード。 */
   roleSessions?: Map<string, RoleSession>;
@@ -92,7 +100,9 @@ export interface PilotSession {
 export const STAGE_TOOLS = {
   survey: ["browser_navigate", "browser_fill", "browser_click", "login", "probe_paths", "ignore_paths", "survey_status", "survey_done"],
   methodology: ["get_inventory", "record_methodology", "methodology_done"],
-  diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_logic", "analyze_session", "verify_access", "browser_navigate", "browser_fill", "browser_click", "record_finding", "screen_done"],
+  diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_redirect", "probe_jwt", "probe_logic", "analyze_session", "verify_access", "browser_navigate", "browser_fill", "browser_click", "record_finding", "screen_done"],
+  // シナリオ(A04 横断ロジック): inventory 俯瞰 + 多段リクエスト連鎖を probe_scenario で撃つ。画面診断の後に1回。
+  scenario: ["get_inventory", "login", "http_request", "probe_scenario", "record_finding", "scenario_done"],
 } as const;
 
 const txt = (s: string): { content: { type: "text"; text: string }[] } => ({ content: [{ type: "text", text: s }] });
@@ -120,20 +130,22 @@ function maxSev(a: Severity, b: Severity): Severity {
 /** vulnClass の自由文 → 粗いカテゴリ(dedup キー用)。同じ穴の言い換えを1つに畳む。
  *  正準カテゴリ(CATEGORIES)を渡された場合はそのまま返す(冪等。xss-stored の誤畳み防止)。 */
 export function coarseClass(vulnClass: string): string {
-  const s = vulnClass.toLowerCase();
-  if ((CATEGORIES as readonly string[]).includes(s)) return s;
-  if (/stored xss|persistent xss/.test(s)) return "xss-stored";
-  if (/xss|cross[\s-]?site script/.test(s)) return "xss-reflected";
-  if (/path travers|arbitrary file|file read|\blfi\b|directory travers|cwe-22/.test(s)) return "path-traversal";
-  if (/\bsqli\b|sql inj/.test(s)) return "sqli";
-  if (/idor|bola|object[\s-]?level|broken access|broken object/.test(s))
-    return /write|overwrite|update|modif|edit/.test(s) ? "idor-write" : "idor";
-  if (/open redirect|unvalidated redirect/.test(s)) return "open-redirect";
-  if (/\bssrf\b/.test(s)) return "ssrf";
-  if (/\brce\b|command inj|remote code/.test(s)) return "rce";
-  if (/rate limit|lockout|brute[\s-]?force/.test(s)) return "rate-limit";
-  if (/security header|missing header|response header/.test(s)) return "headers";
-  if (/\bcsrf\b|cross[\s-]?site request/.test(s)) return "csrf";
+  const s = vulnClass.toLowerCase().trim();
+  if ((CATEGORIES as readonly string[]).includes(s)) return s; // 正準カテゴリはそのまま(冪等)
+  // ハイフン/アンダースコアを空白に正規化(methodology の "SQL-injection"/"stored-XSS" 等の言い換えに強く)。
+  const sn = s.replace(/[_-]+/g, " ");
+  if (/stored xss|persistent xss/.test(sn)) return "xss-stored";
+  if (/xss|cross\s?site script/.test(sn)) return "xss-reflected";
+  if (/path travers|arbitrary file|file read|\blfi\b|directory travers|cwe 22/.test(sn)) return "path-traversal";
+  if (/\bsqli\b|sql inj/.test(sn)) return "sqli";
+  if (/idor|bola|object\s?level|broken access|broken object/.test(sn))
+    return /write|overwrite|update|modif|edit/.test(sn) ? "idor-write" : "idor";
+  if (/open redirect|unvalidated redirect/.test(sn)) return "open-redirect";
+  if (/\bssrf\b/.test(sn)) return "ssrf";
+  if (/\brce\b|command inj|remote code|template inj|\bssti\b/.test(sn)) return "rce";
+  if (/rate limit|lockout|brute\s?force/.test(sn)) return "rate-limit";
+  if (/security header|missing header|response header/.test(sn)) return "headers";
+  if (/\bcsrf\b|cross\s?site request/.test(sn)) return "csrf";
   return s.replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 24) || "other";
 }
 
@@ -188,6 +200,10 @@ export const CATEGORIES = [
 /** ビジネスロジック系(probe_logic の差分テスト + record_finding のマーカーベース確証を使う)。 */
 export const BUSINESS_LOGIC_CATEGORIES = new Set<string>(["price-tampering", "qty-tampering", "workflow-bypass", "mass-assignment"]);
 
+/** 「特定マーカーがレスポンスに現れたら確証」型のカテゴリ(長さ差分でなくマーカー有無で判定)。
+ *  ビジネスロジック(probe_logic/probe_scenario)＋ 反射 XSS(未エスケープ反射)＋ open-redirect(Location が OOB)。 */
+export const MARKER_BASED_CATEGORIES = new Set<string>([...BUSINESS_LOGIC_CATEGORIES, "xss-reflected", "xss-stored", "open-redirect"]);
+
 /** probe_paths の「簡単なディレクトリリスト」= 未リンク endpoint を踏むための厳選ワードリスト。
  *  ※ logout/signout 系は **入れない**。認証済みセッションで GET するとサーバ側セッションが破棄され、
  *    以降の認証診断が全滅する(自滅)。isSessionDestroyingPath でも二重に弾く。 */
@@ -231,8 +247,70 @@ const PARAM_PROBES: Array<{ name: string; value: string; kind: "idor" | "redirec
   ),
 ];
 
-function cookieHeader(s: PilotSession): Record<string, string> {
-  return s.currentCookie ? { cookie: s.currentCookie } : {};
+/** probe_scenario の {{var}} 置換。文字列中の {{name}} を vars[name] で差し替え(未定義は空文字)。 */
+export function substVars(input: string, vars: Record<string, string>): string {
+  return input.replace(/\{\{\s*([A-Za-z0-9_.]+)\s*\}\}/g, (_, k: string) => vars[k] ?? "");
+}
+
+/** レスポンス本文から値を抽出(probe_scenario の capture)。まず JSON パス(dot/array index 例 data.0.id)、
+ *  失敗したら正規表現の第1キャプチャ。取れなければ null。前段の id/token を後段に差し込むための土台。 */
+export function extractValue(body: string, expr: string): string | null {
+  // ① JSON パス
+  try {
+    const json = JSON.parse(body);
+    let cur: unknown = json;
+    for (const seg of expr.split(".")) {
+      if (cur == null) break;
+      const idx = /^\d+$/.test(seg) ? Number(seg) : seg;
+      cur = (cur as Record<string | number, unknown>)[idx];
+    }
+    if (cur != null && (typeof cur === "string" || typeof cur === "number" || typeof cur === "boolean")) return String(cur);
+  } catch {
+    /* not json — fall through to regex */
+  }
+  // ② 正規表現(第1キャプチャ、無ければマッチ全体)
+  try {
+    const m = new RegExp(expr).exec(body);
+    if (m) return m[1] ?? m[0];
+  } catch {
+    /* invalid regex */
+  }
+  return null;
+}
+
+/** 現在ロールの認証材料(cookie + Bearer JWT)をヘッダ化。cookie 認証でない API(Juice Shop 等の
+ *  `Authorization: Bearer <localStorage.token>`)にも届くよう bearer を載せる。呼び出し側ヘッダで上書き可能。 */
+export function authHeaders(s: Pick<PilotSession, "currentCookie" | "currentBearer">): Record<string, string> {
+  return {
+    ...(s.currentCookie ? { cookie: s.currentCookie } : {}),
+    ...(s.currentBearer ? { authorization: `Bearer ${s.currentBearer}` } : {}),
+  };
+}
+
+function b64urlDecode(s: string): string {
+  const pad = s.length % 4 === 0 ? "" : "=".repeat(4 - (s.length % 4));
+  return Buffer.from(s.replace(/-/g, "+").replace(/_/g, "/") + pad, "base64").toString("utf8");
+}
+function b64urlEncode(s: string): string {
+  return Buffer.from(s, "utf8").toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/** JWT を alg:none で再エンコード(署名空)。サーバが署名検証していなければ受理される = 致命的偽造。
+ *  header.alg を "none" に、payload はそのまま(mutate で claim 改変も可)。失敗時 null。 */
+export function forgeAlgNone(token: string, mutate?: (claims: Record<string, unknown>) => void): string | null {
+  const parts = token.split(".");
+  if (parts.length < 2 || !parts[0] || !parts[1]) return null;
+  let header: Record<string, unknown>;
+  let payload: Record<string, unknown>;
+  try {
+    header = JSON.parse(b64urlDecode(parts[0]));
+    payload = JSON.parse(b64urlDecode(parts[1]));
+  } catch {
+    return null;
+  }
+  header.alg = "none";
+  if (mutate) mutate(payload);
+  return `${b64urlEncode(JSON.stringify(header))}.${b64urlEncode(JSON.stringify(payload))}.`;
 }
 
 /** ignore_paths のパターン照合。`*` をワイルドカードとして扱い、`*` を含まないパターンは前方一致。
@@ -376,8 +454,53 @@ export function frontierLinks(
 /** 診断プローブの応答ステータスを集計(認証壁サーキットブレーカ用)。401=壁、2xx=通過。 */
 function bumpHttp(s: PilotSession, status: number): void {
   s.httpProbes += 1;
+  s.screenProbes += 1; // 画面ごとの診断アクティビティ(screen_done ゲートの裏取り)
   if (status === 401) s.httpAuthWall += 1;
   else if (status >= 200 && status < 300) s.httpThrough += 1;
+}
+
+/** 画面プランの `classes=[a,b,c]` 接頭辞から、計画した攻撃クラスを正準化して取り出す(カバレッジ・ゲート用)。
+ *  info-disclosure/headers/misconfig 等の「単発で出る」クラスは網羅強制の対象外(プランに無くても発見されうる)。 */
+export function plannedClassesFor(plan: string | undefined): string[] {
+  if (!plan) return [];
+  const m = /^classes=\[([^\]]*)\]/.exec(plan);
+  if (!m) return [];
+  const raw = (m[1] ?? "").split(",").map((c) => c.trim()).filter(Boolean);
+  // 受動的・機会的に見つかるクラス(計画に書かれてもアクティブ網羅の強制対象にしない)。
+  const EXCLUDED = new Set(["other", "headers", "info-disclosure", "misconfig"]);
+  const out = new Set<string>();
+  for (const c of raw) {
+    const cc = coarseClass(c);
+    if (cc && !EXCLUDED.has(cc)) out.add(cc);
+  }
+  return [...out];
+}
+
+/** screen_done のカバレッジ・ゲート(純粋)。計画した攻撃クラスを coverage が全部説明していて、かつ
+ *  「tested-clean/found を主張するなら最低1回は probe している」ことを要求する。満たさなければ差し戻し理由を返す。
+ *  プランにクラスが無い画面(計画なし/info系のみ)はゲート対象外(従来どおり閉じれる)。 */
+export function checkScreenCoverage(
+  planned: string[],
+  coverage: ReadonlyArray<{ class: string; result: string }>,
+  screenProbes: number,
+): { ok: true } | { ok: false; reason: string } {
+  if (planned.length === 0) return { ok: true };
+  const covered = new Set(coverage.map((c) => coarseClass(c.class)));
+  const missing = planned.filter((p) => !covered.has(p));
+  if (missing.length > 0) {
+    return {
+      ok: false,
+      reason: `the plan named ${planned.length} attack class(es); you haven't accounted for: ${missing.join(", ")}. Test each (record_finding) or pass a coverage entry marking it tested-clean / not-applicable(reason). Do NOT stop at the first finding.`,
+    };
+  }
+  const claimsTested = coverage.some((c) => c.result === "tested-clean" || c.result === "found");
+  if (claimsTested && screenProbes === 0) {
+    return {
+      ok: false,
+      reason: `coverage claims classes were tested, but no probe (http_request / probe_params / probe_logic / verify_access) was fired on this screen. Actually exercise the plan before closing.`,
+    };
+  }
+  return { ok: true };
 }
 
 /** 証拠規律の構造チェック(純粋・カテゴリ非依存)。runValidator と同じ規律を pilot finding に強制する:
@@ -634,6 +757,8 @@ export function buildTools(s: PilotSession) {
           JSON.stringify({
             screen: { ...screenDigest(sc), observedUrls: sc.observedUrls.slice(0, 6), description: sc.description },
             plan: s.plans.get(sc.screenId) ?? "(no recorded plan — use judgement)",
+            // 必ず潰すチェックリスト。screen_done は各クラスの coverage を要求する(1個見つけて打ち切るのを防ぐ)。
+            plannedClasses: plannedClassesFor(s.plans.get(sc.screenId)),
             currentRole: s.currentRole || "unauth",
             rolesAvailable: availableRoles(s),
             knownObjectIds: knownObjectIds(s),
@@ -657,7 +782,7 @@ export function buildTools(s: PilotSession) {
         const req: HttpRequest = {
           method: method.toUpperCase(),
           url,
-          headers: { ...(s.currentCookie ? { cookie: s.currentCookie } : {}), ...(headers ?? {}) },
+          headers: { ...authHeaders(s), ...(headers ?? {}) },
           body: body ?? null,
         };
         let res: HttpResponse;
@@ -701,8 +826,9 @@ export function buildTools(s: PilotSession) {
           const fresh = await live.driver.sessionCookieHeader().catch(() => live.cookie);
           if (fresh) live.cookie = fresh;
           s.currentCookie = live.cookie;
+          s.currentBearer = (await live.driver.bearerToken().catch(() => null)) ?? "";
           s.currentRole = role;
-          return txt(`switched to live attended session for role '${role}'${tag} (manual login; cookie ${live.cookie ? "present" : "empty"}).`);
+          return txt(`switched to live attended session for role '${role}'${tag} (manual login; cookie ${live.cookie ? "present" : "empty"}${s.currentBearer ? ", bearer present" : ""}).`);
         }
         // ① 事前取得 Cookie ファイルがあれば、ログインせずに注入(自動ログイン不能な壁向け)。
         const cookieFile = s.roleCookieFiles.get(role);
@@ -713,6 +839,7 @@ export function buildTools(s: PilotSession) {
             await s.driver.clearSession();
             await s.driver.addCookies(browserCookies);
             s.currentCookie = header;
+            s.currentBearer = (await s.driver.bearerToken().catch(() => null)) ?? "";
             s.currentRole = role;
             return txt(`role '${role}'${tag}: injected ${browserCookies.length} pre-captured cookie(s) from file (no login).`);
           } catch (e) {
@@ -733,13 +860,186 @@ export function buildTools(s: PilotSession) {
           });
           if (r.ok) {
             s.currentCookie = await s.driver.sessionCookieHeader();
+            s.currentBearer = (await s.driver.bearerToken().catch(() => null)) ?? "";
             s.currentRole = role;
-            return txt(`logged in as '${role}'${tag}; now at ${s.driver.currentUrl()}`);
+            return txt(`logged in as '${role}'${tag}; now at ${s.driver.currentUrl()}${s.currentBearer ? " (bearer JWT captured)" : ""}`);
           }
           return txt(`login as '${role}' did not complete: ${r.reason}`);
         } catch (e) {
           return txt(`login error: ${String(e).slice(0, 200)}`);
         }
+      },
+    ),
+    tool(
+      "probe_xss",
+      "Confirm REFLECTED XSS: injects a unique marker into `param` and checks the HTML response reflects it UNESCAPED (the literal <tag> comes back, not &lt;tag&gt;). Sends a benign control (no tag) + a breakout payload twice. Returns negativeControl + positiveReplays evidenceIds + the effectMarker, ready for record_finding(category xss-reflected). Default = GET query-param reflection; pass a `body` containing {{XSS}} (and method/url) to test a body field. NOTE: confirms unescaped HTML reflection (high-signal first-order XSS); not proof of execution.",
+      { url: z.string(), param: z.string().optional(), method: z.string().optional(), body: z.string().optional() },
+      async ({ url, param, method, body }) => {
+        const tok = `xZ${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`;
+        const marker = `<xss${tok}>`; // 未エスケープで返れば HTML パース文脈に注入できている
+        const send = async (val: string, kind: "negative_control" | "positive_replay", tag: string) => {
+          let u = url;
+          let b: string | null = null;
+          if (body != null) b = body.replace(/\{\{XSS\}\}/g, val);
+          else if (param) {
+            try {
+              const uu = new URL(url);
+              uu.searchParams.set(param, val);
+              u = uu.toString();
+            } catch {
+              return null;
+            }
+          }
+          if (!isInScope(u, s.scope)) throw new Error(`out of scope: ${u}`);
+          const req: HttpRequest = { method: (method ?? (body != null ? "POST" : "GET")).toUpperCase(), url: u, headers: authHeaders(s), body: b };
+          const res = await s.http.send(req);
+          bumpHttp(s, res.status);
+          const ev = s.evidence.record({
+            screenId: s.currentScreenId ?? "pilot",
+            validator: "claude-pilot-xss",
+            kind,
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
+            response: res,
+            note: `xss ${tag} ${param ?? "body"}`,
+          });
+          return { evId: ev.id, status: res.status, raw: res.body.includes(marker), html: /html/i.test(res.headers["content-type"] ?? "") };
+        };
+        let ctrl: Awaited<ReturnType<typeof send>>;
+        let p1: Awaited<ReturnType<typeof send>>;
+        let p2: Awaited<ReturnType<typeof send>>;
+        try {
+          ctrl = await send(`xss${tok}`, "negative_control", "control(benign, no tag)");
+          p1 = await send(`"><xss${tok}>`, "positive_replay", "payload #1");
+          p2 = await send(`"><xss${tok}>`, "positive_replay", "payload #2");
+        } catch (e) {
+          return txt(`ERROR: ${String(e).slice(0, 180)}`);
+        }
+        if (!ctrl || !p1 || !p2) return txt("ERROR: could not build request (bad url/param — pass a valid url + param or a body with {{XSS}})");
+        const verdict = checkLogicEvidence(
+          { status: ctrl.status, hasMarker: ctrl.raw },
+          [p1, p2].map((p) => ({ status: p.status, hasMarker: p.raw })),
+        );
+        const htmlCtx = p1.html && p2.html;
+        return txt(
+          JSON.stringify({
+            negativeControl: ctrl.evId,
+            positiveReplays: [p1.evId, p2.evId],
+            effectMarker: marker,
+            control: { reflectedUnescaped: ctrl.raw },
+            payload: [{ reflectedUnescaped: p1.raw, htmlResponse: p1.html }, { reflectedUnescaped: p2.raw, htmlResponse: p2.html }],
+            verdict: verdict.ok
+              ? htmlCtx
+                ? "REFLECTED XSS — payload reflected UNESCAPED in an HTML response; record_finding(xss-reflected) with these evidenceIds + effectMarker"
+                : "payload reflected unescaped but response is NOT html content-type — likely not browser-executable; verify the sink before recording"
+              : `not confirmed: ${(verdict as { reason: string }).reason}`,
+          }),
+        );
+      },
+    ),
+    tool(
+      "probe_redirect",
+      "Confirm an OPEN REDIRECT: sets `param` to an attacker-controlled external host and checks the response redirects there (Location header → the OOB host). Sends a benign in-scope control + the external payload twice. Returns negativeControl + positiveReplays evidenceIds + the effectMarker (the OOB host), ready for record_finding(category open-redirect).",
+      { url: z.string(), param: z.string() },
+      async ({ url, param }) => {
+        const marker = OOB_MARKER;
+        const send = async (val: string, kind: "negative_control" | "positive_replay", tag: string) => {
+          let u: string;
+          try {
+            const uu = new URL(url);
+            uu.searchParams.set(param, val);
+            u = uu.toString();
+          } catch {
+            return null;
+          }
+          if (!isInScope(u, s.scope)) throw new Error(`out of scope: ${u}`);
+          const req: HttpRequest = { method: "GET", url: u, headers: authHeaders(s), body: null };
+          const res = await s.http.send(req);
+          bumpHttp(s, res.status);
+          const loc = res.headers["location"] ?? "";
+          const ev = s.evidence.record({
+            screenId: s.currentScreenId ?? "pilot",
+            validator: "claude-pilot-redirect",
+            kind,
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
+            response: res,
+            note: `redirect ${tag} ${param}`,
+          });
+          return { evId: ev.id, status: res.status, toOob: loc.includes(marker), location: loc.slice(0, 200) };
+        };
+        let ctrl: Awaited<ReturnType<typeof send>>;
+        let p1: Awaited<ReturnType<typeof send>>;
+        let p2: Awaited<ReturnType<typeof send>>;
+        try {
+          ctrl = await send("/account", "negative_control", "control(in-scope path)");
+          p1 = await send(`https://${marker}/`, "positive_replay", "payload #1");
+          p2 = await send(`https://${marker}/`, "positive_replay", "payload #2");
+        } catch (e) {
+          return txt(`ERROR: ${String(e).slice(0, 180)}`);
+        }
+        if (!ctrl || !p1 || !p2) return txt("ERROR: could not build request (bad url/param)");
+        const verdict = checkLogicEvidence(
+          { status: ctrl.status, hasMarker: ctrl.toOob },
+          [p1, p2].map((p) => ({ status: p.status, hasMarker: p.toOob })),
+        );
+        return txt(
+          JSON.stringify({
+            negativeControl: ctrl.evId,
+            positiveReplays: [p1.evId, p2.evId],
+            effectMarker: marker,
+            control: { location: ctrl.location, toOob: ctrl.toOob },
+            payload: [{ location: p1.location, toOob: p1.toOob }, { location: p2.location, toOob: p2.toOob }],
+            verdict: verdict.ok
+              ? "OPEN REDIRECT — Location points to the attacker-controlled OOB host; record_finding(open-redirect) with these evidenceIds + effectMarker"
+              : `not confirmed: ${(verdict as { reason: string }).reason}`,
+          }),
+        );
+      },
+    ),
+    tool(
+      "probe_jwt",
+      "Confirm a JWT signature-verification bypass (alg:none forgery). Requires the current session to hold a Bearer JWT (login first). Forges an alg:none token from it (empty signature) and replays it against an identity-returning authed `url`; sends a garbage token as the negative control (must be rejected) and the forged token twice (if accepted = the server does not verify the signature). Returns negativeControl + positiveReplays evidenceIds for record_finding(category session). Optionally mutate a claim via `claimKey`/`claimValue` to also prove privilege escalation.",
+      { url: z.string(), claimKey: z.string().optional(), claimValue: z.string().optional() },
+      async ({ url, claimKey, claimValue }) => {
+        if (!s.currentBearer) return txt("no Bearer JWT in the current session — login(role) first (this probe forges from the live token).");
+        if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} is out of scope`);
+        const forged = forgeAlgNone(s.currentBearer, claimKey ? (c) => { c[claimKey] = claimValue ?? "admin"; } : undefined);
+        if (!forged) return txt("could not parse the current Bearer token as a JWT (header.payload.signature).");
+        const send = async (bearer: string, kind: "negative_control" | "positive_replay", tag: string) => {
+          const req: HttpRequest = { method: "GET", url, headers: { ...authHeaders(s), authorization: `Bearer ${bearer}` }, body: null };
+          const res = await s.http.send(req);
+          bumpHttp(s, res.status);
+          const ev = s.evidence.record({
+            screenId: s.currentScreenId ?? "pilot",
+            validator: "claude-pilot-jwt",
+            kind,
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
+            response: res,
+            note: `jwt ${tag}`,
+          });
+          return { evId: ev.id, status: res.status, len: res.body.length };
+        };
+        let ctrl: Awaited<ReturnType<typeof send>>;
+        let p1: Awaited<ReturnType<typeof send>>;
+        let p2: Awaited<ReturnType<typeof send>>;
+        try {
+          ctrl = await send("eyJhbGciOiJub25lIn0.eyJpbnZhbGlkIjp0cnVlfQ.", "negative_control", "garbage/invalid token"); // 明らかに無効 → 401 が期待
+          p1 = await send(forged, "positive_replay", "forged alg:none #1");
+          p2 = await send(forged, "positive_replay", "forged alg:none #2");
+        } catch (e) {
+          return txt(`ERROR: ${String(e).slice(0, 180)}`);
+        }
+        const accepted = p1.status < 400 && p2.status < 400 && ctrl.status >= 400;
+        return txt(
+          JSON.stringify({
+            negativeControl: ctrl.evId,
+            positiveReplays: [p1.evId, p2.evId],
+            control: { status: ctrl.status },
+            forged: [{ status: p1.status }, { status: p2.status }],
+            verdict: accepted
+              ? "JWT FORGERY — the alg:none token was ACCEPTED while the garbage control was rejected; the server does not verify the signature. record_finding(session, severity high/critical) with these evidenceIds."
+              : `not confirmed: forged token status ${p1.status}/${p2.status}, control ${ctrl.status} (need forged<400 and control>=400)`,
+          }),
+        );
       },
     ),
     tool(
@@ -756,7 +1056,7 @@ export function buildTools(s: PilotSession) {
         const mkReq = (r: { method: string; url: string; headers?: Record<string, string>; body?: string | null }): HttpRequest => ({
           method: r.method.toUpperCase(),
           url: r.url,
-          headers: { ...cookieHeader(s), ...(r.headers ?? {}) },
+          headers: { ...authHeaders(s), ...(r.headers ?? {}) },
           body: r.body ?? null,
         });
         const fire = async (req: HttpRequest, kind: "negative_control" | "positive_replay", tag: string) => {
@@ -801,6 +1101,98 @@ export function buildTools(s: PilotSession) {
       },
     ),
     tool(
+      "probe_scenario",
+      'Confirm a MULTI-STEP business-logic abuse that spans endpoints (coupon stacking/forging, negative quantity/price reaching checkout, skipping a payment/approval/ownership step, mass-assignment escalation, double-spend). You give an ordered `control` flow (legitimate) and an ordered `exploit` flow (manipulated). Each step: {method,url,headers?,body?,capture?}. `capture` maps varName→a JSON path (e.g. data.id, basket.0.id) OR regex applied to THAT step\'s response; later steps reference it as {{varName}} in url/body/headers (thread ids/tokens through the chain). The current session cookie+Bearer are attached automatically. `effectMarker` is a string that appears in a response ONLY when the manipulation is ACCEPTED (the injected total/price, an out-of-order step returning 200, a coupon applied twice). The control flow runs once (must NOT show the marker); the exploit flow runs twice (must show it, stably). Returns evidenceIds (control=negativeControl, exploit=positiveReplays) ready for record_finding with a price-tampering/qty-tampering/workflow-bypass/mass-assignment category.',
+      {
+        control: z.array(z.object({ method: z.string(), url: z.string(), headers: z.record(z.string()).optional(), body: z.string().nullable().optional(), capture: z.record(z.string()).optional() })).min(1),
+        exploit: z.array(z.object({ method: z.string(), url: z.string(), headers: z.record(z.string()).optional(), body: z.string().nullable().optional(), capture: z.record(z.string()).optional() })).min(1),
+        effectMarker: z.string(),
+        note: z.string().optional(),
+      },
+      async ({ control, exploit, effectMarker, note }) => {
+        type Step = { method: string; url: string; headers?: Record<string, string>; body?: string | null; capture?: Record<string, string> };
+        // 1 フローを順番に実行: {{var}} 置換 → 送信 → 証拠記録 → capture を vars に蓄積。
+        const runFlow = async (steps: Step[], kind: "negative_control" | "positive_replay", tag: string) => {
+          const vars: Record<string, string> = {};
+          let lastStatus = 0;
+          // マーカーは「最終ステップのレスポンス」で判定する(record_finding の logic ゲートが引用する
+          // 最終ステップ evidence と一致させるため)。効果は確認画面=フロー末尾に出る想定。
+          let finalMarker = false;
+          const evIds: string[] = [];
+          for (let i = 0; i < steps.length; i++) {
+            const st = steps[i] as Step;
+            const url = substVars(st.url, vars);
+            if (!isInScope(url, s.scope)) throw new Error(`step ${i + 1} out of scope: ${url}`);
+            const stepHeaders: Record<string, string> = {};
+            for (const [k, v] of Object.entries(st.headers ?? {})) stepHeaders[k] = substVars(v, vars);
+            const req: HttpRequest = {
+              method: st.method.toUpperCase(),
+              url,
+              headers: { ...authHeaders(s), ...stepHeaders },
+              body: st.body != null ? substVars(st.body, vars) : null,
+            };
+            const res = await s.http.send(req);
+            bumpHttp(s, res.status);
+            lastStatus = res.status;
+            finalMarker = res.body.includes(effectMarker);
+            for (const [name, expr] of Object.entries(st.capture ?? {})) {
+              const val = extractValue(res.body, expr);
+              if (val != null) vars[name] = val;
+            }
+            const ev = s.evidence.record({
+              screenId: s.currentScreenId ?? "scenario",
+              validator: "claude-pilot-scenario",
+              kind,
+              request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
+              response: res,
+              note: `${note ? note + " " : ""}${tag} · step ${i + 1}/${steps.length} ${req.method} ${url}`,
+            });
+            evIds.push(ev.id);
+          }
+          return { status: lastStatus, hasMarker: finalMarker, evId: evIds[evIds.length - 1] as string, evIds };
+        };
+        let ctrl: Awaited<ReturnType<typeof runFlow>>;
+        let ex1: Awaited<ReturnType<typeof runFlow>>;
+        let ex2: Awaited<ReturnType<typeof runFlow>>;
+        try {
+          ctrl = await runFlow(control, "negative_control", "control (legit flow)");
+          ex1 = await runFlow(exploit, "positive_replay", "exploit flow #1");
+          ex2 = await runFlow(exploit, "positive_replay", "exploit flow #2");
+        } catch (e) {
+          return txt(`ERROR: ${String(e).slice(0, 200)}`);
+        }
+        // 証拠規律(マーカーベース): control にマーカー無し + exploit ≥2 にマーカー有り + status<400 + 安定。
+        const verdict = checkLogicEvidence(
+          { status: ctrl.status, hasMarker: ctrl.hasMarker },
+          [ex1, ex2].map((x) => ({ status: x.status, hasMarker: x.hasMarker })),
+        );
+        return txt(
+          JSON.stringify({
+            negativeControl: ctrl.evId,
+            positiveReplays: [ex1.evId, ex2.evId],
+            control: { status: ctrl.status, marker: ctrl.hasMarker, steps: ctrl.evIds.length },
+            exploit: [
+              { status: ex1.status, marker: ex1.hasMarker, steps: ex1.evIds.length },
+              { status: ex2.status, marker: ex2.hasMarker, steps: ex2.evIds.length },
+            ],
+            verdict: verdict.ok
+              ? "WORKFLOW MANIPULATION ACCEPTED — record_finding with these evidenceIds + effectMarker"
+              : `not confirmed: ${(verdict as { reason: string }).reason}`,
+          }),
+        );
+      },
+    ),
+    tool(
+      "scenario_done",
+      "Finish the scenario (A04 multi-step) stage. Call this once every transactional workflow has been tested. Pass a one-line coverage summary.",
+      { summary: z.string() },
+      async ({ summary }) => {
+        s.scenarioDone = true;
+        s.store.appendEvent(s.assessmentId, { type: "note", payload: { message: `🧩 SCENARIO done: ${summary.slice(0, 300)}` } });
+        return txt("scenario stage complete.");
+      },
+    ),
+    tool(
       "record_finding",
       "Record a CONFIRMED vulnerability. Requires evidence discipline: cite ONE `negativeControl` evidenceId (a request that should FAIL — the bug absent) and >=2 `positiveReplays` evidenceIds (the bug reproduced, stable). Use evidenceIds returned by http_request / verify_access THIS run. The control must be distinguishable from the positives (different status/length) or it is rejected as a catch-all. Pick the canonical `category`, and pass the vulnerable `endpoint` (URL or path template, e.g. /search or /orders/{id}) and `param` (e.g. q) — findings are DEDUPED by (category, endpoint, param).",
       {
@@ -830,13 +1222,17 @@ export function buildTools(s: PilotSession) {
         const missing = [negativeControl, ...positiveReplays].filter((eid) => !findEv(eid));
         if (!negRec || posRecs.some((r) => !r))
           return txt(`REJECTED: unknown evidenceId(s) ${missing.join(", ")}. Cite ids returned by http_request / verify_access / probe_logic in THIS run (1 negativeControl + >=2 positiveReplays).`);
-        if (BUSINESS_LOGIC_CATEGORIES.has(category)) {
-          // ビジネスロジックは長さ差分でなく「操作が効いた印(effectMarker)」で確証する(probe_logic 経由)。
+        if (MARKER_BASED_CATEGORIES.has(category)) {
+          // マーカーベース: 長さ差分でなく「印(effectMarker)」の有無で確証する。
+          //   business-logic → probe_logic/probe_scenario の effectMarker / xss → 未エスケープ反射 / redirect → OOB host。
           if (!effectMarker)
-            return txt(`REJECTED: ${category} requires effectMarker (the string that appears only when the manipulation took effect). Run probe_logic and cite its evidenceIds + the marker.`);
+            return txt(`REJECTED: ${category} requires effectMarker (the string that appears only when the issue fires — the unescaped payload for xss, the OOB host for open-redirect, the injected total for business-logic). Run probe_xss / probe_redirect / probe_logic / probe_scenario and cite its evidenceIds + the marker.`);
+          // マーカーは body だけでなくヘッダも見る(open-redirect の印は Location ヘッダに出る)。
+          const hasMarker = (r: { body: string; headers: Record<string, string> }): boolean =>
+            r.body.includes(effectMarker) || JSON.stringify(r.headers ?? {}).includes(effectMarker);
           const verdict = checkLogicEvidence(
-            { status: negRec.response.status, hasMarker: negRec.response.body.includes(effectMarker) },
-            posRecs.map((r) => ({ status: r!.response.status, hasMarker: r!.response.body.includes(effectMarker) })),
+            { status: negRec.response.status, hasMarker: hasMarker(negRec.response) },
+            posRecs.map((r) => ({ status: r!.response.status, hasMarker: hasMarker(r!.response) })),
           );
           if (!verdict.ok) return txt(`REJECTED (logic evidence): ${verdict.reason}.`);
         } else if (category !== "auth-bypass") {
@@ -888,13 +1284,29 @@ export function buildTools(s: PilotSession) {
     ),
     tool(
       "screen_done",
-      "Finish diagnosing the current screen. verdict 'finding' if at least one confirmed vulnerability was recorded for it, else 'clean'.",
-      { verdict: z.enum(["finding", "clean"]), note: z.string().optional() },
-      async ({ verdict, note }) => {
+      "Finish diagnosing the current screen. You MUST account for EVERY class the plan named: pass `coverage` with one entry per planned class — result 'found' (you recorded it), 'tested-clean' (you actively probed it and it held), or 'not-applicable' (with a concrete reason it cannot apply here). Finding ONE hole does NOT let you skip the rest of the plan. verdict 'finding' if >=1 confirmed, else 'clean'.",
+      {
+        verdict: z.enum(["finding", "clean"]),
+        coverage: z
+          .array(z.object({ class: z.string(), result: z.enum(["found", "tested-clean", "not-applicable"]), note: z.string().optional() }))
+          .optional()
+          .describe("one entry per planned attack class (from get_screen.plannedClasses)"),
+        note: z.string().optional(),
+      },
+      async ({ verdict, coverage, note }) => {
+        // ── カバレッジ・ゲート ── プランが挙げた攻撃クラスを全部 coverage で説明できるまで画面を閉じさせない。
+        //   「1個見つけて screen_done」を構造的に封じる(non-terminal nudge: screenDone は立てずに差し戻す)。
+        const planned = plannedClassesFor(s.plans.get(s.currentScreenId ?? ""));
+        const gate = checkScreenCoverage(planned, coverage ?? [], s.screenProbes);
+        if (!gate.ok) return txt(`NOT DONE — ${gate.reason}`);
         s.screenVerdict = verdict;
         s.screenDone = true;
-        if (note) s.store.appendEvent(s.assessmentId, { type: "note", payload: { message: `✓ ${s.currentScreenId}: ${note.slice(0, 200)}` } });
-        return txt(`screen ${s.currentScreenId} → ${verdict}`);
+        const covSummary = coverage?.length ? ` [${coverage.map((c) => `${coarseClass(c.class)}:${c.result}`).join(", ")}]` : "";
+        s.store.appendEvent(s.assessmentId, {
+          type: "note",
+          payload: { message: `✓ ${s.currentScreenId} → ${verdict}${covSummary}${note ? ` — ${note.slice(0, 160)}` : ""}` },
+        });
+        return txt(`screen ${s.currentScreenId} → ${verdict}${covSummary}`);
       },
     ),
     // ───────────────────────── 能動探索(A): paths ─────────────────────────
@@ -905,7 +1317,7 @@ export function buildTools(s: PilotSession) {
       async ({ extra }) => {
         let base = { status: 404, len: -1 };
         try {
-          const r = await s.http.send({ method: "GET", url: new URL(`/veritas-404-${Date.now()}`, s.targetUrl).toString(), headers: cookieHeader(s), body: null });
+          const r = await s.http.send({ method: "GET", url: new URL(`/veritas-404-${Date.now()}`, s.targetUrl).toString(), headers: authHeaders(s), body: null });
           base = { status: r.status, len: r.body.length };
         } catch {
           /* ignore */
@@ -929,7 +1341,7 @@ export function buildTools(s: PilotSession) {
           }
           let res: HttpResponse;
           try {
-            res = await s.http.send({ method: "GET", url, headers: cookieHeader(s), body: null });
+            res = await s.http.send({ method: "GET", url, headers: authHeaders(s), body: null });
           } catch {
             continue;
           }
@@ -956,7 +1368,7 @@ export function buildTools(s: PilotSession) {
         if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} is out of scope`);
         let base: HttpResponse;
         try {
-          base = await s.http.send({ method: "GET", url, headers: cookieHeader(s), body: null });
+          base = await s.http.send({ method: "GET", url, headers: authHeaders(s), body: null });
           bumpHttp(s, base.status);
         } catch (e) {
           return txt(`ERROR baseline: ${String(e).slice(0, 150)}`);
@@ -978,7 +1390,7 @@ export function buildTools(s: PilotSession) {
           if (!isInScope(u, s.scope)) continue;
           let res: HttpResponse;
           try {
-            res = await s.http.send({ method: "GET", url: u, headers: cookieHeader(s), body: null });
+            res = await s.http.send({ method: "GET", url: u, headers: authHeaders(s), body: null });
           } catch {
             continue;
           }
@@ -991,7 +1403,7 @@ export function buildTools(s: PilotSession) {
             screenId: s.currentScreenId ?? "pilot",
             validator: "claude-pilot",
             kind: "positive_replay",
-            request: { method: "GET", url: u, headers: s.http.effectiveHeaders(cookieHeader(s)), body: null },
+            request: { method: "GET", url: u, headers: s.http.effectiveHeaders(authHeaders(s)), body: null },
             response: res,
             note: `probe ${pr.name}=${pr.value} (${pr.kind})`,
           });
@@ -1065,9 +1477,9 @@ export function buildTools(s: PilotSession) {
           return txt(`ERROR (unauth): ${String(e).slice(0, 150)}`);
         }
         let rAuth: HttpResponse | null = null;
-        if (s.currentCookie) {
+        if (s.currentCookie || s.currentBearer) {
           try {
-            rAuth = await s.http.send({ method: "GET", url, headers: { cookie: s.currentCookie }, body: null });
+            rAuth = await s.http.send({ method: "GET", url, headers: authHeaders(s), body: null });
             bumpHttp(s, rAuth.status);
           } catch {
             rAuth = null;
@@ -1089,7 +1501,7 @@ export function buildTools(s: PilotSession) {
               screenId: s.currentScreenId ?? "pilot",
               validator: "verify_access",
               kind: "positive_replay",
-              request: { method: "GET", url, headers: s.http.effectiveHeaders(cookieHeader(s)), body: null },
+              request: { method: "GET", url, headers: s.http.effectiveHeaders(authHeaders(s)), body: null },
               response: rAuth,
               note: `authenticated baseline as ${s.currentRole || "?"}`,
             }).id,

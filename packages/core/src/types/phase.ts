@@ -5,6 +5,7 @@ export type Phase =
   | "phase1_recon"
   | "phase1_label"
   | "phase2_scan"
+  | "phase2_burpscan"
   | "report"
   | "done"
   | "halted";

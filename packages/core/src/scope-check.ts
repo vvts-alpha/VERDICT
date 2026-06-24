@@ -4,12 +4,18 @@
 
 import type { ScopePolicy } from "./types/index.js";
 
-/** ホストが許可パターンに合致(完全一致 or `*.suffix`)。 */
+/** ホストが許可パターンに合致(完全一致 or `*.suffix`)。ポートは無視して判定する
+ *  (host="app.example.com:3000" でも `*.example.com` / `app.example.com` に一致させる)。 */
 export function hostMatches(host: string, patterns: string[]): boolean {
+  const hostname = host.replace(/:\d+$/, ""); // ポートを除いたホスト名
   return patterns.some((p) => {
     if (p === "*") return true; // "unrestricted" モードのワイルドカード(全ホスト一致)
-    if (p === host) return true;
-    if (p.startsWith("*.")) return host === p.slice(2) || host.endsWith(p.slice(1));
+    if (p === host || p === hostname) return true;
+    if (p.startsWith("*.")) {
+      const apex = p.slice(2); // "example.com"
+      const suffix = p.slice(1); // ".example.com"
+      return hostname === apex || hostname.endsWith(suffix);
+    }
     return false;
   });
 }

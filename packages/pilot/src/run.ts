@@ -16,7 +16,7 @@ import { join } from "node:path";
 import { buildTools, STAGE_TOOLS, dedupKey, isAuthWalled, loadCookieFile, sessionLooksDead, stripHash } from "./tools.js";
 import type { PilotSession, RoleSession } from "./tools.js";
 import { LiveControl } from "./live-control.js";
-import { DIAGNOSE_PROMPT, METHODOLOGY_PROMPT, SURVEY_PROMPT } from "./system.js";
+import { DIAGNOSE_PROMPT, METHODOLOGY_PROMPT, SCENARIO_PROMPT, SURVEY_PROMPT } from "./system.js";
 
 export interface RunPilotOptions {
   store: AssessmentStore;
@@ -44,6 +44,9 @@ export interface RunPilotOptions {
   /** survey/methodology/login と低価値画面の「速い」モデル(例 claude-sonnet-4-6)。
    *  未指定なら model と同じ(= モデル使い分け無し・挙動不変)。指定すると Opus/Sonnet を tier 化。 */
   fastModel?: string;
+  /** 診断後の A04 シナリオ(画面横断の多段ロジック濫用)ステージを実行するか。既定 true。
+   *  取引面(カート/注文/決済/クーポン/送金/権限変更)が無ければ自動スキップ。deep モデル固定。 */
+  scenarioPass?: boolean;
   maxTurns?: number;
   rateMs?: number;
   headless?: boolean;
@@ -83,6 +86,10 @@ export interface RunPilotOptions {
   controlUrl?: string;
   onText?: (text: string) => void;
   onTool?: (name: string, input: unknown) => void;
+  /** 診断/シナリオの後、**セッションを保ったまま**実行する追加スキャンのフック(Burp 能動スキャン等)。
+   *  指定時のみ phase2_burpscan を report の前に挟む。keepWarm() を定期的に呼べば authed セッションを維持できる
+   *  (長い Burp スキャン中にトークン/Cookie が stale 化しないように)。driver はこの時点でまだ生きている。 */
+  onBurpScanPhase?: (ctx: { keepWarm: () => Promise<void> }) => Promise<void>;
 }
 
 export interface PilotResult {
@@ -306,6 +313,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     roleDescriptions: opts.roleDescriptions ?? new Map(),
     loginLlm: new ClaudeCliClient({ defaultModel: fastModel ?? "claude-sonnet-4-6" }),
     currentCookie: primaryCookie, // attended は primary ロールの生 Cookie で開始(通常は "")
+    currentBearer: "", // login() がロールごとに localStorage の Bearer JWT を載せる
     currentRole: primaryRole,
     findings: [],
     findCounter: 0,
@@ -315,6 +323,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     httpProbes: 0,
     httpAuthWall: 0,
     httpThrough: 0,
+    screenProbes: 0,
     done: false,
     doneSummary: "",
     model: fastModel, // login ツール(smartLogin)は機械的 → fast モデル
@@ -330,6 +339,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     surveyDone: false,
     methodologyDone: false,
     screenDone: false,
+    scenarioDone: false,
     ...(roleSessions ? { roleSessions } : {}),
   };
 
@@ -356,6 +366,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
   if (prev) {
     session.inv.seed(prev.screens); // screenId 採番 + dedup を継続
     session.currentCookie = await driver.sessionCookieHeader(); // run の認証セッション(browser-profile)を再利用
+    session.currentBearer = (await driver.bearerToken().catch(() => null)) ?? ""; // SPA の Bearer JWT も再利用
     session.currentRole = [...opts.roleCreds.keys()][0] ?? "";
     // 方法論プランをイベントログ(📋 PLAN <id>: …)から復元
     for (const e of prev.events) {
@@ -581,6 +592,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         session.currentScreenId = sc.screenId;
         session.screenDone = false;
         session.screenVerdict = null;
+        session.screenProbes = 0; // カバレッジ・ゲートの裏取り用に画面ごとリセット
         const recordsBefore = session.recordCalls;
         opts.store.setScreenScanStatus(opts.assessmentId, sc.screenId, "scanning");
         turns += await runStage({
@@ -616,6 +628,51 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         }
       }
       session.currentScreenId = null;
+
+      // ── STAGE 4: シナリオ(A04 横断ロジック) ── 画面診断の後に1回。real id・auth 確証・実挙動を継承して
+      //    多段の workflow 濫用(クーポン/価格・数量改ざん/手順スキップ/権限昇格)を狙う。deep モデル固定。
+      //    「取引フローがあるか」の文脈判断は **LLM に委ねる**(脆い語彙正規表現を置かない): get_inventory を
+      //    見てモデルが workflow を見つけ、無ければ即 scenario_done で締める。--no-scenario で無効化可。
+      if (opts.scenarioPass !== false && !session.done) {
+        session.scenarioDone = false;
+        opts.onText?.(`🧩 scenario stage: surveying the inventory for multi-step (A04) workflows`);
+        turns += await runStage({
+          system: SCENARIO_PROMPT,
+          goal: `Per-screen diagnosis is done. Call get_inventory and decide FROM THE INVENTORY whether this app has any multi-step / state-changing workflow worth abusing (e.g. a cart→checkout→order flow, a coupon/voucher redemption, a fund/points transfer, a multi-step registration/approval, a role/privilege change). If there is none, call scenario_done immediately. Otherwise, for each workflow: log in, walk the legitimate flow once, then build probe_scenario(control, exploit, effectMarker) threading captured ids via {{var}}, and record_finding only on a confirmed verdict. Call scenario_done when every workflow is covered.`,
+          allowed: STAGE_TOOLS.scenario,
+          maxTurns: Math.min(maxTurns, 40),
+          model: deepModel, // workflow の発見・構築は最難の推論 → deep 固定
+          shouldStop: () => session.scenarioDone || session.done,
+        });
+      }
+    }
+
+    // ── Burp スキャン・フェーズ ── 診断/シナリオの後、report に落とす前に、**セッション生存中**に実行する。
+    //    (従来は runPilot 返却 → driver 破棄 → cmdPilot で Burp、だったので authed 面が取れなかった)。
+    //    keepWarm でトップへ navigate + Cookie 再同期し、長いスキャン中もセッションを維持する。
+    if (!opts.surveyOnly && !session.done && opts.onBurpScanPhase) {
+      opts.store.setPhase(opts.assessmentId, "phase2_burpscan");
+      opts.onText?.("🐝 burp scan phase — active scan with the auth session kept warm");
+      const keepWarm = async (): Promise<void> => {
+        try {
+          if (roleSessions) {
+            for (const rs of roleSessions.values()) await rs.driver.gotoUrl(opts.targetUrl).catch(() => {});
+          } else if (session.currentCookie) {
+            await driver.gotoUrl(opts.targetUrl);
+            const fresh = await driver.sessionCookieHeader();
+            if (fresh) session.currentCookie = fresh;
+          }
+        } catch {
+          /* best-effort keepalive */
+        }
+      };
+      try {
+        await opts.onBurpScanPhase({ keepWarm });
+      } catch (e) {
+        const m = String(e instanceof Error ? e.message : e).slice(0, 160);
+        opts.onText?.(`⚠ burp scan phase error: ${m}`);
+        opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: `⚠ burp scan phase error: ${m}` } });
+      }
     }
 
     // survey-only は phase1_recon のまま(全 screen queued=未診断)→ 後で resume できる。

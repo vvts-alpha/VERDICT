@@ -74,3 +74,5 @@ export { buildReport, renderMarkdown } from "./report.js";
 export { buildReportModel, SEVERITY_ORDER } from "./report-model.js";
 export type { ReportModel, ReportFindingRow, ReportScreenRow, ReportEvidence, EvidenceLoader, BuildReportOptions } from "./report-model.js";
 export { renderReportHtml, renderFindingsCsv, renderScreensCsv, renderInventoryHtml } from "./report-formats.js";
+export { buildOpenApi, jsonShapeToSchema } from "./openapi.js";
+export type { BuildOpenApiOptions } from "./openapi.js";

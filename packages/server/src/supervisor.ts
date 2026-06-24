@@ -118,7 +118,29 @@ export class Supervisor {
     this.spawnChild(id, "pilot --resume", args);
   }
 
-  /** 実行中の子を停止(SIGTERM → 猶予後に SIGKILL でエスカレート)。停止に着手したら true。
+  /** 既存 run に対して Burp 能動スキャン(REST)を起動 → 完了までポーリング → issue を自動取り込み。
+   *  接続は env(BURP_API/BURP_API_KEY/BURP_RESOURCE_POOL)。manifest があれば認証スキャン(application_logins)。
+   *  config は surface から自動選択(pickBurpConfigs)。XML を手で export せずに済むライブ取り込み版。 */
+  burpScan(id: string): void {
+    const dir = join(this.cfg.runsDir, id);
+    const args = [this.cfg.cliPath, "burp-scan", "--id", id, "--out", this.cfg.runsDir];
+    const manifestPath = join(dir, "manifest.json");
+    if (existsSync(manifestPath)) args.push("--manifest", manifestPath);
+    this.spawnChild(id, "burp-scan", args);
+  }
+
+  /** アップロードされた Burp XML レポートを既存 run に取り込む(merge → High+ を AI 再検証)。
+   *  server は in-process でマージせず CLI(burp-import)を spawn する(検証フェーズも CLI 側に集約)。
+   *  manifest があれば認証下 finding の再検証に Basic 資格を渡す。 */
+  burpImport(id: string, reportPath: string): void {
+    const dir = join(this.cfg.runsDir, id);
+    const args = [this.cfg.cliPath, "burp-import", "--id", id, "--out", this.cfg.runsDir, "--report", reportPath];
+    const manifestPath = join(dir, "manifest.json");
+    if (existsSync(manifestPath)) args.push("--manifest", manifestPath);
+    this.spawnChild(id, "burp-import", args);
+  }
+
+  /** 既存 run に対して Burp 能動スキャン(REST)を起動 → 完了までポーリング → issue を自動取り込み。
    *  Playwright/chromium は SIGTERM に独自ハンドラを付け graceful close が長引く/詰まるため SIGKILL で確実に殺す。 */
   stop(id: string): boolean {
     const rec = this.procs.get(id);

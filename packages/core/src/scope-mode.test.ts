@@ -43,6 +43,28 @@ test("unrestricted: any http(s) host passes, but protocol + out-of-scope still a
   assert.ok(!isInScope("https://blocked.test/x", withDeny));
 });
 
+test("etld on an IP target falls back to exact host (no nonsense *.IP)", () => {
+  const scope = deriveScopeFromUrls(["http://192.168.74.148:3000/"], "etld");
+  assert.deepEqual(scope.inScopeHosts, ["192.168.74.148:3000"]);
+  assert.ok(isInScope("http://192.168.74.148:3000/", scope)); // the target itself must be in scope
+  assert.ok(isInScope("http://192.168.74.148:3000/rest/products", scope));
+  assert.ok(!isInScope("http://10.0.0.1:3000/", scope)); // other host out
+});
+
+test("etld on localhost target falls back to exact host", () => {
+  const scope = deriveScopeFromUrls(["http://localhost:8080/"], "etld");
+  assert.deepEqual(scope.inScopeHosts, ["localhost:8080"]);
+  assert.ok(isInScope("http://localhost:8080/app", scope));
+});
+
+test("etld scope matches a host carrying a non-default port (port-insensitive)", () => {
+  const scope = deriveScopeFromUrls(["https://app.example.com:8443/"], "etld");
+  assert.deepEqual(scope.inScopeHosts, ["*.example.com"]);
+  assert.ok(isInScope("https://app.example.com:8443/x", scope)); // port must not break the wildcard
+  assert.ok(isInScope("https://api.example.com:8443/v1", scope));
+  assert.ok(isInScope("https://example.com/", scope)); // apex, default port
+});
+
 test("hostMatches: bare '*' is match-all", () => {
   assert.ok(hostMatches("whatever.test", ["*"]));
   assert.ok(!hostMatches("whatever.test", ["*.example.com"]));
