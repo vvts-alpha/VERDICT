@@ -55,9 +55,34 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
   // サイト全体を覆う HTTP Basic/Digest(アプリのログイン以前の壁)
   const [basicUser, setBasicUser] = useState("");
   const [basicPass, setBasicPass] = useState("");
+  // カスタムヘッダ(WAF 回避・案件指定の必須ヘッダ)。name/value 別入力で複数。
+  const [headersList, setHeadersList] = useState<Array<{ name: string; value: string }>>([]);
+  const [loginUrl, setLoginUrl] = useState(""); // 手動ログインの入口 URL(attended)
+  const [maxScreens, setMaxScreens] = useState(""); // 診断する画面数の上限(空=既定 40)
 
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+
+  const setHeader = (i: number, patch: Partial<{ name: string; value: string }>): void =>
+    setHeadersList((hs) => hs.map((h, j) => (j === i ? { ...h, ...patch } : h)));
+  const addHeader = (): void => setHeadersList((hs) => [...hs, { name: "", value: "" }]);
+  const rmHeader = (i: number): void => setHeadersList((hs) => hs.filter((_, j) => j !== i));
+
+  // URL リストのファイル読込(CSV / 単一リスト)→ Target URLs テキストエリアに展開。
+  const importUrlList = (file: File): void => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const text = String(reader.result ?? "");
+      // 行ごと → 各行の最初のセル(カンマ/タブ/空白区切り)を URL とみなす。http(s) を含む行だけ採用。
+      const urls = text
+        .split(/\r?\n/)
+        .map((ln) => (ln.split(/[,\t]/)[0] ?? "").trim().replace(/^["']|["']$/g, ""))
+        .filter((u) => /^https?:\/\//i.test(u));
+      if (urls.length) setTargetUrls((prev) => [...lines(prev), ...urls].filter((u, i, a) => a.indexOf(u) === i).join("\n"));
+      else setErr("no http(s) URLs found in the file");
+    };
+    reader.readAsText(file);
+  };
 
   const setRole = (i: number, patch: Partial<Role>): void =>
     setRoles((rs) => rs.map((r, j) => (j === i ? { ...r, ...patch } : r)));
@@ -102,6 +127,10 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
     if (authRoles.length) auth.roles = authRoles;
     if (basicUser.trim() && basicPass) auth.httpBasic = { user: basicUser.trim(), pass: basicPass }; // site-wide Basic/Digest
     if (Object.keys(auth).length) manifest.auth = auth;
+    // カスタムヘッダ(name が入ってるものだけ)→ manifest.http.headers
+    const headers: Record<string, string> = {};
+    for (const h of headersList) if (h.name.trim()) headers[h.name.trim()] = h.value;
+    if (Object.keys(headers).length) manifest.http = { headers };
 
     const options: Record<string, unknown> = {};
     if (model) options.model = model;
@@ -114,6 +143,8 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
     if (command === "pilot" && burpScan) options.burpScan = true;
     if (command === "pilot" && burpProxy) options.burpProxy = true;
     if (command === "pilot" && anyManual) options.attended = true;
+    if (loginUrl.trim()) options.loginUrl = loginUrl.trim();
+    if (command === "pilot" && maxScreens) options.maxScreens = Number.parseInt(maxScreens, 10);
 
     try {
       const res = await fetch("/api/run", {
@@ -199,6 +230,12 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
             <input value={maxTurns} onChange={(e) => setMaxTurns(e.target.value)} placeholder="(default)" inputMode="numeric" />
           </label>
         ) : null}
+        {command === "pilot" ? (
+          <label className="nf-field" title="how many screens to diagnose (default 40). raise for large apps.">
+            <span>Max screens</span>
+            <input value={maxScreens} onChange={(e) => setMaxScreens(e.target.value)} placeholder="40" inputMode="numeric" />
+          </label>
+        ) : null}
       </div>
 
       <div className="nf-checks">
@@ -226,7 +263,22 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
       <details className="nf-section">
         <summary>Scope (optional — blank derives from target + scope mode)</summary>
         <label className="nf-field">
-          <span>Target URLs — extra seeds, one per line (URL-list diagnosis)</span>
+          <span>
+            Target URLs — extra seeds, one per line (URL-list diagnosis){" "}
+            <label className="nf-import" title="load a URL list from a file (CSV: first column, or one URL per line)">
+              ⬆ import list
+              <input
+                type="file"
+                accept=".csv,.txt,text/csv,text/plain"
+                style={{ display: "none" }}
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  e.target.value = "";
+                  if (f) importUrlList(f);
+                }}
+              />
+            </label>
+          </span>
           <textarea
             value={targetUrls}
             onChange={(e) => setTargetUrls(e.target.value)}
@@ -288,7 +340,27 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
       </details>
 
       <details className="nf-section">
+        <summary>Custom headers ({headersList.length}) — added to in-scope requests (WAF bypass / required headers)</summary>
+        {headersList.map((h, i) => (
+          <div className="nf-role" key={i}>
+            <input placeholder="header name (e.g. X-Forwarded-For)" value={h.name} onChange={(e) => setHeader(i, { name: e.target.value })} autoComplete="off" />
+            <input placeholder="value" value={h.value} onChange={(e) => setHeader(i, { value: e.target.value })} autoComplete="off" />
+            <button type="button" onClick={() => rmHeader(i)}>
+              ✕
+            </button>
+          </div>
+        ))}
+        <button type="button" className="nf-addrole" onClick={addHeader}>
+          + add header
+        </button>
+      </details>
+
+      <details className="nf-section">
         <summary>Auth roles ({roles.length}) — a “manual” role makes the run attended (log in via the Sessions tab)</summary>
+        <label className="nf-field" title="entry URL for manual login windows (attended). blank = target URL.">
+          <span>Login URL (manual login entry — blank = target)</span>
+          <input value={loginUrl} onChange={(e) => setLoginUrl(e.target.value)} placeholder="https://app.example.com/login" autoComplete="off" />
+        </label>
         {roles.map((r, i) => (
           <div className="nf-role" key={i}>
             <input placeholder="name" value={r.name} onChange={(e) => setRole(i, { name: e.target.value })} />

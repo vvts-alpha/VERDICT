@@ -31,6 +31,9 @@ export interface RunPilotOptions {
   /** サイト全体を覆う HTTP Basic/Digest 認証(operator 提供)。ブラウザは httpCredentials で自動応答、
    *  raw http(FetchHttpClient)には Authorization: Basic を注入(Digest はブラウザ経路のみ)。 */
   httpBasic?: { user: string; pass: string };
+  /** operator 提供のカスタムヘッダ(WAF 回避・案件指定の必須ヘッダ等)。ブラウザ(同一オリジンのみ)+
+   *  raw http 経路の両方に付与する。 */
+  customHeaders?: Record<string, string>;
   profileDir: string;
   artifactsDir: string;
   roleCreds: Map<string, LoginCreds>;
@@ -183,6 +186,8 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     ...(opts.burpProxy ? { proxy: opts.burpProxy } : {}),
     // サイト全体の Basic/Digest: Playwright が 401 を自動応答(全 driver 起動=attended ロール窓含む)。
     ...(opts.httpBasic ? { httpCredentials: { username: opts.httpBasic.user, password: opts.httpBasic.pass } } : {}),
+    // operator のカスタムヘッダ(WAF 回避等)。同一オリジンのみに付く(driver 側でゲート)。
+    ...(opts.customHeaders && Object.keys(opts.customHeaders).length ? { extraHeaders: opts.customHeaders } : {}),
   };
 
   // ── attended: ロールごとに headed 永続コンテキストを 1 つ起動し、人手でログインさせる ──
@@ -290,6 +295,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       "x-amraam": "assessment",
       // サイト全体の Basic: raw http 経路にも Authorization を注入(Digest はブラウザ経路のみ対応)。
       ...(opts.httpBasic ? { authorization: `Basic ${Buffer.from(`${opts.httpBasic.user}:${opts.httpBasic.pass}`, "utf8").toString("base64")}` } : {}),
+      ...(opts.customHeaders ?? {}), // operator のカスタムヘッダ(WAF 回避等)を raw http 経路にも付与
     },
     ...(opts.burpProxy ? { proxy: opts.burpProxy } : {}),
   });

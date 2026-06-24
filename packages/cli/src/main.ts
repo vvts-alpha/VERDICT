@@ -33,7 +33,8 @@ import {
 import { PlaywrightDriver, buildInventory, crawl, exploreScreen, htmlToPdf, labelInventory, normalizePath, smartLogin, writeScreenInventory } from "@veritas/crawler";
 import type { LoginCreds } from "@veritas/crawler";
 import { ClaudeCliClient } from "@veritas/llm";
-import { EvidenceStore, FetchHttpClient, SECURITY_HEADERS, auditHeaders, parseBurpReport, pickBurpConfigs, readEvidenceArtifact, scanInventory, startBurpScan, getBurpScan, dedupSeedUrls, mergeBurpIssues as scannerMergeBurpIssues } from "@veritas/scanner";
+import { EvidenceStore, FetchHttpClient, SECURITY_HEADERS, auditHeaders, parseBurpReport, pickBurpConfigs, readEvidenceArtifact, scanInventory, startBurpScan, getBurpScan, dedupSeedUrls, submitAudit, getAuditStatusAll, getAuditIssues, resetAudit, buildRawRequest, mergeBurpIssues as scannerMergeBurpIssues } from "@veritas/scanner";
+import type { BurpAuditConn } from "@veritas/scanner";
 import type { BurpIssue } from "@veritas/scanner";
 import { assessLogicInventory, assessScreenLogic, authDiffScreen } from "@veritas/agent";
 import type { RoleContext } from "@veritas/agent";
@@ -66,6 +67,7 @@ commands:
             roles can be given inline via --attended admin,userA,userB (no manifest needed / overrides). bare --attended uses the manifest's auth.roles
             ※ Burp integration (env by default, overridable by args): [--burp-proxy [url]] route all traffic through Burp (env BURP_PROXY if no value).
               [--burp-scan [--burp-api url]] after diagnosis, also run a Burp active scan against the same run → merge results → AI re-verifies the High+ imports (connection via env BURP_API/BURP_API_KEY/BURP_RESOURCE_POOL). both off by default. [--no-burp-verify] skips the verify phase.
+                 ※ set env BURP_AUDIT_API=http://<host>:1338 (+ BURP_AUDIT_TOKEN) to route --burp-scan through the AMRAAM Audit REST extension instead: it submits the AUTHENTICATED raw requests (session in the request) so it scans behind login — see tools/burp-audit-ext/.
   burp-scan --id <id> [--burp-api <url>] [--api-key <key>] [--config "<named config>"]... [--resource-pool <name>] [--manifest <m.json>] [--max-min <n>] [--poll <sec>] [--no-burp-verify] [--model <m>] [--out <dir>]
             launch a Burp Pro active scan via its REST API → poll to completion → import issues (no XML export needed) → AI re-verifies the High+ imports. connection via env (BURP_API/BURP_API_KEY/BURP_RESOURCE_POOL) → overridable by args.
             target URLs = the in-scope screens the AI mapped for that run (= the AI decides the targets). checks/speed = Burp's named config.
@@ -548,6 +550,9 @@ interface AssessManifest {
   /** 明示スコープ(部分指定可。未指定フィールドは target/scopeMode から導出した既定で補完) */
   scope?: Partial<ScopePolicy>;
   crawl?: { followLinks?: boolean; maxDepth?: number };
+  /** operator 提供のカスタムヘッダ(WAF 回避・案件指定の必須ヘッダ等)。ブラウザ(同一オリジンのみ)+
+   *  raw http 経路の両方に付与。state.sqlite には書かれない(manifest は gitignore)。 */
+  http?: { headers?: Record<string, string> };
   model?: string;
   /** 認証(DESIGN §6.3)。資格情報だけでよい — ログインURL/項目はエージェントが自動発見。
    *  state.sqlite には書かれない。manifest は gitignore。 */
@@ -585,6 +590,15 @@ function manifestHasManualRole(m: AssessManifest | null): boolean {
 function manifestHttpBasic(m: AssessManifest | null): { user: string; pass: string } | null {
   const b = m?.auth?.httpBasic;
   return b && b.user && b.pass ? { user: b.user, pass: b.pass } : null;
+}
+
+/** manifest のカスタムヘッダ(WAF 回避等)。name が空のものは捨てる。空なら null。 */
+function manifestCustomHeaders(m: AssessManifest | null): Record<string, string> | null {
+  const h = m?.http?.headers;
+  if (!h) return null;
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(h)) if (k.trim()) out[k.trim()] = String(v ?? "");
+  return Object.keys(out).length ? out : null;
 }
 
 /** raw http(FetchHttpClient)用の Authorization: Basic ヘッダ(null なら空オブジェクト)。 */
@@ -1015,6 +1029,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
   const roleDescriptions = new Map<string, string>();
   for (const rc of manifestRoleDescriptions(manifest)) roleDescriptions.set(rc.name, rc.description);
   const httpBasic = manifestHttpBasic(manifest); // サイト全体の Basic/Digest(あれば)
+  const customHeaders = manifestCustomHeaders(manifest); // カスタムヘッダ(WAF 回避等。あれば)
   if (resume)
     console.log(
       `  ↻ resume: restored config from manifest — httpBasic ${httpBasic ? "✓" : "—"}, creds ${roleCreds.size}, cookies ${roleCookieFiles.size}, attended ${attended ? "✓" : "—"}`,
@@ -1052,6 +1067,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       ...(seedUrls.length > 1 ? { seedUrls } : {}),
       ...(lockToTargets ? { lockToSeeds: true } : {}),
       ...(httpBasic ? { httpBasic } : {}),
+      ...(customHeaders ? { customHeaders } : {}),
       profileDir: join(runsDir, id, "browser-profile"),
       artifactsDir: join(runsDir, id, "artifacts"),
       roleCreds,
@@ -1091,6 +1107,22 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
             onBurpScanPhase: async ({ keepWarm, cookie, bearer }: { keepWarm: () => Promise<void>; cookie: string; bearer: string }): Promise<void> => {
               const burpState = store.loadAssessment(id);
               if (!burpState) return;
+              // BURP_AUDIT_API が設定されてれば AMRAAM Audit REST(1338, セッション内包)を使う。無ければ標準 REST(1337)。
+              const auditConn = resolveBurpAudit();
+              if (auditConn) {
+                await runBurpAuditOnRun(store, id, burpState, runsDir, {
+                  conn: auditConn,
+                  cookie,
+                  bearer,
+                  httpBasic,
+                  verify: !values["no-burp-verify"],
+                  ...(model ? { verifyModel: model } : {}),
+                  pollSec: 10,
+                  maxMin: 30,
+                  onPoll: keepWarm,
+                });
+                return;
+              }
               const burpLogins = manifestRoleCreds(manifest).map((rc) => ({ username: rc.creds.username, password: rc.creds.password }));
               const auto = pickBurpConfigs(burpState); // surface に応じて最適な named config を自動選択(crawl 戦略等)
               const customConfigs = buildBurpCustomConfigs(cookie, bearer); // 君の scan policy + session 注入(env)
@@ -1681,6 +1713,155 @@ async function verifyImportedBurp(
   } catch (e) {
     console.log(`⚠ burp-verify skipped: ${String(e).slice(0, 160)}`);
   }
+}
+
+// ── AMRAAM Audit REST(別ポート 1338)経由のスキャン ──
+// 標準 REST(1337)と違い「認証済みの生リクエストをそのまま投入」する(セッション内包)。AMRAAM が
+// inventory の in-scope エンドポイントを live Cookie/Bearer 込みの生リクエストにして送る → Burp が認証下を能動監査。
+
+/** JsonShape → 具体的なボディ例(reqSchema からダミー値)。Burp の insertion point 用。 */
+function exampleFromShape(shape: { type: string; fields?: Record<string, unknown>; items?: unknown }): unknown {
+  switch (shape.type) {
+    case "object": {
+      const o: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(shape.fields ?? {})) o[k] = exampleFromShape(v as { type: string });
+      return o;
+    }
+    case "array":
+      return [exampleFromShape((shape.items ?? { type: "string" }) as { type: string })];
+    case "number":
+      return 1;
+    case "boolean":
+      return true;
+    case "null":
+      return null;
+    default:
+      return "test";
+  }
+}
+
+/** inventory(in-scope の観測 URL + 非 GET API)→ 認証スキャン用のリクエスト仕様。 */
+function collectAuditRequests(state: AssessmentState): Array<{ method: string; url: string; body?: string; contentType?: string }> {
+  const specs: Array<{ method: string; url: string; body?: string; contentType?: string }> = [];
+  // 1) 観測した具体 URL を GET(クエリ値そのまま = 良い insertion point)。パス+param 名で dedup。
+  const observed = state.screens.flatMap((sc) => (sc.observedUrls ?? []).map((u) => u.split("#")[0] ?? u)).filter((u) => isInScope(u, state.scope));
+  for (const u of dedupSeedUrls(observed)) specs.push({ method: "GET", url: u });
+  // 2) フォーム/ XHR の非 GET API。urlTemplate を具体化({x}→1)し reqSchema からボディを合成。
+  const base = "url" in state.target && state.target.url ? state.target.url : observed[0] ?? "";
+  const seen = new Set<string>();
+  for (const sc of state.screens) {
+    for (const api of sc.apis ?? []) {
+      const m = api.method.toUpperCase();
+      if (m === "GET" || m === "HEAD") continue;
+      const key = `${m} ${api.urlTemplate}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      let abs: string;
+      try {
+        abs = new URL(api.urlTemplate.replace(/\{[^}]+\}/g, "1"), base).toString();
+      } catch {
+        continue;
+      }
+      if (!isInScope(abs, state.scope)) continue;
+      const body = api.reqSchema ? JSON.stringify(exampleFromShape(api.reqSchema as { type: string })) : null;
+      specs.push({ method: m, url: abs, ...(body ? { body, contentType: "application/json" } : {}) });
+    }
+  }
+  return specs.slice(0, 300);
+}
+
+/** AMRAAM Audit REST 経由でスキャン(submit→poll→issues→merge→verify→report)。非致命。 */
+async function runBurpAuditOnRun(
+  store: AssessmentStore,
+  id: string,
+  state: AssessmentState,
+  runsDir: string,
+  o: { conn: BurpAuditConn; cookie: string; bearer: string; httpBasic?: { user: string; pass: string } | null; verify?: boolean; verifyModel?: string; pollSec: number; maxMin: number; onPoll?: () => Promise<void> },
+): Promise<number> {
+  const sessionHeaders: Record<string, string> = {};
+  if (o.cookie) sessionHeaders.Cookie = o.cookie;
+  if (o.bearer) sessionHeaders.Authorization = `Bearer ${o.bearer}`;
+  else if (o.httpBasic) sessionHeaders.Authorization = `Basic ${Buffer.from(`${o.httpBasic.user}:${o.httpBasic.pass}`, "utf8").toString("base64")}`;
+
+  const specs = collectAuditRequests(state);
+  if (specs.length === 0) {
+    console.log("⚠ burp-audit: no in-scope endpoints (run survey/pilot first) — skipping");
+    return 0;
+  }
+  console.log(`▶ burp-audit ${id} → ${o.conn.base} | ${specs.length} authenticated request(s) (cookie ${o.cookie ? "✓" : "—"} / bearer ${o.bearer ? "✓" : "—"})`);
+
+  const startTs = Date.now();
+  await resetAudit(o.conn); // この拡張の蓄積をクリア(過去 run の issue を混ぜない)
+
+  const hostKeys = new Set<string>();
+  let submitted = 0;
+  for (const spec of specs) {
+    try {
+      const u = new URL(spec.url);
+      const port = u.port ? Number(u.port) : u.protocol === "https:" ? 443 : 80;
+      const raw = buildRawRequest({
+        method: spec.method,
+        pathWithQuery: u.pathname + u.search,
+        hostHeader: u.host,
+        headers: sessionHeaders,
+        ...(spec.body ? { body: spec.body, contentType: spec.contentType } : {}),
+      });
+      const key = await submitAudit(o.conn, { host: u.hostname, port, secure: u.protocol === "https:", auditMode: "active", request: raw });
+      hostKeys.add(key);
+      submitted += 1;
+    } catch (e) {
+      console.log(`  ⚠ submit failed for ${spec.method} ${spec.url}: ${String(e).slice(0, 120)}`);
+    }
+  }
+  if (submitted === 0) {
+    console.log("⚠ burp-audit: nothing submitted — is the extension up? (BURP_AUDIT_API / token) — skipping");
+    return 0;
+  }
+  console.log(`  submitted ${submitted}; polling every ${o.pollSec}s (timeout ${o.maxMin}m)…`);
+
+  const deadline = Date.now() + o.maxMin * 60_000;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, o.pollSec * 1000));
+    await o.onPoll?.();
+    let statuses;
+    try {
+      statuses = await getAuditStatusAll(o.conn);
+    } catch (e) {
+      console.log(`  ⚠ poll error: ${String(e).slice(0, 120)}`);
+      continue;
+    }
+    const mine = statuses.filter((s) => hostKeys.has(s.host));
+    const reqs = mine.reduce((n, s) => n + s.requestsMade, 0);
+    console.log(`  [${mine.map((s) => s.status).join(", ") || "?"}] ${reqs} requests`);
+    if (mine.length > 0 && mine.every((s) => /finished|succeeded|failed|paused/i.test(s.status))) break;
+  }
+
+  let issues;
+  try {
+    issues = await getAuditIssues(o.conn, { since: startTs });
+  } catch (e) {
+    console.log(`⚠ burp-audit /issues failed: ${String(e).slice(0, 160)} — skipping import`);
+    return 0;
+  }
+  const { added, skipped, oos } = scannerMergeBurpIssues(store, id, state, join(runsDir, id, "artifacts"), issues, {
+    prefix: "ba",
+    pathTemplate: (p) => normalizePath(p).template,
+  });
+  console.log(`\nburp-audit ${id}: ${issues.length} issue(s) → +${added} net-new(dup ${skipped} / out-of-scope ${oos})`);
+  if (added > 0) {
+    if (o.verify !== false) await verifyImportedBurp(store, id, runsDir, { ...(o.verifyModel ? { model: o.verifyModel } : {}), httpBasic: o.httpBasic ?? null });
+    const fs2 = store.loadAssessment(id);
+    if (fs2) writeFileSync(join(runsDir, id, "report.md"), buildReport(fs2, new Date(), { loadEvidence: evidenceLoaderFor(runsDir, id) }));
+  }
+  return added;
+}
+
+/** Audit REST 接続を env(BURP_AUDIT_API / BURP_AUDIT_TOKEN)から解決。未設定なら null(=標準 REST 1337 を使う)。 */
+function resolveBurpAudit(): BurpAuditConn | null {
+  const base = process.env.BURP_AUDIT_API;
+  if (!base) return null;
+  const token = process.env.BURP_AUDIT_TOKEN;
+  return { base, ...(token ? { token } : {}) };
 }
 
 // Burp Pro の REST API を叩いて能動スキャンを起動 → 完了までポーリング → issue を取り込む(XML export 不要のライブ版)。

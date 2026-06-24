@@ -54,6 +54,10 @@ export interface PlaywrightDriverOptions {
   /** サイト全体を覆う HTTP Basic/Digest 認証の資格情報(operator 提供)。指定すると Playwright が
    *  401 WWW-Authenticate を毎ナビ/リダイレクトで自動応答する(Basic/Digest 両対応・CORS 影響なし)。 */
   httpCredentials?: { username: string; password: string };
+  /** operator 提供のカスタムヘッダ(WAF 回避・案件指定の必須ヘッダ等)。マーカーと同じく「同一オリジン
+   *  (+ドキュメント遷移)」のリクエストにだけ付ける(クロスオリジンには付けない=第三者を CORS preflight で
+   *  壊さない)。raw http 経路(FetchHttpClient)には別途載せる。 */
+  extraHeaders?: Record<string, string>;
   navTimeoutMs?: number;
   settleMs?: number;
   maxBodySample?: number;
@@ -190,6 +194,8 @@ export class PlaywrightDriver implements Driver {
     // スコープとマーカーは別概念: スコープ=何を評価してよいか(別ドメイン・API 込みで広げてOK)、
     // マーカー=識別ヘッダで、同一オリジンなら preflight 不要なので常に無害。markerAllow で更に絞れる(既定=全許可)。
     const markerAllow = options.markerAllow ?? ((): boolean => true);
+    const extraHeaders = options.extraHeaders;
+    const hasExtra = !!extraHeaders && Object.keys(extraHeaders).length > 0;
     await context.route("**/*", async (route) => {
       try {
         const req = route.request();
@@ -204,8 +210,12 @@ export class PlaywrightDriver implements Driver {
             sameOrigin = false;
           }
         }
-        if (sameOrigin && markerAllow(req.url())) {
-          await route.continue({ headers: { ...req.headers(), [MARKER_HEADER]: MARKER_VALUE } });
+        if (sameOrigin && (hasExtra || markerAllow(req.url()))) {
+          // 同一オリジンのみ: operator のカスタムヘッダ + x-amraam マーカーを付与(CORS preflight 化しない)。
+          const headers: Record<string, string> = { ...req.headers() };
+          if (hasExtra) Object.assign(headers, extraHeaders);
+          if (markerAllow(req.url())) headers[MARKER_HEADER] = MARKER_VALUE;
+          await route.continue({ headers });
         } else {
           await route.continue();
         }
