@@ -97,6 +97,9 @@ export interface RunPilotOptions {
   /** OOB(Burp Collaborator)接続。設定すると診断中に probe_oob が使える(ブラインド SSRF/XXE/SQLi の確証)。
    *  CLI が BURP_AUDIT_API/BURP_AUDIT_TOKEN から解決して渡す。未設定なら probe_oob は not-available。 */
   oob?: BurpAuditConn;
+  /** 操作者の重点ヒント(自由文)。**シナリオ段の最優先目的**として注入する(per-screen 診断には混ぜない)。
+   *  例 "決済フローと /api/orders の IDOR を重点的に。クーポン/価格改ざんも"。emphasis であって排他ではない。 */
+  focus?: string;
 }
 
 export interface PilotResult {
@@ -708,10 +711,18 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       //    見てモデルが workflow を見つけ、無ければ即 scenario_done で締める。--no-scenario で無効化可。
       if (opts.scenarioPass !== false && !session.done) {
         session.scenarioDone = false;
-        opts.onText?.(`🧩 scenario stage: surveying the inventory for multi-step (A04) workflows`);
+        // 操作者の重点ヒント(--focus)は **このシナリオ段で実行**する(横断・目的志向なので per-screen 診断ではなくここが適切)。
+        const focusClause = opts.focus
+          ? `OPERATOR FOCUS (highest priority): ${opts.focus}\nTreat this as the PRIMARY objective of THIS stage. Build and test the scenario(s) it implies FIRST, and do NOT call scenario_done until you have ACTIVELY attempted the focus (log in, probe the relevant endpoints, build probe_scenario control/exploit flows for it). After the focus is covered, also handle any other obvious multi-step workflows. `
+          : "";
+        opts.onText?.(
+          opts.focus
+            ? `🧩 scenario stage: operator focus → ${opts.focus.slice(0, 120)}`
+            : `🧩 scenario stage: surveying the inventory for multi-step (A04) workflows`,
+        );
         turns += await runStage({
           system: SCENARIO_PROMPT,
-          goal: `Per-screen diagnosis is done. Call get_inventory and decide FROM THE INVENTORY whether this app has any multi-step / state-changing workflow worth abusing (e.g. a cart→checkout→order flow, a coupon/voucher redemption, a fund/points transfer, a multi-step registration/approval, a role/privilege change). If there is none, call scenario_done immediately. Otherwise, for each workflow: log in, walk the legitimate flow once, then build probe_scenario(control, exploit, effectMarker) threading captured ids via {{var}}, and record_finding only on a confirmed verdict. Call scenario_done when every workflow is covered.`,
+          goal: `${focusClause}Per-screen diagnosis is done. Call get_inventory and decide FROM THE INVENTORY whether this app has any multi-step / state-changing workflow worth abusing (e.g. a cart→checkout→order flow, a coupon/voucher redemption, a fund/points transfer, a multi-step registration/approval, a role/privilege change). If there is none${opts.focus ? " beyond the operator focus" : ""}, call scenario_done immediately. Otherwise, for each workflow: log in, walk the legitimate flow once, then build probe_scenario(control, exploit, effectMarker) threading captured ids via {{var}}, and record_finding only on a confirmed verdict. Call scenario_done when every workflow is covered.`,
           allowed: STAGE_TOOLS.scenario,
           maxTurns: Math.min(maxTurns, 40),
           model: deepModel, // workflow の発見・構築は最難の推論 → deep 固定

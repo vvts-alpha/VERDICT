@@ -50,8 +50,9 @@ commands:
   manifest [--out <file.json>] [--force]   (alias: init)
             interactive scope-manifest generator: answer the prompts to produce the JSON pilot/assess read
             (target / in·out-of-scope hosts·path / rate / crawl / model / auth roles. password echo is masked)
-  pilot   --manifest <file.json> | --url <url> [--model <m>] [--fast-model <m>] [--max-turns <n>] [--rate <ms>] [--headed] [--browser-path <bin>] [--no-sandbox] [--out <dir>]
+  pilot   --manifest <file.json> | --url <url> [--model <m>] [--fast-model <m>] [--max-turns <n>] [--rate <ms>] [--headed] [--focus "<text>"] [--browser-path <bin>] [--no-sandbox] [--out <dir>]
             ★Claude-led: Claude drives the tools (browser/http/login/record) to autonomously explore, verify, and record
+            --focus "<text>": operator emphasis injected as the TOP priority of the A04 scenario stage (not per-screen diagnosis). e.g. "決済フローと /api/orders の IDOR を重点的に"
             uses the manifest's auth.roles via the login(role) tool. more flexible than the deterministic pipeline (no metered API / Max subscription)
             --fast-model enables model tiering: survey/methodology/login and low-value screens on fast, only high-value screen diagnosis on --model (e.g. --model opus --fast-model sonnet)
             after per-screen diagnosis, a SCENARIO stage (deep model) hunts multi-step A04 business-logic abuse across endpoints (coupon/price/qty tampering, step-skip, mass-assignment) — auto-skipped if no transactional surface. [--no-scenario] disables it.
@@ -553,6 +554,8 @@ interface AssessManifest {
   /** operator 提供のカスタムヘッダ(WAF 回避・案件指定の必須ヘッダ等)。ブラウザ(同一オリジンのみ)+
    *  raw http 経路の両方に付与。state.sqlite には書かれない(manifest は gitignore)。 */
   http?: { headers?: Record<string, string> };
+  /** 操作者の重点ヒント(自由文)。シナリオ段の最優先目的として注入される(--focus と同義)。 */
+  focus?: string;
   model?: string;
   /** 認証(DESIGN §6.3)。資格情報だけでよい — ログインURL/項目はエージェントが自動発見。
    *  state.sqlite には書かれない。manifest は gitignore。 */
@@ -952,6 +955,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       rate: { type: "string" },
       "max-turns": { type: "string" },
       "max-screens": { type: "string" },
+      focus: { type: "string" }, // 操作者の重点ヒント(自由文)。シナリオ段の最優先目的として注入(per-screen には混ぜない)
       "no-scenario": { type: "boolean" }, // 既定で診断後に A04 シナリオ(横断ロジック)を実行。立てるとスキップ
       "burp-scan": { type: "boolean" },
       "burp-api": { type: "string" },
@@ -1072,6 +1076,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       ...(httpBasic ? { httpBasic } : {}),
       ...(customHeaders ? { customHeaders } : {}),
       ...(oobConn ? { oob: oobConn } : {}),
+      ...((values.focus ?? manifest?.focus) ? { focus: values.focus ?? manifest?.focus } : {}),
       profileDir: join(runsDir, id, "browser-profile"),
       artifactsDir: join(runsDir, id, "artifacts"),
       roleCreds,

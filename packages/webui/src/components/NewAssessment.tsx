@@ -32,6 +32,7 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
   const [fastModel, setFastModel] = useState(""); // fast: survey/methodology/低価値画面。空 = tiering なし
   const [rate, setRate] = useState("250");
   const [maxTurns, setMaxTurns] = useState("");
+  const [focus, setFocus] = useState(""); // 操作者の重点ヒント → シナリオ段の最優先目的
   const [headed, setHeaded] = useState(false);
   const [surveyOnly, setSurveyOnly] = useState(false);
   const [exhaustive, setExhaustive] = useState(false);
@@ -145,6 +146,7 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
     if (command === "pilot" && anyManual) options.attended = true;
     if (loginUrl.trim()) options.loginUrl = loginUrl.trim();
     if (command === "pilot" && maxScreens) options.maxScreens = Number.parseInt(maxScreens, 10);
+    if (command === "pilot" && focus.trim()) options.focus = focus.trim();
 
     try {
       const res = await fetch("/api/run", {
@@ -237,6 +239,17 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
           </label>
         ) : null}
       </div>
+      {command === "pilot" ? (
+        <label className="nf-field nf-wide" title="operator focus — injected as the TOP priority of the scenario (A04) stage, not per-screen diagnosis. emphasis, not exclusive (full coverage still runs).">
+          <span>Focus (scenario emphasis)</span>
+          <textarea
+            value={focus}
+            onChange={(e) => setFocus(e.target.value)}
+            placeholder="e.g. 決済フローと /api/orders の IDOR を重点的に。クーポン/価格改ざんも"
+            rows={2}
+          />
+        </label>
+      ) : null}
 
       <div className="nf-checks">
         <label>

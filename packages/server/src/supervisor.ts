@@ -34,6 +34,8 @@ export interface StartRunInput {
     loginUrl?: string;
     /** 診断する画面数の上限(既定 40)。0/未指定で既定。 */
     maxScreens?: number;
+    /** 操作者の重点ヒント(自由文)。シナリオ段の最優先目的として注入される(--focus)。 */
+    focus?: string;
     /** pilot のみ: 診断後に Burp 能動スキャンも実施(接続は env BURP_API)。 */
     burpScan?: boolean;
     /** pilot のみ: 全トラフィックを Burp プロキシ経由(接続は env BURP_PROXY)。 */
@@ -86,6 +88,7 @@ export class Supervisor {
     if (o.attended) args.push("--attended");
     if (o.loginUrl) args.push("--login-url", o.loginUrl);
     if (o.maxScreens != null) args.push("--max-screens", String(o.maxScreens));
+    if (o.focus) args.push("--focus", o.focus);
     if (input.command === "pilot" && o.burpScan) args.push("--burp-scan");
     if (input.command === "pilot" && o.burpProxy) args.push("--burp-proxy");
     // attended×LiveHands: 子は serve に逆接続して role セッションを screencast する(token 認証)。
@@ -116,6 +119,7 @@ export class Supervisor {
     if (o.burpProxy) args.push("--burp-proxy"); // 値なしフラグ(BURP_PROXY env から読む)
     if (o.loginUrl) args.push("--login-url", o.loginUrl);
     if (o.maxScreens != null) args.push("--max-screens", String(o.maxScreens));
+    if (o.focus) args.push("--focus", o.focus);
     // attended は新しい control チャネル(token)を発行して窓を WebUI に再オープンさせる。
     if (o.attended && this.relay && this.controlBase) {
       args.push("--attended");
