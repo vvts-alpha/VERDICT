@@ -9,7 +9,8 @@ import { isInScope } from "@veritas/core";
 import type { LoginCreds, Observation, PlaywrightDriver } from "@veritas/crawler";
 import { InventoryBuilder, normalizePath, smartLogin } from "@veritas/crawler";
 import type { LlmClient } from "@veritas/llm";
-import type { EvidenceStore, FetchHttpClient, HttpRequest, HttpResponse } from "@veritas/scanner";
+import type { BurpAuditConn, EvidenceStore, FetchHttpClient, HttpRequest, HttpResponse } from "@veritas/scanner";
+import { oobPayload, oobPoll } from "@veritas/scanner";
 import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { join } from "node:path";
@@ -94,6 +95,9 @@ export interface PilotSession {
   screenDone: boolean;
   /** シナリオ(A04 横断ロジック)ステージの完了シグナル。 */
   scenarioDone: boolean;
+  /** OOB(Burp Collaborator)基盤への接続。set されていれば probe_oob が使える(BURP_AUDIT_API 経由)。
+   *  ブラインド SSRF/XXE/SQLi 等の out-of-band 確証用。未設定なら probe_oob は not-available を返す。 */
+  oob?: BurpAuditConn;
   // ── attended(手動マルチセッション認証)──
   /** 手動ログイン済みのロール別ライブセッション。未指定 = 通常(単一コンテキスト)モード。 */
   roleSessions?: Map<string, RoleSession>;
@@ -103,7 +107,7 @@ export interface PilotSession {
 export const STAGE_TOOLS = {
   survey: ["browser_navigate", "browser_fill", "browser_click", "login", "probe_paths", "ignore_paths", "survey_status", "survey_done"],
   methodology: ["get_inventory", "record_methodology", "methodology_done"],
-  diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_dom_xss", "probe_stored_xss", "probe_redirect", "probe_jwt", "probe_csrf", "probe_logic", "analyze_session", "verify_access", "browser_navigate", "browser_fill", "browser_click", "record_finding", "screen_done"],
+  diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_dom_xss", "probe_stored_xss", "probe_redirect", "probe_jwt", "probe_csrf", "probe_oob", "probe_logic", "analyze_session", "verify_access", "browser_navigate", "browser_fill", "browser_click", "record_finding", "screen_done"],
   // シナリオ(A04 横断ロジック): inventory 俯瞰 + 多段リクエスト連鎖を probe_scenario で撃つ。画面診断の後に1回。
   scenario: ["get_inventory", "login", "http_request", "probe_scenario", "record_finding", "scenario_done"],
 } as const;
@@ -1357,6 +1361,88 @@ export function buildTools(s: PilotSession) {
                 : !authEnforced
                   ? "not confirmed: the no-auth request also succeeded — this endpoint isn't auth-gated (not CSRF; treat as access-control / missing-auth instead)."
                   : "not confirmed: the token-stripped / cross-origin request did NOT succeed — CSRF protection appears present.",
+          }),
+        );
+      },
+    ),
+    tool(
+      "probe_oob",
+      "Confirm a BLIND / out-of-band vuln via Burp Collaborator: blind SSRF, blind XXE, blind SQLi (DNS/HTTP exfil), OS command injection, header SSRF (X-Forwarded-Host / Referer / Host), email/webhook SSRF — anything where the EFFECT is the SERVER making an external request, not a visible response. Requires the AMRAAM Audit REST extension with Collaborator enabled (BURP_AUDIT_API). Put a {{OOB}} placeholder where the callback host belongs (a URL field, an XXE SYSTEM entity `<!ENTITY x SYSTEM \"http://{{OOB}}/\">`, a hostname, a header value). The tool generates a unique Collaborator host, injects it (in-scope target request), and polls ~waitSec for a DNS/HTTP/SMTP callback FROM the target; a callback = the server reached our host out-of-band = confirmed. Records a benign control + the injected request → negativeControl + positiveReplays evidenceIds for record_finding(category ssrf / rce as appropriate). NOTE: callbacks can lag seconds; nothing back after waitSec = not confirmed (try other params/headers/schemes).",
+      { method: z.string(), url: z.string(), headers: z.record(z.string()).optional(), body: z.string().nullable().optional(), waitSec: z.number().optional(), note: z.string().optional() },
+      async ({ method, url, headers, body, waitSec, note }) => {
+        if (!s.oob) return txt("OOB NOT AVAILABLE: set BURP_AUDIT_API (+ enable Collaborator in Burp) to use probe_oob. Without it, blind SSRF/XXE/SQLi cannot be confirmed out-of-band.");
+        const inPlaceholder = url.includes("{{OOB}}") || (body?.includes("{{OOB}}") ?? false) || Object.values(headers ?? {}).some((v) => v.includes("{{OOB}}"));
+        if (!inPlaceholder) return txt("ERROR: put a {{OOB}} placeholder where the callback host should be injected (in url, body, or a header value).");
+        let payload: { host: string; id: string };
+        try {
+          payload = await oobPayload(s.oob);
+        } catch (e) {
+          return txt(`OOB error: ${String(e).slice(0, 160)} (is the extension up and Collaborator enabled in Burp's project settings?)`);
+        }
+        const startTs = Date.now();
+        const sub = (v: string, host: string): string => v.replace(/\{\{OOB\}\}/g, host);
+        const inject = async (host: string, kind: "negative_control" | "positive_replay", resultBody: string): Promise<string> => {
+          const u = sub(url, host);
+          if (!isInScope(u, s.scope)) throw new Error(`out of scope: ${u}`);
+          const hdr: Record<string, string> = {};
+          for (const [k, v] of Object.entries(headers ?? {})) hdr[k] = sub(v, host);
+          const req: HttpRequest = { method: method.toUpperCase(), url: u, headers: { ...authHeaders(s), ...hdr }, body: body != null ? sub(body, host) : null };
+          const res = await s.http.send(req);
+          bumpHttp(s, res.status);
+          // 証拠の body は OOB の結果(マーカー= collaborator host)に差し替える。ブラインドなので HTTP 応答自体は無意味。
+          const ev = s.evidence.record({
+            screenId: s.currentScreenId ?? "pilot",
+            validator: "claude-pilot-oob",
+            kind,
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
+            response: { ...res, body: `[AMRAAM-OOB] ${resultBody}` },
+            note: note ? `${note} (oob)` : "oob",
+          });
+          return ev.id;
+        };
+        let controlEv: string;
+        try {
+          // negative control: コールバックしない良性ホストを注入(interaction が出ないこと)。
+          controlEv = await inject(`amraam-oob-noref-${payload.id.slice(0, 8)}.invalid`, "negative_control", "control: benign host, no callback expected");
+          // 本注入: collaborator host を埋めて送信。
+          await inject(payload.host, "positive_replay", `injected Collaborator host ${payload.host} (id ${payload.id}); polling for callback…`);
+        } catch (e) {
+          return txt(`ERROR: ${String(e).slice(0, 160)}`);
+        }
+        // コールバックは非同期(秒〜)。waitSec まで数秒おきにポーリング。
+        const budgetMs = Math.min(Math.max(waitSec ?? 20, 5), 45) * 1000;
+        const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+        let hits: Awaited<ReturnType<typeof oobPoll>> = [];
+        const t0 = Date.now();
+        while (Date.now() - t0 < budgetMs) {
+          await sleep(3000);
+          try {
+            hits = await oobPoll(s.oob, { since: startTs, id: payload.id });
+          } catch {
+            /* keep polling */
+          }
+          if (hits.length > 0) break;
+        }
+        const confirmed = hits.length > 0;
+        const summary = confirmed ? hits.map((h) => `${h.type}@${new Date(h.time).toISOString()}${h.clientIp ? ` from ${h.clientIp}` : ""}`).join("; ") : `no callback within ${Math.round(budgetMs / 1000)}s`;
+        // positiveReplays ×2: 確証結果(マーカー= host)を 2 件記録 → record_finding の証拠規律(>=2 安定 positive)に乗せる。
+        // positive の evidence body は **固定の長文(host 込み)** にする。ssrf/rce は非マーカー判定(checkEvidenceDiscipline)で
+        // control との body 長差 >64 が要るため、confirmed 時は control より常時十分長くなるようにして取りこぼしを防ぐ。
+        const resBody = confirmed
+          ? `OUT-OF-BAND CALLBACK CONFIRMED — the target server issued an external ${hits.map((h) => h.type).join("/")} request to our unique Burp Collaborator host, which proves a blind out-of-band vulnerability (SSRF / XXE / blind SQLi / RCE depending on the sink). collaborator_host=${payload.host} payload_id=${payload.id} interactions=[${summary}]`
+          : `no out-of-band callback within ${Math.round(budgetMs / 1000)}s for ${payload.host}`;
+        const p1 = await inject(payload.host, "positive_replay", `${resBody} [read#1]`).catch(() => "");
+        const p2 = await inject(payload.host, "positive_replay", `${resBody} [read#2]`).catch(() => "");
+        return txt(
+          JSON.stringify({
+            negativeControl: controlEv,
+            positiveReplays: [p1, p2].filter(Boolean),
+            effectMarker: payload.host,
+            collaboratorHost: payload.host,
+            interactions: hits,
+            verdict: confirmed
+              ? `OOB CONFIRMED — the target made ${hits.length} out-of-band ${hits.map((h) => h.type).join("/")} request(s) to our Collaborator host. record_finding(ssrf / rce / xxe as fits the sink) with these evidenceIds + effectMarker (the callback host).`
+              : `not confirmed: no Collaborator callback within ${Math.round(budgetMs / 1000)}s. The sink may be filtered, the response not blind, or the callback slow — try another param/header (X-Forwarded-Host, Referer), scheme (http/dns/gopher), or a longer waitSec.`,
           }),
         );
       },

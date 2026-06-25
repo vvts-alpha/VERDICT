@@ -40,13 +40,16 @@ public class AuditExtension implements BurpExtension {
         }
 
         AuditRegistry registry = new AuditRegistry(api);
+        // Burp Collaborator を使った OOB(ブラインド SSRF/XXE/SQLi 等)基盤。無効なら available()=false で透過。
+        OobManager oob = new OobManager(api);
+        api.logging().logToOutput("Collaborator OOB: " + (oob.available() ? "ready (server " + oob.server() + ")" : "unavailable — " + oob.error()));
         try {
-            ApiServer server = new ApiServer(api, store, registry, cfg.host, cfg.port, cfg.token);
+            ApiServer server = new ApiServer(api, store, registry, oob, cfg.host, cfg.port, cfg.token);
             server.start();
             api.logging().logToOutput(
                 "AMRAAM Audit REST listening on http://" + cfg.host + ":" + cfg.port
                 + (cfg.token != null ? " (X-Scan-Token required)" : " (no auth)")
-                + "  — docs: /docs , spec: /openapi.yaml");
+                + "  — docs: /docs , spec: /openapi.yaml , oob: /oob/payload");
             api.extension().registerUnloadingHandler(server::stop);
         } catch (IOException e) {
             api.logging().logToError("Failed to start API server on " + cfg.host + ":" + cfg.port + ": " + e.getMessage());

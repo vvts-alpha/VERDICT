@@ -1059,6 +1059,9 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
     });
 
   try {
+    // OOB(Burp Collaborator)接続を診断中に使えるよう解決(BURP_AUDIT_API があれば probe_oob が有効化)。
+    const oobConn = resolveBurpAudit();
+    if (oobConn) console.log(`  🛰 OOB ready via Collaborator (${oobConn.base}) — probe_oob enabled for blind SSRF/XXE/SQLi`);
     const res = await runPilot({
       store,
       assessmentId: id,
@@ -1068,6 +1071,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       ...(lockToTargets ? { lockToSeeds: true } : {}),
       ...(httpBasic ? { httpBasic } : {}),
       ...(customHeaders ? { customHeaders } : {}),
+      ...(oobConn ? { oob: oobConn } : {}),
       profileDir: join(runsDir, id, "browser-profile"),
       artifactsDir: join(runsDir, id, "artifacts"),
       roleCreds,

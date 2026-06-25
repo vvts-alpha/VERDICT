@@ -12,6 +12,7 @@ import type { LoginCreds } from "@veritas/crawler";
 import { InventoryBuilder, PlaywrightDriver, smartLogin } from "@veritas/crawler";
 import { ClaudeCliClient } from "@veritas/llm";
 import { EvidenceStore, FetchHttpClient } from "@veritas/scanner";
+import type { BurpAuditConn } from "@veritas/scanner";
 import { join } from "node:path";
 import { buildTools, STAGE_TOOLS, dedupKey, isAuthWalled, loadCookieFile, sessionLooksDead, stripHash } from "./tools.js";
 import type { PilotSession, RoleSession } from "./tools.js";
@@ -93,6 +94,9 @@ export interface RunPilotOptions {
    *  指定時のみ phase2_burpscan を report の前に挟む。keepWarm() を定期的に呼べば authed セッションを維持できる
    *  (長い Burp スキャン中にトークン/Cookie が stale 化しないように)。driver はこの時点でまだ生きている。 */
   onBurpScanPhase?: (ctx: { keepWarm: () => Promise<void>; cookie: string; bearer: string }) => Promise<void>;
+  /** OOB(Burp Collaborator)接続。設定すると診断中に probe_oob が使える(ブラインド SSRF/XXE/SQLi の確証)。
+   *  CLI が BURP_AUDIT_API/BURP_AUDIT_TOKEN から解決して渡す。未設定なら probe_oob は not-available。 */
+  oob?: BurpAuditConn;
 }
 
 export interface PilotResult {
@@ -366,6 +370,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     methodologyDone: false,
     screenDone: false,
     scenarioDone: false,
+    ...(opts.oob ? { oob: opts.oob } : {}),
     ...(roleSessions ? { roleSessions } : {}),
   };
 

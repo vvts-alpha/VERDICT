@@ -36,3 +36,5 @@ export { mergeBurpIssues } from "./burp-merge.js";
 export type { MergeBurpOptions, MergeBurpResult } from "./burp-merge.js";
 export { submitAudit, getAuditStatusAll, getAuditIssues, resetAudit, auditIssuesToBurpIssues, buildRawRequest } from "./burp-audit.js";
 export type { BurpAuditConn, AuditSubmit, AuditHostStatus } from "./burp-audit.js";
+export { oobStatus, oobPayload, oobPoll } from "./burp-oob.js";
+export type { OobInteraction } from "./burp-oob.js";

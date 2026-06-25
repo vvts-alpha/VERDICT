@@ -1,6 +1,7 @@
 package com.amraam.burpaudit;
 
 import burp.api.montoya.MontoyaApi;
+import burp.api.montoya.collaborator.Interaction;
 import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.scanner.ReportFormat;
 import burp.api.montoya.scanner.audit.Audit;
@@ -30,16 +31,18 @@ public final class ApiServer {
     private final MontoyaApi api;
     private final IssueStore store;
     private final AuditRegistry registry;
+    private final OobManager oob;
     private final String host;
     private final int port;
     private final String token; // null = 認証なし
     private final Gson gson = new GsonBuilder().disableHtmlEscaping().create();
     private MicroHttpServer server;
 
-    public ApiServer(MontoyaApi api, IssueStore store, AuditRegistry registry, String host, int port, String token) {
+    public ApiServer(MontoyaApi api, IssueStore store, AuditRegistry registry, OobManager oob, String host, int port, String token) {
         this.api = api;
         this.store = store;
         this.registry = registry;
+        this.oob = oob;
         this.host = host;
         this.port = port;
         this.token = token;
@@ -79,9 +82,17 @@ public final class ApiServer {
             if (!method.equals("POST")) { sendError(resp, 405, "POST only"); return; }
             store.clear();
             registry.clear(); // 既存 Audit も破棄 → 次の run は新規 Audit で再スキャンできる
+            if (oob != null) oob.clear();
             JsonObject o = new JsonObject();
             o.addProperty("status", "cleared");
             sendJson(resp, 200, o);
+        } else if (path.equals("/oob/payload")) {
+            if (!method.equals("POST")) { sendError(resp, 405, "POST only"); return; }
+            handleOobPayload(resp);
+        } else if (path.equals("/oob/interactions")) {
+            handleOobInteractions(resp, q);
+        } else if (path.equals("/oob/status")) {
+            handleOobStatus(resp);
         } else if (path.equals("/openapi.yaml") || path.equals("/openapi.yml")) {
             serveResource(resp, "/burp-audit-api.openapi.yaml", "application/yaml; charset=utf-8");
         } else if (path.equals("/docs") || path.equals("/")) {
@@ -204,6 +215,62 @@ public final class ApiServer {
         } finally {
             try { Files.deleteIfExists(tmp); } catch (IOException ignored) { /* best effort */ }
         }
+    }
+
+    // ── OOB(Burp Collaborator)── AMRAAM がブラインド SSRF/XXE/SQLi 等の確証に使う。
+    // POST /oob/payload → 一意ドメイン発行 / GET /oob/interactions?since=&id= → コールバック回収。
+    private void handleOobPayload(MicroHttpServer.Response resp) throws IOException {
+        if (oob == null || !oob.available()) {
+            sendError(resp, 503, "Collaborator unavailable" + (oob != null && !oob.error().isEmpty() ? ": " + oob.error() : " (enable it in Burp project settings)"));
+            return;
+        }
+        String[] p;
+        try {
+            p = oob.generate();
+        } catch (Exception e) {
+            // 一時障害(無効化/接続不能等)→ クライアントエラー(400)ではなく 503 を返す。
+            sendError(resp, 503, "Collaborator payload generation failed: " + e.getMessage());
+            return;
+        }
+        JsonObject o = new JsonObject();
+        o.addProperty("host", p[0]); // 注入用の完全なドメイン
+        o.addProperty("id", p[1]); // interaction.id と一致する相関キー
+        sendJson(resp, 200, o);
+    }
+
+    private void handleOobInteractions(MicroHttpServer.Response resp, Map<String, String> q) throws IOException {
+        if (oob == null || !oob.available()) { sendError(resp, 503, "Collaborator unavailable"); return; }
+        Long since = q.containsKey("since") ? Long.valueOf(q.get("since")) : null;
+        String idFilter = q.get("id");
+        JsonArray arr = new JsonArray();
+        for (Interaction i : oob.poll()) {
+            long ts = i.timeStamp().toInstant().toEpochMilli();
+            if (since != null && ts < since) continue;
+            String iid = i.id().toString();
+            if (idFilter != null && !idFilter.equals(iid)) continue;
+            JsonObject o = new JsonObject();
+            o.addProperty("id", iid);
+            o.addProperty("type", i.type().name()); // DNS / HTTP / SMTP
+            o.addProperty("time", ts);
+            try {
+                o.addProperty("client_ip", i.clientIp().getHostAddress());
+            } catch (Exception ignored) {
+                /* best-effort */
+            }
+            arr.add(o);
+        }
+        JsonObject out = new JsonObject();
+        out.add("interactions", arr);
+        sendJson(resp, 200, out);
+    }
+
+    private void handleOobStatus(MicroHttpServer.Response resp) throws IOException {
+        JsonObject o = new JsonObject();
+        boolean ok = oob != null && oob.available();
+        o.addProperty("available", ok);
+        o.addProperty("server", oob != null ? oob.server() : "");
+        if (!ok && oob != null && !oob.error().isEmpty()) o.addProperty("error", oob.error());
+        sendJson(resp, 200, o);
     }
 
     // バンドルした OpenAPI を Swagger UI(CDN)で描画。オフラインでも /openapi.yaml は生で取れる。
