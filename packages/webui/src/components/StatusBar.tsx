@@ -40,39 +40,6 @@ function BurpImport({ id }: { id: string }) {
   );
 }
 
-// Burp 能動スキャン(REST)を既存 run に対して起動。完了時に子プロセスが自動で issue を取り込むので
-// findings は WS 経由で勝手に増える(XML を手で export する必要なし)。Burp 接続は server 側 env(BURP_API)。
-function BurpScanButton({ id }: { id: string }) {
-  const [status, setStatus] = useState<string>("");
-  const [busy, setBusy] = useState(false);
-  async function onClick() {
-    if (busy) return;
-    setBusy(true);
-    setStatus("▶ starting…");
-    try {
-      const r = await fetch(`/api/run/${encodeURIComponent(id)}/burp-scan`, { method: "POST" });
-      const j = (await r.json().catch(() => ({}))) as { ok?: boolean; error?: string };
-      if (!r.ok) {
-        setStatus(`⚠ ${j.error ?? `HTTP ${r.status}`}`);
-      } else {
-        setStatus("✓ scanning in Burp — findings import automatically when done");
-      }
-    } catch (err) {
-      setStatus(`⚠ ${String(err).slice(0, 100)}`);
-    } finally {
-      setBusy(false);
-    }
-  }
-  return (
-    <span className="burpscan" title="Run a Burp Pro active scan (REST) on this run's in-scope surface and auto-import results">
-      <button type="button" className="burpscan-btn" onClick={onClick} disabled={busy}>
-        🐛 Burp scan
-      </button>
-      {status && <span className="burpscan-status">{status}</span>}
-    </span>
-  );
-}
-
 // レポート / 画面一覧のダウンロード。GET エンドポイントなので Cookie が自動送出される。
 // html/pdf は新タブでプレビュー(inline)、md/csv は添付 DL(server が Content-Disposition を付与)。
 function DownloadMenu({ id }: { id: string }) {
@@ -134,7 +101,6 @@ export function StatusBar({
       <button type="button" className="pausebtn" onClick={onTogglePause}>
         {view.paused ? "▶ resume" : "⏸ pause"}
       </button>
-      <BurpScanButton id={view.id} />
       <DownloadMenu id={view.id} />
       <span className={`conn ${conn}`}>● {view.paused ? "paused" : conn}</span>
     </header>
