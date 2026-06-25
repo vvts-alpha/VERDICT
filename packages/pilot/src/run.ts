@@ -112,7 +112,16 @@ export interface PilotResult {
   costUsd: number;
 }
 
-const DISALLOWED = ["Bash", "Read", "Write", "Edit", "NotebookEdit", "WebFetch", "WebSearch", "Glob", "Grep"];
+// disallowedTools は「モデルに見せない」リスト。onlyVeritasToolsHook が真の境界(全 non-veritas を deny)だが、
+// ここに **挙げていない組み込みツールは claude_code preset がモデルに提示する** → モデルが ToolSearch/TodoWrite/Task
+// 等を叩いて PreToolUse 拒否され、ターンとログを浪費する(実 run で頻発)。なので preset の組み込み系を網羅して隠す。
+const DISALLOWED = [
+  // file / exec / web
+  "Bash", "BashOutput", "KillShell", "Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "Glob", "Grep", "WebFetch", "WebSearch",
+  // agentic / meta(これが「tools search が使えない」の犯人。隠せばモデルは叩きに行かない)
+  "Task", "Agent", "ToolSearch", "TodoWrite", "Skill", "Monitor", "Workflow", "EnterPlanMode", "ExitPlanMode", "SendMessage",
+  "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "TaskStop", "TaskOutput", "CronCreate", "CronList", "CronDelete",
+];
 
 /** pilot は veritas の MCP ツールだけで回す(bounded 設計)。だが SDK は Bash/Read 以外にも Task/Agent/
  *  Monitor/Skill/ToolSearch/TaskCreate… を公開しており、bypassPermissions 下ではモデルがそれらを呼べてしまう

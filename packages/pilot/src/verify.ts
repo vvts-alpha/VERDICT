@@ -42,7 +42,13 @@ export interface VerifyBurpResult {
 }
 
 const HIGH_PLUS = new Set<Severity>(["high", "critical"]);
-const DISALLOWED = ["Bash", "Read", "Write", "Edit", "NotebookEdit", "WebFetch", "WebSearch", "Glob", "Grep"];
+// onlyVeritasToolsHook が真の境界。だが preset が提示する組み込み系をここで隠さないとモデルが ToolSearch 等を
+// 叩いて拒否され続ける(ターン浪費)。run.ts の DISALLOWED と揃える。
+const DISALLOWED = [
+  "Bash", "BashOutput", "KillShell", "Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "Glob", "Grep", "WebFetch", "WebSearch",
+  "Task", "Agent", "ToolSearch", "TodoWrite", "Skill", "Monitor", "Workflow", "EnterPlanMode", "ExitPlanMode", "SendMessage",
+  "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "TaskStop", "TaskOutput", "CronCreate", "CronList", "CronDelete",
+];
 
 const onlyVeritasToolsHook: HookCallback = async (input) => {
   const name = (input as { tool_name?: string }).tool_name ?? "";
