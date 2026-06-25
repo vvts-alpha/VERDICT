@@ -8,11 +8,12 @@ import { Findings } from "./components/Findings";
 import { ScreenView } from "./components/ScreenView";
 import { ApiList } from "./components/ApiList";
 import { Log } from "./components/Log";
+import { Scenarios } from "./components/Scenarios";
 import { Index } from "./components/Index";
 import { Sessions } from "./components/Sessions";
 import { Chat } from "./components/Chat";
 
-type Tab = "screen" | "findings" | "log" | "apis" | "sessions" | "ask";
+type Tab = "screen" | "findings" | "scenarios" | "log" | "apis" | "sessions" | "ask";
 
 // DESIGN §8 — 左 SITE TREE(ナビ)+ 進捗バー、右はタブ: Screen / Findings / 診断ログ / APIs。
 export function App() {
@@ -74,6 +75,9 @@ export function App() {
             <button type="button" className={tab === "findings" ? "active" : ""} onClick={() => setTab("findings")}>
               Findings ({view.findings.length})
             </button>
+            <button type="button" className={tab === "scenarios" ? "active" : ""} onClick={() => setTab("scenarios")}>
+              🧩 Scenarios
+            </button>
             <button type="button" className={tab === "apis" ? "active" : ""} onClick={() => setTab("apis")}>
               APIs
             </button>
@@ -101,6 +105,7 @@ export function App() {
               />
             ) : null}
             {tab === "findings" ? <Findings view={view} onJump={onSelect} /> : null}
+            {tab === "scenarios" ? <Scenarios view={view} onJump={onSelect} /> : null}
             {tab === "apis" ? <ApiList view={view} onJump={onSelect} /> : null}
             {tab === "log" ? <Log events={view.events} /> : null}
             {tab === "sessions" ? <Sessions id={view.id} /> : null}
