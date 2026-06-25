@@ -103,7 +103,7 @@ export interface PilotSession {
 export const STAGE_TOOLS = {
   survey: ["browser_navigate", "browser_fill", "browser_click", "login", "probe_paths", "ignore_paths", "survey_status", "survey_done"],
   methodology: ["get_inventory", "record_methodology", "methodology_done"],
-  diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_redirect", "probe_jwt", "probe_logic", "analyze_session", "verify_access", "browser_navigate", "browser_fill", "browser_click", "record_finding", "screen_done"],
+  diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_dom_xss", "probe_redirect", "probe_jwt", "probe_logic", "analyze_session", "verify_access", "browser_navigate", "browser_fill", "browser_click", "record_finding", "screen_done"],
   // シナリオ(A04 横断ロジック): inventory 俯瞰 + 多段リクエスト連鎖を probe_scenario で撃つ。画面診断の後に1回。
   scenario: ["get_inventory", "login", "http_request", "probe_scenario", "record_finding", "scenario_done"],
 } as const;
@@ -961,6 +961,81 @@ export function buildTools(s: PilotSession) {
                 ? "REFLECTED XSS — payload reflected UNESCAPED in an HTML response; record_finding(xss-reflected) with these evidenceIds + effectMarker"
                 : "payload reflected unescaped but response is NOT html content-type — likely not browser-executable; verify the sink before recording"
               : `not confirmed: ${(verdict as { reason: string }).reason}`,
+          }),
+        );
+      },
+    ),
+    tool(
+      "probe_dom_xss",
+      "Confirm DOM-based / innerHTML-sink XSS by ACTUAL BROWSER EXECUTION — what probe_xss CANNOT see (probe_xss only checks HTTP-response reflection, so it misses client-rendered SPA sinks: a search box that renders `q` into innerHTML, e.g. Juice Shop `#/search?q=`, returns JSON/SPA-shell from the server and executes only in the browser). Navigates a real browser to the injection point with an executing payload and reports whether it RAN. Pass `url` with a `{{XSS}}` placeholder at the injection point (best — also works for hash routes), or `url` + `param` (the query/hash param to inject). Sends a benign control (no payload) + the payload twice; returns negativeControl + positiveReplays evidenceIds + effectMarker, ready for record_finding(category xss-reflected). USE THIS whenever probe_xss came back 'reflected but NOT html' / 'not confirmed' on a client-rendered or SPA route.",
+      { url: z.string(), param: z.string().optional() },
+      async ({ url, param }) => {
+        const tok = `domX${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`;
+        // 実行時に window.__amraam_xss=tok を立て、alert でも出す(どちらか1つでも検出)。img.onerror は innerHTML 挿入で発火。
+        const payload = `"><img src=x onerror="window.__amraam_xss='${tok}';alert('${tok}')">`;
+        const benign = `amraam${tok}safe`;
+        const buildUrl = (val: string): string | null => {
+          try {
+            if (url.includes("{{XSS}}")) return url.replace(/\{\{XSS\}\}/g, encodeURIComponent(val));
+            if (!param) return null;
+            // ハッシュルート対応: '#…' があればハッシュ側のクエリへ注入(URL API は hash 内を触らないため手で組む)。
+            const hashAt = url.indexOf("#");
+            if (hashAt >= 0) {
+              const base = url.slice(0, hashAt);
+              let hash = url.slice(hashAt); // 例 '#/search?q=…'
+              const enc = `${encodeURIComponent(param)}=${encodeURIComponent(val)}`;
+              const re = new RegExp(`([?&]${param}=)[^&]*`);
+              if (hash.includes("?")) hash = re.test(hash) ? hash.replace(re, `$1${encodeURIComponent(val)}`) : `${hash}&${enc}`;
+              else hash = `${hash}?${enc}`;
+              return base + hash;
+            }
+            const uu = new URL(url);
+            uu.searchParams.set(param, val);
+            return uu.toString();
+          } catch {
+            return null;
+          }
+        };
+        const run = async (val: string, kind: "negative_control" | "positive_replay", tag: string) => {
+          const u = buildUrl(val);
+          if (!u) return null;
+          if (!isInScope(u, s.scope)) throw new Error(`out of scope: ${u}`);
+          const r = await s.driver.detectXssExecution(u, tok);
+          const ev = s.evidence.record({
+            screenId: s.currentScreenId ?? "pilot",
+            validator: "claude-pilot-dom-xss",
+            kind,
+            request: { method: "GET", url: u, headers: {}, body: null },
+            // 実行結果を body に符号化(executed のとき tok を含む)→ record_finding のマーカーゲートに乗る。
+            response: { status: 200, finalUrl: u, durationMs: 0, headers: { "content-type": "text/html" }, body: r.executed ? `${r.signal} [${tok}]` : r.signal },
+            note: `dom-xss ${tag}`,
+          });
+          return { evId: ev.id, executed: r.executed, signal: r.signal };
+        };
+        let ctrl: Awaited<ReturnType<typeof run>>;
+        let p1: Awaited<ReturnType<typeof run>>;
+        let p2: Awaited<ReturnType<typeof run>>;
+        try {
+          ctrl = await run(benign, "negative_control", "control(benign, no payload)");
+          p1 = await run(payload, "positive_replay", "payload #1");
+          p2 = await run(payload, "positive_replay", "payload #2");
+        } catch (e) {
+          return txt(`ERROR: ${String(e).slice(0, 180)}`);
+        }
+        if (!ctrl || !p1 || !p2) return txt("ERROR: could not build injection URL — pass url with a {{XSS}} placeholder, or url + param.");
+        const confirmed = !ctrl.executed && p1.executed && p2.executed;
+        return txt(
+          JSON.stringify({
+            negativeControl: ctrl.evId,
+            positiveReplays: [p1.evId, p2.evId],
+            effectMarker: tok,
+            control: { executed: ctrl.executed },
+            payload: [{ executed: p1.executed, signal: p1.signal }, { executed: p2.executed, signal: p2.signal }],
+            verdict: confirmed
+              ? "DOM XSS CONFIRMED — payload EXECUTED in the browser (control did not). record_finding(xss-reflected) with these evidenceIds + effectMarker."
+              : ctrl.executed
+                ? "inconclusive: the benign control also 'executed' — detection is unreliable here, do not record."
+                : "not confirmed: payload did not execute in the browser (the sink escapes it or is not a live DOM sink).",
           }),
         );
       },

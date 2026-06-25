@@ -1687,7 +1687,7 @@ async function verifyImportedBurp(
   store: AssessmentStore,
   id: string,
   runsDir: string,
-  o: { model?: string; httpBasic?: { user: string; pass: string } | null },
+  o: { model?: string; httpBasic?: { user: string; pass: string } | null; cookie?: string; bearer?: string },
 ): Promise<void> {
   const st = store.loadAssessment(id);
   if (!st) return;
@@ -1695,7 +1695,12 @@ async function verifyImportedBurp(
   const rpm = scope.rate?.requestsPerMinute ?? 30;
   const minDelayMs = Math.max(0, Math.floor(60_000 / Math.max(1, rpm)));
   const artifactsDir = join(runsDir, id, "artifacts");
-  const http = new FetchHttpClient({ allow: (u) => isInScope(u, scope), minDelayMs, ...(o.httpBasic ? { headers: basicHeader(o.httpBasic) } : {}) });
+  // 認証下 finding(Bearer 必須の /profile など)を再現できるよう、http クライアントに session を載せる。
+  const sessionHeaders: Record<string, string> = {
+    ...(o.cookie ? { cookie: o.cookie } : {}),
+    ...(o.bearer ? { authorization: `Bearer ${o.bearer}` } : basicHeader(o.httpBasic ?? null)),
+  };
+  const http = new FetchHttpClient({ allow: (u) => isInScope(u, scope), minDelayMs, headers: sessionHeaders });
   const evidence = new EvidenceStore(artifactsDir);
   try {
     const res = await verifyBurpFindings({
@@ -1705,6 +1710,8 @@ async function verifyImportedBurp(
       http,
       evidence,
       artifactsDir,
+      ...(o.cookie ? { cookie: o.cookie } : {}),
+      ...(o.bearer ? { bearer: o.bearer } : {}),
       ...(o.model ? { model: o.model } : {}),
       onText: (t) => console.log(`  🔎 ${t.slice(0, 200)}`),
       onTool: (n, i) => console.log(`    ⚙ ${n.replace("mcp__veritas__", "")} ${JSON.stringify(i).slice(0, 120)}`),
@@ -1849,7 +1856,14 @@ async function runBurpAuditOnRun(
   });
   console.log(`\nburp-audit ${id}: ${issues.length} issue(s) → +${added} net-new(dup ${skipped} / out-of-scope ${oos})`);
   if (added > 0) {
-    if (o.verify !== false) await verifyImportedBurp(store, id, runsDir, { ...(o.verifyModel ? { model: o.verifyModel } : {}), httpBasic: o.httpBasic ?? null });
+    // Audit 経路は authed セッション(cookie/bearer)を持つので再検証にも渡す(/profile 等の認証下 finding を再現可能に)。
+    if (o.verify !== false)
+      await verifyImportedBurp(store, id, runsDir, {
+        ...(o.verifyModel ? { model: o.verifyModel } : {}),
+        httpBasic: o.httpBasic ?? null,
+        ...(o.cookie ? { cookie: o.cookie } : {}),
+        ...(o.bearer ? { bearer: o.bearer } : {}),
+      });
     const fs2 = store.loadAssessment(id);
     if (fs2) writeFileSync(join(runsDir, id, "report.md"), buildReport(fs2, new Date(), { loadEvidence: evidenceLoaderFor(runsDir, id) }));
   }

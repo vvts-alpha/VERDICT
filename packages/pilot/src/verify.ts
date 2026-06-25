@@ -26,6 +26,9 @@ export interface VerifyBurpDeps {
   artifactsDir: string;
   /** 認証下 finding を再現するための Cookie ヘッダ(任意。無ければ未認証で検証)。 */
   cookie?: string;
+  /** Bearer JWT(任意)。Juice Shop 等は /profile を Bearer で検証するので、これが無いと再テストが 401/「Blocked」で
+   *  弾かれ「再現できず」と誤判定する(SSTI/XSS 再検証が失敗していた根因)。cookie と併せて Authorization に載せる。 */
+  bearer?: string;
   model?: string;
   maxTurnsPerFinding?: number;
   onText?: (t: string) => void;
@@ -141,7 +144,13 @@ export async function verifyBurpFindings(deps: VerifyBurpDeps): Promise<VerifyBu
         const req: HttpRequest = {
           method: method.toUpperCase(),
           url,
-          headers: { ...(deps.cookie ? { cookie: deps.cookie } : {}), ...(headers ?? {}) },
+          // 認証下 finding(/profile の JWT none・SSTI 等)を再現できるよう、cookie + Bearer をデフォルトで載せる
+          // (モデルが headers で上書きすれば優先)。これが無いと Juice Shop は 401/「Blocked illegal activity」を返す。
+          headers: {
+            ...(deps.cookie ? { cookie: deps.cookie } : {}),
+            ...(deps.bearer ? { authorization: `Bearer ${deps.bearer}` } : {}),
+            ...(headers ?? {}),
+          },
           body: body ?? null,
         };
         let res: HttpResponse;

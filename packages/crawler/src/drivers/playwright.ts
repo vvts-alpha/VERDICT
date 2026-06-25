@@ -4,7 +4,7 @@
 // in-page で実行されるコールバックは (globalThis as any) 経由で DOM へ触れる
 // → DOM lib を引かず Node 型と衝突させない。
 
-import type { BrowserContext, CDPSession, Page } from "playwright-core";
+import type { BrowserContext, CDPSession, Dialog, Page } from "playwright-core";
 import type { CapturedExchange, Driver, FormObservation, Observation } from "../types.js";
 import { detectStuck } from "../auth.js";
 
@@ -392,6 +392,47 @@ export class PlaywrightDriver implements Driver {
       /* 到達できなくても続行 */
     }
     await new Promise<void>((resolve) => setTimeout(resolve, this.opts.settleMs));
+  }
+
+  /**
+   * ブラウザ XSS *実行* 検出。`url`(ペイロード内包)へ navigate し、ペイロードが実際に走ったかを見る。
+   * HTTP 応答の反映を見る probe_xss では原理的に捉えられない **DOM-based / innerHTML-sink XSS** 用
+   * (例: Juice Shop の検索 `#/search?q=…` は q を innerHTML へ描画 → サーバ応答には出ず browser 内で実行)。
+   * 検出シグナル: ペイロードが (1) `window.__amraam_xss = marker` を立てる(`<img onerror>`/`<svg onload>` 等が発火)
+   * か (2) `alert/confirm/prompt` で marker を出す。どちらか1つでも実行確証。
+   */
+  async detectXssExecution(url: string, marker: string): Promise<{ executed: boolean; signal: string }> {
+    let dialog = "";
+    const onDialog = (d: Dialog) => {
+      dialog = d.message();
+      void d.dismiss().catch(() => {});
+    };
+    this.page.on("dialog", onDialog);
+    try {
+      try {
+        await this.page.goto(url, { waitUntil: "domcontentloaded", timeout: this.opts.navTimeoutMs });
+      } catch {
+        /* SPA ハッシュルートは navigation 完了扱いにならないことがある → 続行して描画を待つ */
+      }
+      // SPA がルートを評価し q を innerHTML へ反映 → img.onerror / svg.onload が走るのを待つ。
+      await new Promise<void>((resolve) => setTimeout(resolve, Math.max(this.opts.settleMs, 900)));
+      const g = await this.page
+        .evaluate(() => String((globalThis as { __amraam_xss?: unknown }).__amraam_xss ?? ""))
+        .catch(() => "");
+      const viaGlobal = g.includes(marker);
+      const viaDialog = dialog.includes(marker);
+      const executed = viaGlobal || viaDialog;
+      return {
+        executed,
+        signal: executed
+          ? viaGlobal
+            ? `XSS EXECUTED — sink fired (onerror/onload set window.__amraam_xss=${g})`
+            : `XSS EXECUTED — dialog(alert/confirm/prompt): ${dialog}`
+          : "no execution — payload was not run by the browser (escaped / not a live sink)",
+      };
+    } finally {
+      this.page.off("dialog", onDialog);
+    }
   }
 
   async snapshot(): Promise<PageSnapshot> {
