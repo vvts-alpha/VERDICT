@@ -103,7 +103,7 @@ export interface PilotSession {
 export const STAGE_TOOLS = {
   survey: ["browser_navigate", "browser_fill", "browser_click", "login", "probe_paths", "ignore_paths", "survey_status", "survey_done"],
   methodology: ["get_inventory", "record_methodology", "methodology_done"],
-  diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_dom_xss", "probe_redirect", "probe_jwt", "probe_logic", "analyze_session", "verify_access", "browser_navigate", "browser_fill", "browser_click", "record_finding", "screen_done"],
+  diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_dom_xss", "probe_stored_xss", "probe_redirect", "probe_jwt", "probe_csrf", "probe_logic", "analyze_session", "verify_access", "browser_navigate", "browser_fill", "browser_click", "record_finding", "screen_done"],
   // シナリオ(A04 横断ロジック): inventory 俯瞰 + 多段リクエスト連鎖を probe_scenario で撃つ。画面診断の後に1回。
   scenario: ["get_inventory", "login", "http_request", "probe_scenario", "record_finding", "scenario_done"],
 } as const;
@@ -1200,6 +1200,163 @@ export function buildTools(s: PilotSession) {
               { status: mut2.status, len: mut2.len, marker: mut2.hasMarker },
             ],
             verdict: verdict.ok ? "MANIPULATION ACCEPTED — record_finding with these evidenceIds + effectMarker" : `not confirmed: ${(verdict as { reason: string }).reason}`,
+          }),
+        );
+      },
+    ),
+    tool(
+      "probe_stored_xss",
+      "Confirm STORED / cross-context XSS: injects a marker payload at a STORE point (a request that PERSISTS input — comment, profile, filename, ticket, review) then reads it back at a RENDER point to see if it comes back UNESCAPED (or EXECUTES in a browser). The render point can be a DIFFERENT endpoint/screen and can be viewed AS ANOTHER ROLE (`renderAsRole`) to prove cross-user stored XSS (store as the attacker, it fires in a victim/admin view). `store`: {method,url,headers?,body?} with a {{XSS}} placeholder where the input lands. `renderUrl`: where to read it back (GET). Set `renderBrowser:true` to drive a real browser at renderUrl and detect ACTUAL execution (client-rendered stores). Returns negativeControl + positiveReplays evidenceIds + effectMarker, ready for record_finding(category xss-stored).",
+      {
+        store: z.object({ method: z.string(), url: z.string(), headers: z.record(z.string()).optional(), body: z.string().nullable().optional() }),
+        renderUrl: z.string(),
+        renderBrowser: z.boolean().optional(),
+        renderAsRole: z.string().optional(),
+      },
+      async ({ store, renderUrl, renderBrowser, renderAsRole }) => {
+        const tok = `stoX${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`;
+        const payload = `"><img src=x onerror="window.__amraam_xss='${tok}'">`;
+        const benign = `amraam${tok}safe`;
+        const sig = `onerror="window.__amraam_xss='${tok}'"`; // HTTP 反映の確証= 未エスケープのこの片が render に出ること
+        const effectMarker = renderBrowser ? tok : sig; // ブラウザ実行なら tok、HTTP 反映なら未エスケープ片
+        if (!isInScope(store.url, s.scope) || !isInScope(renderUrl, s.scope)) return txt("BLOCKED: store/render url out of scope");
+        // render を別ロールで覗く(cross-user stored XSS の確証)。roleSessions に無ければ現在のセッションのまま。
+        let renderHeaders: Record<string, string> = authHeaders(s);
+        if (renderAsRole) {
+          const live = s.roleSessions?.get(renderAsRole);
+          if (live) {
+            const ck = await live.driver.sessionCookieHeader().catch(() => live.cookie);
+            const bt = await live.driver.bearerToken().catch(() => null);
+            renderHeaders = { ...(ck ? { cookie: ck } : {}), ...(bt ? { authorization: `Bearer ${bt}` } : {}) };
+          }
+        }
+        const doStore = async (val: string): Promise<number> => {
+          const body = store.body != null ? store.body.replace(/\{\{XSS\}\}/g, val) : null;
+          const u = store.url.replace(/\{\{XSS\}\}/g, encodeURIComponent(val));
+          const req: HttpRequest = { method: store.method.toUpperCase(), url: u, headers: { ...authHeaders(s), ...(store.headers ?? {}) }, body };
+          const res = await s.http.send(req);
+          bumpHttp(s, res.status);
+          return res.status;
+        };
+        const render = async (kind: "negative_control" | "positive_replay", tag: string): Promise<{ evId: string; status: number; has: boolean }> => {
+          if (renderBrowser) {
+            const r = await s.driver.detectXssExecution(renderUrl, tok);
+            const ev = s.evidence.record({
+              screenId: s.currentScreenId ?? "pilot",
+              validator: "claude-pilot-stored-xss",
+              kind,
+              request: { method: "GET", url: renderUrl, headers: {}, body: null },
+              response: { status: 200, finalUrl: renderUrl, durationMs: 0, headers: { "content-type": "text/html" }, body: r.executed ? `${r.signal} [${tok}]` : r.signal },
+              note: `stored-xss browser ${tag}`,
+            });
+            return { evId: ev.id, status: 200, has: r.executed };
+          }
+          const req: HttpRequest = { method: "GET", url: renderUrl, headers: renderHeaders, body: null };
+          const res = await s.http.send(req);
+          bumpHttp(s, res.status);
+          const ev = s.evidence.record({
+            screenId: s.currentScreenId ?? "pilot",
+            validator: "claude-pilot-stored-xss",
+            kind,
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
+            response: res,
+            note: `stored-xss render ${tag}`,
+          });
+          return { evId: ev.id, status: res.status, has: res.body.includes(sig) };
+        };
+        let ctrl: Awaited<ReturnType<typeof render>>;
+        let p1: Awaited<ReturnType<typeof render>>;
+        let p2: Awaited<ReturnType<typeof render>>;
+        try {
+          await doStore(benign);
+          ctrl = await render("negative_control", "control(benign stored)");
+          await doStore(payload);
+          p1 = await render("positive_replay", "payload read #1");
+          p2 = await render("positive_replay", "payload read #2");
+        } catch (e) {
+          return txt(`ERROR: ${String(e).slice(0, 160)}`);
+        }
+        const confirmed = !ctrl.has && p1.has && p2.has;
+        return txt(
+          JSON.stringify({
+            negativeControl: ctrl.evId,
+            positiveReplays: [p1.evId, p2.evId],
+            effectMarker,
+            renderedAs: renderAsRole ?? s.currentRole ?? "current session",
+            mode: renderBrowser ? "browser-execution" : "http-reflection",
+            control: { fired: ctrl.has },
+            payload: [{ fired: p1.has }, { fired: p2.has }],
+            verdict: confirmed
+              ? `STORED XSS — the payload ${renderBrowser ? "EXECUTED in the browser" : "came back UNESCAPED"} at the render point (control clean)${renderAsRole ? ` viewed as role '${renderAsRole}' (cross-user)` : ""}. record_finding(xss-stored) with these evidenceIds + effectMarker.`
+              : "not confirmed: the payload did not persist + fire at the render point (escaped, not stored, or not rendered there).",
+          }),
+        );
+      },
+    ),
+    tool(
+      "probe_csrf",
+      "Confirm CSRF on a state-changing request. Only meaningful for COOKIE-based sessions — Bearer/Authorization is NOT auto-sent cross-site, so Bearer-auth endpoints are not CSRF-able (the tool returns not-applicable). Give a request that currently SUCCEEDS with the session ({method,url,headers?,body?}); the tool (1) sends it with NO auth (must FAIL → proves auth is enforced), then (2) sends it with the COOKIE ONLY (no Authorization, like a browser cross-site request), the anti-CSRF token STRIPPED, and a cross-site Origin/Referer — twice; if it still SUCCEEDS, CSRF protection is missing/ineffective. `stripFields`/`stripHeaders` override which token names are removed (defaults cover csrf/_csrf/authenticity_token/X-CSRF-Token/X-Requested-With). Returns negativeControl(no-auth) + positiveReplays(stripped) evidenceIds for record_finding(category csrf). IMPORTANT: also confirm the session cookie is NOT SameSite=Strict/Lax (use analyze_session) — if it is, it is NOT cross-site exploitable.",
+      { method: z.string(), url: z.string(), headers: z.record(z.string()).optional(), body: z.string().nullable().optional(), stripFields: z.array(z.string()).optional(), stripHeaders: z.array(z.string()).optional() },
+      async ({ method, url, headers, body, stripFields, stripHeaders }) => {
+        if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} out of scope`);
+        if (!s.currentCookie)
+          return txt("NOT APPLICABLE: no session cookie — this session is Bearer/none. Browsers don't auto-send Authorization cross-site, so Bearer-auth endpoints are not CSRF-able (CSRF needs a cookie-based session).");
+        const fields = (stripFields ?? ["csrf", "_csrf", "csrf_token", "csrftoken", "authenticity_token", "__requestverificationtoken", "xsrf", "_token"]).map((f) => f.toLowerCase());
+        const dropHeaders = new Set((stripHeaders ?? ["x-csrf-token", "x-xsrf-token", "x-csrftoken", "x-requested-with", "csrf-token"]).map((h) => h.toLowerCase()));
+        const stripBody = (b: string | null): string | null => {
+          if (!b) return b;
+          const t = b.trim();
+          if (t.startsWith("{")) {
+            try {
+              const o = JSON.parse(t) as Record<string, unknown>;
+              for (const k of Object.keys(o)) if (fields.includes(k.toLowerCase())) delete o[k];
+              return JSON.stringify(o);
+            } catch {
+              /* not JSON → form 扱いへ */
+            }
+          }
+          return b.split("&").filter((kv) => !fields.includes((kv.split("=")[0] ?? "").toLowerCase())).join("&");
+        };
+        const baseHeaders: Record<string, string> = {};
+        for (const [k, v] of Object.entries(headers ?? {})) if (!dropHeaders.has(k.toLowerCase())) baseHeaders[k] = v;
+        const evil = "https://amraam-csrf.example";
+        const crossOrigin = { origin: evil, referer: `${evil}/` };
+        const fire = async (hdr: Record<string, string>, bdy: string | null, kind: "negative_control" | "positive_replay", tag: string) => {
+          const req: HttpRequest = { method: method.toUpperCase(), url, headers: hdr, body: bdy };
+          const res = await s.http.send(req);
+          bumpHttp(s, res.status);
+          const ev = s.evidence.record({ screenId: s.currentScreenId ?? "pilot", validator: "claude-pilot-csrf", kind, request: { ...req, headers: s.http.effectiveHeaders(req.headers) }, response: res, note: `csrf ${tag}` });
+          return { evId: ev.id, status: res.status };
+        };
+        let ctrl: Awaited<ReturnType<typeof fire>>;
+        let p1: Awaited<ReturnType<typeof fire>>;
+        let p2: Awaited<ReturnType<typeof fire>>;
+        try {
+          // (1) 無認証(cookie も bearer も無し)+ cross-origin → 認証が効いていれば失敗するはず。
+          ctrl = await fire({ ...baseHeaders, ...crossOrigin }, body ?? null, "negative_control", "no-auth (must fail)");
+          // (2) cookie のみ(Authorization は付けない=ブラウザのクロスサイト相当)+ token 除去 + cross-origin。
+          const atkHeaders = { ...baseHeaders, ...crossOrigin, cookie: s.currentCookie };
+          const atkBody = stripBody(body ?? null);
+          p1 = await fire(atkHeaders, atkBody, "positive_replay", "cookie-only, token-stripped #1");
+          p2 = await fire(atkHeaders, atkBody, "positive_replay", "cookie-only, token-stripped #2");
+        } catch (e) {
+          return txt(`ERROR: ${String(e).slice(0, 160)}`);
+        }
+        const ok2xx = (n: number): boolean => n >= 200 && n < 300;
+        const authEnforced = !ok2xx(ctrl.status);
+        const csrfWorks = ok2xx(p1.status) && ok2xx(p2.status);
+        return txt(
+          JSON.stringify({
+            negativeControl: ctrl.evId,
+            positiveReplays: [p1.evId, p2.evId],
+            noAuth: { status: ctrl.status },
+            strippedCookieOnly: [{ status: p1.status }, { status: p2.status }],
+            verdict:
+              authEnforced && csrfWorks
+                ? "LIKELY CSRF — auth IS enforced (no-auth failed) yet the cookie-only, token-stripped, cross-origin request SUCCEEDED twice. Before record_finding(csrf): confirm the session cookie is NOT SameSite=Strict/Lax (analyze_session) — only then is it cross-site exploitable."
+                : !authEnforced
+                  ? "not confirmed: the no-auth request also succeeded — this endpoint isn't auth-gated (not CSRF; treat as access-control / missing-auth instead)."
+                  : "not confirmed: the token-stripped / cross-origin request did NOT succeed — CSRF protection appears present.",
           }),
         );
       },
