@@ -64,6 +64,9 @@ export interface PilotSession {
   screenProbes: number;
   done: boolean;
   doneSummary: string;
+  /** done の中でも「トークン/利用上限の枯渇で中断」= スキップではなく resume 可能な一時停止。
+   *  立つと最終処理が phase を report に落とさず、診断中だった画面も queued に戻す(再診断できる)。 */
+  paused: boolean;
   model: string | undefined;
   // ── ステージ運用の状態 ──
   /** 観測 → Screen 化 + dedup(assess と同じ台帳)。 */
@@ -503,6 +506,13 @@ export function checkScreenCoverage(
   return { ok: true };
 }
 
+/** survey_done の認証ゲート(純関数): ロールが設定されているのに認証セッションが立っていなければ拒否。
+ *  匿名のまま survey を閉じると post-login サーフェスが丸ごと未マップになり、画面数が静かに半減する。
+ *  authActive = currentCookie か Bearer が非空か(currentRole が立つだけでは不可 — attended は誤陽性になる)。 */
+export function surveyAuthGate(roleCount: number, authActive: boolean): { ok: true } | { ok: false } {
+  return roleCount > 0 && !authActive ? { ok: false } : { ok: true };
+}
+
 /** 証拠規律の構造チェック(純粋・カテゴリ非依存)。runValidator と同じ規律を pilot finding に強制する:
  *  (1) positive replay が ≥2 で互いに安定(status 一致・本文長が ±64 以内)= 再現性、
  *  (2) negative control が positive と区別できる(status 違い or 本文長差 >64)= catch-all でない実差分。
@@ -707,6 +717,25 @@ export function buildTools(s: PilotSession) {
       "Finish the SURVEY stage once the frontier is empty and every role's authenticated surface is mapped. Provide a one-line coverage summary.",
       { summary: z.string() },
       async ({ summary }) => {
+        // 構造的な認証ゲート: ロールが設定されているのに認証セッションが一度も立っていない
+        // (currentCookie も Bearer も空)なら、post-login サーフェスが丸ごと未マップ＝匿名 survey。
+        // ここで survey_done を拒否し、各ロールで login() してから完了させる(evidence discipline /
+        // screen_done の coverage gate と同じ「省略を構造で防ぐ」思想)。attended の primary も、
+        // 手動ログインが実際に cookie を生むまでは未認証扱いになる(currentRole が立つだけでは通さない)。
+        const roles = availableRoles(s);
+        const authActive = !!(s.currentCookie || s.currentBearer);
+        if (!surveyAuthGate(roles.length, authActive).ok) {
+          const names = roles.map((r) => (r.description ? `${r.name} (${r.description})` : r.name)).join(", ");
+          s.store.appendEvent(s.assessmentId, {
+            type: "note",
+            payload: { message: `⛔ survey_done refused — ${roles.length} role(s) configured but no authenticated session active; post-login surface unmapped` },
+          });
+          return txt(
+            `survey_done REFUSED — ${roles.length} role(s) are configured (${names}) but no authenticated session is active, so the entire post-login surface is unmapped (this is how a run silently drops from ~60 to ~30 screens). ` +
+              `For EACH role: call login(role) — in attended mode this switches to the operator's live session; verify the response shows a cookie/bearer is present — then browser_navigate the authenticated pages it unlocks so they enter the inventory. ` +
+              `Only call survey_done again once each role's authenticated surface is mapped. (If a target genuinely has no auth, no roles would be configured and this gate would not apply.)`,
+          );
+        }
         s.surveyDone = true;
         s.store.appendEvent(s.assessmentId, { type: "note", payload: { message: `🗺  SURVEY done: ${summary.slice(0, 300)}` } });
         return txt(`survey complete — ${s.inv.screens().length} screens mapped`);

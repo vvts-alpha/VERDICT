@@ -158,6 +158,25 @@ export function resumeStageState(
   return { surveyDone, methodologyDone };
 }
 
+/** Claude(サブスク CLI / SDK)の利用上限・トークン枯渇エラーかを判定する純関数。
+ *  該当したら「スキップして次へ」ではなく run を一時停止(resume 可能)させる。
+ *  ネットワーク先(診断対象)由来の 429 はこの経路(LLM 呼び出しの失敗)には来ないので誤検知しない。
+ *  一過性の overloaded(529)は含めない — リトライで回復するので止めるべきではない。 */
+export function isClaudeUsageLimit(text: string): boolean {
+  const s = (text || "").toLowerCase();
+  return (
+    /usage limit|usage_limit/.test(s) ||
+    /limit reached/.test(s) ||
+    /rate.?limit/.test(s) ||
+    /too many requests/.test(s) ||
+    /\b429\b/.test(s) ||
+    /quota/.test(s) ||
+    /resets? at/.test(s) || // 「Your limit will reset at …」系
+    /insufficient (credit|quota|balance|funds)/.test(s) ||
+    /out of (credit|tokens)/.test(s)
+  );
+}
+
 /** SDK usage(assistant/result どちらの形でも)を input+output+cache の合計トークンに畳む。 */
 export function usageTokens(u: Record<string, number> | undefined): number {
   return u ? (u.input_tokens ?? 0) + (u.output_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) : 0;
@@ -332,6 +351,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     screenProbes: 0,
     done: false,
     doneSummary: "",
+    paused: false,
     model: fastModel, // login ツール(smartLogin)は機械的 → fast モデル
     inv: new InventoryBuilder(),
     visited: new Set(),
@@ -364,7 +384,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         return d ? `${r} (${d})` : r;
       })
       .join(", ") || "none";
-  const maxTurns = opts.maxTurns ?? 60;
+  const maxTurns = opts.maxTurns ?? 80; // CLI 既定と一致(main.ts も 80)。WebUI 空欄→CLI 既定で 80 に揃う。
 
   // ── resume: 既存 run から再シード(survey/methodology はスキップ、未診断画面だけ診断) ──
   const prev = opts.resume ? opts.store.loadAssessment(opts.assessmentId) : null;
@@ -401,6 +421,22 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
   let budget = (prev ?? opts.store.loadAssessment(opts.assessmentId))?.budget ?? null;
   let runTokens = 0; // この run の増分(サマリ表示用)
   let costUsd = 0;
+
+  // トークン/利用上限の枯渇でステージが落ちたら、スキップして次画面へ進めず run を一時停止する。
+  //   done=true で以降の全ステージ/画面を止め、paused=true で最終処理が report に落とさない(resume 可能)。
+  //   利用枠が回復したら `pilot --resume --id <id>`(WebUI の ▶ resume)で未診断の queued 画面から続けられる。
+  const pauseRun = (detail: string): void => {
+    if (session.paused) return; // 二重計上しない
+    session.done = true;
+    session.paused = true;
+    session.doneSummary = `⏸ paused — Claude usage/token limit reached. Resume when it resets: pilot --resume --id ${opts.assessmentId}`;
+    opts.onText?.(`${session.doneSummary}${detail ? ` (${detail})` : ""}`);
+    opts.store.appendEvent(opts.assessmentId, {
+      type: "note",
+      payload: { message: `${session.doneSummary}${detail ? ` — ${detail}` : ""}` },
+    });
+    opts.store.setPaused(opts.assessmentId, true, "Claude usage/token limit reached");
+  };
 
   // 1 ステージ = 1 query()。stage の done フラグが立つか、Claude が手を止めたら抜ける。
   const runStage = async (p: {
@@ -448,19 +484,29 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
             }
           }
         } else if (msg.type === "result") {
-          const r = msg as unknown as { usage?: Record<string, number>; total_cost_usd?: number };
+          const r = msg as unknown as { usage?: Record<string, number>; total_cost_usd?: number; subtype?: string; is_error?: boolean; result?: string };
           sawResult = true;
           resultTokens = tally(r.usage);
           costUsd += r.total_cost_usd ?? 0;
+          // エラー結果(throw ではなく result で返るケース)。error_max_turns は正常な打ち切りなので除外。
+          if ((r.is_error || (r.subtype && r.subtype !== "success")) && r.subtype !== "error_max_turns") {
+            const detail = `${r.subtype ?? "error"} ${r.result ?? ""}`.trim();
+            if (isClaudeUsageLimit(detail)) pauseRun(detail.slice(0, 160));
+          }
         }
-        if (p.shouldStop()) break;
+        if (p.shouldStop() || session.done) break;
       }
     } catch (err) {
-      // maxTurns 到達や SDK エラーでステージが落ちても run 全体は止めない(best-effort で次の画面/ステージへ)。
+      // ステージが throw で落ちた場合。トークン/利用上限の枯渇なら **スキップせず一時停止**(resume 可能)。
+      // それ以外(maxTurns / 一過性 SDK エラー)は従来どおり best-effort で次の画面/ステージへ。
       // この時点で発火済みのツール(record_finding 等)は既に store に反映されているので finding は失われない。
       const m = String(err instanceof Error ? err.message : err).slice(0, 160);
-      opts.onText?.(`⚠ stage ended early: ${m}`);
-      opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: `⚠ stage ended early: ${m}` } });
+      if (isClaudeUsageLimit(m)) {
+        pauseRun(m);
+      } else {
+        opts.onText?.(`⚠ stage ended early: ${m}`);
+        opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: `⚠ stage ended early: ${m}` } });
+      }
     }
     try {
       await q.return?.(undefined as never);
@@ -482,6 +528,11 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
 
   let turns = 0;
   try {
+    // resume = いま走り始めた = もう停止中ではない。前回トークン枯渇で立てた「⏸ paused」を解除する
+    //   (これが残っていると WebUI が稼働中なのに paused 表示のままになる)。
+    if (opts.resume && opts.store.isPaused(opts.assessmentId)) {
+      opts.store.setPaused(opts.assessmentId, false, "resumed");
+    }
     // resume 時に survey/methodology が前回どこまで進んだかを events から判定する。
     // ※ survey-only も「完了」だが phase は phase1_recon のままなので phase では中断と区別できない。
     //   survey_done が出す "SURVEY done" マーカーと、methodology の "📋 PLAN" イベントで判定する。
@@ -493,13 +544,18 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       // ── STAGE 1: 調査(写像のみ) ── resume で survey 未完なら既存 screens を seed したまま継続。
       if (opts.resume) opts.onText?.("↻ survey was incomplete, resuming from recon");
       opts.store.setPhase(opts.assessmentId, "phase1_recon");
+      // ロールがあるなら「フロンティアが空 ≠ 完了」— 認証後サーフェスを必ずマップさせる(survey_done は認証ゲート付き)。
+      const authClause =
+        rolesLine === "none"
+          ? ""
+          : ` CRITICAL: an empty frontier is NOT a reason to call survey_done while roles are still unauthenticated. After mapping the public surface you MUST login(role) for EACH role (${rolesLine}), confirm the response shows a cookie/bearer is present, and navigate the authenticated pages it unlocks (orders / basket / wallet / admin / settings / etc.) so they enter the inventory. survey_done is GATED on having an active authenticated session and will be refused otherwise.`;
       const surveyGoal = opts.lockToSeeds
         ? // URL リスト固定: シードだけをマップし、横断クロールしない。
-          `URL-list mode — LOCKED. Diagnose ONLY these exact URLs; do NOT follow links or explore beyond this list:\n${seedList.map((u, i) => `  ${i + 1}. ${u}`).join("\n")}\nFor EACH url: browser_navigate to it (its screen and the APIs it calls are recorded automatically). Log in as needed — roles for login(): ${rolesLine}. When survey_status shows the frontier empty (all ${seedList.length} mapped), call survey_done.`
+          `URL-list mode — LOCKED. Diagnose ONLY these exact URLs; do NOT follow links or explore beyond this list:\n${seedList.map((u, i) => `  ${i + 1}. ${u}`).join("\n")}\nFor EACH url: browser_navigate to it (its screen and the APIs it calls are recorded automatically). Log in as needed — roles for login(): ${rolesLine}. When survey_status shows the frontier empty (all ${seedList.length} mapped), call survey_done.${authClause}`
         : seedList.length > 1
           ? // 複数シード(横断あり): 各シードを起点にスコープ面をマップ。
-            `Map the in-scope surface starting from these ${seedList.length} seed URLs:\n${seedList.map((u) => `  - ${u}`).join("\n")}\nIn-scope hosts: ${opts.scope.inScopeHosts.join(", ")}. Roles for login(): ${rolesLine}. Visit each seed, follow links, log in as each role, and keep going until survey_status shows the frontier empty. Then survey_done.`
-          : `Map the entire in-scope surface of ${opts.targetUrl}. In-scope hosts: ${opts.scope.inScopeHosts.join(", ")}. Roles for login(): ${rolesLine}. Start at the target, follow links, log in as each role, and keep going until survey_status shows the frontier empty. Then survey_done.`;
+            `Map the in-scope surface starting from these ${seedList.length} seed URLs:\n${seedList.map((u) => `  - ${u}`).join("\n")}\nIn-scope hosts: ${opts.scope.inScopeHosts.join(", ")}. Roles for login(): ${rolesLine}. Visit each seed, follow links, log in as each role, and keep going until survey_status shows the frontier empty. Then survey_done.${authClause}`
+          : `Map the entire in-scope surface of ${opts.targetUrl}. In-scope hosts: ${opts.scope.inScopeHosts.join(", ")}. Roles for login(): ${rolesLine}. Start at the target, follow links, log in as each role, and keep going until survey_status shows the frontier empty. Then survey_done.${authClause}`;
       turns += await runStage({
         system: SURVEY_PROMPT,
         goal: surveyGoal,
@@ -609,6 +665,12 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
           model: screenIsHighValue(sc) ? deepModel : fastModel, // 高価値画面だけ deep(opus)
           shouldStop: () => session.screenDone || session.done,
         });
+        // トークン/利用上限の枯渇で中断した場合: この画面は **未診断のまま** queued に戻し(clean にしない)、
+        // 一時停止して抜ける。resume すれば queued の画面(この画面と未着手の残り)から再開できる。
+        if (session.paused) {
+          opts.store.setScreenScanStatus(opts.assessmentId, sc.screenId, "queued");
+          break;
+        }
         // 台帳は実際に finding を記録(新規 or マージ)できたかで terminal を決める。
         const found = session.recordCalls > recordsBefore;
         opts.store.setScreenScanStatus(opts.assessmentId, sc.screenId, found ? "finding" : "clean");
@@ -682,7 +744,14 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     }
 
     // survey-only は phase1_recon のまま(全 screen queued=未診断)→ 後で resume できる。
-    if (!opts.surveyOnly) {
+    if (session.paused) {
+      // トークン枯渇で一時停止 = まだ未完。phase を report に落とさず(診断フェーズのまま)残し、
+      // queued 画面を resume で続けられるようにする。WebUI は control_changed で「⏸ paused」を表示。
+      opts.store.appendEvent(opts.assessmentId, {
+        type: "note",
+        payload: { message: `⏸ run paused (token/usage limit) — ${session.inv.screens().length} screens mapped; resume to finish diagnosis` },
+      });
+    } else if (!opts.surveyOnly) {
       opts.store.setPhase(opts.assessmentId, "report");
     } else {
       // survey-only が(クラッシュせず)正常終了 = 調査は完了扱い。resume が recon ではなく診断へ進めるよう印を残す。
