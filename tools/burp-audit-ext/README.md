@@ -10,6 +10,14 @@ body/query がそのまま insertion point になる)。
 
 API 仕様は `API.md`(本ディレクトリ)。
 
+## Prebuilt jar(ビルド不要・すぐ使う）
+
+`prebuilt/amraam-burp-audit.jar` をそのまま Burp にロードできる(Gson 同梱の fat jar、`montoya-api:2026.4` でコンパイル済み）。
+
+- **既定は `127.0.0.1:1338` + 認証なし**(config も env も無い場合）= **localhost 限定なので安全**。同一マシンの AMRAAM からだけ叩ける。
+- **別マシン(WSL→Windows 等)から叩くなら**、初回ロード時にユーザホームへ生成される `~/.amraam-audit.properties` を編集 → `host=0.0.0.0` + `token=<秘密>` を設定 → 拡張を Reload(0.0.0.0 公開時は token 必須）。
+- ソース(`src/`）を変更したら `gradle shadowJar` で焼き直すこと(この prebuilt は**手動更新の便宜バイナリ**で、ソースと自動同期はしない）。
+
 ## ビルド
 
 要 JDK 17+ と Gradle(or `gradle wrapper` を生成)。初回はネットワーク(Montoya / Gson / shadow plugin)が要る。
