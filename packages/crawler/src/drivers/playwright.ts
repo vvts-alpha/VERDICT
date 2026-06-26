@@ -582,6 +582,90 @@ export class PlaywrightDriver implements Driver {
     return out;
   }
 
+  /**
+   * 能動的な入力スイープ: 現在のページのフォーム/入力欄を benign 値で埋めて送信し、出てきた
+   * **新ルート + 発火した XHR/fetch URL** を返す(「入力欄を全部触る」survey 用)。
+   * - aggressive=false なら GET/検索フォームだけ送信(POST は触らない=データを書かない)。true なら POST も送信。
+   * - logout / スコープ外は allow() で弾く(自滅防止)。DELETE/PUT/PATCH フォームは常にスキップ。
+   * - フォーム送信のたびにページが遷移しうるので、毎回 origin へ navigate して状態を復元する。
+   */
+  async exerciseInputs(opts: { aggressive: boolean; allow: (url: string) => boolean; cap?: number }): Promise<{ exercised: number; discovered: string[] }> {
+    const origin = this.page.url();
+    const MARK = "amraam-probe";
+    const cap = opts.cap ?? 12;
+    const discovered = new Set<string>();
+    let exercised = 0;
+    this.drainApiCalls(); // 開始前にバッファをクリア
+
+    const collect = (before: string): void => {
+      const after = this.page.url();
+      if (after !== before && opts.allow(after)) discovered.add(after);
+      for (const ex of this.drainApiCalls()) {
+        if ((ex.resourceType === "xhr" || ex.resourceType === "fetch") && opts.allow(ex.url)) discovered.add(ex.url);
+      }
+    };
+
+    // ① フォーム
+    const forms = await this.page.$$("form").catch(() => []);
+    for (const form of forms) {
+      if (exercised >= cap) break;
+      try {
+        const method = ((await form.getAttribute("method")) || "get").toLowerCase();
+        const action = (await form.getAttribute("action")) || origin;
+        let actionUrl = origin;
+        try {
+          actionUrl = new URL(action, origin).toString();
+        } catch {
+          /* relative/garbage → origin 扱い */
+        }
+        if (!opts.allow(actionUrl)) continue;
+        if (method === "delete" || method === "put" || method === "patch") continue;
+        if (method === "post" && !opts.aggressive) continue;
+        let filled = false;
+        for (const el of await form.$$("input, textarea, select")) {
+          const tag = await el.evaluate((n: { tagName: string }) => n.tagName.toLowerCase()).catch(() => "");
+          if (tag === "select") {
+            await el.selectOption({ index: 1 }).then(() => { filled = true; }).catch(() => {});
+            continue;
+          }
+          const type = ((await el.getAttribute("type")) || "text").toLowerCase();
+          if (["password", "file", "hidden", "checkbox", "radio", "submit", "button", "image", "reset"].includes(type)) continue;
+          await el.fill(MARK).then(() => { filled = true; }).catch(() => {});
+        }
+        if (!filled) continue;
+        const before = this.page.url();
+        const btn = await form.$("button[type=submit], input[type=submit], button");
+        if (btn) await btn.click({ timeout: 3000 }).catch(() => {});
+        else await form.evaluate((f: { requestSubmit?: () => void; submit: () => void }) => { if (f.requestSubmit) f.requestSubmit(); else f.submit(); }).catch(() => {});
+        await this.page.waitForLoadState("networkidle", { timeout: 4000 }).catch(() => {});
+        exercised += 1;
+        collect(before);
+        await this.gotoUrl(origin); // 復元
+      } catch {
+        /* 次のフォームへ */
+      }
+    }
+
+    // ② フォーム外の単独 search/text 入力(SPA の検索ボックス等は <form> を持たないことが多い)
+    const loose = await this.page.$$("input[type=search], input[type=text]").catch(() => []);
+    for (const el of loose) {
+      if (exercised >= cap) break;
+      try {
+        if (await el.evaluate((n: { closest: (s: string) => unknown }) => !!n.closest("form")).catch(() => true)) continue; // フォーム内は①で処理済み
+        await el.fill(MARK).catch(() => {});
+        const before = this.page.url();
+        await el.press("Enter").catch(() => {});
+        await this.page.waitForLoadState("networkidle", { timeout: 4000 }).catch(() => {});
+        exercised += 1;
+        collect(before);
+        await this.gotoUrl(origin);
+      } catch {
+        /* 次の入力へ */
+      }
+    }
+    return { exercised, discovered: [...discovered] };
+  }
+
   async close(): Promise<void> {
     await this.context.close();
   }

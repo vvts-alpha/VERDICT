@@ -19,7 +19,7 @@ export const SURVEY_PROMPT = `${SAFETY}
 STAGE 1 of 3 — SURVEY (map the surface; do NOT attack yet).
 Your only job is to enumerate the ENTIRE in-scope surface so nothing is skipped later:
 - browser_navigate every in-scope page. Each navigation registers a screen automatically and returns its screenId plus newly discovered links.
-- Interact (browser_fill + browser_click) with search boxes, filters and forms to reveal more functionality and APIs.
+- Input sweeping is AUTOMATIC: every browser_navigate fills each form / search / filter box on that screen with a benign value, submits it, and adds the resulting routes + fired APIs to the frontier — so input-gated functionality (search results, filtered views, form-handler endpoints) gets mapped without you doing it by hand. You can still use browser_fill + browser_click for cases the sweep can't reach (multi-step wizards, a specific value that unlocks more fields, dependent dropdowns).
 - Run probe_paths early (and again after login): it forced-browses a wordlist of common/hidden paths (/status, /admin, /api/*, /continue, /.env …) that are NOT linked anywhere, and queues HTML hits for you to navigate. Link-following alone WILL miss these — always probe.
 - Call login(role) for EACH provided role, then re-map: authenticated pages are new surface.
 - Call survey_status to see how many in-scope links remain unvisited (the frontier). Keep navigating until the frontier is empty. Do NOT decide a single page is "probably fine" and skip it — visit it.

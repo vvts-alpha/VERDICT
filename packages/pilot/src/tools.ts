@@ -83,6 +83,10 @@ export interface PilotSession {
   /** URL リストのハードロック。true なら recordObservation で発見リンクを frontier に積まない
    *  (横断クロールせず、シード URL だけをマップする)。 */
   lockToSeeds: boolean;
+  /** browser_navigate のたびに入力欄スイープ(フォーム/検索を benign 値で送信して新ルート/API を発見)を自動実行。 */
+  inputSweep: boolean;
+  /** 入力スイープで POST フォームも送信する(=標的にデータを書く)。false なら GET/検索のみ。 */
+  aggressiveForms: boolean;
   /** screenId → 方法論(攻撃計画)。 */
   plans: Map<string, string>;
   /** 診断中の screenId(record_finding / http_request evidence の紐付け先)。 */
@@ -627,6 +631,34 @@ export function buildTools(s: PilotSession) {
           const o = await s.driver.visit(url);
           const { screen, isNew } = recordObservation(s, o);
           await captureScreenshot(s, screen);
+          // ── 入力欄スイープ ── この画面のフォーム/検索を benign 値で送信して、出てきた新ルート/API を frontier に積む。
+          //    「入力欄を全部触る」= 入力ゲートの裏に隠れた機能/エンドポイントを取りこぼさないため。logout/スコープ外は弾く。
+          let swept = 0;
+          let sweptAdded = 0;
+          if (s.inputSweep && !s.lockToSeeds && isNew) {
+            try {
+              const sweep = await s.driver.exerciseInputs({
+                aggressive: s.aggressiveForms,
+                allow: (u) => isInScope(u, s.scope) && !isSessionDestroyingPath(u),
+              });
+              swept = sweep.exercised;
+              for (const d of sweep.discovered) {
+                const abs = stripHash(d);
+                if (!isInScope(abs, s.scope) || isSessionDestroyingPath(abs)) continue;
+                if (s.visited.has(abs) || s.frontier.has(abs)) continue;
+                if (pathIsIgnored(abs, s.ignorePaths, s.targetUrl)) continue;
+                s.frontier.add(abs);
+                sweptAdded += 1;
+              }
+              if (swept > 0)
+                s.store.appendEvent(s.assessmentId, {
+                  type: "note",
+                  payload: { message: `⌨ input sweep ${screen.screenId}: exercised ${swept} form/input(s) → +${sweptAdded} new route/API to frontier` },
+                });
+            } catch (e) {
+              s.store.appendEvent(s.assessmentId, { type: "note", payload: { message: `⚠ input sweep ${screen.screenId} failed: ${String(e).slice(0, 100)}` } });
+            }
+          }
           return txt(
             JSON.stringify({
               screenId: screen.screenId,
@@ -638,6 +670,7 @@ export function buildTools(s: PilotSession) {
               links: o.links.slice(0, 40),
               forms: o.forms,
               firedApis: o.apiCalls.map((a) => ({ method: a.method, url: a.url, status: a.status })).slice(0, 30),
+              inputSweep: s.inputSweep ? { exercised: swept, discovered: sweptAdded } : "disabled",
               frontierRemaining: s.frontier.size,
             }),
           );

@@ -956,6 +956,8 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       "max-turns": { type: "string" },
       "max-screens": { type: "string" },
       focus: { type: "string" }, // 操作者の重点ヒント(自由文)。シナリオ段の最優先目的として注入(per-screen には混ぜない)
+      "no-input-sweep": { type: "boolean" }, // 各画面で入力欄を benign 値で送信して新ルート/API を発見(既定 on)。立てると無効
+      "safe-forms": { type: "boolean" }, // 入力スイープで POST フォームを送信しない(GET/検索のみ=標的にデータを書かない)
       "no-scenario": { type: "boolean" }, // 既定で診断後に A04 シナリオ(横断ロジック)を実行。立てるとスキップ
       "burp-scan": { type: "boolean" },
       "burp-api": { type: "string" },
@@ -1077,6 +1079,8 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       ...(customHeaders ? { customHeaders } : {}),
       ...(oobConn ? { oob: oobConn } : {}),
       ...((values.focus ?? manifest?.focus) ? { focus: values.focus ?? manifest?.focus } : {}),
+      ...(values["no-input-sweep"] ? { inputSweep: false } : {}),
+      ...(values["safe-forms"] ? { aggressiveForms: false } : {}),
       profileDir: join(runsDir, id, "browser-profile"),
       artifactsDir: join(runsDir, id, "artifacts"),
       roleCreds,

@@ -100,6 +100,10 @@ export interface RunPilotOptions {
   /** 操作者の重点ヒント(自由文)。**シナリオ段の最優先目的**として注入する(per-screen 診断には混ぜない)。
    *  例 "決済フローと /api/orders の IDOR を重点的に。クーポン/価格改ざんも"。emphasis であって排他ではない。 */
   focus?: string;
+  /** 入力欄スイープ: browser_navigate のたびにフォーム/検索を benign 値で送信して新ルート/API を発見(既定 on）。 */
+  inputSweep?: boolean;
+  /** 入力スイープで POST フォームも送信する(=標的にデータを書く)。既定 true。false なら GET/検索のみ。 */
+  aggressiveForms?: boolean;
 }
 
 export interface PilotResult {
@@ -375,6 +379,8 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     ignorePaths: [],
     exhaustive: !!opts.exhaustiveSurvey,
     lockToSeeds: !!opts.lockToSeeds,
+    inputSweep: opts.inputSweep ?? true,
+    aggressiveForms: opts.aggressiveForms ?? true,
     plans: new Map(),
     currentScreenId: null,
     screenVerdict: null,
