@@ -102,6 +102,11 @@ body { background: var(--bg); color: var(--fg); font-size: 13px; }
 .sess-stat { margin-left: 8px; color: var(--muted); font-size: 12px; }
 .sess-done { margin-left: auto; background: #1d3a2a; border-color: #2f6f4f; color: #cfe; font-weight: 700; }
 .sess-done:hover { background: #244a34; }
+.sess-nav { display: flex; gap: 6px; margin: 6px 0; }
+.sess-url { flex: 1; background: #161c24; color: var(--fg); border: 1px solid var(--line); border-radius: 6px; padding: 5px 9px; font: inherit; font-size: 12px; font-family: ui-monospace, monospace; }
+.sess-url:focus { outline: none; border-color: var(--accent); }
+.sess-go { background: var(--accent); color: #06121f; border: none; border-radius: 6px; padding: 0 14px; font-weight: 700; cursor: pointer; white-space: nowrap; }
+.sess-go:hover { opacity: .9; }
 .sess-wrap { display: flex; justify-content: center; background: #000; border: 1px solid var(--line); border-radius: 8px; }
 .sess-canvas { cursor: crosshair; max-width: 100%; outline: none; }
 

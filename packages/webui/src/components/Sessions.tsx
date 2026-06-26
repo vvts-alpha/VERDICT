@@ -16,6 +16,7 @@ export function Sessions({ id }: { id: string }) {
   const [roles, setRoles] = useState<RoleSession[]>([]);
   const [active, setActive] = useState<string | null>(null);
   const [status, setStatus] = useState("");
+  const [url, setUrl] = useState(""); // ライブセッションを飛ばす URL(真っ白画面からの復帰用)
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const buttonsRef = useRef(0);
@@ -64,6 +65,8 @@ export function Sessions({ id }: { id: string }) {
           c.getContext("2d")?.drawImage(img, 0, 0);
         };
         img.src = "data:image/jpeg;base64," + m.data;
+      } else if (m.t === "url") {
+        setUrl(m.url); // バックエンドが nav 後に現在 URL を返す
       } else if (m.t === "fatal") {
         setStatus(m.message);
       }
@@ -104,6 +107,28 @@ export function Sessions({ id }: { id: string }) {
               ✅ Done (logged in)
             </button>
           </div>
+          <form
+            className="sess-nav"
+            onSubmit={(e) => {
+              e.preventDefault();
+              const u = url.trim();
+              if (u) {
+                send({ t: "nav", url: u });
+                setStatus(`→ navigating to ${u}`);
+              }
+            }}
+            title="navigate the live session browser here — use this to recover from a blank/stuck page"
+          >
+            <input
+              className="sess-url"
+              value={url}
+              onChange={(e) => setUrl(e.target.value)}
+              placeholder="https://app.example.com/login  — navigate the live session here (blank-screen recovery)"
+              spellCheck={false}
+              autoComplete="off"
+            />
+            <button type="submit" className="sess-go">Go ↵</button>
+          </form>
           <div className="sess-wrap">
             <canvas
               ref={canvasRef}
