@@ -186,15 +186,57 @@ export function isClaudeUsageLimit(text: string): boolean {
   const s = (text || "").toLowerCase();
   return (
     /usage limit|usage_limit/.test(s) ||
+    /session limit/.test(s) || // 「You've hit your session limit …」(claude CLI のサブスク上限)
     /limit reached/.test(s) ||
+    /hit your\b[\s\S]{0,30}\blimit/.test(s) || // 「(you've) hit your session/usage limit」
+    /\blimit\b[\s\S]{0,40}\bresets?\b/.test(s) || // 「… limit · resets 12:50am」(limit と resets の共起)
     /rate.?limit/.test(s) ||
     /too many requests/.test(s) ||
     /\b429\b/.test(s) ||
     /quota/.test(s) ||
-    /resets? at/.test(s) || // 「Your limit will reset at …」系
+    /resets?\s+(at\b|\d)/.test(s) || // 「reset at …」/「resets 12:50am」両方
     /insufficient (credit|quota|balance|funds)/.test(s) ||
     /out of (credit|tokens)/.test(s)
   );
+}
+
+/** epoch(秒 or ミリ秒)を「(resets <ISO>)」に整形。判別不能なら空文字。 */
+function fmtReset(epoch: unknown): string {
+  if (typeof epoch !== "number" || !Number.isFinite(epoch) || epoch <= 0) return "";
+  const ms = epoch < 1e12 ? epoch * 1000 : epoch; // 秒なら ms に正規化
+  try {
+    return ` (resets ${new Date(ms).toISOString()})`;
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * SDK メッセージの**構造化フィールド**から利用上限を判定する一次シグナル(文字列マッチより堅い)。
+ * 該当時は pause 理由文字列を、非該当は null を返す。順に強い順:
+ *  1. `rate_limit_event` … 専用イベント。`status==='rejected'` = 今まさに弾かれている(+ 復帰時刻)。
+ *  2. `assistant.error` …  `'rate_limit' | 'billing_error'`(`'overloaded'` は一過性なので**含めない**)。
+ *  3. `result.api_error_status` … HTTP 429。
+ * これで「You've hit your session limit …」のような文言ゆれに依存せず確定できる。throw 経路だけは
+ * 文字列しか無いので isClaudeUsageLimit() をフォールバックに残す。
+ */
+export function usageLimitFromMessage(msg: unknown): string | null {
+  const m = msg as { type?: string; error?: string; rate_limit_info?: Record<string, unknown>; api_error_status?: number | null };
+  if (!m || typeof m !== "object") return null;
+  if (m.type === "rate_limit_event") {
+    const info = m.rate_limit_info ?? {};
+    if (info.status === "rejected") {
+      return `rate_limit_event: ${String(info.rateLimitType ?? "rate limit")} rejected${fmtReset(info.resetsAt)}`;
+    }
+    return null; // allowed / allowed_warning は止めない
+  }
+  if (m.type === "assistant" && (m.error === "rate_limit" || m.error === "billing_error")) {
+    return `assistant error: ${m.error}`;
+  }
+  if (m.type === "result" && m.api_error_status === 429) {
+    return "result api_error_status 429";
+  }
+  return null;
 }
 
 /** SDK usage(assistant/result どちらの形でも)を input+output+cache の合計トークンに畳む。 */
@@ -494,6 +536,10 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     });
     try {
       for await (const msg of q) {
+        // 構造化フィールドを一次シグナルに(rate_limit_event / assistant.error / api_error_status 429)。
+        // 検出したら pauseRun が done=true を立て、下の `session.done` チェックでこの stage を抜ける。
+        const structuredLimit = usageLimitFromMessage(msg);
+        if (structuredLimit) pauseRun(structuredLimit.slice(0, 160));
         if (msg.type === "assistant") {
           assistantTokens += tally((msg.message as unknown as { usage?: Record<string, number> }).usage);
           for (const block of msg.message.content) {
