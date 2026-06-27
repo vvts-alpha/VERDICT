@@ -265,6 +265,41 @@ export class PlaywrightDriver implements Driver {
     });
   }
 
+  /**
+   * networkidle / 固定 settle だけでは、遅延 XHR でレンダリングする SPA を取りこぼす
+   * (描画完了前にスナップショット → 空 skeleton / links・API 欠落 = 「取れるとき/取れないとき」のムラ)。
+   * そこで body の内容量(可視テキスト長 + 要素数)を一定間隔で観測し、**2 回連続で変化しなくなったら
+   * 描画が落ち着いた**とみなして返す(上限 maxMs で打ち切り)。静的ページは ~0.4s で即抜け、
+   * 遅延描画ページだけ必要な分だけ待つ適応待ち。snapshot を後ろにずらすので、その間に解決した
+   * XHR も this.buffer に載り、firedApis の取りこぼしも同時に減る。
+   *   in-page コールバックは (globalThis as any) 経由で DOM へ(crawler tsconfig は dom lib 無し)。
+   */
+  private async waitForDomStable(maxMs = 4_000, intervalMs = 200): Promise<void> {
+    const sig = (): Promise<number> =>
+      this.page
+        .evaluate(() => {
+          const g = globalThis as any;
+          const b = g.document && g.document.body;
+          if (!b) return 0;
+          return (b.innerText ? String(b.innerText).length : 0) + b.getElementsByTagName("*").length;
+        })
+        .catch(() => -1); // 評価不能(遷移中など)→ 安定待ちを諦める番兵
+    const start = Date.now();
+    let last = -1;
+    let stable = 0;
+    while (Date.now() - start < maxMs) {
+      const cur = await sig();
+      if (cur < 0) return; // ページ評価不能 → 呼び出し側の固定 settle に委ねる
+      if (cur > 0 && cur === last) {
+        if (++stable >= 2) return; // 2 連続で不変 → 描画安定とみなす
+      } else {
+        stable = 0;
+        last = cur;
+      }
+      await this.page.waitForTimeout(intervalMs);
+    }
+  }
+
   async visit(url: string): Promise<Observation> {
     this.buffer = [];
     let status = 0;
@@ -280,8 +315,9 @@ export class PlaywrightDriver implements Driver {
     try {
       await this.page.waitForLoadState("networkidle", { timeout: 5_000 });
     } catch {
-      /* networkidle に達しない SPA はタイムアウト無視 */
+      /* networkidle に達しない SPA はタイムアウト無視 → 下の DOM 安定待ちで描画完了を待つ */
     }
+    await this.waitForDomStable(); // 遅延 XHR レンダリングの取りこぼし対策(描画が止まるまで適応待ち)
     await new Promise<void>((resolve) => setTimeout(resolve, this.opts.settleMs));
 
     const finalUrl = this.page.url();
@@ -391,6 +427,7 @@ export class PlaywrightDriver implements Driver {
     } catch {
       /* 到達できなくても続行 */
     }
+    await this.waitForDomStable(); // visit() と同じく描画が落ち着くまで適応待ち
     await new Promise<void>((resolve) => setTimeout(resolve, this.opts.settleMs));
   }
 
