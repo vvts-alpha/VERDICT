@@ -40,3 +40,5 @@ export { submitAudit, getAuditStatusAll, getAuditIssues, resetAudit, auditIssues
 export type { BurpAuditConn, AuditSubmit, AuditHostStatus } from "./burp-audit.js";
 export { oobStatus, oobPayload, oobPoll } from "./burp-oob.js";
 export type { OobInteraction } from "./burp-oob.js";
+export { fingerprintTech, formatTechInventory } from "./fingerprint.js";
+export type { TechComponent, TechKind, TechSample } from "./fingerprint.js";

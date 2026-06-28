@@ -9,8 +9,8 @@ import { isInScope } from "@veritas/core";
 import type { LoginCreds, Observation, PlaywrightDriver } from "@veritas/crawler";
 import { InventoryBuilder, normalizePath, smartLogin } from "@veritas/crawler";
 import type { LlmClient } from "@veritas/llm";
-import type { BurpAuditConn, EvidenceStore, FetchHttpClient, HttpRequest, HttpResponse } from "@veritas/scanner";
-import { oobPayload, oobPoll } from "@veritas/scanner";
+import type { BurpAuditConn, EvidenceStore, FetchHttpClient, HttpRequest, HttpResponse, TechSample } from "@veritas/scanner";
+import { oobPayload, oobPoll, fingerprintTech, formatTechInventory } from "@veritas/scanner";
 import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { join } from "node:path";
@@ -99,6 +99,8 @@ export interface PilotSession {
   screenDone: boolean;
   /** シナリオ(A04 横断ロジック)ステージの完了シグナル。 */
   scenarioDone: boolean;
+  /** フィンガープリント(A06 既知脆弱性コンポーネント)ステージの完了シグナル。 */
+  fingerprintDone: boolean;
   /** OOB(Burp Collaborator)基盤への接続。set されていれば probe_oob が使える(BURP_AUDIT_API 経由)。
    *  ブラインド SSRF/XXE/SQLi 等の out-of-band 確証用。未設定なら probe_oob は not-available を返す。 */
   oob?: BurpAuditConn;
@@ -114,6 +116,8 @@ export const STAGE_TOOLS = {
   diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_dom_xss", "probe_stored_xss", "probe_redirect", "probe_jwt", "probe_csrf", "probe_oob", "probe_logic", "analyze_session", "verify_access", "browser_navigate", "browser_fill", "browser_click", "record_finding", "screen_done"],
   // シナリオ(A04 横断ロジック): inventory 俯瞰 + 多段リクエスト連鎖を probe_scenario で撃つ。画面診断の後に1回。
   scenario: ["get_inventory", "login", "http_request", "probe_scenario", "record_finding", "scenario_done"],
+  // フィンガープリント(A06 既知脆弱コンポーネント): fingerprint_scan で版を集め、既知 CVE を評価して記録。
+  fingerprint: ["fingerprint_scan", "http_request", "record_finding", "fingerprint_done"],
 } as const;
 
 const txt = (s: string): { content: { type: "text"; text: string }[] } => ({ content: [{ type: "text", text: s }] });
@@ -199,6 +203,7 @@ export const CATEGORIES = [
   "misconfig",
   "rate-limit",
   "headers",
+  "vulnerable-component", // A06: 既知脆弱性のある古いコンポーネント(server/middleware/frontend lib)
   // A04 ビジネスロジック(差分テスト verifier = probe_logic で確証)
   "price-tampering",
   "qty-tampering",
@@ -1570,6 +1575,45 @@ export function buildTools(s: PilotSession) {
         s.scenarioDone = true;
         s.store.appendEvent(s.assessmentId, { type: "note", payload: { message: `🧩 SCENARIO done: ${summary.slice(0, 300)}` } });
         return txt("scenario stage complete.");
+      },
+    ),
+    tool(
+      "fingerprint_scan",
+      "Fetch one or more in-scope URLs and extract the technology stack from their response headers, cookies, <meta generator> and <script src> (web server, language, framework, CMS, frontend libraries) with versions where available. Known-vulnerable JS library versions are flagged automatically; assess the rest against your own CVE knowledge. Start with the site root and a couple of representative pages / the main JS bundle.",
+      { urls: z.array(z.string()).describe("in-scope URLs to fetch & fingerprint (e.g. the root, a JS bundle). 1–12.") },
+      async ({ urls }) => {
+        const samples: TechSample[] = [];
+        const fetched: string[] = [];
+        for (const url of urls.slice(0, 12)) {
+          if (!isInScope(url, s.scope)) continue;
+          try {
+            const res = await s.http.send({ method: "GET", url, headers: { ...authHeaders(s) }, body: null });
+            bumpHttp(s, res.status);
+            samples.push({ url, headers: res.headers, body: res.body });
+            fetched.push(`${res.status} ${url}`);
+          } catch (e) {
+            fetched.push(`ERR ${url}: ${String(e).slice(0, 80)}`);
+          }
+        }
+        const components = fingerprintTech(samples);
+        return txt(
+          JSON.stringify({
+            fetched,
+            components,
+            inventory: formatTechInventory(components),
+            note: "Versions only — assess each (name, version) against KNOWN CVEs/EOL from your knowledge; the ⚠ KNOWN marks are deterministic JS-library matches.",
+          }),
+        );
+      },
+    ),
+    tool(
+      "fingerprint_done",
+      "Finish the fingerprint (A06 known-vulnerable-components) stage. Call once every detected component has been assessed against known CVEs. Pass a one-line coverage summary.",
+      { summary: z.string() },
+      async ({ summary }) => {
+        s.fingerprintDone = true;
+        s.store.appendEvent(s.assessmentId, { type: "note", payload: { message: `🔎 FINGERPRINT done: ${summary.slice(0, 300)}` } });
+        return txt("fingerprint stage complete.");
       },
     ),
     tool(

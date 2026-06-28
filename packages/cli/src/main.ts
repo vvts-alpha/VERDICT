@@ -55,7 +55,7 @@ commands:
             --focus "<text>": operator emphasis injected as the TOP priority of the A04 scenario stage (not per-screen diagnosis). e.g. "決済フローと /api/orders の IDOR を重点的に"
             uses the manifest's auth.roles via the login(role) tool. more flexible than the deterministic pipeline (no metered API / Max subscription)
             --fast-model enables model tiering: survey/methodology/login and low-value screens on fast, only high-value screen diagnosis on --model (e.g. --model opus --fast-model sonnet)
-            after per-screen diagnosis, a SCENARIO stage (deep model) hunts multi-step A04 business-logic abuse across endpoints (coupon/price/qty tampering, step-skip, mass-assignment) — auto-skipped if no transactional surface. [--no-scenario] disables it. the stage also always runs built-in default scenarios (e.g. credential/secret hunting); [--no-default-scenarios] keeps A04 but drops those. [--focus "<text>"] adds an operator objective on top.
+            after per-screen diagnosis, a SCENARIO stage (deep model) hunts multi-step A04 business-logic abuse across endpoints (coupon/price/qty tampering, step-skip, mass-assignment) — auto-skipped if no transactional surface. [--no-scenario] disables it. the stage also always runs built-in default scenarios (e.g. credential/secret hunting); [--no-default-scenarios] keeps A04 but drops those. [--focus "<text>"] adds an operator objective on top. after that, a FINGERPRINT stage (A06) collects tech/version banners (server, middleware, frontend libs) and flags components with known CVEs; [--no-fingerprint] skips it.
   pilot --survey-only --manifest <file.json> | --url <url> [...]
             survey only: maps screens + screenshots + API extraction only, no diagnosis/findings (cheap recon. diagnose later with --resume)
             ※ by default, during survey the model dynamically prunes low-value CMS content trees etc. via ignore_paths (curbs frontier explosion).
@@ -960,6 +960,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       "safe-forms": { type: "boolean" }, // 入力スイープで POST フォームを送信しない(GET/検索のみ=標的にデータを書かない)
       "no-scenario": { type: "boolean" }, // 既定で診断後に A04 シナリオ(横断ロジック)を実行。立てるとスキップ
       "no-default-scenarios": { type: "boolean" }, // 既定で常駐シナリオ(資格情報ハント等)を注入。立てるとそれだけ無効(A04 は残る)
+      "no-fingerprint": { type: "boolean" }, // 既定で A06 フィンガープリント(版収集→既知 CVE 評価)を実行。立てるとスキップ
       "burp-scan": { type: "boolean" },
       "burp-api": { type: "string" },
       "no-burp-verify": { type: "boolean" }, // 既定で Burp High+ を AI 再検証。立てると検証フェーズをスキップ
@@ -1109,6 +1110,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       ...(values["fast-model"] ? { fastModel: values["fast-model"] } : {}),
       ...(values["no-scenario"] ? { scenarioPass: false } : {}), // 既定 ON。立てると A04 シナリオを省く
       ...(values["no-default-scenarios"] ? { defaultScenarios: false } : {}), // 既定 ON。立てると常駐シナリオだけ省く
+      ...(values["no-fingerprint"] ? { fingerprintPass: false } : {}), // 既定 ON。立てると A06 フィンガープリントを省く
       ...(burpProxy ? { burpProxy } : {}),
       ...(values["keepalive-min"] ? { keepAliveMinutes: Number.parseInt(values["keepalive-min"], 10) } : {}),
       ...(browserPath ? { browserPath } : {}),

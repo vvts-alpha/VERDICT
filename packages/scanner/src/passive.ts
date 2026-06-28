@@ -86,7 +86,7 @@ export const VULN_JS_LIBS: JsLib[] = [
 ];
 
 /** a <= b ? (数値タプル比較) */
-function versionLeq(a: string, b: string): boolean {
+export function versionLeq(a: string, b: string): boolean {
   const pa = a.split(".").map((x) => Number.parseInt(x, 10));
   const pb = b.split(".").map((x) => Number.parseInt(x, 10));
   for (let i = 0; i < Math.max(pa.length, pb.length); i += 1) {

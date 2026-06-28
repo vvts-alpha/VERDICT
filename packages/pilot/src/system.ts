@@ -75,6 +75,20 @@ Call get_inventory first to see the full API surface. Then enumerate the transac
 4. On a confirmed verdict, record_finding with category price-tampering / qty-tampering / workflow-bypass / mass-assignment (or race-condition), citing probe_scenario's negativeControl + positiveReplays evidenceIds AND the effectMarker. Set an honest severity grounded in real impact (free/under-priced goods, account/balance takeover = high+).
 Do NOT re-report single-request holes already found in diagnosis. Reject the usual false positives (catch-all 200s, unchanged totals, errors). When every transactional workflow has been exercised, call scenario_done(summary).`;
 
+/** STAGE — フィンガープリント(A06: 既知脆弱性のある古いコンポーネント)。版を集めて既知 CVE を当てる。 */
+export const FINGERPRINT_PROMPT = `${SAFETY}
+
+STAGE — KNOWN-VULNERABLE & OUTDATED COMPONENTS (OWASP A06).
+Goal: inventory the target's technology stack with versions, then flag the ones with KNOWN vulnerabilities.
+1. Call fingerprint_scan with the site root and a few representative URLs (and the main JS bundle if you know its path). It returns detected components — web server, language, framework, CMS, frontend libraries — with versions parsed from Server / X-Powered-By / X-AspNet-Version headers, Set-Cookie names, <meta generator>, and <script src> filenames. Frontend libs already carry a deterministic ⚠ KNOWN mark when the version is in our vulnerable-library catalog. Scan a couple more pages if the root reveals little (different endpoints can leak different banners).
+2. For EACH detected (component, version), assess KNOWN vulnerabilities from your own knowledge: concrete CVEs, security advisories, or hard EOL status (e.g. "Apache httpd 2.4.49 → CVE-2021-41773 path traversal/RCE", "PHP 7.4 is EOL → unpatched", "AngularJS 1.x EOL", "jQuery <3.5 → CVE-2020-11022 XSS", "Lodash <4.17.12 → prototype pollution"). Only cite vulnerabilities you are CONFIDENT are real and apply to that version — do NOT invent CVE numbers; if unsure of the exact id, describe the class and say the id is approximate.
+3. record_finding(category vulnerable-component) for each component with a real known issue:
+   - title like "Outdated <component> <version> — known <CVE/issue>".
+   - severity by the WORST known issue for that version (RCE/auth-bypass CVE = high/critical; XSS/DoS = medium; EOL-without-known-RCE = low/medium).
+   - In the description, name the CVE(s)/advisory and state plainly that this is a VERSION-BASED finding (matched by banner, not yet exploited) so the operator verifies before relying on it. Cite the fingerprint evidence (the header/script that revealed the version) — pass the endpoint where the banner was observed.
+   - Where you KNOW a safe, in-scope active check for a specific CVE (e.g. requesting the known-vulnerable path of CVE-2021-41773), you MAY use http_request to confirm it, then say "confirmed by active probe" with the evidence.
+Skip components with no known issue (a current, patched version is not a finding). Do not duplicate single-request holes already found in diagnosis. When every detected component has been assessed, call fingerprint_done(summary).`;
+
 /**
  * 既定シナリオ(standing objectives): operator の --focus とは別に、**毎回シナリオ段で必ず追う**横断目的。
  * per-screen 診断が体系的に拾わない「アプリ全体を見渡して初めて成立する」高価値タスクを少数だけ常駐させる。

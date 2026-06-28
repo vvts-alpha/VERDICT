@@ -17,7 +17,7 @@ import { join } from "node:path";
 import { buildTools, STAGE_TOOLS, dedupKey, isAuthWalled, loadCookieFile, sessionLooksDead, stripHash } from "./tools.js";
 import type { PilotSession, RoleSession } from "./tools.js";
 import { LiveControl } from "./live-control.js";
-import { DEFAULT_SCENARIOS, DIAGNOSE_PROMPT, METHODOLOGY_PROMPT, SCENARIO_PROMPT, SURVEY_PROMPT } from "./system.js";
+import { DEFAULT_SCENARIOS, DIAGNOSE_PROMPT, FINGERPRINT_PROMPT, METHODOLOGY_PROMPT, SCENARIO_PROMPT, SURVEY_PROMPT } from "./system.js";
 
 export interface RunPilotOptions {
   store: AssessmentStore;
@@ -53,6 +53,8 @@ export interface RunPilotOptions {
   scenarioPass?: boolean;
   /** シナリオ段に常駐の既定シナリオ(資格情報ハント等の横断目的)を注入するか。既定 true。--no-default-scenarios で off。 */
   defaultScenarios?: boolean;
+  /** A06 フィンガープリント(版収集→既知 CVE 評価)ステージを実行するか。既定 true。--no-fingerprint で off。 */
+  fingerprintPass?: boolean;
   maxTurns?: number;
   rateMs?: number;
   headless?: boolean;
@@ -432,6 +434,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     methodologyDone: false,
     screenDone: false,
     scenarioDone: false,
+    fingerprintDone: false,
     ...(opts.oob ? { oob: opts.oob } : {}),
     ...(roleSessions ? { roleSessions } : {}),
   };
@@ -832,6 +835,22 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
           maxTurns: Math.min(maxTurns, 40),
           model: deepModel, // workflow の発見・構築は最難の推論 → deep 固定
           shouldStop: () => session.scenarioDone || session.done,
+        });
+      }
+
+      // ── STAGE: フィンガープリント(A06 既知脆弱コンポーネント) ── 技術スタックの版を集め、既知 CVE/EOL を当てる。
+      //    収集は決定的(fingerprint_scan がヘッダ/Cookie/meta/script から版抽出)、CVE 評価は deep モデルの知識依存。
+      //    WebFetch 禁止なので外部 CVE DB は引かず、findings は「version-based・要確認」として正直に記録する。
+      if (opts.fingerprintPass !== false && !session.done) {
+        session.fingerprintDone = false;
+        opts.onText?.("🔎 fingerprint stage: collecting tech/version banners → assessing known CVEs (A06)");
+        turns += await runStage({
+          system: FINGERPRINT_PROMPT,
+          goal: `Per-screen diagnosis and scenarios are done. Inventory the technology stack: call fingerprint_scan on ${opts.targetUrl} (plus a couple of representative in-scope URLs / the main JS bundle). For EVERY detected (component, version), assess KNOWN vulnerabilities (concrete CVEs or hard EOL) from your knowledge and record_finding(category vulnerable-component) for the ones with a real issue — name the CVE, cite the version evidence (the banner/script that revealed it), set severity by the worst known issue, and state plainly it is version-based unless you actively confirmed it. Skip patched/current versions. Call fingerprint_done when every detected component has been assessed.`,
+          allowed: STAGE_TOOLS.fingerprint,
+          maxTurns: Math.min(maxTurns, 25),
+          model: deepModel, // 版↔CVE の対応付けは知識集約的 → deep 固定
+          shouldStop: () => session.fingerprintDone || session.done,
         });
       }
     }
