@@ -17,6 +17,23 @@ export function renderMarkdown(m: ReportModel): string {
   const out: string[] = [];
   out.push(`# ${m.brand} Security Assessment Report`, "");
 
+  // ── 目次(レンダラ上でクリックすると各節へジャンプ) ──
+  //    固定節は GFM 自動アンカー(#assessment-information 等)、finding は見出しに [SEV]・連番が入り
+  //    スラッグが renderer 依存になるため明示アンカー <a id="finding-N"> に飛ばす。
+  out.push("## Contents", "");
+  out.push("- [Assessment Information](#assessment-information)");
+  out.push("- [Scope](#scope)");
+  out.push("- [Summary](#summary)");
+  if (m.findings.length > 0) {
+    out.push("- [Findings](#findings)");
+    for (const f of m.findings) {
+      // Markdown のリンク文字列に [] があると構文が壊れるので、severity の括弧は付けず title の [] も除去。
+      const label = `${f.index}. ${f.severity.toUpperCase()} — ${f.title.replace(/[[\]]/g, "")}`;
+      out.push(`    - [${label}](#finding-${f.index})`);
+    }
+  }
+  out.push("");
+
   // ── 対象情報 ──
   out.push("## Assessment Information", "");
   out.push(`| | |`, `|---|---|`);
@@ -50,6 +67,7 @@ export function renderMarkdown(m: ReportModel): string {
   if (m.findings.length > 0) {
     out.push("## Findings", "");
     for (const f of m.findings) {
+      out.push(`<a id="finding-${f.index}"></a>`, ""); // 目次からの明示ジャンプ先(renderer 非依存)
       out.push(`### ${f.index}. [${f.severity.toUpperCase()}] ${f.title}`, "");
       out.push(`- Screen: \`${f.screenId ?? "(cross-screen)"}\``);
       out.push(`- Source: ${f.sourceKind === "validator" ? `validator \`${f.sourceName}\`` : `hypothesis \`${f.sourceName}\``}`);

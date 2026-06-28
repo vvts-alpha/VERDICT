@@ -94,6 +94,12 @@ test("renderReportHtml is a self-contained document with the finding", () => {
     assert.match(html, /Exposed sensitive file/);
     assert.match(html, /HIGH<\/span>/);
     assert.ok(!html.includes("<script")); // no script injection surface
+    // 目次: nav + 各節 id + finding アンカーへのリンク。
+    assert.match(html, /<nav class="toc">/);
+    assert.match(html, /<a href="#assessment-information">Assessment Information<\/a>/);
+    assert.match(html, /<a href="#finding-1">/);
+    assert.match(html, /<h2 id="findings">Findings<\/h2>/);
+    assert.match(html, /<div class="f" id="finding-1">/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -47,6 +47,12 @@ test("buildReport renders findings, repro, evidence, scope", () => {
     assert.match(md, /GET \/\.git\/config/);
     assert.match(md, /artifacts\/s-0001\/ev-1\//);
     assert.match(md, /## Scope/);
+    // 目次: Contents 節 + 各節リンク + finding への明示アンカー/リンク。
+    assert.match(md, /## Contents/);
+    assert.match(md, /- \[Assessment Information\]\(#assessment-information\)/);
+    assert.match(md, /- \[Findings\]\(#findings\)/);
+    assert.match(md, /\[1\. HIGH — Exposed sensitive file[^\]]*\]\(#finding-1\)/); // TOC は [] を含まない
+    assert.match(md, /<a id="finding-1"><\/a>/); // 見出し直前の明示アンカー
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

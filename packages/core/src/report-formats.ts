@@ -49,7 +49,13 @@ img.shot{max-width:220px;max-height:140px;border:1px solid #ddd;border-radius:4p
 .ev .evh{font-size:12px;color:#555;margin:0 0 4px}
 .ev .lbl{font-size:11px;font-weight:700;letter-spacing:.4px;color:#5f7d8c;margin:6px 0 2px}
 .ev pre{margin:0;max-height:420px}
-@media print{body{padding:0}.f{break-inside:avoid}.ev pre{max-height:none}}
+html{scroll-behavior:smooth}
+.toc{background:#fafbfc;border:1px solid #e3e6ea;border-radius:8px;padding:10px 16px;margin:14px 0 8px}
+.toc .toctitle{font-weight:700;font-size:12px;color:#555;letter-spacing:.4px;text-transform:uppercase;margin:0 0 6px}
+.toc ul{margin:0;padding-left:18px} .toc>ul{padding-left:16px;list-style:none}
+.toc li{margin:2px 0;font-size:13px} .toc a{color:#0366d6;text-decoration:none} .toc a:hover{text-decoration:underline}
+.toc .sev{font-weight:700;font-size:11px;letter-spacing:.3px}
+@media print{body{padding:0}.f{break-inside:avoid}.ev pre{max-height:none}.toc{break-inside:avoid}}
 `;
 
 function docHtml(title: string, body: string): string {
@@ -78,8 +84,24 @@ export function renderReportHtml(m: ReportModel): string {
   const out: string[] = [];
   out.push(`<h1>${esc(m.brand)} Security Assessment Report</h1>`);
 
+  // 目次(クリックで各節 / 各 finding のアンカーへジャンプ)
+  out.push(`<nav class="toc"><div class="toctitle">Contents</div><ul>`);
+  out.push(`<li><a href="#assessment-information">Assessment Information</a></li>`);
+  out.push(`<li><a href="#scope">Scope</a></li>`);
+  out.push(`<li><a href="#summary">Summary</a></li>`);
+  if (m.findings.length > 0) {
+    out.push(`<li><a href="#findings">Findings</a><ul>`);
+    for (const f of m.findings) {
+      out.push(
+        `<li><a href="#finding-${f.index}">${f.index}. <span class="sev" style="color:${SEV_COLOR[f.severity]}">${f.severity.toUpperCase()}</span> ${esc(f.title)}</a></li>`,
+      );
+    }
+    out.push(`</ul></li>`);
+  }
+  out.push(`</ul></nav>`);
+
   // 対象情報
-  out.push(`<h2>Assessment Information</h2><table class="info">`);
+  out.push(`<h2 id="assessment-information">Assessment Information</h2><table class="info">`);
   out.push(row("Assessment ID", `<code>${esc(m.id)}</code>`));
   out.push(row("Target", `<code>${esc(m.target)}</code>`));
   out.push(row("Started", esc(m.startedAt)));
@@ -94,7 +116,7 @@ export function renderReportHtml(m: ReportModel): string {
   // スコープ
   const s = m.scope;
   const hostList = (xs: string[]): string => (xs.length ? xs.map((h) => `<code>${esc(h)}</code>`).join(", ") : "&mdash;");
-  out.push(`<h2>Scope</h2><table class="info">`);
+  out.push(`<h2 id="scope">Scope</h2><table class="info">`);
   out.push(row("In-scope hosts", hostList(s.inScopeHosts)));
   out.push(row("Out-of-scope hosts", hostList(s.outOfScopeHosts)));
   out.push(row("In-scope paths", hostList(s.inScopePathPrefixes)));
@@ -103,7 +125,7 @@ export function renderReportHtml(m: ReportModel): string {
   out.push(`</table>`);
 
   // サマリ
-  out.push(`<h2>Summary</h2>`);
+  out.push(`<h2 id="summary">Summary</h2>`);
   if (m.findings.length === 0) {
     out.push(`<p class="muted"><em>No confirmed findings.</em></p>`);
   } else {
@@ -116,9 +138,9 @@ export function renderReportHtml(m: ReportModel): string {
 
   // findings(req/resp 全文)
   if (m.findings.length > 0) {
-    out.push(`<h2>Findings</h2>`);
+    out.push(`<h2 id="findings">Findings</h2>`);
     for (const f of m.findings) {
-      out.push(`<div class="f">`);
+      out.push(`<div class="f" id="finding-${f.index}">`);
       out.push(`<h3><span class="badge" style="background:${SEV_COLOR[f.severity]}">${f.severity.toUpperCase()}</span> ${f.index}. ${esc(f.title)}</h3>`);
       out.push(`<div class="kv">Screen: <code>${esc(f.screenId ?? "(cross-screen)")}</code></div>`);
       out.push(`<div class="kv">Source: ${f.sourceKind} <code>${esc(f.sourceName)}</code></div>`);
