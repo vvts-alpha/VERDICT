@@ -9,8 +9,8 @@ import { isInScope } from "@veritas/core";
 import type { LoginCreds, Observation, PlaywrightDriver } from "@veritas/crawler";
 import { InventoryBuilder, normalizePath, smartLogin } from "@veritas/crawler";
 import type { LlmClient } from "@veritas/llm";
-import type { BurpAuditConn, EvidenceStore, FetchHttpClient, HttpRequest, HttpResponse, TechSample } from "@veritas/scanner";
-import { oobPayload, oobPoll, fingerprintTech, formatTechInventory } from "@veritas/scanner";
+import type { BurpAuditConn, EvidenceStore, FetchHttpClient, HttpRequest, HttpResponse, TechComponent, TechSample } from "@veritas/scanner";
+import { oobPayload, oobPoll, fingerprintTech, formatTechInventory, lookupCves, formatCveResults } from "@veritas/scanner";
 import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { join } from "node:path";
@@ -87,6 +87,8 @@ export interface PilotSession {
   inputSweep: boolean;
   /** 入力スイープで POST フォームも送信する(=標的にデータを書く)。false なら GET/検索のみ。 */
   aggressiveForms: boolean;
+  /** A06 で検出版をオンライン CVE DB(OSV/NVD)に照会するか(opt-in: 第三者への egress)。off なら cve_lookup は無効。 */
+  cveLookup: boolean;
   /** screenId → 方法論(攻撃計画)。 */
   plans: Map<string, string>;
   /** 診断中の screenId(record_finding / http_request evidence の紐付け先)。 */
@@ -116,8 +118,8 @@ export const STAGE_TOOLS = {
   diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_dom_xss", "probe_stored_xss", "probe_redirect", "probe_jwt", "probe_csrf", "probe_oob", "probe_logic", "analyze_session", "verify_access", "browser_navigate", "browser_fill", "browser_click", "record_finding", "screen_done"],
   // シナリオ(A04 横断ロジック): inventory 俯瞰 + 多段リクエスト連鎖を probe_scenario で撃つ。画面診断の後に1回。
   scenario: ["get_inventory", "login", "http_request", "probe_scenario", "record_finding", "scenario_done"],
-  // フィンガープリント(A06 既知脆弱コンポーネント): fingerprint_scan で版を集め、既知 CVE を評価して記録。
-  fingerprint: ["fingerprint_scan", "http_request", "record_finding", "fingerprint_done"],
+  // フィンガープリント(A06 既知脆弱コンポーネント): fingerprint_scan で版を集め、(opt-in で cve_lookup)既知 CVE を評価して記録。
+  fingerprint: ["fingerprint_scan", "cve_lookup", "http_request", "record_finding", "fingerprint_done"],
 } as const;
 
 const txt = (s: string): { content: { type: "text"; text: string }[] } => ({ content: [{ type: "text", text: s }] });
@@ -1602,6 +1604,37 @@ export function buildTools(s: PilotSession) {
             components,
             inventory: formatTechInventory(components),
             note: "Versions only — assess each (name, version) against KNOWN CVEs/EOL from your knowledge; the ⚠ KNOWN marks are deterministic JS-library matches.",
+          }),
+        );
+      },
+    ),
+    tool(
+      "cve_lookup",
+      "Look up KNOWN CVEs for detected components in ONLINE CVE databases — OSV.dev (libraries, matched by EXACT version) and NVD (servers/middleware, by keyword). Pass the components returned by fingerprint_scan. Returns authoritative CVE ids + severities; PREFER these over your own recollection and cite the returned CVE ids in findings. (Network egress runs only when CVE-DB lookup is enabled by the operator.)",
+      {
+        components: z
+          .array(z.object({ name: z.string(), version: z.string().nullable().optional(), kind: z.string().optional() }))
+          .describe("the detected components to look up (from fingerprint_scan)"),
+      },
+      async ({ components }) => {
+        if (!s.cveLookup)
+          return txt(JSON.stringify({ disabled: true, note: "Online CVE-DB lookup is OFF (operator did not pass --cve-lookup). Assess each component against your own CVE knowledge instead." }));
+        const KINDS = new Set(["server", "language", "framework", "cms", "frontend-lib"]);
+        const comps: TechComponent[] = components.slice(0, 16).map((c) => ({
+          kind: (KINDS.has(c.kind ?? "") ? c.kind : "frontend-lib") as TechComponent["kind"],
+          name: c.name,
+          version: c.version ?? null,
+          source: "fingerprint",
+          evidence: "",
+        }));
+        const results = await lookupCves(comps);
+        const hits = results.filter((r) => r.cves.length > 0).length;
+        s.store.appendEvent(s.assessmentId, { type: "note", payload: { message: `🛰 cve_lookup: ${comps.length} component(s) → ${hits} with CVE(s) (OSV/NVD)` } });
+        return txt(
+          JSON.stringify({
+            results,
+            summary: formatCveResults(results),
+            note: "Authoritative DB matches. record_finding(vulnerable-component) for components with real CVEs, citing the CVE id. OSV results are version-matched (high confidence); NVD keyword results may include CVEs for other versions — judge applicability before recording.",
           }),
         );
       },

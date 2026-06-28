@@ -55,6 +55,8 @@ export interface RunPilotOptions {
   defaultScenarios?: boolean;
   /** A06 フィンガープリント(版収集→既知 CVE 評価)ステージを実行するか。既定 true。--no-fingerprint で off。 */
   fingerprintPass?: boolean;
+  /** A06 で検出版をオンライン CVE DB(OSV/NVD)へ照会するか。既定 false(第三者への egress = opt-in)。--cve-lookup で on。 */
+  cveLookup?: boolean;
   maxTurns?: number;
   rateMs?: number;
   headless?: boolean;
@@ -427,6 +429,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     lockToSeeds: !!opts.lockToSeeds,
     inputSweep: opts.inputSweep ?? true,
     aggressiveForms: opts.aggressiveForms ?? true,
+    cveLookup: opts.cveLookup ?? false, // opt-in: 第三者 CVE DB への egress は明示 on の時だけ
     plans: new Map(),
     currentScreenId: null,
     screenVerdict: null,
@@ -843,11 +846,16 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       //    WebFetch 禁止なので外部 CVE DB は引かず、findings は「version-based・要確認」として正直に記録する。
       if (opts.fingerprintPass !== false && !session.done) {
         session.fingerprintDone = false;
-        opts.onText?.("🔎 fingerprint stage: collecting tech/version banners → assessing known CVEs (A06)");
+        opts.onText?.(`🔎 fingerprint stage: collecting tech/version banners → ${session.cveLookup ? "online CVE-DB (OSV/NVD)" : "model-knowledge"} CVE assessment (A06)`);
+        // CVE DB 照会が off のときは cve_lookup を提示しない(無駄ターン防止)。
+        const fpTools = session.cveLookup ? STAGE_TOOLS.fingerprint : STAGE_TOOLS.fingerprint.filter((t) => t !== "cve_lookup");
+        const cveClause = session.cveLookup
+          ? "After fingerprint_scan, call cve_lookup with the detected components to get AUTHORITATIVE CVE ids from OSV/NVD, and cite those ids. "
+          : "Assess each (component, version) against your own CVE/EOL knowledge (online CVE-DB lookup is off). ";
         turns += await runStage({
           system: FINGERPRINT_PROMPT,
-          goal: `Per-screen diagnosis and scenarios are done. Inventory the technology stack: call fingerprint_scan on ${opts.targetUrl} (plus a couple of representative in-scope URLs / the main JS bundle). For EVERY detected (component, version), assess KNOWN vulnerabilities (concrete CVEs or hard EOL) from your knowledge and record_finding(category vulnerable-component) for the ones with a real issue — name the CVE, cite the version evidence (the banner/script that revealed it), set severity by the worst known issue, and state plainly it is version-based unless you actively confirmed it. Skip patched/current versions. Call fingerprint_done when every detected component has been assessed.`,
-          allowed: STAGE_TOOLS.fingerprint,
+          goal: `Per-screen diagnosis and scenarios are done. Inventory the technology stack: call fingerprint_scan on ${opts.targetUrl} (plus a couple of representative in-scope URLs / the main JS bundle). ${cveClause}record_finding(category vulnerable-component) for every component with a real known issue — name the CVE, cite the version evidence (the banner/script that revealed it), set severity by the worst known issue, and state plainly it is version-based unless actively confirmed. Skip patched/current versions. Call fingerprint_done when every detected component has been assessed.`,
+          allowed: fpTools,
           maxTurns: Math.min(maxTurns, 25),
           model: deepModel, // 版↔CVE の対応付けは知識集約的 → deep 固定
           shouldStop: () => session.fingerprintDone || session.done,
