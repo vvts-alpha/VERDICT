@@ -7,7 +7,7 @@
 import { createSdkMcpServer, query } from "@anthropic-ai/claude-agent-sdk";
 import type { HookCallback } from "@anthropic-ai/claude-agent-sdk";
 import type { AssessmentStore, Screen, ScopePolicy } from "@veritas/core";
-import { isInScope, recordTokens } from "@veritas/core";
+import { isInScope, isScannable, recordTokens } from "@veritas/core";
 import type { LoginCreds } from "@veritas/crawler";
 import { InventoryBuilder, PlaywrightDriver, smartLogin } from "@veritas/crawler";
 import { ClaudeCliClient } from "@veritas/llm";
@@ -717,8 +717,8 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         lastTouch = Date.now();
       };
 
-      for (const sc of screens) {
-        if (session.done) break;
+      // 1 画面を診断する(primary パスとドレインの両方から呼ぶ共通本体)。"break" で外側ループを止める。
+      const diagnoseOne = async (sc: Screen): Promise<"continue" | "break"> => {
         await keepSessionWarm();
         session.currentScreenId = sc.screenId;
         session.screenDone = false;
@@ -738,7 +738,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         // 一時停止して抜ける。resume すれば queued の画面(この画面と未着手の残り)から再開できる。
         if (session.paused) {
           opts.store.setScreenScanStatus(opts.assessmentId, sc.screenId, "queued");
-          break;
+          return "break";
         }
         // 台帳は実際に finding を記録(新規 or マージ)できたかで terminal を決める。
         const found = session.recordCalls > recordsBefore;
@@ -761,9 +761,46 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
           });
           session.done = true;
           session.doneSummary = msg;
-          break;
+          return "break";
         }
+        return "continue";
+      };
+
+      const handled = new Set<string>();
+      const maxScan = opts.maxScreens ?? 40;
+      // primary パス: 開始時スナップショット(優先度順)を回す。
+      for (const sc of screens) {
+        if (session.done) break;
+        handled.add(sc.screenId);
+        if ((await diagnoseOne(sc)) === "break") break;
       }
+      // ── ドレイン ── 診断中に input sweep / browser_navigate が新規 enroll した queued 画面を拾い切る。
+      //    for(screens) は **開始時スナップショット** なので、診断中に台帳へ積まれた画面は固定リストから漏れて
+      //    queued のまま残る(= WebUI が「scanned 79/81」になる正体)。設計意図「台帳の queued を全部 terminal に」
+      //    を満たすため、台帳を都度引き直して scannable かつ未処理の画面を maxScan / pause まで潰し切る。
+      //    上限 maxScan は全体の hard budget として維持(input sweep が掘り続けても暴走しない)。
+      let drained = 0;
+      while (!session.done && handled.size < maxScan) {
+        const live = opts.store.loadAssessment(opts.assessmentId);
+        if (!live) break;
+        const scanById = new Map(live.screenScans.map((s) => [s.screenId, s] as const));
+        const next = live.screens.find((s) => {
+          if (handled.has(s.screenId)) return false;
+          const scan = scanById.get(s.screenId);
+          return !!scan && isScannable(scan);
+        });
+        if (!next) break;
+        if (drained === 0)
+          opts.onText?.("🔁 draining screens discovered mid-diagnosis (input sweep / new routes) so coverage closes");
+        drained += 1;
+        handled.add(next.screenId);
+        if ((await diagnoseOne(next)) === "break") break;
+      }
+      if (drained > 0)
+        opts.store.appendEvent(opts.assessmentId, {
+          type: "note",
+          payload: { message: `🔁 drained ${drained} screen(s) discovered during diagnosis (coverage closed: no queued screens stranded)` },
+        });
       session.currentScreenId = null;
 
       // ── STAGE 4: シナリオ(A04 横断ロジック) ── 画面診断の後に1回。real id・auth 確証・実挙動を継承して
