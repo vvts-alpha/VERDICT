@@ -34,8 +34,8 @@ export { startBurpScan, getBurpScan, restIssuesToBurpIssues, pickBurpConfigs, de
 export type { BurpScanRequest, BurpScanStatus } from "./burp-rest.js";
 export { mergeBurpIssues } from "./burp-merge.js";
 export type { MergeBurpOptions, MergeBurpResult } from "./burp-merge.js";
-export { triageBurpInfo, formatBurpLeads } from "./burp-triage.js";
-export type { BurpLead, LeadPriority } from "./burp-triage.js";
+export { triageBurpInfo, formatBurpLeads, classifyBurpName } from "./burp-triage.js";
+export type { BurpLead, LeadPriority, BurpLeadClass } from "./burp-triage.js";
 export { submitAudit, getAuditStatusAll, getAuditIssues, resetAudit, auditIssuesToBurpIssues, buildRawRequest } from "./burp-audit.js";
 export type { BurpAuditConn, AuditSubmit, AuditHostStatus } from "./burp-audit.js";
 export { oobStatus, oobPayload, oobPoll } from "./burp-oob.js";

@@ -146,6 +146,20 @@ const LEAD_RULES: Array<{ re: RegExp; lead: string; priority: LeadPriority; why:
   },
 ];
 
+export interface BurpLeadClass {
+  lead: string;
+  priority: LeadPriority;
+  why: string;
+  probe: string;
+}
+
+/** Burp issue 名(または "[burp] …" を剥がした finding タイトル)→ リード分類。未分類/hygiene は null。
+ *  triage の集約と、選択フェーズのヒント表示・確証時の severity 引き上げの両方から使う単一の真実。 */
+export function classifyBurpName(name: string): BurpLeadClass | null {
+  for (const r of LEAD_RULES) if (r.re.test(name)) return { lead: r.lead, priority: r.priority, why: r.why, probe: r.probe };
+  return null;
+}
+
 function matchRule(name: string): (typeof LEAD_RULES)[number] | null {
   for (const r of LEAD_RULES) if (r.re.test(name)) return r;
   return null;

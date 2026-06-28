@@ -38,7 +38,7 @@ import type { BurpAuditConn } from "@veritas/scanner";
 import type { BurpIssue } from "@veritas/scanner";
 import { assessLogicInventory, assessScreenLogic, authDiffScreen } from "@veritas/agent";
 import type { RoleContext } from "@veritas/agent";
-import { runPilot, verifyBurpFindings } from "@veritas/pilot";
+import { runPilot, verifyBurpFindings, triageAndDeepDiveBurp } from "@veritas/pilot";
 import { startServer } from "@veritas/server";
 import { loadDotEnv } from "./dotenv.js";
 
@@ -81,8 +81,8 @@ commands:
               defaults to the "250ms" pool (create it in Burp: Settings → Resource pool → Add → concurrency 1 / Delay 250ms).
               if absent, auto-continues on Burp's default pool (prints how to create one). override with --resource-pool <name>, --resource-pool "" for Burp's default.
             pass --manifest credentials for an authenticated scan. API key via --api-key or env BURP_API_KEY. Burp Pro's REST API must be enabled.
-  burp-import --id <id> --report <burp.xml> [--manifest <m.json>] [--no-burp-verify] [--model <m>] [--out <dir>]
-            import a Burp Pro XML report, adding only net-new issues that don't duplicate existing findings, then AI re-verifies the High+ imports (--no-burp-verify to skip). integration is flag-driven / optional.
+  burp-import --id <id> --report <burp.xml> [--manifest <m.json>] [--no-burp-verify] [--no-burp-triage] [--model <m>] [--out <dir>]
+            import a Burp Pro XML report, adding only net-new issues that don't duplicate existing findings, then AI re-verifies the High+ imports (--no-burp-verify to skip). after that, a triage phase shows the model the sub-High lead titles (reflected-input→XSS, external-interaction→SSRF, loose CORS…), it picks the promising ones, and only those are deep-dived with the same evidence discipline (--no-burp-triage to skip just this phase). integration is flag-driven / optional.
   assess  --manifest <file.json> | --url <url> [--login-url <u>] [--login-wait <s>] [--no-label] [--no-logic] [--no-explore] [--browser-path <bin>] [--no-sandbox] [--model <m>] [--out <dir>]
             one-shot run (deterministic pipeline): crawl → label → scan → logic → report in a single command
             --login-url opens a headed browser and waits for login (password entered by hand, never injected)
@@ -1541,6 +1541,7 @@ async function cmdBurpImport(args: string[]): Promise<void> {
       out: { type: "string" },
       manifest: { type: "string" }, // 認証下 finding の再検証に Basic 資格を渡す(任意)
       "no-burp-verify": { type: "boolean" },
+      "no-burp-triage": { type: "boolean" }, // High+ 検証は残しつつ、sub-High リードの深堀フェーズだけ無効化
       model: { type: "string" },
     },
   });
@@ -1564,7 +1565,7 @@ async function cmdBurpImport(args: string[]): Promise<void> {
   // 取り込んだ Burp 由来 High+ を AI が能動再検証(REST 経路と同じフェーズ)。--no-burp-verify で無効。
   if (added > 0 && !values["no-burp-verify"]) {
     const httpBasic = manifestHttpBasic(values.manifest ? loadManifest(values.manifest) : null);
-    await verifyImportedBurp(store, id, runsDir, { ...(values.model ? { model: values.model } : {}), httpBasic });
+    await verifyImportedBurp(store, id, runsDir, { ...(values.model ? { model: values.model } : {}), httpBasic, triage: !values["no-burp-triage"] });
     const fs2 = store.loadAssessment(id);
     if (fs2) writeFileSync(join(runsDir, id, "report.md"), buildReport(fs2, new Date(), { loadEvidence: evidenceLoaderFor(runsDir, id) }));
   }
@@ -1731,7 +1732,7 @@ async function verifyImportedBurp(
   store: AssessmentStore,
   id: string,
   runsDir: string,
-  o: { model?: string; httpBasic?: { user: string; pass: string } | null; cookie?: string; bearer?: string },
+  o: { model?: string; httpBasic?: { user: string; pass: string } | null; cookie?: string; bearer?: string; triage?: boolean },
 ): Promise<void> {
   const st = store.loadAssessment(id);
   if (!st) return;
@@ -1761,6 +1762,28 @@ async function verifyImportedBurp(
       onTool: (n, i) => console.log(`    ⚙ ${n.replace("mcp__veritas__", "")} ${JSON.stringify(i).slice(0, 120)}`),
     });
     if (res.checked > 0) console.log(`▶ burp-verify ${id}: ${res.checked} High+ re-tested → ${res.confirmed} confirmed ✓ / ${res.refuted} not reproduced ?`);
+
+    // ── 深堀フェーズ ── High+ の後に、sub-High リード(info/low/medium)の **タイトル一覧をモデルに見せて
+    //    有望なものを選ばせ、選ばれた分だけ同じ証拠規律で能動再テスト**する。全部はやらない(operator 方針)。
+    if (o.triage !== false) {
+      const t = await triageAndDeepDiveBurp({
+        store,
+        assessmentId: id,
+        scope,
+        http,
+        evidence,
+        artifactsDir,
+        ...(o.cookie ? { cookie: o.cookie } : {}),
+        ...(o.bearer ? { bearer: o.bearer } : {}),
+        ...(o.model ? { model: o.model } : {}),
+        onText: (txt) => console.log(`  🔬 ${txt.slice(0, 200)}`),
+        onTool: (n, i) => console.log(`    ⚙ ${n.replace("mcp__veritas__", "")} ${JSON.stringify(i).slice(0, 120)}`),
+      });
+      if (t.listed > 0)
+        console.log(
+          `▶ burp-triage ${id}: ${t.listed} sub-High lead(s) listed → model deep-dived ${t.selected} → ${t.confirmed} confirmed ✓ / ${t.refuted} not reproduced ?`,
+        );
+    }
   } catch (e) {
     console.log(`⚠ burp-verify skipped: ${String(e).slice(0, 160)}`);
   }

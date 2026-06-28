@@ -11,7 +11,7 @@ import type { HookCallback } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { isInScope } from "@veritas/core";
 import type { AssessmentStore, Finding, ScopePolicy, Severity } from "@veritas/core";
-import { readEvidenceArtifact } from "@veritas/scanner";
+import { readEvidenceArtifact, classifyBurpName } from "@veritas/scanner";
 import type { EvidenceStore, FetchHttpClient, HttpRequest, HttpResponse } from "@veritas/scanner";
 
 export interface VerifyBurpDeps {
@@ -109,10 +109,26 @@ export async function verifyBurpFindings(deps: VerifyBurpDeps): Promise<VerifyBu
   if (targets.length === 0) return result;
 
   const maxTurns = deps.maxTurnsPerFinding ?? 12;
-
   for (const f of targets) {
-    const endpoint = endpointOf(f);
     result.checked += 1;
+    const o = await deepDiveOne(deps, f, maxTurns);
+    if (o === "confirmed") result.confirmed += 1;
+    else result.refuted += 1;
+  }
+  return result;
+}
+
+/**
+ * Burp finding 1 件を AI が能動再テストして確証/反証する共通本体(High+ 検証と sub-High 深堀の両方が使う)。
+ * confirmSeverity を渡すと、確証時に severity をそこへ **引き上げる**(info で取り込んだ反射点が実 XSS だった等)。
+ */
+async function deepDiveOne(
+  deps: VerifyBurpDeps,
+  f: Finding,
+  maxTurns: number,
+  opts: { confirmSeverity?: Severity } = {},
+): Promise<"confirmed" | "refuted"> {
+    const endpoint = endpointOf(f);
     // verdict ツールが書き込むこのフィンディング 1 件分の結果。
     // ※ クロージャ越しに書き換わるので holder オブジェクトにする(TS の flow-narrowing 回避)。
     const box: { outcome: "confirmed" | "refuted" | null; note: string; ev: string[] } = { outcome: null, note: "", ev: [] };
@@ -239,30 +255,151 @@ export async function verifyBurpFindings(deps: VerifyBurpDeps): Promise<VerifyBu
     // verdict が出ないまま終わった(maxTurns 等)→ 反証扱い(再現できなかった=注記のみ)。
     const finalOutcome: "confirmed" | "refuted" = box.outcome ?? "refuted";
     const note = box.note || (box.outcome ? "" : "no verdict reached within the re-test budget");
-    annotate(deps, f, finalOutcome, note, box.ev);
-    if (finalOutcome === "confirmed") result.confirmed += 1;
-    else result.refuted += 1;
-  }
-  return result;
+    annotate(deps, f, finalOutcome, note, box.ev, finalOutcome === "confirmed" ? opts.confirmSeverity : undefined);
+    return finalOutcome;
 }
 
-/** finding に検証結果の印と注記を付ける(severity は据え置き)。confirmed=[burp✓] / refuted=[burp?]。 */
+export interface TriageDeepDiveResult {
+  /** sub-High の Burp リード総数(モデルに提示した一覧の件数) */
+  listed: number;
+  /** モデルが深堀を選んだ件数 */
+  selected: number;
+  confirmed: number;
+  refuted: number;
+}
+
+const SELECT_SYSTEM = `You are triaging a list of LOWER-severity issues Burp's scanner reported. Most are noise (hygiene, low-value disclosures), but some are ENTRY POINTS to real vulnerabilities the scanner under-rated:
+- "Input returned in response (reflected/stored)" / "Cross-site scripting" → reflected/stored XSS, IF the input returns unescaped in an executable context.
+- "External service interaction (DNS/HTTP)" → SSRF / OOB.
+- "Cross-origin resource sharing: arbitrary origin trusted" → cross-site data theft, IF the response is credentialed and sensitive.
+- "Cross-site request forgery", "Open redirection", "File upload", weak CSP, exposed API spec → their respective classes.
+Each row carries a heuristic hint «lead/priority» — treat it as a suggestion, not a verdict; use your own judgement on the title and endpoint.
+Pick ONLY the rows genuinely worth a deep active re-test — favour those that plausibly lead to a concrete, high-impact effect; skip pure hygiene and trivial disclosures. Then call select_leads(ids, reason) EXACTLY ONCE. Be selective: a handful, not all of them.`;
+
+/**
+ * 新フェーズ「タイトル一覧 → 有望なものをモデルが選択 → 深堀」。
+ * verifyBurpFindings が触らない **sub-High の Burp リード** を一覧でモデルに見せ(各行にヒューリスティック
+ * ヒント付き)、選ばせた分だけ deepDiveOne で能動再テスト(証拠規律)する。確証ならヒント相当へ severity 引き上げ。
+ * 全部 verify しない=操作者の方針どおり「有望そうなものだけ深堀」。
+ */
+export async function triageAndDeepDiveBurp(
+  deps: VerifyBurpDeps,
+  opts: { maxDeepDives?: number } = {},
+): Promise<TriageDeepDiveResult> {
+  const all = deps.store.loadAssessment(deps.assessmentId)?.findings ?? [];
+  const leads = all.filter(
+    (f) =>
+      f.source.kind === "validator" &&
+      f.source.validatorName === "burp" &&
+      !HIGH_PLUS.has(f.severity) &&
+      !/\[burp[✓?]\]/.test(f.title), // 既に検証済みは飛ばす(冪等)
+  );
+  const res: TriageDeepDiveResult = { listed: leads.length, selected: 0, confirmed: 0, refuted: 0 };
+  if (leads.length === 0) return res;
+
+  const strip = (t: string): string => t.replace(/^\[burp\]\s*/, "").replace(/\s*\(\d+ URLs?\)\s*$/, "");
+  const listing = leads
+    .map((f) => {
+      const c = classifyBurpName(strip(f.title));
+      const ep = endpointOf(f);
+      return `- ${f.id} [${f.severity}] ${strip(f.title)}${ep ? ` @ ${ep}` : ""}${c ? `  «hint: ${c.lead}/${c.priority}»` : ""}`;
+    })
+    .join("\n");
+
+  // ── 選択フェーズ(1 クエリ) ── モデルが一覧を見て深堀対象を選ぶ。
+  const picked: { ids: string[]; reason: string } = { ids: [], reason: "" };
+  const selectLeads = tool(
+    "select_leads",
+    "Record which lead ids are worth a deep active re-test. Call EXACTLY ONCE.",
+    {
+      ids: z.array(z.string()).describe("the finding ids (e.g. b-012) to deep-dive"),
+      reason: z.string().describe("one sentence: why these and not the rest"),
+    },
+    async ({ ids, reason }) => {
+      picked.ids = ids;
+      picked.reason = reason;
+      return txt(`selected ${ids.length} of ${leads.length}`);
+    },
+  );
+  const server = createSdkMcpServer({ name: "veritas", version: "1.0.0", tools: [selectLeads] });
+  const q = query({
+    prompt: `${leads.length} lower-severity Burp issues (format: id [severity] title @ endpoint «heuristic hint»):\n${listing}\n\nReview the titles and pick the ones worth deep-diving, then call select_leads.`,
+    options: {
+      mcpServers: { veritas: server },
+      allowedTools: ["select_leads"].map((n) => `mcp__veritas__${n}`),
+      disallowedTools: DISALLOWED,
+      permissionMode: "bypassPermissions",
+      hooks: { PreToolUse: [{ hooks: [onlyVeritasToolsHook] }] },
+      ...(deps.model ? { model: deps.model } : {}),
+      systemPrompt: { type: "preset", preset: "claude_code", append: SELECT_SYSTEM },
+      maxTurns: 4,
+    },
+  });
+  try {
+    for await (const msg of q) {
+      if (msg.type === "assistant") {
+        for (const block of msg.message.content) {
+          if (block.type === "text" && block.text.trim()) deps.onText?.(block.text.trim());
+          else if (block.type === "tool_use") deps.onTool?.(block.name, block.input);
+        }
+      }
+      if (picked.ids.length) break;
+    }
+  } catch (e) {
+    deps.onText?.(`⚠ burp triage selection ended early: ${String(e instanceof Error ? e.message : e).slice(0, 140)}`);
+  }
+  try {
+    await q.return?.(undefined as never);
+  } catch {
+    /* generator already done */
+  }
+
+  const cap = opts.maxDeepDives ?? 12;
+  const chosen = leads.filter((f) => picked.ids.includes(f.id)).slice(0, cap);
+  res.selected = chosen.length;
+  if (chosen.length === 0) {
+    deps.onText?.(`burp triage: model selected nothing to deep-dive of ${leads.length} lead(s)`);
+    return res;
+  }
+  deps.store.appendEvent(deps.assessmentId, {
+    type: "note",
+    payload: { message: `🔬 burp triage: deep-diving ${chosen.length}/${leads.length} model-flagged lead(s) — ${picked.reason.slice(0, 160)}` },
+  });
+
+  const maxTurns = deps.maxTurnsPerFinding ?? 12;
+  for (const f of chosen) {
+    const c = classifyBurpName(strip(f.title));
+    const confirmSeverity: Severity | undefined = c?.priority === "high" ? "high" : c?.priority === "medium" ? "medium" : undefined;
+    const outcome = await deepDiveOne(deps, f, maxTurns, confirmSeverity ? { confirmSeverity } : {});
+    if (outcome === "confirmed") res.confirmed += 1;
+    else res.refuted += 1;
+  }
+  return res;
+}
+
+const SEV_RANK: Record<Severity, number> = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
+
+/** finding に検証結果の印と注記を付ける。confirmed=[burp✓] / refuted=[burp?]。
+ *  newSeverity 指定時は確証された sub-High リードの severity を **上方向にだけ** 引き上げる(info→high 等)。 */
 function annotate(
   deps: VerifyBurpDeps,
   f: Finding,
   outcome: "confirmed" | "refuted",
   note: string,
   evidenceIds: string[],
+  newSeverity?: Severity,
 ): void {
   const cur = deps.store.loadAssessment(deps.assessmentId)?.findings.find((x) => x.id === f.id) ?? f;
   const mark = outcome === "confirmed" ? "[burp✓]" : "[burp?]";
   const title = cur.title.replace(/^\[burp\]/, mark);
+  // 確証され、かつヒント severity が現状より高ければ引き上げる(過小評価された info 取り込みを是正)。下げはしない。
+  const bumped = outcome === "confirmed" && newSeverity && SEV_RANK[newSeverity] > SEV_RANK[cur.severity] ? newSeverity : cur.severity;
   const head =
     outcome === "confirmed"
-      ? `✅ AI-verified by active re-test: ${note}`
+      ? `✅ AI-verified by active re-test: ${note}${bumped !== cur.severity ? ` (severity raised ${cur.severity}→${bumped}: confirmed real, not info-only)` : ""}`
       : `⚠ AI re-test could not reproduce (severity kept, manual confirmation advised): ${note}`;
   const ev = [...new Set([...cur.evidenceIds, ...evidenceIds])];
-  deps.store.upsertFinding(deps.assessmentId, { ...cur, title, description: `${head}\n\n${cur.description}`, evidenceIds: ev });
+  deps.store.upsertFinding(deps.assessmentId, { ...cur, title, severity: bumped, description: `${head}\n\n${cur.description}`, evidenceIds: ev });
   deps.store.appendEvent(deps.assessmentId, {
     type: "note",
     payload: { message: `${outcome === "confirmed" ? "✅" : "⚠"} burp-verify ${f.id}: ${outcome} — ${note.slice(0, 200)}` },
