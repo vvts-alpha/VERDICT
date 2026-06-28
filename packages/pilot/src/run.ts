@@ -17,7 +17,7 @@ import { join } from "node:path";
 import { buildTools, STAGE_TOOLS, dedupKey, isAuthWalled, loadCookieFile, sessionLooksDead, stripHash } from "./tools.js";
 import type { PilotSession, RoleSession } from "./tools.js";
 import { LiveControl } from "./live-control.js";
-import { DIAGNOSE_PROMPT, METHODOLOGY_PROMPT, SCENARIO_PROMPT, SURVEY_PROMPT } from "./system.js";
+import { DEFAULT_SCENARIOS, DIAGNOSE_PROMPT, METHODOLOGY_PROMPT, SCENARIO_PROMPT, SURVEY_PROMPT } from "./system.js";
 
 export interface RunPilotOptions {
   store: AssessmentStore;
@@ -51,6 +51,8 @@ export interface RunPilotOptions {
   /** 診断後の A04 シナリオ(画面横断の多段ロジック濫用)ステージを実行するか。既定 true。
    *  取引面(カート/注文/決済/クーポン/送金/権限変更)が無ければ自動スキップ。deep モデル固定。 */
   scenarioPass?: boolean;
+  /** シナリオ段に常駐の既定シナリオ(資格情報ハント等の横断目的)を注入するか。既定 true。--no-default-scenarios で off。 */
+  defaultScenarios?: boolean;
   maxTurns?: number;
   rateMs?: number;
   headless?: boolean;
@@ -813,14 +815,19 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         const focusClause = opts.focus
           ? `OPERATOR FOCUS (highest priority): ${opts.focus}\nTreat this as the PRIMARY objective of THIS stage. Build and test the scenario(s) it implies FIRST, and do NOT call scenario_done until you have ACTIVELY attempted the focus (log in, probe the relevant endpoints, build probe_scenario control/exploit flows for it). After the focus is covered, also handle any other obvious multi-step workflows. `
           : "";
+        // 既定シナリオ(standing objectives): --focus とは別に毎回必ず追う横断目的(資格情報ハント等)。
+        const defaultsOn = opts.defaultScenarios !== false && DEFAULT_SCENARIOS.length > 0;
+        const defaultClause = defaultsOn
+          ? `STANDING OBJECTIVES — pursue every one of these THIS stage, regardless of operator focus or whether any workflow exists:\n${DEFAULT_SCENARIOS.map((s, i) => `  ${i + 1}. [${s.key}] ${s.directive}`).join("\n")}\n\n`
+          : "";
         opts.onText?.(
           opts.focus
-            ? `🧩 scenario stage: operator focus → ${opts.focus.slice(0, 120)}`
-            : `🧩 scenario stage: surveying the inventory for multi-step (A04) workflows`,
+            ? `🧩 scenario stage: operator focus → ${opts.focus.slice(0, 120)}${defaultsOn ? ` (+ ${DEFAULT_SCENARIOS.length} default scenario(s))` : ""}`
+            : `🧩 scenario stage: ${defaultsOn ? `${DEFAULT_SCENARIOS.length} default scenario(s) + ` : ""}surveying the inventory for multi-step (A04) workflows`,
         );
         turns += await runStage({
           system: SCENARIO_PROMPT,
-          goal: `${focusClause}Per-screen diagnosis is done. Call get_inventory and decide FROM THE INVENTORY whether this app has any multi-step / state-changing workflow worth abusing (e.g. a cart→checkout→order flow, a coupon/voucher redemption, a fund/points transfer, a multi-step registration/approval, a role/privilege change). If there is none${opts.focus ? " beyond the operator focus" : ""}, call scenario_done immediately. Otherwise, for each workflow: log in, walk the legitimate flow once, then build probe_scenario(control, exploit, effectMarker) threading captured ids via {{var}}, and record_finding only on a confirmed verdict. Call scenario_done when every workflow is covered.`,
+          goal: `${focusClause}${defaultClause}Per-screen diagnosis is done. Call get_inventory, then (a) carry out the STANDING OBJECTIVES above, and (b) decide FROM THE INVENTORY whether this app has any multi-step / state-changing workflow worth abusing (e.g. a cart→checkout→order flow, a coupon/voucher redemption, a fund/points transfer, a multi-step registration/approval, a role/privilege change). For each workflow: log in, walk the legitimate flow once, then build probe_scenario(control, exploit, effectMarker) threading captured ids via {{var}}, and record_finding only on a confirmed verdict. Call scenario_done ONLY after the standing objectives AND every workflow have been covered${defaultsOn ? " (if there are no workflows, still finish the standing objectives before scenario_done)" : opts.focus ? " (if there is none beyond the operator focus, finish the focus first)" : " — if there is no workflow and nothing else to do, call scenario_done"}.`,
           allowed: STAGE_TOOLS.scenario,
           maxTurns: Math.min(maxTurns, 40),
           model: deepModel, // workflow の発見・構築は最難の推論 → deep 固定

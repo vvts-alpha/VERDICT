@@ -74,3 +74,22 @@ Call get_inventory first to see the full API surface. Then enumerate the transac
    - effectMarker = a string that appears in the FINAL step's response ONLY when the manipulation was accepted (the manipulated total/price echoed back, the out-of-order step returning 200, a discount applied twice). The control flow must NOT produce it; the exploit must, on both replays.
 4. On a confirmed verdict, record_finding with category price-tampering / qty-tampering / workflow-bypass / mass-assignment (or race-condition), citing probe_scenario's negativeControl + positiveReplays evidenceIds AND the effectMarker. Set an honest severity grounded in real impact (free/under-priced goods, account/balance takeover = high+).
 Do NOT re-report single-request holes already found in diagnosis. Reject the usual false positives (catch-all 200s, unchanged totals, errors). When every transactional workflow has been exercised, call scenario_done(summary).`;
+
+/**
+ * 既定シナリオ(standing objectives): operator の --focus とは別に、**毎回シナリオ段で必ず追う**横断目的。
+ * per-screen 診断が体系的に拾わない「アプリ全体を見渡して初めて成立する」高価値タスクを少数だけ常駐させる。
+ * run.ts がこれを SCENARIO ステージの goal に注入する(--no-default-scenarios で無効化可)。追加はこの配列に 1 項目。
+ */
+export const DEFAULT_SCENARIOS: { key: string; directive: string }[] = [
+  {
+    key: "credential-exposure",
+    directive:
+      "Hunt for exposed credentials/secrets across the whole app, independent of any workflow. " +
+      "Fetch the application's own JavaScript bundles and source maps, and probe common secret-bearing paths that are IN SCOPE " +
+      "(e.g. /.env, /.git/config, /config(.json), /actuator/env, /api/config, /swagger.json or the OpenAPI doc, and backup files like *.bak/*.old/*~). " +
+      "Grep every response you get for hardcoded API keys, bearer/JWT tokens, passwords, private keys ('BEGIN PRIVATE KEY'), cloud credentials " +
+      "(AWS 'AKIA…', Google 'api_key', Slack 'xox…'), basic-auth URLs (user:pass@host), and leaked password hashes. " +
+      "For any REAL, live, in-scope secret, record_finding(category secret-exposure) citing the exact response/location as evidence — " +
+      "do NOT report obvious placeholders, example keys, or public client IDs.",
+  },
+];
