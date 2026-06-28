@@ -33,7 +33,7 @@ import {
 import { PlaywrightDriver, buildInventory, crawl, exploreScreen, htmlToPdf, labelInventory, normalizePath, smartLogin, writeScreenInventory } from "@veritas/crawler";
 import type { LoginCreds } from "@veritas/crawler";
 import { ClaudeCliClient } from "@veritas/llm";
-import { EvidenceStore, FetchHttpClient, SECURITY_HEADERS, auditHeaders, parseBurpReport, pickBurpConfigs, readEvidenceArtifact, scanInventory, startBurpScan, getBurpScan, dedupSeedUrls, submitAudit, getAuditStatusAll, getAuditIssues, resetAudit, buildRawRequest, mergeBurpIssues as scannerMergeBurpIssues } from "@veritas/scanner";
+import { EvidenceStore, FetchHttpClient, SECURITY_HEADERS, auditHeaders, parseBurpReport, pickBurpConfigs, readEvidenceArtifact, scanInventory, startBurpScan, getBurpScan, dedupSeedUrls, submitAudit, getAuditStatusAll, getAuditIssues, resetAudit, buildRawRequest, mergeBurpIssues as scannerMergeBurpIssues, triageBurpInfo, formatBurpLeads } from "@veritas/scanner";
 import type { BurpAuditConn } from "@veritas/scanner";
 import type { BurpIssue } from "@veritas/scanner";
 import { assessLogicInventory, assessScreenLogic, authDiffScreen } from "@veritas/agent";
@@ -1495,6 +1495,37 @@ function mergeBurpIssues(
     pathTemplate: (p) => normalizePath(p).template,
   });
   if (res.added) console.log(`  + ${res.added} net-new finding(s) merged (from ${before} existing)`);
+
+  // ── info triage ── verifyImportedBurp は High+ しか再検証しない。その下(Information/Low/Medium)は
+  //    素通りするが、反射点→XSS・外部通信→SSRF・緩い CORS→データ窃取…と「実脆弱性の入口」が紛れている。
+  //    全部 verify はせず(operator の方針)、名前ベースで triage して **有望リードだけ** を提示する。
+  const subHigh = issues.filter((i) => {
+    if (/high|critical/i.test(i.severity)) return false; // High+ は verify 側の担当
+    let url: string;
+    try {
+      url = new URL(i.path || "/", i.host).toString();
+    } catch {
+      url = i.host;
+    }
+    return isInScope(url, state.scope);
+  });
+  const leads = triageBurpInfo(subHigh);
+  if (leads.length) {
+    const lines = formatBurpLeads(leads);
+    console.log(`  🔎 Burp info triage — ${leads.length} promising lead type(s) below High (verify covers High+ only; not auto-verified):`);
+    for (const ln of lines) console.log(`     ${ln}`);
+    const notable = leads.filter((l) => l.priority !== "low");
+    store.appendEvent(id, {
+      type: "note",
+      payload: {
+        message:
+          `🔎 Burp info triage: ${leads.length} lead(s) worth a look (High+ go to verify; these don't) — ` +
+          formatBurpLeads(notable.length ? notable : leads)
+            .slice(0, 8)
+            .join(" | "),
+      },
+    });
+  }
   return res;
 }
 
