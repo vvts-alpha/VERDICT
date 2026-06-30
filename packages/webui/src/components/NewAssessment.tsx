@@ -28,8 +28,8 @@ function lines(s: string): string[] {
 export function NewAssessment({ onCancel }: { onCancel: () => void }) {
   const [command, setCommand] = useState<"pilot" | "assess">("pilot");
   const [target, setTarget] = useState("");
-  const [model, setModel] = useState("claude-sonnet-4-6"); // deep: 高価値画面の診断
-  const [fastModel, setFastModel] = useState(""); // fast: survey/methodology/低価値画面。空 = tiering なし
+  const [model, setModel] = useState("claude-opus-4-8"); // deep 既定 = Opus: 高価値画面/シナリオ/fingerprint
+  const [fastModel, setFastModel] = useState("claude-sonnet-4-6"); // fast 既定 = Sonnet: survey/methodology/低価値画面(= tiering 既定 ON。"none" で単一モデル)
   const [rate, setRate] = useState("250");
   const [maxTurns, setMaxTurns] = useState("");
   const [focus, setFocus] = useState(""); // 操作者の重点ヒント → シナリオ段の最優先目的
@@ -50,7 +50,7 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
   const [outPaths, setOutPaths] = useState("");
   // crawl
   const [followLinks, setFollowLinks] = useState(true);
-  const [maxDepth, setMaxDepth] = useState("");
+  const [maxDepth, setMaxDepth] = useState("10"); // crawl 既定深さ = 10
   // auth roles
   const [roles, setRoles] = useState<Role[]>([]);
   // サイト全体を覆う HTTP Basic/Digest(アプリのログイン以前の壁)
@@ -333,7 +333,7 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
           </label>
           <label className="nf-field nf-inline">
             <span>max depth</span>
-            <input value={maxDepth} onChange={(e) => setMaxDepth(e.target.value)} placeholder="3" inputMode="numeric" />
+            <input value={maxDepth} onChange={(e) => setMaxDepth(e.target.value)} placeholder="10" inputMode="numeric" />
           </label>
         </div>
       </details>
