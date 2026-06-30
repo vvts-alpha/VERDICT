@@ -139,6 +139,23 @@ test("coverage reaches complete only when every screen is terminal", () => {
   });
 });
 
+test("a 'suspected' screen is terminal — coverage stays reachable (no hang on a lead-only screen)", () => {
+  withStore((store) => {
+    const id = seed(store);
+    store.setScreenScanStatus(id, "s-0001", "finding", { findingIds: ["f-1"] });
+    store.setScreenScanStatus(id, "s-0002", "suspected"); // 異常リードのみ。診断は完了 = terminal
+    store.setScreenScanStatus(id, "s-0003", "clean");
+    store.setScreenScanStatus(id, "s-0004", "suspected");
+    const state = store.loadAssessment(id);
+    assert.ok(state);
+    const cov = coverage(state);
+    assert.equal(cov.byStatus.suspected, 2);
+    assert.equal(cov.terminal, 4, "suspected counts toward terminal");
+    assert.equal(cov.remaining, 0);
+    assert.equal(cov.complete, true, "a suspected-only screen does not hang the stop condition");
+  });
+});
+
 test("scan-status transitions are recorded as events and survive reopen", () => {
   const dir = mkdtempSync(join(tmpdir(), "veritas-cov-"));
   const dbPath = join(dir, "state.sqlite");

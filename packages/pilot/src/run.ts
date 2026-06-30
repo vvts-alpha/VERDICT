@@ -661,7 +661,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       opts.store.setPhase(opts.assessmentId, "phase2_scan");
       // resume 時は terminal(clean/finding/excluded)を**先に**飛ばし、未診断だけを maxScreens まで回す。
       // ※ slice を先にすると先頭が全部 terminal の場合に queued を見ずに 0 件で終わる(バグだった)。
-      const TERMINAL = new Set(["clean", "finding", "excluded"]);
+      const TERMINAL = new Set(["clean", "finding", "suspected", "excluded"]);
       const candidates = resumeStatus
         ? session.inv.screens().filter((sc) => !TERMINAL.has(resumeStatus.get(sc.screenId) ?? "queued"))
         : session.inv.screens();
@@ -732,7 +732,6 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         session.screenDone = false;
         session.screenVerdict = null;
         session.screenProbes = 0; // カバレッジ・ゲートの裏取り用に画面ごとリセット
-        const recordsBefore = session.recordCalls;
         opts.store.setScreenScanStatus(opts.assessmentId, sc.screenId, "scanning");
         turns += await runStage({
           system: DIAGNOSE_PROMPT,
@@ -748,9 +747,10 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
           opts.store.setScreenScanStatus(opts.assessmentId, sc.screenId, "queued");
           return "break";
         }
-        // 台帳は実際に finding を記録(新規 or マージ)できたかで terminal を決める。
-        const found = session.recordCalls > recordsBefore;
-        opts.store.setScreenScanStatus(opts.assessmentId, sc.screenId, found ? "finding" : "clean");
+        // 台帳は **実際に記録された finding の確度** で terminal を決める(confirmed→finding / suspected→suspected /
+        //   無し→clean)。screenVerdict は record_finding が維持する権威値(upgrade-only、モデルの screen_done 自己申告では上書きしない)。
+        const status = session.screenVerdict === "finding" ? "finding" : session.screenVerdict === "suspected" ? "suspected" : "clean";
+        opts.store.setScreenScanStatus(opts.assessmentId, sc.screenId, status);
 
         // ── 認証壁サーキットブレーカ ── 全プローブが 401 で何も通らない(2xx ゼロ・finding ゼロ)なら、
         //    これ以上画面を回しても無駄。止めて operator に認証設定(httpBasic/creds/cookie)を促す。

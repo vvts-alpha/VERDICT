@@ -7,6 +7,7 @@ const STATUS_LABEL: Record<string, string> = {
   scanning: "scanning",
   clean: "clean",
   finding: "finding",
+  suspected: "suspected (needs manual verification)",
   blocked: "blocked",
   excluded: "excluded",
   error: "error",

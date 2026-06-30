@@ -8,7 +8,8 @@ export type ScreenScanStatus =
   | "queued" // 検出済・未スキャン(自動エンロール直後)
   | "scanning" // サブエージェントが処理中
   | "clean" // スキャン済・findings なし(terminal)
-  | "finding" // スキャン済・findings あり(terminal)
+  | "finding" // スキャン済・confirmed findings あり(terminal)
+  | "suspected" // スキャン済・suspected リードのみ(confirmed なし)。診断は完了 = terminal、人手確認待ち
   | "blocked" // 認証/スコープ/handoff 待ちで着手不能(非 terminal)
   | "excluded" // 人間がスキャン対象から除外(terminal)
   | "error"; // 失敗。再試行枠が残る限り再着手可
@@ -29,7 +30,7 @@ export interface ScreenScan {
 export interface Coverage {
   total: number;
   byStatus: Record<ScreenScanStatus, number>;
-  /** clean + finding + excluded */
+  /** clean + finding + suspected + excluded */
   terminal: number;
   /** total - terminal(queued / scanning / error / blocked の合計) */
   remaining: number;

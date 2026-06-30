@@ -84,18 +84,25 @@ export function renderReportHtml(m: ReportModel): string {
   const out: string[] = [];
   out.push(`<h1>${esc(m.brand)} Security Assessment Report</h1>`);
 
+  // confirmed と suspected を分離。headline は confirmed のみ、suspected は別セクション。
+  const confirmed = m.findings.filter((f) => f.verdict === "confirmed");
+  const suspected = m.findings.filter((f) => f.verdict === "suspected");
+  const tocLi = (f: ReportModel["findings"][number]): string =>
+    `<li><a href="#finding-${f.index}">${f.index}. <span class="sev" style="color:${SEV_COLOR[f.severity]}">${f.severity.toUpperCase()}</span> ${esc(f.title)}</a></li>`;
+
   // 目次(クリックで各節 / 各 finding のアンカーへジャンプ)
   out.push(`<nav class="toc"><div class="toctitle">Contents</div><ul>`);
   out.push(`<li><a href="#assessment-information">Assessment Information</a></li>`);
   out.push(`<li><a href="#scope">Scope</a></li>`);
   out.push(`<li><a href="#summary">Summary</a></li>`);
-  if (m.findings.length > 0) {
+  if (confirmed.length > 0) {
     out.push(`<li><a href="#findings">Findings</a><ul>`);
-    for (const f of m.findings) {
-      out.push(
-        `<li><a href="#finding-${f.index}">${f.index}. <span class="sev" style="color:${SEV_COLOR[f.severity]}">${f.severity.toUpperCase()}</span> ${esc(f.title)}</a></li>`,
-      );
-    }
+    for (const f of confirmed) out.push(tocLi(f));
+    out.push(`</ul></li>`);
+  }
+  if (suspected.length > 0) {
+    out.push(`<li><a href="#suspected">Suspected (needs manual verification)</a><ul>`);
+    for (const f of suspected) out.push(tocLi(f));
     out.push(`</ul></li>`);
   }
   out.push(`</ul></nav>`);
@@ -126,32 +133,45 @@ export function renderReportHtml(m: ReportModel): string {
 
   // サマリ
   out.push(`<h2 id="summary">Summary</h2>`);
-  if (m.findings.length === 0) {
+  if (confirmed.length === 0) {
     out.push(`<p class="muted"><em>No confirmed findings.</em></p>`);
   } else {
     const tags = (Object.entries(m.stats.findings.bySeverity) as [Severity, number][])
       .filter(([, n]) => n > 0)
       .map(([sev, n]) => `<span><b style="color:${SEV_COLOR[sev]}">${n}</b> ${sev}</span>`)
       .join("");
-    out.push(`<p>${m.findings.length} finding(s)</p><p class="sumtags">${tags}</p>`);
+    out.push(`<p>${confirmed.length} finding(s)</p><p class="sumtags">${tags}</p>`);
   }
+  if (suspected.length > 0)
+    out.push(`<p class="muted">Plus <b>${suspected.length}</b> suspected lead(s) needing manual verification (listed separately, not counted above).</p>`);
 
-  // findings(req/resp 全文)
-  if (m.findings.length > 0) {
+  // 1 件分(confirmed / suspected 共通。suspected は [SUSPECTED] バッジ + anomaly)。
+  const renderF = (f: ReportModel["findings"][number]): void => {
+    out.push(`<div class="f" id="finding-${f.index}">`);
+    const sus = f.verdict === "suspected" ? `<span class="badge" style="background:#8a6d00">SUSPECTED</span> ` : "";
+    out.push(`<h3>${sus}<span class="badge" style="background:${SEV_COLOR[f.severity]}">${f.severity.toUpperCase()}</span> ${f.index}. ${esc(f.title)}</h3>`);
+    out.push(`<div class="kv">Screen: <code>${esc(f.screenId ?? "(cross-screen)")}</code></div>`);
+    out.push(`<div class="kv">Source: ${f.sourceKind} <code>${esc(f.sourceName)}</code></div>`);
+    out.push(`<div class="kv">Scope basis: ${esc(f.scopeBasis)}</div>`);
+    if (f.anomaly) out.push(`<div class="kv"><b>Anomaly (why this is a lead):</b> ${esc(f.anomaly)}</div>`);
+    out.push(`<div class="desc">${esc(f.description)}</div>`);
+    out.push(`<div><b>Reproduction</b></div><pre>${esc(f.reproSteps)}</pre>`);
+    out.push(`<div><b>Evidence</b></div>`);
+    if (f.evidence.length === 0) out.push(`<p class="muted">(none recorded)</p>`);
+    else for (const e of f.evidence) out.push(evidenceHtml(e));
+    out.push(`</div>`);
+  };
+
+  // confirmed findings(req/resp 全文)
+  if (confirmed.length > 0) {
     out.push(`<h2 id="findings">Findings</h2>`);
-    for (const f of m.findings) {
-      out.push(`<div class="f" id="finding-${f.index}">`);
-      out.push(`<h3><span class="badge" style="background:${SEV_COLOR[f.severity]}">${f.severity.toUpperCase()}</span> ${f.index}. ${esc(f.title)}</h3>`);
-      out.push(`<div class="kv">Screen: <code>${esc(f.screenId ?? "(cross-screen)")}</code></div>`);
-      out.push(`<div class="kv">Source: ${f.sourceKind} <code>${esc(f.sourceName)}</code></div>`);
-      out.push(`<div class="kv">Scope basis: ${esc(f.scopeBasis)}</div>`);
-      out.push(`<div class="desc">${esc(f.description)}</div>`);
-      out.push(`<div><b>Reproduction</b></div><pre>${esc(f.reproSteps)}</pre>`);
-      out.push(`<div><b>Evidence</b></div>`);
-      if (f.evidence.length === 0) out.push(`<p class="muted">(none recorded)</p>`);
-      else for (const e of f.evidence) out.push(evidenceHtml(e));
-      out.push(`</div>`);
-    }
+    for (const f of confirmed) renderF(f);
+  }
+  // suspected(要手動確認・confirmed 集計外)
+  if (suspected.length > 0) {
+    out.push(`<h2 id="suspected">Suspected (needs manual verification)</h2>`);
+    out.push(`<p class="muted">Leads with one concrete anomaly but without control+2-replay confirmation — verify before relying on them.</p>`);
+    for (const f of suspected) renderF(f);
   }
 
   return docHtml(`${m.brand} Report ${m.id}`, out.join("\n"));

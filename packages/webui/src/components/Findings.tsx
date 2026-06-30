@@ -49,6 +49,7 @@ export function Findings({ view, onJump }: { view: StateView; onJump: (screenId:
             <div key={f.id} className={`finding sev-${f.severity}`}>
               <div className="finding-head">
                 <span className={`sevpill sev-${f.severity}`}>{f.severity}</span>
+                {f.verdict === "suspected" ? <span className="sevpill suspected">suspected</span> : null}
                 <span className="finding-title">{f.title}</span>
                 <span className="finding-id">
                   {f.id}

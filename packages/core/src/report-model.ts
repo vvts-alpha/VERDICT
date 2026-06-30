@@ -2,10 +2,14 @@
 // レンダラ(markdown / html / csv / inventory)が "どう出すか" を担う。PDF は html を
 // Chromium で印刷する(crawler 側)。screens[] は survey 結果の画面一覧(単体エクスポート用)。
 
-import type { AssessmentState, AuthState, Phase, ScopePolicy, ScreenScanStatus, ScreenType, Severity } from "./types/index.js";
+import type { AssessmentState, AuthState, Finding, FindingVerdict, Phase, ScopePolicy, ScreenScanStatus, ScreenType, Severity } from "./types/index.js";
 import { coverage } from "./coverage.js";
 
 export const SEVERITY_ORDER: Record<Severity, number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
+const VERDICT_ORDER: Record<FindingVerdict, number> = { confirmed: 0, suspected: 1 };
+
+/** finding の確度。欠落 ⇒ confirmed(後方互換: 既存 finding は全て confirmed)。 */
+export const findingVerdict = (f: Pick<Finding, "verdict">): FindingVerdict => f.verdict ?? "confirmed";
 
 /** finding が引用する証拠 1 件。本文(req/resp)は loadEvidence が供給した時のみ入る。 */
 export interface ReportEvidence {
@@ -20,6 +24,9 @@ export interface ReportFindingRow {
   index: number; // 1-based
   title: string;
   severity: Severity;
+  verdict: FindingVerdict;
+  /** suspected のとき: 観測異常 + 根拠。 */
+  anomaly?: string;
   screenId: string | null;
   sourceKind: "validator" | "hypothesis";
   sourceName: string; // validatorName または hypothesisId
@@ -60,7 +67,7 @@ export interface ReportModel {
   stats: {
     screens: { total: number; scanned: number; remaining: number };
     hypotheses: { total: number; confirmed: number };
-    findings: { total: number; bySeverity: Record<Severity, number> };
+    findings: { total: number; bySeverity: Record<Severity, number>; suspected: number };
   };
   findings: ReportFindingRow[]; // severity 昇順(critical→info)
   screens: ReportScreenRow[]; // screenId 昇順
@@ -70,12 +77,18 @@ export interface ReportModel {
  *  opts.loadEvidence を渡すと各証拠の req/resp 本文を取り込む(fs 読みは呼び出し側が注入)。 */
 export function buildReportModel(state: AssessmentState, now: Date = new Date(), opts: BuildReportOptions = {}): ReportModel {
   const cov = coverage(state);
-  const sorted = [...state.findings].sort((a, b) => SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity]);
+  // confirmed を先に、その中で severity 昇順。suspected は後段の別セクションへ。
+  const sorted = [...state.findings].sort(
+    (a, b) => VERDICT_ORDER[findingVerdict(a)] - VERDICT_ORDER[findingVerdict(b)] || SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity],
+  );
   const target = state.target.kind === "single_url" ? state.target.url : `scope_manifest ${state.target.path}`;
   const confirmedHypotheses = state.hypotheses.filter((h) => h.status === "confirmed").length;
 
+  // headline(bySeverity / total)は confirmed のみ。suspected は別カウント。
   const bySeverity: Record<Severity, number> = { critical: 0, high: 0, medium: 0, low: 0, info: 0 };
-  for (const f of sorted) bySeverity[f.severity] += 1;
+  let confirmedCount = 0;
+  for (const f of sorted) if (findingVerdict(f) === "confirmed") { bySeverity[f.severity] += 1; confirmedCount += 1; }
+  const suspectedCount = sorted.length - confirmedCount;
 
   const scanByScreen = new Map<string, ScreenScanStatus>();
   for (const sc of state.screenScans) scanByScreen.set(sc.screenId, sc.status);
@@ -84,6 +97,8 @@ export function buildReportModel(state: AssessmentState, now: Date = new Date(),
     index: idx + 1,
     title: f.title,
     severity: f.severity,
+    verdict: findingVerdict(f),
+    ...(f.anomaly ? { anomaly: f.anomaly } : {}),
     screenId: f.screenId ?? null,
     sourceKind: f.source.kind,
     sourceName: f.source.kind === "validator" ? f.source.validatorName : f.source.hypothesisId,
@@ -127,7 +142,7 @@ export function buildReportModel(state: AssessmentState, now: Date = new Date(),
     stats: {
       screens: { total: cov.total, scanned: cov.terminal, remaining: cov.remaining },
       hypotheses: { total: state.hypotheses.length, confirmed: confirmedHypotheses },
-      findings: { total: state.findings.length, bySeverity },
+      findings: { total: confirmedCount, bySeverity, suspected: suspectedCount },
     },
     findings,
     screens,

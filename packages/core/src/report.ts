@@ -17,6 +17,13 @@ export function renderMarkdown(m: ReportModel): string {
   const out: string[] = [];
   out.push(`# ${m.brand} Security Assessment Report`, "");
 
+  // confirmed(control+2replay)と suspected(異常1件のリード)を分離。headline は confirmed のみ。
+  const confirmed = m.findings.filter((f) => f.verdict === "confirmed");
+  const suspected = m.findings.filter((f) => f.verdict === "suspected");
+  const tocRow = (f: ReportModel["findings"][number]): string =>
+    // Markdown のリンク文字列に [] があると構文が壊れるので、severity の括弧は付けず title の [] も除去。
+    `    - [${f.index}. ${f.severity.toUpperCase()} — ${f.title.replace(/[[\]]/g, "")}](#finding-${f.index})`;
+
   // ── 目次(レンダラ上でクリックすると各節へジャンプ) ──
   //    固定節は GFM 自動アンカー(#assessment-information 等)、finding は見出しに [SEV]・連番が入り
   //    スラッグが renderer 依存になるため明示アンカー <a id="finding-N"> に飛ばす。
@@ -24,13 +31,13 @@ export function renderMarkdown(m: ReportModel): string {
   out.push("- [Assessment Information](#assessment-information)");
   out.push("- [Scope](#scope)");
   out.push("- [Summary](#summary)");
-  if (m.findings.length > 0) {
+  if (confirmed.length > 0) {
     out.push("- [Findings](#findings)");
-    for (const f of m.findings) {
-      // Markdown のリンク文字列に [] があると構文が壊れるので、severity の括弧は付けず title の [] も除去。
-      const label = `${f.index}. ${f.severity.toUpperCase()} — ${f.title.replace(/[[\]]/g, "")}`;
-      out.push(`    - [${label}](#finding-${f.index})`);
-    }
+    for (const f of confirmed) out.push(tocRow(f));
+  }
+  if (suspected.length > 0) {
+    out.push("- [Suspected (needs manual verification)](#suspected-needs-manual-verification)");
+    for (const f of suspected) out.push(tocRow(f));
   }
   out.push("");
 
@@ -61,23 +68,37 @@ export function renderMarkdown(m: ReportModel): string {
     .filter(([, n]) => n > 0)
     .map(([sev, n]) => `${n} ${sev}`)
     .join(", ");
-  out.push("## Summary", "", m.findings.length === 0 ? "_No confirmed findings._" : `${m.findings.length} finding(s): ${summary}`, "");
+  out.push("## Summary", "", confirmed.length === 0 ? "_No confirmed findings._" : `${confirmed.length} finding(s): ${summary}`, "");
+  if (suspected.length > 0)
+    out.push(`_Plus ${suspected.length} suspected lead(s) needing manual verification — listed separately below, NOT counted above._`, "");
 
-  // ── findings(証拠は req/resp 全文) ──
-  if (m.findings.length > 0) {
+  // 1 件分を描画(confirmed / suspected 共通。suspected は見出しに [SUSPECTED] + anomaly を添える)。
+  const renderFinding = (f: ReportModel["findings"][number]): void => {
+    out.push(`<a id="finding-${f.index}"></a>`, ""); // 目次からの明示ジャンプ先(renderer 非依存)
+    const mark = f.verdict === "suspected" ? "[SUSPECTED] " : "";
+    out.push(`### ${f.index}. ${mark}[${f.severity.toUpperCase()}] ${f.title}`, "");
+    out.push(`- Screen: \`${f.screenId ?? "(cross-screen)"}\``);
+    out.push(`- Source: ${f.sourceKind === "validator" ? `validator \`${f.sourceName}\`` : `hypothesis \`${f.sourceName}\``}`);
+    out.push(`- Scope basis: ${f.scopeBasis}`, "");
+    if (f.anomaly) out.push(`**Anomaly (why this is a lead):** ${f.anomaly}`, "");
+    out.push(f.description, "");
+    out.push("**Reproduction**", "", "```", f.reproSteps, "```", "");
+    out.push("**Evidence**", "");
+    if (f.evidence.length === 0) out.push("_(none recorded)_", "");
+    else for (const e of f.evidence) out.push(...evidenceMd(e), "");
+  };
+
+  // ── confirmed findings(証拠は req/resp 全文) ──
+  if (confirmed.length > 0) {
     out.push("## Findings", "");
-    for (const f of m.findings) {
-      out.push(`<a id="finding-${f.index}"></a>`, ""); // 目次からの明示ジャンプ先(renderer 非依存)
-      out.push(`### ${f.index}. [${f.severity.toUpperCase()}] ${f.title}`, "");
-      out.push(`- Screen: \`${f.screenId ?? "(cross-screen)"}\``);
-      out.push(`- Source: ${f.sourceKind === "validator" ? `validator \`${f.sourceName}\`` : `hypothesis \`${f.sourceName}\``}`);
-      out.push(`- Scope basis: ${f.scopeBasis}`, "");
-      out.push(f.description, "");
-      out.push("**Reproduction**", "", "```", f.reproSteps, "```", "");
-      out.push("**Evidence**", "");
-      if (f.evidence.length === 0) out.push("_(none recorded)_", "");
-      else for (const e of f.evidence) out.push(...evidenceMd(e), "");
-    }
+    for (const f of confirmed) renderFinding(f);
+  }
+
+  // ── suspected(要手動確認。confirmed 集計には含めない) ──
+  if (suspected.length > 0) {
+    out.push("## Suspected (needs manual verification)", "");
+    out.push("_Leads with one concrete observed anomaly but without control+2-replay confirmation. NOT counted in the confirmed total above — verify before relying on them._", "");
+    for (const f of suspected) renderFinding(f);
   }
 
   return out.join("\n");

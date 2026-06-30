@@ -4,8 +4,8 @@
 // 3 ステージ(調査 / 方法論 / 診断)で使うツールはここに全部定義し、run.ts が allowedTools で
 // ステージごとに見せるツールを絞る(= Claude に一度に全部見せない → 省略を防ぐ)。
 
-import type { AssessmentStore, Finding, Screen, ScopePolicy, Severity } from "@veritas/core";
-import { isInScope } from "@veritas/core";
+import type { AssessmentStore, Finding, FindingVerdict, Screen, ScopePolicy, Severity } from "@veritas/core";
+import { findingVerdict, isInScope } from "@veritas/core";
 import type { LoginCreds, Observation, PlaywrightDriver } from "@veritas/crawler";
 import { InventoryBuilder, normalizePath, smartLogin } from "@veritas/crawler";
 import type { LlmClient } from "@veritas/llm";
@@ -94,7 +94,7 @@ export interface PilotSession {
   /** 診断中の screenId(record_finding / http_request evidence の紐付け先)。 */
   currentScreenId: string | null;
   /** 直近画面の診断結果(screen_done が設定)。 */
-  screenVerdict: "finding" | "clean" | null;
+  screenVerdict: "finding" | "suspected" | "clean" | null;
   // ── ステージ完了シグナル ──
   surveyDone: boolean;
   methodologyDone: boolean;
@@ -159,7 +159,9 @@ export function coarseClass(vulnClass: string): string {
     return /write|overwrite|update|modif|edit/.test(sn) ? "idor-write" : "idor";
   if (/open redirect|unvalidated redirect/.test(sn)) return "open-redirect";
   if (/\bssrf\b/.test(sn)) return "ssrf";
-  if (/\brce\b|command inj|remote code|template inj|\bssti\b/.test(sn)) return "rce";
+  if (/template inj|\bssti\b/.test(sn)) return "ssti";
+  if (/\brce\b|command inj|remote code|\bcmdi\b/.test(sn)) return "rce";
+  if (/secret|credential|hardcoded|api[\s-]?key|private key|leaked key|access key/.test(sn)) return "secret-exposure";
   if (/rate limit|lockout|brute\s?force/.test(sn)) return "rate-limit";
   if (/security header|missing header|response header/.test(sn)) return "headers";
   if (/\bcsrf\b|cross\s?site request/.test(sn)) return "csrf";
@@ -203,6 +205,7 @@ export const CATEGORIES = [
   "session",
   "csrf",
   "info-disclosure",
+  "secret-exposure", // 露出した資格情報/秘密(impact オラクルの secret/file-leak で確証)
   "misconfig",
   "rate-limit",
   "headers",
@@ -221,7 +224,7 @@ export const BUSINESS_LOGIC_CATEGORIES = new Set<string>(["price-tampering", "qt
 
 /** 「特定マーカーがレスポンスに現れたら確証」型のカテゴリ(長さ差分でなくマーカー有無で判定)。
  *  ビジネスロジック(probe_logic/probe_scenario)＋ 反射 XSS(未エスケープ反射)＋ open-redirect(Location が OOB)。 */
-export const MARKER_BASED_CATEGORIES = new Set<string>([...BUSINESS_LOGIC_CATEGORIES, "xss-reflected", "xss-stored", "open-redirect", "ssti"]);
+export const MARKER_BASED_CATEGORIES = new Set<string>([...BUSINESS_LOGIC_CATEGORIES, "xss-reflected", "xss-stored", "open-redirect", "ssti", "secret-exposure"]);
 
 /** probe_paths の「簡単なディレクトリリスト」= 未リンク endpoint を踏むための厳選ワードリスト。
  *  ※ logout/signout 系は **入れない**。認証済みセッションで GET するとサーバ側セッションが破棄され、
@@ -512,7 +515,7 @@ export function checkScreenCoverage(
       reason: `the plan named ${planned.length} attack class(es); you haven't accounted for: ${missing.join(", ")}. Test each (record_finding) or pass a coverage entry marking it tested-clean / not-applicable(reason). Do NOT stop at the first finding.`,
     };
   }
-  const claimsTested = coverage.some((c) => c.result === "tested-clean" || c.result === "found");
+  const claimsTested = coverage.some((c) => c.result === "tested-clean" || c.result === "found" || c.result === "suspected");
   if (claimsTested && screenProbes === 0) {
     return {
       ok: false,
@@ -1724,7 +1727,7 @@ export function buildTools(s: PilotSession) {
     ),
     tool(
       "record_finding",
-      "Record a CONFIRMED vulnerability. Requires evidence discipline: cite ONE `negativeControl` evidenceId (a request that should FAIL — the bug absent) and >=2 `positiveReplays` evidenceIds (the bug reproduced, stable). Use evidenceIds returned by http_request / verify_access THIS run. The control must be distinguishable from the positives (different status/length) or it is rejected as a catch-all. Pick the canonical `category`, and pass the vulnerable `endpoint` (URL or path template, e.g. /search or /orders/{id}) and `param` (e.g. q) — findings are DEDUPED by (category, endpoint, param).",
+      "Record a vulnerability at one of TWO confidence tiers. verdict='confirmed' (default) requires evidence discipline: ONE `negativeControl` evidenceId (the bug absent, should FAIL) + >=2 `positiveReplays` evidenceIds (the bug reproduced, stable, distinguishable from the control). verdict='suspected' is for a real LEAD you cannot yet fully prove (e.g. a likely IDOR you can't confirm without a second account, or an upload you couldn't deliver): it needs ONE cited `observation` evidenceId + a concrete `anomaly` (>=40 chars: what you saw + why it's a lead). Suspected NEVER counts in the confirmed total — it surfaces the lead for manual verification, and is auto-upgraded to confirmed if you later prove it. Pick the canonical `category`; pass the vulnerable `endpoint` (e.g. /orders/{id}) and `param` — findings DEDUPE by (category, endpoint, param). Prefer suspected over silently dropping a screen as clean when you saw something off.",
       {
         title: z.string(),
         severity: z.enum(["info", "low", "medium", "high", "critical"]),
@@ -1733,11 +1736,74 @@ export function buildTools(s: PilotSession) {
         param: z.string().optional(),
         description: z.string(),
         reproSteps: z.string(),
-        negativeControl: z.string(),
-        positiveReplays: z.array(z.string()).min(2),
+        verdict: z.enum(["confirmed", "suspected"]).default("confirmed"),
+        // confirmed 経路:
+        negativeControl: z.string().optional(),
+        positiveReplays: z.array(z.string()).optional(),
         effectMarker: z.string().optional(),
+        // suspected 経路:
+        anomaly: z.string().optional().describe("required for verdict=suspected: the ONE observed anomaly + why it is a lead (>=40 chars)"),
+        observation: z.string().optional().describe("required for verdict=suspected: ONE cited evidenceId for the anomaly"),
       },
-      async ({ title, severity, category, endpoint, param, description, reproSteps, negativeControl, positiveReplays, effectMarker }) => {
+      async ({ title, severity, category, endpoint, param, description, reproSteps, verdict, negativeControl, positiveReplays, effectMarker, anomaly, observation }) => {
+        // ── 共通コミット(dedup/merge/construct)。confirmed/suspected 両経路が使う。verdict は **昇格のみ**。 ──
+        const commit = (v: FindingVerdict, evidenceIds: string[], anomalyText?: string): string => {
+          s.recordCalls += 1;
+          if (v === "confirmed") s.screenVerdict = "finding";
+          else if (s.screenVerdict !== "finding") s.screenVerdict = "suspected"; // finding は上書きしない
+          const key = dedupKey(category, endpoint, param, s.targetUrl);
+          const existing = s.findingsByKey.get(key);
+          if (existing) {
+            existing.evidenceIds = [...new Set([...existing.evidenceIds, ...evidenceIds])];
+            existing.severity = maxSev(existing.severity, severity as Severity);
+            if (v === "confirmed" && findingVerdict(existing) === "suspected") {
+              existing.verdict = "confirmed"; // 後から証明 → 昇格(降格は無い)
+              existing.anomaly = undefined;
+            }
+            existing.description += `\n\n[+] Also observed as "${title}"${s.currentScreenId ? ` (screen ${s.currentScreenId})` : ""}.`;
+            s.store.upsertFinding(s.assessmentId, existing);
+            s.store.appendEvent(s.assessmentId, {
+              type: "note",
+              payload: { message: `↩ DEDUP ${existing.id} += "${title}" (${key}; ${existing.evidenceIds.length} ev, sev ${existing.severity}, ${findingVerdict(existing)})` },
+            });
+            return `merged into ${existing.id} (same ${key}); now ${existing.evidenceIds.length} evidence, severity ${existing.severity}, verdict ${findingVerdict(existing)}. Do not re-report this endpoint+param.`;
+          }
+          s.findCounter += 1;
+          const f: Finding = {
+            id: `f-${String(s.findCounter).padStart(3, "0")}`,
+            screenId: s.currentScreenId,
+            title: `[${category}] ${title}`,
+            severity: severity as Severity,
+            verdict: v,
+            ...(v === "suspected" && anomalyText ? { anomaly: anomalyText } : {}),
+            source: { kind: "validator", validatorName: "claude-pilot" },
+            description,
+            reproSteps,
+            evidenceIds,
+            scopeBasis: `authorized target ${s.targetUrl}`,
+          };
+          s.findings.push(f);
+          s.findingsByKey.set(key, f);
+          s.store.upsertFinding(s.assessmentId, f);
+          s.store.appendEvent(s.assessmentId, {
+            type: "note",
+            payload: { message: `${v === "suspected" ? "SUSPECTED" : "FINDING"} ${f.id}: ${f.title} [${f.severity}]${f.screenId ? ` @${f.screenId}` : ""}` },
+          });
+          return `recorded ${f.id} (${v}): ${f.title}`;
+        };
+
+        // ── SUSPECTED 経路 ── confirmed のゲート(checkEvidenceDiscipline/checkLogicEvidence)には**一切到達しない**。
+        if (verdict === "suspected") {
+          if (!observation || !s.evidence.records.find((r) => r.id === observation))
+            return txt(`REJECTED: a suspected finding requires ONE cited 'observation' evidenceId from a probe/http_request THIS run (the single observed anomaly).`);
+          if (!anomaly || anomaly.trim().length < 40)
+            return txt(`REJECTED: a suspected finding requires a concrete 'anomaly' (>=40 chars): WHAT you observed and WHY it is a lead (e.g. "GET /orders/8123 returned a populated object for an id this session was never authorized to list, while /orders/999999 returned the blank template").`);
+          return txt(commit("suspected", [observation], anomaly.trim()));
+        }
+
+        // ── CONFIRMED 経路 ── schema を optional 化したので、まず存在を手で強制(その後は従来どおり)。
+        if (!negativeControl || !positiveReplays || positiveReplays.length < 2)
+          return txt(`REJECTED: a confirmed finding requires 1 negativeControl + >=2 positiveReplays evidenceIds. If you have a real lead you cannot fully prove yet, use verdict:"suspected" with an 'anomaly' + one 'observation' instead of dropping it.`);
         // auth-bypass は verify_access の機械判定を通った時だけ記録できる(CRM の 302/401 誤検知を硬く封じる)。
         if (category === "auth-bypass") {
           const av = s.accessVerdicts.get(normEndpoint(endpoint, s.targetUrl));
@@ -1774,51 +1840,16 @@ export function buildTools(s: PilotSession) {
             return txt(`REJECTED (evidence discipline): ${verdict.reason}. Get a negative control that fails + >=2 stable positive replays, then record.`);
         }
         const evidenceIds = [...new Set([negativeControl, ...positiveReplays])];
-        s.recordCalls += 1;
-        s.screenVerdict = "finding";
-        const key = dedupKey(category, endpoint, param, s.targetUrl);
-        const existing = s.findingsByKey.get(key);
-        if (existing) {
-          // 同一の穴を別画面/別シンクから再発見 → マージ(証拠を束ね、重大度は最大、文脈を追記)。
-          existing.evidenceIds = [...new Set([...existing.evidenceIds, ...evidenceIds])];
-          existing.severity = maxSev(existing.severity, severity as Severity);
-          existing.description += `\n\n[+] Also observed as "${title}"${s.currentScreenId ? ` (screen ${s.currentScreenId})` : ""}.`;
-          s.store.upsertFinding(s.assessmentId, existing);
-          s.store.appendEvent(s.assessmentId, {
-            type: "note",
-            payload: { message: `↩ DEDUP ${existing.id} += "${title}" (${key}; ${existing.evidenceIds.length} ev, sev ${existing.severity})` },
-          });
-          return txt(`merged into ${existing.id} (same ${key}); now ${existing.evidenceIds.length} evidence, severity ${existing.severity}. Do not re-report this endpoint+param.`);
-        }
-        s.findCounter += 1;
-        const f: Finding = {
-          id: `f-${String(s.findCounter).padStart(3, "0")}`,
-          screenId: s.currentScreenId,
-          title: `[${category}] ${title}`,
-          severity: severity as Severity,
-          source: { kind: "validator", validatorName: "claude-pilot" },
-          description,
-          reproSteps,
-          evidenceIds,
-          scopeBasis: `authorized target ${s.targetUrl}`,
-        };
-        s.findings.push(f);
-        s.findingsByKey.set(key, f);
-        s.store.upsertFinding(s.assessmentId, f);
-        s.store.appendEvent(s.assessmentId, {
-          type: "note",
-          payload: { message: `FINDING ${f.id}: ${f.title} [${f.severity}]${f.screenId ? ` @${f.screenId}` : ""}` },
-        });
-        return txt(`recorded ${f.id}: ${f.title}`);
+        return txt(commit("confirmed", evidenceIds));
       },
     ),
     tool(
       "screen_done",
-      "Finish diagnosing the current screen. You MUST account for EVERY class the plan named: pass `coverage` with one entry per planned class — result 'found' (you recorded it), 'tested-clean' (you actively probed it and it held), or 'not-applicable' (with a concrete reason it cannot apply here). Finding ONE hole does NOT let you skip the rest of the plan. verdict 'finding' if >=1 confirmed, else 'clean'.",
+      "Finish diagnosing the current screen. You MUST account for EVERY class the plan named: pass `coverage` with one entry per planned class — result 'found' (confirmed + recorded), 'suspected' (you saw a real anomaly but couldn't fully confirm — record_finding it as verdict:suspected), 'tested-clean' (actively probed, held), or 'not-applicable' (concrete reason it can't apply). Finding ONE hole does NOT let you skip the rest of the plan. verdict 'finding' if >=1 confirmed, 'suspected' if only suspected leads, else 'clean'.",
       {
-        verdict: z.enum(["finding", "clean"]),
+        verdict: z.enum(["finding", "suspected", "clean"]),
         coverage: z
-          .array(z.object({ class: z.string(), result: z.enum(["found", "tested-clean", "not-applicable"]), note: z.string().optional() }))
+          .array(z.object({ class: z.string(), result: z.enum(["found", "suspected", "tested-clean", "not-applicable"]), note: z.string().optional() }))
           .optional()
           .describe("one entry per planned attack class (from get_screen.plannedClasses)"),
         note: z.string().optional(),
@@ -1829,7 +1860,8 @@ export function buildTools(s: PilotSession) {
         const planned = plannedClassesFor(s.plans.get(s.currentScreenId ?? ""));
         const gate = checkScreenCoverage(planned, coverage ?? [], s.screenProbes);
         if (!gate.ok) return txt(`NOT DONE — ${gate.reason}`);
-        s.screenVerdict = verdict;
+        // screenVerdict は record_finding が維持する(commit、upgrade-only)。モデルの自己申告 verdict では上書きしない
+        //   — 記録された実体(confirmed/suspected/無し)が screen status の権威。verdict はログ/返却にのみ使う。
         s.screenDone = true;
         const covSummary = coverage?.length ? ` [${coverage.map((c) => `${coarseClass(c.class)}:${c.result}`).join(", ")}]` : "";
         s.store.appendEvent(s.assessmentId, {

@@ -46,6 +46,16 @@ test("gate: claims tested but fired zero probes → rejected (anti self-report)"
   if (!g.ok) assert.match(g.reason, /no probe/i);
 });
 
+test("gate: a 'suspected' coverage result accounts for the class AND counts as actually-tested", () => {
+  const planned = ["idor", "ssti"];
+  // 'suspected' は planned を満たし、claimsTested 側にも数える(=最低1 probe を要求する)。
+  const ok = checkScreenCoverage(planned, [{ class: "idor", result: "suspected" }, { class: "ssti", result: "tested-clean" }], 4);
+  assert.equal(ok.ok, true);
+  const noProbe = checkScreenCoverage(["idor"], [{ class: "idor", result: "suspected" }], 0);
+  assert.equal(noProbe.ok, false); // suspected を主張するなら probe を撃っているはず
+  if (!noProbe.ok) assert.match(noProbe.reason, /no probe/i);
+});
+
 test("gate: not-applicable counts as accounted (escape hatch), and no-plan screens pass freely", () => {
   // 全部 not-applicable は probe 0 でも閉じれる(該当しない画面の正当な締め)
   assert.deepEqual(checkScreenCoverage(["csrf"], [{ class: "csrf", result: "not-applicable" }], 0), { ok: true });

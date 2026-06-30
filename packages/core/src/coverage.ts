@@ -16,6 +16,7 @@ const ALL_STATUSES: readonly ScreenScanStatus[] = [
   "scanning",
   "clean",
   "finding",
+  "suspected",
   "blocked",
   "excluded",
   "error",
@@ -41,7 +42,7 @@ export function coverage(
     if (isScannable(scan, maxAttempts)) scannable += 1;
   }
   const total = state.screenScans.length;
-  const terminal = byStatus.clean + byStatus.finding + byStatus.excluded;
+  const terminal = byStatus.clean + byStatus.finding + byStatus.suspected + byStatus.excluded;
   const remaining = total - terminal;
   return { total, byStatus, terminal, remaining, scannable, complete: total > 0 && remaining === 0 };
 }
