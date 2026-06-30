@@ -1,7 +1,7 @@
 // #2 確証ツールの純粋部分: JWT の alg:none 偽造 + マーカーベース・カテゴリのルーティング。
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { forgeAlgNone, MARKER_BASED_CATEGORIES, BUSINESS_LOGIC_CATEGORIES } from "./tools.js";
+import { forgeAlgNone, MARKER_BASED_CATEGORIES, BUSINESS_LOGIC_CATEGORIES, checkLogicEvidence } from "./tools.js";
 
 const b64url = (o: unknown): string =>
   Buffer.from(JSON.stringify(o), "utf8").toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
@@ -42,4 +42,15 @@ test("xss-reflected and open-redirect route through marker-based confirmation", 
   assert.ok(!MARKER_BASED_CATEGORIES.has("sqli"));
   // business-logic は marker-based の部分集合
   for (const c of BUSINESS_LOGIC_CATEGORIES) assert.ok(MARKER_BASED_CATEGORIES.has(c));
+});
+
+test("ssti routes through marker-based confirmation (eval-result marker)", () => {
+  // probe_ssti confirms via the computed product appearing only in the evaluated replays — a marker diff,
+  // so ssti MUST be marker-based (checkLogicEvidence), not the body-length checkEvidenceDiscipline path.
+  assert.ok(MARKER_BASED_CATEGORIES.has("ssti"));
+  // a literal-reflection control (no template syntax) carries no product; two evaluated replays do → confirmed.
+  const lr = (status: number, hasMarker: boolean) => ({ status, hasMarker });
+  assert.equal(checkLogicEvidence(lr(200, false), [lr(200, true), lr(200, true)]).ok, true);
+  // literal echo only (payload reflected but NOT evaluated → product absent) → not confirmed.
+  assert.equal(checkLogicEvidence(lr(200, false), [lr(200, false), lr(200, false)]).ok, false);
 });

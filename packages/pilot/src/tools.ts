@@ -115,7 +115,7 @@ export interface PilotSession {
 export const STAGE_TOOLS = {
   survey: ["browser_navigate", "browser_fill", "browser_click", "login", "probe_paths", "ignore_paths", "survey_status", "survey_done"],
   methodology: ["get_inventory", "record_methodology", "methodology_done"],
-  diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_dom_xss", "probe_stored_xss", "probe_redirect", "probe_jwt", "probe_csrf", "probe_oob", "probe_logic", "analyze_session", "verify_access", "browser_navigate", "browser_fill", "browser_click", "record_finding", "screen_done"],
+  diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_dom_xss", "probe_stored_xss", "probe_ssti", "probe_redirect", "probe_jwt", "probe_csrf", "probe_oob", "probe_logic", "analyze_session", "verify_access", "browser_navigate", "browser_fill", "browser_click", "record_finding", "screen_done"],
   // シナリオ(A04 横断ロジック): inventory 俯瞰 + 多段リクエスト連鎖を probe_scenario で撃つ。画面診断の後に1回。
   scenario: ["get_inventory", "login", "http_request", "probe_scenario", "record_finding", "scenario_done"],
   // フィンガープリント(A06 既知脆弱コンポーネント): fingerprint_scan で版を集め、(opt-in で cve_lookup)既知 CVE を評価して記録。
@@ -194,6 +194,7 @@ export const CATEGORIES = [
   "xss-reflected",
   "xss-stored",
   "sqli",
+  "ssti",
   "path-traversal",
   "open-redirect",
   "ssrf",
@@ -220,7 +221,7 @@ export const BUSINESS_LOGIC_CATEGORIES = new Set<string>(["price-tampering", "qt
 
 /** 「特定マーカーがレスポンスに現れたら確証」型のカテゴリ(長さ差分でなくマーカー有無で判定)。
  *  ビジネスロジック(probe_logic/probe_scenario)＋ 反射 XSS(未エスケープ反射)＋ open-redirect(Location が OOB)。 */
-export const MARKER_BASED_CATEGORIES = new Set<string>([...BUSINESS_LOGIC_CATEGORIES, "xss-reflected", "xss-stored", "open-redirect"]);
+export const MARKER_BASED_CATEGORIES = new Set<string>([...BUSINESS_LOGIC_CATEGORIES, "xss-reflected", "xss-stored", "open-redirect", "ssti"]);
 
 /** probe_paths の「簡単なディレクトリリスト」= 未リンク endpoint を踏むための厳選ワードリスト。
  *  ※ logout/signout 系は **入れない**。認証済みセッションで GET するとサーバ側セッションが破棄され、
@@ -1080,6 +1081,78 @@ export function buildTools(s: PilotSession) {
               : ctrl.executed
                 ? "inconclusive: the benign control also 'executed' — detection is unreliable here, do not record."
                 : "not confirmed: payload did not execute in the browser (the sink escapes it or is not a live DOM sink).",
+          }),
+        );
+      },
+    ),
+    tool(
+      "probe_ssti",
+      "Confirm SERVER-SIDE TEMPLATE INJECTION (SSTI). Injects a polyglot arithmetic template payload into `param` (or a `body` with {{SSTI}}) and checks whether the server EVALUATES it — i.e. the response contains the COMPUTED PRODUCT, not the literal payload. Sends a benign non-template control (the product must be absent) + the template payload twice (the product must appear, stable). Covers Jinja2/Twig/Nunjucks `{{}}`, FreeMarker/JSP-EL/Thymeleaf `${}`, `#{}`, and ERB `<%= %>`. Returns negativeControl + positiveReplays evidenceIds + the effectMarker (the product), ready for record_finding(category ssti). IMPORTANT: HTML autoescaping refutes XSS but NOT SSTI — run this whenever a param is reflected into a server-rendered response, especially after probe_xss reports 'reflected but escaped' / 'not html'. SSTI is typically RCE-class — set severity high+ on confirm.",
+      { url: z.string(), param: z.string().optional(), method: z.string().optional(), body: z.string().optional() },
+      async ({ url, param, method, body }) => {
+        const tok = `sZ${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`;
+        // 衝突しにくい 8 桁の積。リテラル反射では payload 文字列が返るだけ(積は出ない)→ 評価されたら積が出る。
+        const a = 8000 + Math.floor(Math.random() * 1000);
+        const b = 8000 + Math.floor(Math.random() * 1000);
+        const product = String(a * b);
+        // 多言語ポリグロット。どれか1エンジンが評価すれば積が応答に出る。
+        const payload = `{{${a}*${b}}}\${${a}*${b}}#{${a}*${b}}<%=${a}*${b}%>`;
+        const control = `amrSSTI${tok}`; // テンプレ構文なし → 評価され得ない(積は絶対に出ない)
+        const send = async (val: string, kind: "negative_control" | "positive_replay", tag: string) => {
+          let u = url;
+          let b2: string | null = null;
+          if (body != null) b2 = body.replace(/\{\{SSTI\}\}/g, val);
+          else if (param) {
+            try {
+              const uu = new URL(url);
+              uu.searchParams.set(param, val);
+              u = uu.toString();
+            } catch {
+              return null;
+            }
+          }
+          if (!isInScope(u, s.scope)) throw new Error(`out of scope: ${u}`);
+          const req: HttpRequest = { method: (method ?? (body != null ? "POST" : "GET")).toUpperCase(), url: u, headers: authHeaders(s), body: b2 };
+          const res = await s.http.send(req);
+          bumpHttp(s, res.status);
+          const ev = s.evidence.record({
+            screenId: s.currentScreenId ?? "pilot",
+            validator: "claude-pilot-ssti",
+            kind,
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
+            response: res,
+            note: `ssti ${tag} ${param ?? "body"}`,
+          });
+          // hasMarker = 評価結果(積)が応答に出ているか。payload リテラルが返るだけなら false。
+          return { evId: ev.id, status: res.status, evaluated: res.body.includes(product), echoedLiteral: res.body.includes(payload) };
+        };
+        let ctrl: Awaited<ReturnType<typeof send>>;
+        let p1: Awaited<ReturnType<typeof send>>;
+        let p2: Awaited<ReturnType<typeof send>>;
+        try {
+          ctrl = await send(control, "negative_control", "control(no template syntax)");
+          p1 = await send(payload, "positive_replay", "payload #1");
+          p2 = await send(payload, "positive_replay", "payload #2");
+        } catch (e) {
+          return txt(`ERROR: ${String(e).slice(0, 180)}`);
+        }
+        if (!ctrl || !p1 || !p2) return txt("ERROR: could not build request (pass a valid url + param, or a body with {{SSTI}})");
+        const verdict = checkLogicEvidence(
+          { status: ctrl.status, hasMarker: ctrl.evaluated },
+          [p1, p2].map((p) => ({ status: p.status, hasMarker: p.evaluated })),
+        );
+        return txt(
+          JSON.stringify({
+            negativeControl: ctrl.evId,
+            positiveReplays: [p1.evId, p2.evId],
+            effectMarker: `${a}*${b}=${product}`,
+            control: { evaluated: ctrl.evaluated },
+            payload: [{ evaluated: p1.evaluated, echoedLiteral: p1.echoedLiteral }, { evaluated: p2.evaluated, echoedLiteral: p2.echoedLiteral }],
+            verdict: verdict.ok
+              ? `SSTI CONFIRMED — the server evaluated ${a}*${b} to ${product} (control did not). record_finding(category ssti) with these evidenceIds + effectMarker; severity high+ (template eval is RCE-class — you can escalate to OS command exec).`
+              : p1.echoedLiteral || p2.echoedLiteral
+                ? `not confirmed: the payload was REFLECTED LITERALLY (not evaluated) — that is XSS-surface, not SSTI. ${(verdict as { reason: string }).reason}`
+                : `not confirmed: ${(verdict as { reason: string }).reason}`,
           }),
         );
       },
