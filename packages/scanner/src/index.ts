@@ -44,3 +44,5 @@ export { fingerprintTech, formatTechInventory } from "./fingerprint.js";
 export type { TechComponent, TechKind, TechSample } from "./fingerprint.js";
 export { lookupCves, formatCveResults } from "./cve-lookup.js";
 export type { CveMatch, CveLookupResult, CveLookupOptions, FetchLike } from "./cve-lookup.js";
+export { impactOracle, formatImpact } from "./impact.js";
+export type { ImpactKind, ImpactContext, ImpactSignal } from "./impact.js";
