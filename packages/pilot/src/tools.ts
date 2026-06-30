@@ -626,6 +626,22 @@ function screenDigest(sc: Screen): Record<string, unknown> {
   };
 }
 
+/** get_inventory 用のコンパクト要約。フル digest(params/apis をオブジェクト配列で持つ)は大規模 survey で
+ *  コンテキストを溢れさせ(106K で methodology が screenId を取得できず迷走したバグ)、計画には過剰。
+ *  名前だけ/エンドポイント文字列に畳んで小さくする。フルの per-param 型は診断段の get_screen が返す。 */
+function screenBrief(sc: Screen): Record<string, unknown> {
+  return {
+    screenId: sc.screenId,
+    url: sc.urlTemplate,
+    type: sc.screenType,
+    auth: sc.authState,
+    labels: sc.labels,
+    params: sc.params.map((p) => p.name).join(",") || undefined,
+    apis: sc.apis.slice(0, 12).map((a) => `${a.method} ${a.urlTemplate}`),
+    ...(sc.apis.length > 12 ? { apisMore: sc.apis.length - 12 } : {}),
+  };
+}
+
 export function buildTools(s: PilotSession) {
   return [
     // ───────────────────────── 調査(STAGE 1) ─────────────────────────
@@ -793,15 +809,36 @@ export function buildTools(s: PilotSession) {
     // ───────────────────────── 方法論(STAGE 2) ─────────────────────────
     tool(
       "get_inventory",
-      "Return the COMPLETE mapped screen inventory (every screen with its params, APIs, auth state and labels). Basis for the per-screen attack plan.",
-      {},
-      async () => txt(JSON.stringify({ screens: s.inv.screens().map(screenDigest) })),
+      "Return the mapped screen inventory as a COMPACT per-screen brief (screenId, url, type, auth, labels, param NAMES, API endpoints) — enough to plan an attack per screen and to spot multi-step workflows. PAGINATED so a large survey can't overflow the context: pass offset/limit (default limit 60, max 120); the response includes `total` and `nextOffset` (call again with nextOffset until it is null). Use the exact `screenId` values returned here for record_methodology.",
+      { offset: z.number().optional(), limit: z.number().optional() },
+      async ({ offset, limit }) => {
+        const all = s.inv.screens();
+        const off = Math.max(0, offset ?? 0);
+        const lim = Math.min(Math.max(1, limit ?? 60), 120);
+        const page = all.slice(off, off + lim);
+        const nextOffset = off + page.length < all.length ? off + page.length : null;
+        return txt(
+          JSON.stringify({
+            total: all.length,
+            offset: off,
+            returned: page.length,
+            nextOffset,
+            screens: page.map(screenBrief),
+          }),
+        );
+      },
     ),
     tool(
       "record_methodology",
       "Record the attack plan for ONE screen: which vulnerability classes apply and concretely how to test them. Call once per screen; every screen must get a plan.",
       { screenId: z.string(), vulnClasses: z.array(z.string()), plan: z.string() },
       async ({ screenId, vulnClasses, plan }) => {
+        // screenId は実在の画面でなければ拒否。さもないと診断段で plans.get(real-id) に当たらず計画が黙って失われる
+        //   (= モデルが ID 形式を当てずっぽうで探って迷走したバグ)。拒否メッセージで実 ID 例を見せて即復帰させる。
+        if (!s.inv.screens().some((x) => x.screenId === screenId)) {
+          const sample = s.inv.screens().slice(0, 6).map((x) => x.screenId).join(", ");
+          return txt(`REJECTED: '${screenId}' is not a mapped screenId. Use the EXACT screenId from get_inventory (e.g. ${sample || "s-0001"}). screen IDs look like s-0001, s-0002 — not paths. Call get_inventory (paginated) to read them.`);
+        }
         s.plans.set(screenId, `classes=[${vulnClasses.join(",")}] ${plan}`);
         s.store.appendEvent(s.assessmentId, {
           type: "note",

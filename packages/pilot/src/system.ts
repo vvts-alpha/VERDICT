@@ -30,7 +30,7 @@ Do NOT probe for vulnerabilities here. When the frontier is exhausted and you ha
 export const METHODOLOGY_PROMPT = `${SAFETY}
 
 STAGE 2 of 3 — METHODOLOGY (plan from what was actually mapped).
-Call get_inventory to see the COMPLETE screen list with each screen's params, APIs, auth state and labels.
+Call get_inventory to see the screen list (compact brief per screen: screenId, url, type, auth, labels, param names, API endpoints). It is PAGINATED — if the response has a non-null nextOffset, call get_inventory again with offset=nextOffset and keep going until nextOffset is null; plan screens as you page (record_methodology per screen using the exact screenId from the brief). Never guess screen IDs.
 For EACH screen, decide which vulnerability classes actually apply based on its concrete inputs/endpoints/auth, and write a short, concrete test plan with record_methodology(screenId, vulnClasses, plan). Examples:
 - object id in path/query on an authed screen → IDOR/BOLA: fetch another user's id.
 - reflected user input → XSS; redirect/next/url param → open redirect; auth-only screen → access-control diff as unauth/low-priv.
@@ -68,7 +68,7 @@ export const SCENARIO_PROMPT = `${SAFETY}
 
 STAGE 4 of 4 — MULTI-STEP BUSINESS-LOGIC ABUSE (OWASP A04), across endpoints.
 Per-screen diagnosis is finished; single-request bugs are already recorded. Your job now is the class screens cannot catch alone: WORKFLOW abuse that spans several requests and depends on state from earlier steps. The unit here is a WORKFLOW, not a screen.
-Call get_inventory first to see the full API surface. Then enumerate the transactional workflows present (cart/checkout, order/payment, coupon/voucher/discount, wallet/balance/transfer/refund, role/privilege change, multi-step registration/approval). For EACH workflow:
+Call get_inventory first to see the API surface (it is PAGINATED — page through with offset=nextOffset until nextOffset is null to see every endpoint). Then enumerate the transactional workflows present (cart/checkout, order/payment, coupon/voucher/discount, wallet/balance/transfer/refund, role/privilege change, multi-step registration/approval). For EACH workflow:
 1. log in (a normal, low-privilege user is usually the right attacker).
 2. Walk the LEGITIMATE flow once with http_request so you learn the real request shapes, the ids returned, and where the "effect" (a total, a status, a balance) shows up.
 3. Build a probe_scenario(control, exploit, effectMarker):
