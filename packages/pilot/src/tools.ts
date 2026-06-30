@@ -1674,16 +1674,25 @@ export function buildTools(s: PilotSession) {
       { urls: z.array(z.string()).describe("in-scope URLs to fetch & fingerprint (e.g. the root, a JS bundle). 1–12.") },
       async ({ urls }) => {
         const samples: TechSample[] = [];
-        const fetched: string[] = [];
+        const fetched: Array<{ url: string; status?: number; evidenceId?: string; error?: string }> = [];
         for (const url of urls.slice(0, 12)) {
           if (!isInScope(url, s.scope)) continue;
           try {
             const res = await s.http.send({ method: "GET", url, headers: { ...authHeaders(s) }, body: null });
             bumpHttp(s, res.status);
             samples.push({ url, headers: res.headers, body: res.body });
-            fetched.push(`${res.status} ${url}`);
+            // 版を明かしたバナーを証拠化 → suspected な vulnerable-component finding の observation に引用できる。
+            const ev = s.evidence.record({
+              screenId: s.currentScreenId ?? "pilot",
+              validator: "claude-pilot-fingerprint",
+              kind: "positive_replay",
+              request: { method: "GET", url, headers: s.http.effectiveHeaders(authHeaders(s)), body: null },
+              response: res,
+              note: `fingerprint ${url}`,
+            });
+            fetched.push({ url, status: res.status, evidenceId: ev.id });
           } catch (e) {
-            fetched.push(`ERR ${url}: ${String(e).slice(0, 80)}`);
+            fetched.push({ url, error: String(e).slice(0, 80) });
           }
         }
         const components = fingerprintTech(samples);
@@ -1692,7 +1701,7 @@ export function buildTools(s: PilotSession) {
             fetched,
             components,
             inventory: formatTechInventory(components),
-            note: "Versions only — assess each (name, version) against KNOWN CVEs/EOL from your knowledge; the ⚠ KNOWN marks are deterministic JS-library matches.",
+            note: "Versions only. Each fetched URL has an evidenceId (the banner that revealed the version). Assess each (component, version) against KNOWN CVEs/EOL; the ⚠ KNOWN marks are deterministic JS-library matches. For a SERIOUS known CVE (High/Critical, exploitable class), record it as verdict:'suspected' citing the evidenceId.",
           }),
         );
       },
