@@ -10,7 +10,7 @@ import type { LoginCreds, Observation, PlaywrightDriver } from "@veritas/crawler
 import { InventoryBuilder, normalizePath, smartLogin } from "@veritas/crawler";
 import type { LlmClient } from "@veritas/llm";
 import type { BurpAuditConn, EvidenceStore, FetchHttpClient, HttpRequest, HttpResponse, TechComponent, TechSample } from "@veritas/scanner";
-import { oobPayload, oobPoll, fingerprintTech, formatTechInventory, lookupCves, formatCveResults } from "@veritas/scanner";
+import { oobPayload, oobPoll, fingerprintTech, formatTechInventory, lookupCves, formatCveResults, impactOracle } from "@veritas/scanner";
 import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { join } from "node:path";
@@ -846,15 +846,17 @@ export function buildTools(s: PilotSession) {
     ),
     tool(
       "http_request",
-      "Send a scoped raw HTTP request to probe a hypothesis (IDOR/auth/exposure). Uses the current login session. Records evidence; returns an evidenceId to cite in findings.",
+      "Send a scoped raw HTTP request to probe a hypothesis (IDOR/auth/exposure). Uses the current login session. Records evidence; returns an evidenceId to cite in findings. The full response body is scanned for CONCRETE IMPACT (leaked /etc/passwd, private keys/secrets, command output like uid=…, cross-user data) and any hit is surfaced in `impact` — that is your effectMarker for a CONFIRMED finding. For an IDOR/BOLA test, pass `victimId` (the other user's id you requested) and `selfId` (your own id): if the response carries the victim's id but not yours, you get a cross-user impact hit = the IDOR is real.",
       {
         method: z.string(),
         url: z.string(),
         headers: z.record(z.string()).optional(),
         body: z.string().optional(),
         note: z.string().optional(),
+        victimId: z.string().optional().describe("for IDOR: the other user's id you are requesting (cross-user impact check)"),
+        selfId: z.string().optional().describe("for IDOR: your own session's id (so your own data isn't mistaken for cross-user access)"),
       },
-      async ({ method, url, headers, body, note }) => {
+      async ({ method, url, headers, body, note, victimId, selfId }) => {
         if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} is out of scope`);
         const req: HttpRequest = {
           method: method.toUpperCase(),
@@ -877,12 +879,23 @@ export function buildTools(s: PilotSession) {
           response: res,
           note: note ?? `${req.method} ${url} as ${s.currentRole || "unauth"}`,
         });
+        // impact オラクル: 応答全文(1800 切り詰め前)を走査。hit は CONFIRMED の effectMarker になる。
+        const impact = impactOracle(res.body, {
+          ...(victimId ? { requestedIdentity: victimId } : {}),
+          ...(selfId ? { sessionIdentity: selfId } : {}),
+        });
         return txt(
           JSON.stringify({
             evidenceId: ev.id,
             status: res.status,
             headers: pick(res.headers, ["content-type", "location", "set-cookie", "www-authenticate", "access-control-allow-origin"]),
             bodyLength: res.body.length,
+            ...(impact.length
+              ? {
+                  impact: impact.map((i) => ({ kind: i.kind, severity: i.severity, marker: i.marker, detail: i.detail })),
+                  impactHint: `CONCRETE IMPACT detected — to CONFIRM, re-send a negative control (this impact ABSENT) + this request again, then record_finding citing these evidenceIds with effectMarker="${impact[0]!.marker}".`,
+                }
+              : {}),
             body: res.body.slice(0, 1800),
           }),
         );
@@ -1958,9 +1971,10 @@ export function buildTools(s: PilotSession) {
           }
           const loc = res.headers["location"] ?? "";
           const reflectsMarker = pr.kind === "redirect" && (loc.includes(OOB_MARKER) || res.body.includes(OOB_MARKER));
-          const traversal = pr.kind === "file" && /root:.*:0:0:|\[fonts\]|\[extensions\]/i.test(res.body);
+          // impact オラクル(baseline anti-ambient 付き): file 専用の正規表現を一般化 — /etc/passwd・秘密・コマンド出力等を拾う。
+          const impact = impactOracle(res.body, { baselineBody: base.body });
           const changed = pr.kind !== "redirect" && (res.status !== base.status || Math.abs(res.body.length - base.body.length) > 64);
-          if (!reflectsMarker && !traversal && !changed) continue;
+          if (!reflectsMarker && impact.length === 0 && !changed) continue;
           const ev = s.evidence.record({
             screenId: s.currentScreenId ?? "pilot",
             validator: "claude-pilot",
@@ -1976,7 +1990,8 @@ export function buildTools(s: PilotSession) {
             status: res.status,
             location: loc || undefined,
             len: res.body.length,
-            signal: reflectsMarker ? "redirect/reflection" : traversal ? "traversal" : "changed-vs-baseline",
+            signal: reflectsMarker ? "redirect/reflection" : impact.length ? `impact:${impact[0]!.kind}` : "changed-vs-baseline",
+            ...(impact.length ? { impact: impact.map((i) => ({ kind: i.kind, marker: i.marker })), effectMarker: impact[0]!.marker } : {}),
             evidenceId: ev.id,
           });
         }
