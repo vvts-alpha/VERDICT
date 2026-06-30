@@ -982,7 +982,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
     : resume && values.id && existsSync(join(runsDir, values.id, "manifest.json"))
       ? loadManifest(join(runsDir, values.id, "manifest.json"))
       : null;
-  const model = values.model ?? manifest?.model ?? "claude-sonnet-4-6";
+  const model = values.model ?? manifest?.model ?? "claude-opus-4-8"; // deep モデル既定 = Opus(高価値画面/シナリオ/CVE)
   const rate = values.rate ? Number.parseInt(values.rate, 10) : 250;
   const maxTurns = values["max-turns"] ? Number.parseInt(values["max-turns"], 10) : 80;
   // resume では attended を manifest の手動ロール(creds も cookie も無い)から再導出する。
@@ -1024,7 +1024,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
     store.createAssessment({
       id,
       // ハードロック時はリンク追従しない(survey はシードだけマップ)。
-      target: { kind: "single_url", url: seedUrl, followLinks: !lockToTargets, maxDepth: manifest?.crawl?.maxDepth ?? 6 },
+      target: { kind: "single_url", url: seedUrl, followLinks: !lockToTargets, maxDepth: manifest?.crawl?.maxDepth ?? 10 }, // crawl 既定深さ = 10
       scope,
     });
   }
@@ -1108,7 +1108,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       ...(values["max-screens"] ? { maxScreens: Number.parseInt(values["max-screens"], 10) } : {}),
       ...(roleCookieFiles.size ? { roleCookieFiles } : {}),
       ...(roleDescriptions.size ? { roleDescriptions } : {}),
-      ...(values["fast-model"] ? { fastModel: values["fast-model"] } : {}),
+      fastModel: values["fast-model"] ?? "claude-sonnet-4-6", // fast モデル既定 = Sonnet(survey/methodology/低価値画面 → model tiering を既定 ON)
       ...(values["no-scenario"] ? { scenarioPass: false } : {}), // 既定 ON。立てると A04 シナリオを省く
       ...(values["no-default-scenarios"] ? { defaultScenarios: false } : {}), // 既定 ON。立てると常駐シナリオだけ省く
       ...(values["no-fingerprint"] ? { fingerprintPass: false } : {}), // 既定 ON。立てると A06 フィンガープリントを省く
@@ -2099,7 +2099,7 @@ async function cmdManifest(args: string[]): Promise<void> {
 
     console.log("\n--- crawl ---");
     const followLinks = await askBool("follow links?", true);
-    const maxDepth = await askInt("max depth", 8);
+    const maxDepth = await askInt("max depth", 10);
 
     const model = await ask("\nModel", "claude-sonnet-4-6");
 
