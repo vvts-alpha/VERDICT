@@ -115,7 +115,7 @@ export interface PilotSession {
 export const STAGE_TOOLS = {
   survey: ["browser_navigate", "browser_fill", "browser_click", "login", "probe_paths", "ignore_paths", "survey_status", "survey_done"],
   methodology: ["get_inventory", "record_methodology", "methodology_done"],
-  diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_dom_xss", "probe_stored_xss", "probe_ssti", "probe_redirect", "probe_jwt", "probe_csrf", "probe_oob", "probe_logic", "analyze_session", "verify_access", "browser_navigate", "browser_fill", "browser_click", "record_finding", "screen_done"],
+  diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_dom_xss", "probe_stored_xss", "probe_ssti", "probe_redirect", "probe_jwt", "probe_csrf", "probe_oob", "probe_logic", "analyze_session", "verify_access", "browser_navigate", "browser_fill", "browser_click", "browser_upload", "record_finding", "screen_done"],
   // シナリオ(A04 横断ロジック): inventory 俯瞰 + 多段リクエスト連鎖を probe_scenario で撃つ。画面診断の後に1回。
   scenario: ["get_inventory", "login", "http_request", "probe_scenario", "record_finding", "scenario_done"],
   // フィンガープリント(A06 既知脆弱コンポーネント): fingerprint_scan で版を集め、(opt-in で cve_lookup)既知 CVE を評価して記録。
@@ -155,6 +155,7 @@ const SEVERITY_BAND: Partial<Record<string, { min: Severity; max: Severity }>> =
   "idor-write": { min: "high", max: "critical" }, // 他ユーザデータの改変
   "path-traversal": { min: "medium", max: "critical" }, // 任意ファイル読取=High、RCE 化=Critical
   ssrf: { min: "medium", max: "high" },
+  xxe: { min: "high", max: "critical" }, // 任意ファイル読取/SSRF 連鎖
   "xss-stored": { min: "medium", max: "high" }, // 永続・他ユーザ影響
   "xss-reflected": { min: "low", max: "medium" }, // 反射 XSS は原則 Medium
   "open-redirect": { min: "low", max: "medium" },
@@ -197,6 +198,7 @@ export function coarseClass(vulnClass: string): string {
   if (/idor|bola|object\s?level|broken access|broken object/.test(sn))
     return /write|overwrite|update|modif|edit/.test(sn) ? "idor-write" : "idor";
   if (/open redirect|unvalidated redirect/.test(sn)) return "open-redirect";
+  if (/\bxxe\b|xml external|external entit/.test(sn)) return "xxe";
   if (/\bssrf\b/.test(sn)) return "ssrf";
   if (/template inj|\bssti\b/.test(sn)) return "ssti";
   if (/\brce\b|command inj|remote code|\bcmdi\b/.test(sn)) return "rce";
@@ -239,6 +241,7 @@ export const CATEGORIES = [
   "path-traversal",
   "open-redirect",
   "ssrf",
+  "xxe",
   "rce",
   "auth-bypass",
   "session",
@@ -777,6 +780,28 @@ export function buildTools(s: PilotSession) {
       },
     ),
     tool(
+      "browser_upload",
+      "Upload a file through a real browser form (Playwright setInputFiles) and submit it — use this when the upload is a JS-driven / DOM widget that http_request's `files` can't reach. Pass the file input `selector`, `filename`, `content` (text, e.g. an XXE SVG) OR `base64` (binary/magic-byte polyglot), optional contentType and submitSelector. Returns the resulting page + fired APIs; then check the outcome (rendered file / error) and probe with http_request(impact) for the effect (file read → the leaked content).",
+      { selector: z.string(), filename: z.string(), content: z.string().optional(), base64: z.string().optional(), contentType: z.string().optional(), submitSelector: z.string().optional() },
+      async ({ selector, filename, content, base64, contentType, submitSelector }) => {
+        const b64 = base64 ?? Buffer.from(content ?? "", "utf8").toString("base64");
+        const r = await s.driver.uploadFile(selector, filename, b64, contentType, submitSelector);
+        const fired = s.driver.drainApiCalls();
+        const snap = await s.driver.snapshot();
+        const impact = impactOracle(snap.visibleText ?? "");
+        return txt(
+          JSON.stringify({
+            ...r,
+            url: snap.url,
+            title: snap.title,
+            firedApis: fired.map((a) => ({ method: a.method, url: a.url, status: a.status })).slice(0, 20),
+            ...(impact.length ? { impact: impact.map((i) => ({ kind: i.kind, marker: i.marker })), impactHint: "concrete impact rendered on the page after upload — this is your effectMarker" } : {}),
+            pageText: (snap.visibleText ?? "").slice(0, 800),
+          }),
+        );
+      },
+    ),
+    tool(
       "survey_status",
       "Report mapping progress: screens discovered so far, how many in-scope links remain unvisited (the frontier), and a sample of those links. Use it to know what is still un-mapped before survey_done.",
       {},
@@ -926,7 +951,7 @@ export function buildTools(s: PilotSession) {
     ),
     tool(
       "http_request",
-      "Send a scoped raw HTTP request to probe a hypothesis (IDOR/auth/exposure). Uses the current login session. Records evidence; returns an evidenceId to cite in findings. The full response body is scanned for CONCRETE IMPACT (leaked /etc/passwd, private keys/secrets, command output like uid=…, cross-user data) and any hit is surfaced in `impact` — that is your effectMarker for a CONFIRMED finding. For an IDOR/BOLA test, pass `victimId` (the other user's id you requested) and `selfId` (your own id): if the response carries the victim's id but not yours, you get a cross-user impact hit = the IDOR is real.",
+      "Send a scoped raw HTTP request to probe a hypothesis (IDOR/auth/exposure). Uses the current login session. Records evidence; returns an evidenceId to cite in findings. The full response body is scanned for CONCRETE IMPACT (leaked /etc/passwd, private keys/secrets, command output like uid=…, cross-user data) and any hit is surfaced in `impact` — that is your effectMarker for a CONFIRMED finding. For an IDOR/BOLA test, pass `victimId` (the other user's id you requested) and `selfId` (your own id): if the response carries the victim's id but not yours, you get a cross-user impact hit = the IDOR is real. FILE UPLOAD: pass `files` (and optional `fields`) to send a correct multipart/form-data upload — the boundary/CRLF are built for you (do NOT hand-craft a multipart body in `body`). Each file has {name (the form field), filename, contentType?, and either `content` (text, e.g. an XXE SVG) or `base64` (binary/magic-byte polyglot)}. Use this to test upload attacks: XXE via an SVG DOCTYPE ENTITY, a webshell behind image magic bytes (e.g. GIF89a; then <?php…), a pickle/deserialization blob, extension/type-filter bypass.",
       {
         method: z.string(),
         url: z.string(),
@@ -935,14 +960,32 @@ export function buildTools(s: PilotSession) {
         note: z.string().optional(),
         victimId: z.string().optional().describe("for IDOR: the other user's id you are requesting (cross-user impact check)"),
         selfId: z.string().optional().describe("for IDOR: your own session's id (so your own data isn't mistaken for cross-user access)"),
+        fields: z.record(z.string()).optional().describe("form fields to send alongside file(s) in a multipart upload"),
+        files: z
+          .array(z.object({ name: z.string(), filename: z.string(), contentType: z.string().optional(), content: z.string().optional(), base64: z.string().optional() }))
+          .optional()
+          .describe("file part(s) for a multipart upload; each has a text `content` OR binary `base64`"),
       },
-      async ({ method, url, headers, body, note, victimId, selfId }) => {
+      async ({ method, url, headers, body, note, victimId, selfId, fields, files }) => {
         if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} is out of scope`);
+        const multipart =
+          files && files.length
+            ? {
+                ...(fields ? { fields } : {}),
+                files: files.map((f) => ({
+                  name: f.name,
+                  filename: f.filename,
+                  ...(f.contentType ? { contentType: f.contentType } : {}),
+                  base64: f.base64 ?? Buffer.from(f.content ?? "", "utf8").toString("base64"),
+                })),
+              }
+            : undefined;
         const req: HttpRequest = {
           method: method.toUpperCase(),
           url,
           headers: { ...authHeaders(s), ...(headers ?? {}) },
-          body: body ?? null,
+          body: multipart ? null : body ?? null,
+          ...(multipart ? { multipart } : {}),
         };
         let res: HttpResponse;
         try {
@@ -951,11 +994,16 @@ export function buildTools(s: PilotSession) {
         } catch (e) {
           return txt(`ERROR: ${String(e).slice(0, 200)}`);
         }
+        // multipart はバイナリなので証拠には人間可読の要約(フィールド + ファイルの中身プレビュー)を残す。
+        const evBody = multipart
+          ? `[multipart/form-data]\nfields: ${JSON.stringify(fields ?? {})}\n` +
+            (files ?? []).map((f) => `file "${f.name}" filename="${f.filename}" (${f.contentType ?? "?"}):\n${(f.content ?? `<base64 ${f.base64?.length ?? 0}B>`).slice(0, 1500)}`).join("\n---\n")
+          : req.body;
         const ev = s.evidence.record({
           screenId: s.currentScreenId ?? "pilot",
           validator: "claude-pilot",
           kind: "positive_replay",
-          request: { ...req, headers: s.http.effectiveHeaders(req.headers) }, // 送信ヘッダ全部を証拠に残す
+          request: { ...req, headers: s.http.effectiveHeaders(req.headers), body: evBody }, // 送信ヘッダ全部を証拠に残す
           response: res,
           note: note ?? `${req.method} ${url} as ${s.currentRole || "unauth"}`,
         });

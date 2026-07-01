@@ -1,6 +1,6 @@
 // @veritas/scanner — Phase2: 汎用 validator カタログ + 証拠規律。
 
-export type { HttpClient, HttpRequest, HttpResponse, FetchHttpClientOptions, FakeResponder } from "./http.js";
+export type { HttpClient, HttpRequest, HttpResponse, MultipartSpec, FetchHttpClientOptions, FakeResponder } from "./http.js";
 export { FetchHttpClient, FakeHttpClient } from "./http.js";
 
 export { EvidenceStore, readEvidenceArtifact } from "./evidence.js";

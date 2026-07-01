@@ -1,10 +1,19 @@
 // DESIGN §9 — policy gated な生 HTTP(検証用)。実体は FetchHttpClient、テストは FakeHttpClient。
 
+/** multipart/form-data アップロード指定。undici の FormData が boundary + CRLF + Content-Type を**正しく**生成する
+ *  (LLM が生ワイヤを手書きすると CRLF/boundary を外して python-multipart 等に弾かれる問題の解消)。body より優先。 */
+export interface MultipartSpec {
+  fields?: Record<string, string>;
+  files: Array<{ name: string; filename: string; contentType?: string; base64: string }>;
+}
+
 export interface HttpRequest {
   method: string;
   url: string;
   headers?: Record<string, string>;
   body?: string | null;
+  /** 指定時は body を無視し、multipart/form-data として送る(ファイルアップロード攻撃 = XXE-SVG / webshell / pickle 用)。 */
+  multipart?: MultipartSpec;
 }
 
 export interface HttpResponse {
@@ -80,14 +89,28 @@ export class FetchHttpClient implements HttpClient {
     const timer = setTimeout(() => controller.abort(), this.opts.timeoutMs ?? 15_000);
     try {
       const dispatcher = await this.getDispatcher();
+      const reqHeaders: Record<string, string> = {
+        "user-agent": this.opts.userAgent ?? "amraam-scanner/0.1",
+        ...(this.opts.headers ?? {}),
+        ...(req.headers ?? {}),
+      };
+      let bodyInit: unknown = req.body ?? undefined;
+      if (req.multipart) {
+        // undici の FormData で正しい multipart を生成(boundary/CRLF/Content-Type は自動)。呼び出し側の
+        // content-type は上書きさせない(boundary を undici が決めるため)。
+        const fd = new FormData();
+        for (const [k, v] of Object.entries(req.multipart.fields ?? {})) fd.append(k, v);
+        for (const f of req.multipart.files) {
+          const bytes = Buffer.from(f.base64, "base64");
+          fd.append(f.name, new Blob([bytes], { type: f.contentType || "application/octet-stream" }), f.filename);
+        }
+        bodyInit = fd;
+        for (const k of Object.keys(reqHeaders)) if (k.toLowerCase() === "content-type") delete reqHeaders[k];
+      }
       const init: Record<string, unknown> = {
         method: req.method,
-        headers: {
-          "user-agent": this.opts.userAgent ?? "amraam-scanner/0.1",
-          ...(this.opts.headers ?? {}),
-          ...(req.headers ?? {}),
-        },
-        body: req.body ?? undefined,
+        headers: reqHeaders,
+        body: bodyInit,
         redirect: "manual", // 認証リダイレクトを「到達」と誤認しない
         signal: controller.signal,
       };

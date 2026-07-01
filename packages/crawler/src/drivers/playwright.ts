@@ -504,6 +504,32 @@ export class PlaywrightDriver implements Driver {
     return false;
   }
 
+  /** ファイルアップロード(<input type=file>)を setInputFiles で実行し、送信する。base64 でバイナリも可。 */
+  async uploadFile(
+    selector: string,
+    filename: string,
+    base64: string,
+    contentType?: string,
+    submitSelector?: string,
+  ): Promise<{ ok: boolean; note: string }> {
+    try {
+      await this.page.setInputFiles(selector, {
+        name: filename,
+        mimeType: contentType || "application/octet-stream",
+        buffer: Buffer.from(base64, "base64"),
+      });
+    } catch (e) {
+      return { ok: false, note: `setInputFiles failed on ${selector}: ${String(e).slice(0, 120)}` };
+    }
+    // 送信: 指定 selector、無ければ submit ボタンを試す。
+    const submitted = submitSelector
+      ? await this.page.click(submitSelector, { timeout: 4000 }).then(() => true).catch(() => false)
+      : await this.page.click('button[type="submit"], input[type="submit"], button', { timeout: 3000 }).then(() => true).catch(() => false);
+    await this.page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
+    await this.waitForDomStable();
+    return { ok: true, note: `uploaded ${filename} via ${selector}${submitted ? " + submitted" : " (no submit button clicked — pass submitSelector if needed)"}` };
+  }
+
   async pressEnter(selector: string): Promise<void> {
     await this.page.press(selector, "Enter").catch(() => {});
     await new Promise<void>((resolve) => setTimeout(resolve, this.opts.settleMs));
