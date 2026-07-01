@@ -96,9 +96,10 @@ commands:
             Phase2: generic validators + evidence discipline (neg+2replay). confirmed → findings
   logic   --id <id> [--screen <sid>] [--model <model>] [--rate <ms>] [--out <dir>]
             Phase2 business logic: hypothesis generation (LLM) → verify IDOR etc. with evidence discipline
-  serve   [--port <n>] [--host <h>] [--out <dir>] [--web-root <dir>] [--no-web] [--password <pw>] [--no-auth] [--no-launch]
+  serve   [--port <n>] [--host <h>] [--out <dir>] [--web-root <dir>] [--no-web] [--password <pw>] [--viewer-password <pw>] [--no-auth] [--no-launch]
             start the observability WebUI + state API/WS (default 127.0.0.1:4317. expose to LAN with --host 0.0.0.0)
-            --password or env AMRAAM_WEB_PASSWORD gates the WebUI/API/WS behind a single password (/login + signed cookie). --no-auth disables it
+            two roles gate the WebUI/API/WS (/login + signed cookie): operator = env AMRAAM_WEB_PASSWORD / --password (full: New/Resume/Stop/mutate);
+            viewer = env AMRAAM_WEB_PASSWORD_VIEWER / --viewer-password (read-only). ENV preferred over args. --no-auth disables the gate
             the WebUI "+ New" launches pilot/assess by spawning the CLI as a child; --no-launch disables run launching
   report  --id <id> [--format md,html,pdf,csv] [--browser-path <bin>] [--no-sandbox] [--out <dir>]
             generate the diagnosis report from findings (by severity + repro + evidence + scope basis).
@@ -1297,6 +1298,7 @@ async function cmdServe(args: string[]): Promise<void> {
       "web-root": { type: "string" },
       "no-web": { type: "boolean" },
       password: { type: "string" },
+      "viewer-password": { type: "string" },
       "no-auth": { type: "boolean" },
       "no-launch": { type: "boolean" },
     },
@@ -1308,8 +1310,15 @@ async function cmdServe(args: string[]): Promise<void> {
   if (!values["no-web"] && !webRoot) {
     console.error("warning: webui dist not found (build @veritas/webui first); serving API/WS only");
   }
-  // WebUI 認証: --password / env AMRAAM_WEB_PASSWORD(.env 自動ロード)。--no-auth で明示的に無効化。
-  const authPassword = values["no-auth"] ? undefined : (values.password ?? process.env.AMRAAM_WEB_PASSWORD);
+  // WebUI 認証(2ロール): operator=全権 / viewer=閲覧のみ。ENV 主・引数はフォールバック。--no-auth で無効化。
+  //   operator: --password / env AMRAAM_WEB_PASSWORD   viewer: --viewer-password / env AMRAAM_WEB_PASSWORD_VIEWER
+  const operatorPw = values["no-auth"] ? undefined : (process.env.AMRAAM_WEB_PASSWORD ?? values.password);
+  const viewerPw = values["no-auth"] ? undefined : (process.env.AMRAAM_WEB_PASSWORD_VIEWER ?? values["viewer-password"]);
+  if (!operatorPw && viewerPw) {
+    console.error("error: a viewer password was set without an operator password — set AMRAAM_WEB_PASSWORD (or --password) too.");
+    process.exit(1);
+  }
+  const authPasswords = operatorPw ? { operator: operatorPw, ...(viewerPw ? { viewer: viewerPw } : {}) } : undefined;
   // WebUI からの run 起動/停止/再開(server が CLI を子プロセスで spawn)。--no-launch で無効化。
   // ビルド済み CLI(dist/main.js)からの起動が前提(tsx dev では spawn 不可)。
   const cliPath = process.argv[1] ?? "";
@@ -1323,16 +1332,17 @@ async function cmdServe(args: string[]): Promise<void> {
     port,
     host,
     ...(webRoot ? { webRoot } : {}),
-    ...(authPassword ? { authPassword } : {}),
+    ...(authPasswords ? { authPasswords } : {}),
     ...(runLauncher ? { runLauncher } : {}),
     onLog: (m) => console.log(`  ${m}`),
   });
+  const authLabel = authPasswords ? (authPasswords.viewer ? ", 🔒 auth on (operator+viewer)" : ", 🔒 auth on (operator)") : "";
   console.log(
-    `veritas server: http://${host}:${srv.port}  (runs: ${runsDir}${webRoot ? "" : ", API/WS only"}${authPassword ? ", 🔒 auth on" : ""}${runLauncher ? ", ▶ launch on" : ""})`,
+    `veritas server: http://${host}:${srv.port}  (runs: ${runsDir}${webRoot ? "" : ", API/WS only"}${authLabel}${runLauncher ? ", ▶ launch on" : ""})`,
   );
   if (host === "0.0.0.0") {
     console.log("  ⚠ listening on all interfaces. from the LAN: http://<this-machine-ip>:" + srv.port + "/");
-    if (!authPassword) console.log("  ⚠ exposed without auth. gate the WebUI with --password <pw> or env AMRAAM_WEB_PASSWORD.");
+    if (!authPasswords) console.log("  ⚠ exposed without auth. gate the WebUI with env AMRAAM_WEB_PASSWORD (operator) [+ AMRAAM_WEB_PASSWORD_VIEWER].");
   }
   console.log("Ctrl-C to stop");
   let stopping = false;

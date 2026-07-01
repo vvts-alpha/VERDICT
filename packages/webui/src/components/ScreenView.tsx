@@ -1,10 +1,12 @@
 import type { Screen, StateView } from "@veritas/core";
 import { EvidenceList } from "./EvidenceList";
+import { useRole } from "../api";
 
 const SEV_ORDER: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
 
 // ツリーで選んだ 1 画面の詳細。順序は「ページの情報(スクショ→概要→API/params)→ その画面の findings」。
 export function ScreenView({ view, screen, onExclude }: { view: StateView; screen?: Screen; onExclude: (id: string) => void }) {
+  const { canWrite } = useRole();
   if (!screen) {
     return <p className="muted log-empty">← Select a screen from the tree.</p>;
   }
@@ -18,9 +20,11 @@ export function ScreenView({ view, screen, onExclude }: { view: StateView; scree
       <div className="sv-head">
         <span className="mono sv-url">{screen.urlTemplate}</span>
         <span className={`statuspill st-${status}`}>{status}</span>
-        <button type="button" className="excludebtn" onClick={() => onExclude(screen.screenId)}>
-          Exclude
-        </button>
+        {canWrite ? (
+          <button type="button" className="excludebtn" onClick={() => onExclude(screen.screenId)}>
+            Exclude
+          </button>
+        ) : null}
       </div>
       <div className="sv-meta">
         {screen.screenType} · {screen.authState} · <span className="mono">{screen.screenId}</span>

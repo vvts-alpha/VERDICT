@@ -3,6 +3,7 @@
 import { useEffect, useState, type MouseEvent } from "react";
 import type { TargetInput } from "@veritas/core";
 import { NewAssessment } from "./NewAssessment";
+import { useRole } from "../api";
 
 interface Row {
   id: string;
@@ -43,6 +44,7 @@ export function Index() {
   const [rows, setRows] = useState<Row[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  const { canWrite, authEnabled, role } = useRole();
 
   useEffect(() => {
     let alive = true;
@@ -86,9 +88,21 @@ export function Index() {
         <span className="brand">AMRAAM</span>
         <span className="idxtitle">Projects</span>
         <span className="idxcount">{rows ? `${rows.length}` : ""}</span>
-        <button type="button" className="idxnew" onClick={() => setCreating(true)}>
-          + New
-        </button>
+        {authEnabled ? (
+          <span className={`rolebadge ${role}`} title={canWrite ? "operator — full access" : "viewer — read-only"}>
+            {role}
+          </span>
+        ) : null}
+        {canWrite ? (
+          <button type="button" className="idxnew" onClick={() => setCreating(true)}>
+            + New
+          </button>
+        ) : null}
+        {authEnabled ? (
+          <a className="logout" href="/logout" title="sign out">
+            sign out
+          </a>
+        ) : null}
       </header>
       {err ? <p className="idxempty">{err}</p> : null}
       {rows && rows.length === 0 ? (
@@ -133,7 +147,9 @@ export function Index() {
                 <td className="when">{fmt(r.updatedAt)}</td>
                 <td className="mono idcell">{r.id}</td>
                 <td className="ctl">
-                  {r.running ? (
+                  {!canWrite ? (
+                    r.running ? <span className="rundot" title="running" /> : null
+                  ) : r.running ? (
                     <button type="button" className="stopbtn" onClick={runCtl(r.id, "stop")}>
                       ◼ Stop
                     </button>

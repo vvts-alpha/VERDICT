@@ -1,6 +1,7 @@
 // 💬 Ask — その assessment(findings/screens/scope)について Claude に質問する読み取り Q&A。
 // POST /api/assessments/:id/chat に会話履歴を送り、回答を表示する。履歴はクライアント保持。
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { useRole } from "../api";
 
 interface Msg {
   role: "user" | "assistant";
@@ -8,6 +9,7 @@ interface Msg {
 }
 
 export function Chat({ id }: { id: string }) {
+  const { canWrite } = useRole();
   const [messages, setMessages] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
@@ -67,23 +69,29 @@ export function Chat({ id }: { id: string }) {
         {err ? <p className="nf-err">{err}</p> : null}
         <div ref={endRef} />
       </div>
-      <div className="chat-input">
-        <textarea
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e: KeyboardEvent<HTMLTextAreaElement>) => {
-            if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-              e.preventDefault();
-              void send();
-            }
-          }}
-          placeholder="Ask a question…  (Ctrl/Cmd+Enter to send)"
-          rows={2}
-        />
-        <button type="button" disabled={busy || !input.trim()} onClick={() => void send()}>
-          {busy ? "…" : "Send"}
-        </button>
-      </div>
+      {canWrite ? (
+        <div className="chat-input">
+          <textarea
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e: KeyboardEvent<HTMLTextAreaElement>) => {
+              if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                e.preventDefault();
+                void send();
+              }
+            }}
+            placeholder="Ask a question…  (Ctrl/Cmd+Enter to send)"
+            rows={2}
+          />
+          <button type="button" disabled={busy || !input.trim()} onClick={() => void send()}>
+            {busy ? "…" : "Send"}
+          </button>
+        </div>
+      ) : (
+        <p className="muted" style={{ padding: "8px 12px" }}>
+          Ask is read-only for viewers — sign in as operator to use it.
+        </p>
+      )}
     </div>
   );
 }

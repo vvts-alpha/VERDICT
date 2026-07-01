@@ -12,7 +12,8 @@ import type { TargetInput, WsMessage } from "@veritas/core";
 import { htmlToPdf } from "@veritas/crawler";
 import { ClaudeCliClient } from "@veritas/llm";
 import type { AssessmentState } from "@veritas/core";
-import { handleAuthSubmit, handleLogout, isAuthedReq, loginPageHtml } from "./auth.js";
+import { handleAuthSubmit, handleLogout, roleForReq, loginPageHtml } from "./auth.js";
+import type { AuthConfig, Role } from "./auth.js";
 import { Supervisor, type RunLauncherConfig, type StartRunInput } from "./supervisor.js";
 import { Relay } from "./relay.js";
 
@@ -26,9 +27,10 @@ export interface ServerOptions {
   pollMs?: number;
   /** 接続/push を可観測化するログ(CLI が console.log を渡す。テストは未指定=無音)。 */
   onLog?: (msg: string) => void;
-  /** 設定すると WebUI/API/WS を単一パスワードでゲート(/login フォーム + 署名 Cookie)。
-   *  未設定なら従来どおり無認証。cmdServe が --password / env AMRAAM_WEB_PASSWORD で渡す。 */
-  authPassword?: string;
+  /** 設定すると WebUI/API/WS を認証ゲート(/login フォーム + 署名 Cookie)。operator は全権、
+   *  viewer は read-only(全 POST と attended を 403)。未設定なら従来どおり無認証。
+   *  cmdServe が --password / --viewer-password / env AMRAAM_WEB_PASSWORD[_VIEWER] で渡す。 */
+  authPasswords?: AuthConfig;
   /** 設定すると WebUI から run を起動/停止/再開できる(server が CLI を子プロセスで spawn)。
    *  未設定なら /api/run 等は無効。cmdServe が CLI パス等を DI。 */
   runLauncher?: RunLauncherConfig;
@@ -300,12 +302,13 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
 
 function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptions, supervisor?: Supervisor, relay?: Relay): void {
   const url = req.url ?? "/";
-  // 認証ゲート(authPassword 設定時のみ)。/login と POST /auth は素通し、それ以外は Cookie 必須。
-  const secret = opts.authPassword;
-  if (secret) {
+  // 認証ゲート(authPasswords 設定時のみ)。/login と POST /auth は素通し、それ以外は Cookie 必須。
+  const cfg = opts.authPasswords;
+  let role: Role = "operator"; // 無認証時は全権扱い(従来どおり)
+  if (cfg) {
     const now = Date.now();
     if (req.method === "POST" && (url === "/auth" || url.startsWith("/auth?"))) {
-      handleAuthSubmit(req, res, secret, now);
+      handleAuthSubmit(req, res, cfg, now);
       return;
     }
     if (req.method === "GET" && (url === "/login" || url.startsWith("/login?"))) {
@@ -317,7 +320,8 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptio
       handleLogout(res);
       return;
     }
-    if (!isAuthedReq(req, secret, now)) {
+    const r = roleForReq(req, cfg, now);
+    if (!r) {
       if (url.startsWith("/api/") || req.method === "POST") {
         sendJson(res, 401, { error: "unauthorized" });
       } else {
@@ -326,6 +330,17 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptio
       }
       return;
     }
+    role = r;
+    // viewer は read-only: mutating(全 POST は handleControl 経由)は operator 限定。
+    if (role === "viewer" && req.method === "POST") {
+      sendJson(res, 403, { error: "forbidden: viewer is read-only" });
+      return;
+    }
+  }
+  // 自分のロール(WebUI が operator 専用ボタンを出し分けるため)。無認証なら authEnabled:false。
+  if (req.method === "GET" && (url === "/api/me" || url.startsWith("/api/me?"))) {
+    sendJson(res, 200, { role, authEnabled: !!cfg });
+    return;
   }
   if (req.method === "POST") {
     handleControl(req, res, opts, supervisor);
@@ -707,13 +722,13 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
     });
   httpServer.on("upgrade", (req, socket, head) => {
     const pathname = (req.url ?? "").split("?")[0] ?? "";
-    const secret = opts.authPassword;
-    const cookieOk = !secret || isAuthedReq(req, secret, Date.now());
+    const cfg = opts.authPasswords;
+    const role = cfg ? roleForReq(req, cfg, Date.now()) : "operator"; // 無認証は operator 扱い
     if (pathname === "/ws") {
-      if (!cookieOk) return void socket.destroy();
+      if (!role) return void socket.destroy(); // 読み取り投影は認証済みなら operator/viewer どちらでも可
       wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
     } else if (sessionWss && pathname === "/ws/session") {
-      if (!cookieOk) return void socket.destroy(); // 操作者は Cookie 必須
+      if (role !== "operator") return void socket.destroy(); // attended 乗っ取りは operator 限定(viewer 不可)
       sessionWss.handleUpgrade(req, socket, head, (ws) => sessionWss.emit("connection", ws, req));
     } else if (agentWss && pathname === "/ws/agent") {
       agentWss.handleUpgrade(req, socket, head, (ws) => agentWss.emit("connection", ws, req)); // token は relay 内で検証

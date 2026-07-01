@@ -1,6 +1,7 @@
 import { useRef, useState } from "react";
 import type { StateView } from "@veritas/core";
 import type { ConnState } from "../api";
+import { useRole } from "../api";
 
 // Burp Pro の XML レポートをアップロードして net-new issue を取り込む(CLI burp-import の API 版)。
 // 成功すると server が upsertFinding → WS イベントを出すので、findings は自動で増える。
@@ -42,12 +43,12 @@ function BurpImport({ id }: { id: string }) {
 
 // レポート / 画面一覧のダウンロード。GET エンドポイントなので Cookie が自動送出される。
 // html/pdf は新タブでプレビュー(inline)、md/csv は添付 DL(server が Content-Disposition を付与)。
-function DownloadMenu({ id }: { id: string }) {
+function DownloadMenu({ id, canWrite }: { id: string; canWrite: boolean }) {
   const rep = (f: string): string => `/api/assessments/${encodeURIComponent(id)}/report?format=${f}`;
   const inv = (f: string): string => `/api/assessments/${encodeURIComponent(id)}/inventory?format=${f}`;
   return (
     <details className="dl">
-      <summary>⬇ Export / Import</summary>
+      <summary>{canWrite ? "⬇ Export / Import" : "⬇ Export"}</summary>
       <div className="dl-menu">
         <span className="dl-h">Report</span>
         <a href={rep("html")} target="_blank" rel="noreferrer">HTML</a>
@@ -57,7 +58,7 @@ function DownloadMenu({ id }: { id: string }) {
         <span className="dl-h">Screen inventory</span>
         <a href={inv("html")} target="_blank" rel="noreferrer">Inventory HTML</a>
         <a href={inv("csv")}>Screens CSV</a>
-        <BurpImport id={id} />
+        {canWrite ? <BurpImport id={id} /> : null}
       </div>
     </details>
   );
@@ -73,9 +74,15 @@ export function StatusBar({
   onTogglePause: () => void;
 }) {
   const c = view.coverage;
+  const { canWrite, authEnabled, role } = useRole();
   return (
     <header className="statusbar">
       <a className="brand" href="?" title="Back to projects">AMRAAM</a>
+      {authEnabled ? (
+        <span className={`rolebadge ${role}`} title={canWrite ? "operator — full access" : "viewer — read-only"}>
+          {role}
+        </span>
+      ) : null}
       <span>
         phase: <b>{view.phase}</b>
       </span>
@@ -98,10 +105,17 @@ export function StatusBar({
       <span>
         handoffs: <b>{view.handoffs.filter((h) => h.status === "pending").length}</b>
       </span>
-      <button type="button" className="pausebtn" onClick={onTogglePause}>
-        {view.paused ? "▶ resume" : "⏸ pause"}
-      </button>
-      <DownloadMenu id={view.id} />
+      {canWrite ? (
+        <button type="button" className="pausebtn" onClick={onTogglePause}>
+          {view.paused ? "▶ resume" : "⏸ pause"}
+        </button>
+      ) : null}
+      <DownloadMenu id={view.id} canWrite={canWrite} />
+      {authEnabled ? (
+        <a className="logout" href="/logout" title="sign out">
+          sign out
+        </a>
+      ) : null}
       <span className={`conn ${conn}`}>● {view.paused ? "paused" : conn}</span>
     </header>
   );

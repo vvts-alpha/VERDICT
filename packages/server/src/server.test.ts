@@ -66,7 +66,7 @@ test("auth gate: password-protects WebUI/API with login form + signed cookie", a
   const runsDir = mkdtempSync(join(tmpdir(), "veritas-srv-"));
   const store = seed(runsDir, "a-auth");
   store.close();
-  const srv = await startServer({ runsDir, pollMs: 50, authPassword: "s3cret" });
+  const srv = await startServer({ runsDir, pollMs: 50, authPasswords: { operator: "s3cret", viewer: "look" } });
   const form = { "content-type": "application/x-www-form-urlencoded" };
   try {
     // 未認証 API → 401、未認証 HTML → 302 /login、/login フォーム → 200
@@ -81,17 +81,42 @@ test("auth gate: password-protects WebUI/API with login form + signed cookie", a
     assert.equal(bad.headers.get("location"), "/login?e=1");
     assert.equal(bad.headers.getSetCookie().length, 0);
 
-    // 正PW → 302 /・Set-Cookie
+    // 正PW(operator) → 302 /・Set-Cookie
     const ok = await fetch(`${srv.url}/auth`, { method: "POST", headers: form, body: "password=s3cret", redirect: "manual" });
     assert.equal(ok.headers.get("location"), "/");
     const setc = ok.headers.getSetCookie();
     assert.equal(setc.length, 1);
     const cookie = setc[0]?.split(";")[0] ?? "";
-    assert.match(cookie, /^amraam_session=/);
+    assert.match(cookie, /^amraam_session=operator\./);
 
-    // Cookie 付き API → 200、改竄 Cookie → 401
+    // Cookie 付き API → 200、改竄 Cookie → 401、/api/me → operator(全権)
     assert.equal((await fetch(`${srv.url}/api/assessments`, { headers: { cookie } })).status, 200);
     assert.equal((await fetch(`${srv.url}/api/assessments`, { headers: { cookie: "amraam_session=1.deadbeef" }, redirect: "manual" })).status, 401);
+    assert.deepEqual(await (await fetch(`${srv.url}/api/me`, { headers: { cookie } })).json(), { role: "operator", authEnabled: true });
+  } finally {
+    await srv.close();
+    rmSync(runsDir, { recursive: true, force: true });
+  }
+});
+
+test("role split: viewer can read but every mutating POST is 403 (read-only)", async () => {
+  const runsDir = mkdtempSync(join(tmpdir(), "veritas-srv-"));
+  const store = seed(runsDir, "a-view");
+  store.close();
+  const srv = await startServer({ runsDir, pollMs: 50, authPasswords: { operator: "op", viewer: "vw" } });
+  const form = { "content-type": "application/x-www-form-urlencoded" };
+  try {
+    const login = await fetch(`${srv.url}/auth`, { method: "POST", headers: form, body: "password=vw", redirect: "manual" });
+    const cookie = login.headers.getSetCookie()[0]?.split(";")[0] ?? "";
+    assert.match(cookie, /^amraam_session=viewer\./);
+    // 閲覧 GET は OK
+    assert.equal((await fetch(`${srv.url}/api/assessments`, { headers: { cookie } })).status, 200);
+    assert.deepEqual(await (await fetch(`${srv.url}/api/me`, { headers: { cookie } })).json(), { role: "viewer", authEnabled: true });
+    // mutating POST は 403(read-only)
+    for (const path of ["/api/run", "/api/assessments/a-view/pause", "/api/assessments/a-view/screens/s-1/exclude"]) {
+      const r = await fetch(`${srv.url}${path}`, { method: "POST", headers: { cookie, "content-type": "application/json" }, body: "{}", redirect: "manual" });
+      assert.equal(r.status, 403, `${path} should be forbidden for viewer`);
+    }
   } finally {
     await srv.close();
     rmSync(runsDir, { recursive: true, force: true });

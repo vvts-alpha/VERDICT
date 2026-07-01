@@ -19,6 +19,29 @@ export function useAssessmentId(): string | null {
   return new URLSearchParams(window.location.search).get("id");
 }
 
+export interface Me {
+  role: "operator" | "viewer";
+  authEnabled: boolean;
+}
+
+let _mePromise: Promise<Me> | null = null;
+
+/** 自分のロール(/api/me)。operator=全権 / viewer=閲覧のみ。無認証や取得失敗は operator 扱い(従来どおり全操作可)。 */
+export function useRole(): Me & { canWrite: boolean } {
+  const [me, setMe] = useState<Me>({ role: "operator", authEnabled: false });
+  useEffect(() => {
+    let alive = true;
+    if (!_mePromise) _mePromise = fetch("/api/me").then((r) => r.json()).catch(() => ({ role: "operator", authEnabled: false }) as Me);
+    void _mePromise.then((m) => {
+      if (alive) setMe(m);
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
+  return { ...me, canWrite: me.role === "operator" };
+}
+
 export function useStateView(id: string | null): { view: StateView | null; conn: ConnState } {
   const [view, setView] = useState<StateView | null>(null);
   const [conn, setConn] = useState<ConnState>("connecting");

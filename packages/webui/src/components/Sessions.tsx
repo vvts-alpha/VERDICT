@@ -1,6 +1,7 @@
 // attended×LiveHands: 子(pilot)が逆接続した role セッションを screencast 表示し、操作者がログイン → Done。
 // /api/assessments/:id/sessions で role 一覧、/ws/session?id=&role= で frame 受信 + 入力送信。
 import { useEffect, useRef, useState, type KeyboardEvent, type MouseEvent, type ClipboardEvent, type WheelEvent } from "react";
+import { useRole } from "../api";
 
 interface RoleSession {
   role: string;
@@ -13,6 +14,7 @@ function mods(e: { altKey: boolean; ctrlKey: boolean; metaKey: boolean; shiftKey
 }
 
 export function Sessions({ id }: { id: string }) {
+  const { canWrite } = useRole();
   const [roles, setRoles] = useState<RoleSession[]>([]);
   const [active, setActive] = useState<string | null>(null);
   const [status, setStatus] = useState("");
@@ -42,9 +44,9 @@ export function Sessions({ id }: { id: string }) {
     };
   }, [id]);
 
-  // active role の screencast に接続
+  // active role の screencast に接続(attended 乗っ取りは operator 限定 = viewer は接続しない)
   useEffect(() => {
-    if (!active) return;
+    if (!active || !canWrite) return;
     const proto = window.location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(`${proto}://${window.location.host}/ws/session?id=${encodeURIComponent(id)}&role=${encodeURIComponent(active)}`);
     wsRef.current = ws;
@@ -83,6 +85,10 @@ export function Sessions({ id }: { id: string }) {
     const r = c.getBoundingClientRect();
     return { x: Math.round((e.clientX - r.left) * (c.width / r.width)), y: Math.round((e.clientY - r.top) * (c.height / r.height)) };
   };
+
+  if (!canWrite) {
+    return <p className="idxempty">Attended sessions (live browser takeover) are operator-only. Viewers have read-only access.</p>;
+  }
 
   return (
     <div className="sess">

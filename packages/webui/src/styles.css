@@ -55,6 +55,12 @@ body { background: var(--bg); color: var(--fg); font-size: 13px; }
 .phasepill.scan, .phasepill.logic, .phasepill.diagnose { color: var(--accent); border-color: #2f486b; }
 .idxnew { margin-left: 12px; background: #1d3a4f; border-color: #2f6f8f; color: #cfe; }
 .idxnew:hover { background: #244a63; }
+.rolebadge { font-size: 10px; font-weight: 700; letter-spacing: 0.5px; text-transform: uppercase; padding: 2px 8px;
+  border-radius: 10px; border: 1px solid var(--line); }
+.rolebadge.operator { color: #cfe; background: #1d3a4f; border-color: #2f6f8f; }
+.rolebadge.viewer { color: var(--muted); background: #232831; }
+.logout { margin-left: 10px; font-size: 11px; color: var(--muted); text-decoration: none; }
+.logout:hover { color: var(--fg); text-decoration: underline; }
 .rundot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); margin-right: 7px;
   vertical-align: middle; animation: pulse 1.1s ease-in-out infinite; }
 .idxtable td.ctl { text-align: right; white-space: nowrap; }
