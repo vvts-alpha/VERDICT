@@ -226,6 +226,10 @@ export const BUSINESS_LOGIC_CATEGORIES = new Set<string>(["price-tampering", "qt
  *  ビジネスロジック(probe_logic/probe_scenario)＋ 反射 XSS(未エスケープ反射)＋ open-redirect(Location が OOB)。 */
 export const MARKER_BASED_CATEGORIES = new Set<string>([...BUSINESS_LOGIC_CATEGORIES, "xss-reflected", "xss-stored", "open-redirect", "ssti", "secret-exposure"]);
 
+/** verdict:"suspected" を許さないカテゴリ。決定的に観測できる or 低価値な hygiene 系はリードにする意味が薄く
+ *  ノイズになる(rate-limit/version-disclosure を "suspected" で量産していた)。これらは confirmed か skip の二択。 */
+export const SUSPECT_EXCLUDED_CATEGORIES = new Set<string>(["rate-limit", "headers", "info-disclosure", "misconfig"]);
+
 /** probe_paths の「簡単なディレクトリリスト」= 未リンク endpoint を踏むための厳選ワードリスト。
  *  ※ logout/signout 系は **入れない**。認証済みセッションで GET するとサーバ側セッションが破棄され、
  *    以降の認証診断が全滅する(自滅)。isSessionDestroyingPath でも二重に弾く。 */
@@ -1853,6 +1857,15 @@ export function buildTools(s: PilotSession) {
 
         // ── SUSPECTED 経路 ── confirmed のゲート(checkEvidenceDiscipline/checkLogicEvidence)には**一切到達しない**。
         if (verdict === "suspected") {
+          // ノイズ抑制: suspected は「深刻な exploitation クラス × medium+」限定。低価値/決定的クラスは confirmed か skip。
+          if (severity === "info" || severity === "low")
+            return txt(`REJECTED: 'suspected' is only for medium+ leads worth a human's verification. An info/low observation is either deterministically confirmable (record verdict:"confirmed") or not worth surfacing — do not mark it suspected.`);
+          if (SUSPECT_EXCLUDED_CATEGORIES.has(category))
+            return txt(`REJECTED: '${category}' is deterministically observable (you either saw it or you didn't), not a "suspected" class — if you saw it record verdict:"confirmed" (control + 2 replays), else skip. Reserve 'suspected' for serious exploitation classes you could not fully confirm this run (idor/idor-write/sqli/ssti/rce/path-traversal/ssrf/xxe/auth-bypass/mass-assignment/vulnerable-component/secret-exposure/xss-*).`);
+          // version-based CVE(未 exploit)は High/Critical(RCE/path-traversal/auth-bypass 級)だけ surface。
+          //   medium/EOL-only の版ノートはアクション性が低くノイズ(PHP EOL・Bootstrap EOL・dev server 等)。
+          if (category === "vulnerable-component" && severity !== "high" && severity !== "critical")
+            return txt(`REJECTED: a version-based 'vulnerable-component' lead is only worth surfacing when its known CVE is High/Critical (RCE / path-traversal / auth-bypass). A medium-CVE or EOL-only version note is low-signal — skip it (or record verdict:"confirmed" if you actually exploit it).`);
           if (!observation || !s.evidence.records.find((r) => r.id === observation))
             return txt(`REJECTED: a suspected finding requires ONE cited 'observation' evidenceId from a probe/http_request THIS run (the single observed anomaly).`);
           if (!anomaly || anomaly.trim().length < 40)
