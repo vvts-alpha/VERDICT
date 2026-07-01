@@ -147,8 +147,8 @@ function maxSev(a: Severity, b: Severity): Severity {
 /** カテゴリごとの重大度バンド [min,max]。record_finding がモデルの選択をこのバンドに clamp して一貫性を担保する
  *  (同じクラスで High/Medium が混ざる問題の是正)。文脈による上下は band 内でのみ許す。 */
 const SEVERITY_BAND: Partial<Record<string, { min: Severity; max: Severity }>> = {
-  rce: { min: "high", max: "critical" }, // RCE/CMDi は原則 Critical(制約付きでも最低 High)
-  ssti: { min: "high", max: "critical" }, // SSTI = RCE 相当
+  rce: { min: "critical", max: "critical" }, // RCE/CMDi は常時 Critical(operator 方針)
+  ssti: { min: "high", max: "critical" }, // SSTI = RCE 相当(純テンプレ eval のみなら High)
   sqli: { min: "high", max: "critical" }, // 認証バイパス/全DB露出なら Critical
   "auth-bypass": { min: "high", max: "critical" },
   idor: { min: "medium", max: "high" },

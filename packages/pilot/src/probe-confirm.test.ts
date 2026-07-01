@@ -49,9 +49,9 @@ test("normalizeSeverity clamps each class into its band (consistent severities)"
   assert.equal(normalizeSeverity("xss-reflected", "high"), "medium");
   assert.equal(normalizeSeverity("xss-reflected", "critical"), "medium");
   assert.equal(normalizeSeverity("xss-reflected", "low"), "low"); // band 内はそのまま
-  // RCE は最低 High(low/medium を選んでも High に持ち上げ)。critical は維持。
-  assert.equal(normalizeSeverity("rce", "low"), "high");
-  assert.equal(normalizeSeverity("rce", "medium"), "high");
+  // RCE は常時 Critical(何を選んでも Critical に固定)。
+  assert.equal(normalizeSeverity("rce", "low"), "critical");
+  assert.equal(normalizeSeverity("rce", "high"), "critical");
   assert.equal(normalizeSeverity("rce", "critical"), "critical");
   // stored XSS は Medium〜High、IDOR-read は Medium〜High。
   assert.equal(normalizeSeverity("xss-stored", "low"), "medium");
