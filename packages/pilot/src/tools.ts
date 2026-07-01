@@ -144,6 +144,45 @@ function maxSev(a: Severity, b: Severity): Severity {
   return SEV_ORDER.indexOf(a) >= SEV_ORDER.indexOf(b) ? a : b;
 }
 
+/** カテゴリごとの重大度バンド [min,max]。record_finding がモデルの選択をこのバンドに clamp して一貫性を担保する
+ *  (同じクラスで High/Medium が混ざる問題の是正)。文脈による上下は band 内でのみ許す。 */
+const SEVERITY_BAND: Partial<Record<string, { min: Severity; max: Severity }>> = {
+  rce: { min: "high", max: "critical" }, // RCE/CMDi は原則 Critical(制約付きでも最低 High)
+  ssti: { min: "high", max: "critical" }, // SSTI = RCE 相当
+  sqli: { min: "high", max: "critical" }, // 認証バイパス/全DB露出なら Critical
+  "auth-bypass": { min: "high", max: "critical" },
+  idor: { min: "medium", max: "high" },
+  "idor-write": { min: "high", max: "critical" }, // 他ユーザデータの改変
+  "path-traversal": { min: "medium", max: "critical" }, // 任意ファイル読取=High、RCE 化=Critical
+  ssrf: { min: "medium", max: "high" },
+  "xss-stored": { min: "medium", max: "high" }, // 永続・他ユーザ影響
+  "xss-reflected": { min: "low", max: "medium" }, // 反射 XSS は原則 Medium
+  "open-redirect": { min: "low", max: "medium" },
+  csrf: { min: "low", max: "medium" },
+  "price-tampering": { min: "high", max: "critical" },
+  "qty-tampering": { min: "high", max: "critical" },
+  "workflow-bypass": { min: "medium", max: "high" },
+  "mass-assignment": { min: "high", max: "critical" }, // 権限昇格
+  "race-condition": { min: "medium", max: "high" },
+  "secret-exposure": { min: "medium", max: "critical" }, // 何が漏れたかで上下
+  "vulnerable-component": { min: "low", max: "critical" }, // CVE 依存で広い(suspected は別途 High+ 縛り)
+  "info-disclosure": { min: "info", max: "medium" },
+  session: { min: "low", max: "high" },
+  "rate-limit": { min: "info", max: "medium" },
+  headers: { min: "info", max: "low" },
+  misconfig: { min: "low", max: "high" },
+};
+
+/** モデルが選んだ severity をカテゴリのバンドに収める(バンド外なら min/max に clamp)。バンド未定義はそのまま。 */
+export function normalizeSeverity(category: string, chosen: Severity): Severity {
+  const band = SEVERITY_BAND[category];
+  if (!band) return chosen;
+  const r = (s: Severity): number => SEV_ORDER.indexOf(s);
+  if (r(chosen) < r(band.min)) return band.min;
+  if (r(chosen) > r(band.max)) return band.max;
+  return chosen;
+}
+
 /** vulnClass の自由文 → 粗いカテゴリ(dedup キー用)。同じ穴の言い換えを1つに畳む。
  *  正準カテゴリ(CATEGORIES)を渡された場合はそのまま返す(冪等。xss-stored の誤畳み防止)。 */
 export function coarseClass(vulnClass: string): string {
@@ -1809,6 +1848,8 @@ export function buildTools(s: PilotSession) {
         observation: z.string().optional().describe("required for verdict=suspected: ONE cited evidenceId for the anomaly"),
       },
       async ({ title, severity, category, endpoint, param, description, reproSteps, verdict, negativeControl, positiveReplays, effectMarker, anomaly, observation }) => {
+        // モデルの severity をカテゴリのバンドに clamp(同クラスでの High/Medium 混在を是正)。
+        const normSev = normalizeSeverity(category, severity as Severity);
         // ── 共通コミット(dedup/merge/construct)。confirmed/suspected 両経路が使う。verdict は **昇格のみ**。 ──
         const commit = (v: FindingVerdict, evidenceIds: string[], anomalyText?: string): string => {
           s.recordCalls += 1;
@@ -1818,7 +1859,7 @@ export function buildTools(s: PilotSession) {
           const existing = s.findingsByKey.get(key);
           if (existing) {
             existing.evidenceIds = [...new Set([...existing.evidenceIds, ...evidenceIds])];
-            existing.severity = maxSev(existing.severity, severity as Severity);
+            existing.severity = maxSev(existing.severity, normSev);
             if (v === "confirmed" && findingVerdict(existing) === "suspected") {
               existing.verdict = "confirmed"; // 後から証明 → 昇格(降格は無い)
               existing.anomaly = undefined;
@@ -1836,7 +1877,7 @@ export function buildTools(s: PilotSession) {
             id: `f-${String(s.findCounter).padStart(3, "0")}`,
             screenId: s.currentScreenId,
             title: `[${category}] ${title}`,
-            severity: severity as Severity,
+            severity: normSev,
             verdict: v,
             ...(v === "suspected" && anomalyText ? { anomaly: anomalyText } : {}),
             source: { kind: "validator", validatorName: "claude-pilot" },
@@ -1858,13 +1899,13 @@ export function buildTools(s: PilotSession) {
         // ── SUSPECTED 経路 ── confirmed のゲート(checkEvidenceDiscipline/checkLogicEvidence)には**一切到達しない**。
         if (verdict === "suspected") {
           // ノイズ抑制: suspected は「深刻な exploitation クラス × medium+」限定。低価値/決定的クラスは confirmed か skip。
-          if (severity === "info" || severity === "low")
+          if (normSev === "info" || normSev === "low")
             return txt(`REJECTED: 'suspected' is only for medium+ leads worth a human's verification. An info/low observation is either deterministically confirmable (record verdict:"confirmed") or not worth surfacing — do not mark it suspected.`);
           if (SUSPECT_EXCLUDED_CATEGORIES.has(category))
             return txt(`REJECTED: '${category}' is deterministically observable (you either saw it or you didn't), not a "suspected" class — if you saw it record verdict:"confirmed" (control + 2 replays), else skip. Reserve 'suspected' for serious exploitation classes you could not fully confirm this run (idor/idor-write/sqli/ssti/rce/path-traversal/ssrf/xxe/auth-bypass/mass-assignment/vulnerable-component/secret-exposure/xss-*).`);
           // version-based CVE(未 exploit)は High/Critical(RCE/path-traversal/auth-bypass 級)だけ surface。
           //   medium/EOL-only の版ノートはアクション性が低くノイズ(PHP EOL・Bootstrap EOL・dev server 等)。
-          if (category === "vulnerable-component" && severity !== "high" && severity !== "critical")
+          if (category === "vulnerable-component" && normSev !== "high" && normSev !== "critical")
             return txt(`REJECTED: a version-based 'vulnerable-component' lead is only worth surfacing when its known CVE is High/Critical (RCE / path-traversal / auth-bypass). A medium-CVE or EOL-only version note is low-signal — skip it (or record verdict:"confirmed" if you actually exploit it).`);
           if (!observation || !s.evidence.records.find((r) => r.id === observation))
             return txt(`REJECTED: a suspected finding requires ONE cited 'observation' evidenceId from a probe/http_request THIS run (the single observed anomaly).`);

@@ -1,7 +1,7 @@
 // #2 確証ツールの純粋部分: JWT の alg:none 偽造 + マーカーベース・カテゴリのルーティング。
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { forgeAlgNone, MARKER_BASED_CATEGORIES, BUSINESS_LOGIC_CATEGORIES, SUSPECT_EXCLUDED_CATEGORIES, checkLogicEvidence } from "./tools.js";
+import { forgeAlgNone, MARKER_BASED_CATEGORIES, BUSINESS_LOGIC_CATEGORIES, SUSPECT_EXCLUDED_CATEGORIES, normalizeSeverity, checkLogicEvidence } from "./tools.js";
 
 const b64url = (o: unknown): string =>
   Buffer.from(JSON.stringify(o), "utf8").toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
@@ -42,6 +42,23 @@ test("xss-reflected and open-redirect route through marker-based confirmation", 
   assert.ok(!MARKER_BASED_CATEGORIES.has("sqli"));
   // business-logic は marker-based の部分集合
   for (const c of BUSINESS_LOGIC_CATEGORIES) assert.ok(MARKER_BASED_CATEGORIES.has(c));
+});
+
+test("normalizeSeverity clamps each class into its band (consistent severities)", () => {
+  // 反射 XSS は High を選んでも Medium に落ちる(混在の是正)。
+  assert.equal(normalizeSeverity("xss-reflected", "high"), "medium");
+  assert.equal(normalizeSeverity("xss-reflected", "critical"), "medium");
+  assert.equal(normalizeSeverity("xss-reflected", "low"), "low"); // band 内はそのまま
+  // RCE は最低 High(low/medium を選んでも High に持ち上げ)。critical は維持。
+  assert.equal(normalizeSeverity("rce", "low"), "high");
+  assert.equal(normalizeSeverity("rce", "medium"), "high");
+  assert.equal(normalizeSeverity("rce", "critical"), "critical");
+  // stored XSS は Medium〜High、IDOR-read は Medium〜High。
+  assert.equal(normalizeSeverity("xss-stored", "low"), "medium");
+  assert.equal(normalizeSeverity("idor", "critical"), "high");
+  // rate-limit は Info〜Medium(High を選んでも Medium)。band 未定義カテゴリはそのまま。
+  assert.equal(normalizeSeverity("rate-limit", "high"), "medium");
+  assert.equal(normalizeSeverity("nonexistent-cat", "critical"), "critical");
 });
 
 test("suspected is scoped to serious classes — hygiene/deterministic classes are excluded (noise control)", () => {
