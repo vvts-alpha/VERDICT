@@ -115,7 +115,7 @@ export interface PilotSession {
 export const STAGE_TOOLS = {
   survey: ["browser_navigate", "browser_fill", "browser_click", "login", "probe_paths", "ignore_paths", "survey_status", "survey_done"],
   methodology: ["get_inventory", "record_methodology", "methodology_done"],
-  diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_dom_xss", "probe_stored_xss", "probe_ssti", "probe_sqli", "probe_cmdi", "probe_redirect", "probe_jwt", "probe_csrf", "probe_oob", "probe_logic", "analyze_session", "verify_access", "browser_navigate", "browser_fill", "browser_click", "browser_upload", "record_finding", "screen_done"],
+  diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_dom_xss", "probe_stored_xss", "probe_ssti", "probe_sqli", "probe_cmdi", "probe_redirect", "probe_jwt", "probe_csrf", "probe_oob", "probe_logic", "analyze_session", "verify_access", "probe_idor", "browser_navigate", "browser_fill", "browser_click", "browser_upload", "record_finding", "screen_done"],
   // シナリオ(A04 横断ロジック): inventory 俯瞰 + 多段リクエスト連鎖を probe_scenario で撃つ。画面診断の後に1回。
   scenario: ["get_inventory", "login", "http_request", "probe_scenario", "record_finding", "scenario_done"],
   // フィンガープリント(A06 既知脆弱コンポーネント): fingerprint_scan で版を集め、(opt-in で cve_lookup)既知 CVE を評価して記録。
@@ -2464,6 +2464,75 @@ export function buildTools(s: PilotSession) {
               : {}),
           }),
         );
+      },
+    ),
+
+    tool(
+      "probe_idor",
+      "Confirm IDOR / BOLA mechanically: as YOUR current session, try to reach ANOTHER user's object. Give `selfId` (an object id you legitimately own) and `victimId` (another user's id — from knownObjectIds or a second role). Put the id in the URL/body via a {{ID}} placeholder, or pass `param` (query/body field), or `header` (for header-based BOLA like X-User-Id). It runs three requests: a NON-EXISTENT id (negative control — the endpoint must be able to say 404/deny), then the victim's id TWICE (positive replays). Confirms only if the victim request returns the victim's object (cross-user data present, not your own, not the 404 template) and is stable x2. Returns negativeControl + positiveReplays evidenceIds + the cross-user impact → record_finding(category idor, or idor-write for a mutating method).",
+      { url: z.string(), selfId: z.string(), victimId: z.string(), param: z.string().optional(), header: z.string().optional(), method: z.string().optional(), body: z.string().optional() },
+      async ({ url, selfId, victimId, param, header, method, body }) => {
+        const buildReq = (idVal: string): HttpRequest | null => {
+          let u = url;
+          let b: string | null = body ?? null;
+          const h: Record<string, string> = { ...authHeaders(s) };
+          if (header) h[header] = idVal;
+          else if (body != null && body.includes("{{ID}}")) b = body.replace(/\{\{ID\}\}/g, idVal);
+          else if (param) {
+            try {
+              const uu = new URL(url);
+              uu.searchParams.set(param, idVal);
+              u = uu.toString();
+            } catch {
+              return null;
+            }
+          } else if (url.includes("{{ID}}")) u = url.replace(/\{\{ID\}\}/g, idVal);
+          else return null; // どこに id を差すか不明
+          if (!isInScope(u, s.scope)) return null;
+          return { method: (method ?? (body != null ? "POST" : "GET")).toUpperCase(), url: u, headers: h, body: b };
+        };
+        const send = async (idVal: string, kind: "negative_control" | "positive_replay", tag: string) => {
+          const req = buildReq(idVal);
+          if (!req) return null;
+          const res = await s.http.send(req);
+          bumpHttp(s, res.status);
+          const ev = s.evidence.record({ screenId: s.currentScreenId ?? "pilot", validator: "claude-pilot-idor", kind, request: { ...req, headers: s.http.effectiveHeaders(req.headers) }, response: res, note: `idor ${tag}` });
+          return { evId: ev.id, status: res.status, len: res.body.length, body: res.body };
+        };
+        try {
+          // 非存在 id を control に(数値なら大きな不在値、それ以外はダミー)。
+          const nonexistent = /^\d+$/.test(victimId) ? "2147483646" : "00000000-0000-0000-0000-000000000000";
+          const ctrl = await send(nonexistent, "negative_control", "non-existent id");
+          if (!ctrl) return txt("ERROR: could not place the id — pass a {{ID}} in url/body, or a param, or a header.");
+          const v1 = await send(victimId, "positive_replay", "victim id #1");
+          const v2 = await send(victimId, "positive_replay", "victim id #2");
+          if (!v1 || !v2) return txt("ERROR: victim request failed to build.");
+          const impact = impactOracle(v1.body, { requestedIdentity: victimId, sessionIdentity: selfId, baselineBody: ctrl.body });
+          const crossUser = impact.some((i) => i.kind === "cross-user") || (v1.body.includes(victimId) && !v1.body.includes(selfId));
+          const accessible = v1.status < 400;
+          const controlDenied = ctrl.status >= 400 || Math.abs(ctrl.len - v1.len) > 64 || !ctrl.body.includes(victimId);
+          const stable = Math.abs(v1.len - v2.len) <= 64 && v1.status === v2.status;
+          const confirmed = accessible && crossUser && controlDenied && stable;
+          return txt(
+            JSON.stringify({
+              negativeControl: ctrl.evId,
+              positiveReplays: [v1.evId, v2.evId],
+              ...(impact.length ? { impact: impact.map((i) => ({ kind: i.kind, marker: i.marker })) } : {}),
+              observed: { control: { status: ctrl.status, len: ctrl.len }, victim: { status: v1.status, len: v1.len }, crossUser, controlDenied, stable },
+              verdict: confirmed
+                ? `IDOR/BOLA CONFIRMED — your session read victim ${victimId}'s object (status ${v1.status}, cross-user data present) while a non-existent id was denied (control status ${ctrl.status}). record_finding(category ${(method ?? "GET").toUpperCase() === "GET" ? "idor" : "idor-write"}) with these evidenceIds.`
+                : !accessible
+                  ? `not IDOR: the victim object returned ${v1.status} (access control appears to hold).`
+                  : !crossUser
+                    ? `not confirmed: got 200 but the body does not carry victim ${victimId}'s data (may be your own object, a template, or a catch-all) — verify the id is really another user's.`
+                    : !controlDenied
+                      ? `not confirmed: a NON-EXISTENT id returned the same thing — this endpoint is a catch-all (returns 200 for any id), so a 200 for the victim id proves nothing.`
+                      : `not confirmed: victim replays were unstable.`,
+            }),
+          );
+        } catch (e) {
+          return txt(`ERROR: ${String(e).slice(0, 180)}`);
+        }
       },
     ),
 
