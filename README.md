@@ -17,9 +17,10 @@ drives Burp for breadth, and reaches the authenticated surface other tools miss.
 ![Playwright](https://img.shields.io/badge/Browser-Playwright%20chromium-2EAD33?logo=playwright&logoColor=white)
 [![CI](https://github.com/veritas-rt/UmbraHands/actions/workflows/ci.yml/badge.svg)](https://github.com/veritas-rt/UmbraHands/actions/workflows/ci.yml)
 [![XBOW-Bench](https://img.shields.io/badge/XBOW--Bench-92%25%20(100%2F109)-2ea043)](benchmarks/xbow-bench)
+[![Juice Shop](https://img.shields.io/badge/OWASP%20Juice%20Shop-38%20findings-c0392b)](benchmarks/juice-shop)
 ![status](https://img.shields.io/badge/status-active-blue)
 
-[Quickstart](#-quickstart) · [How it works](#-how-it-works) · [Why VERDICT](#-why-verdict) · [Burp](#-burp-integration) · [WebUI](#-webui)
+[Quickstart](#-quickstart) · [Benchmarks](#-benchmarks) · [How it works](#-how-it-works) · [Why VERDICT](#-why-verdict) · [Burp](#-burp-integration) · [WebUI](#-webui)
 
 </div>
 
@@ -28,6 +29,15 @@ drives Burp for breadth, and reaches the authenticated surface other tools miss.
 > ⚠️ **Authorized testing only.** Every network action passes a scope gate; out-of-scope is denied, not attempted.
 
 VERDICT runs a real browser and a scoped HTTP client through tools that **Claude operates** — survey → methodology → diagnosis → (multi-step logic) → (Burp) → report. It is **staged on purpose** so the model can't "skim and skip", and **evidence-disciplined** so a finding is `confirmed` only when it actually reproduces. Everything streams to a live WebUI.
+
+## 📊 Benchmarks
+
+**Measured, not asserted.** Every finding is backed by the agent's own recorded request/response evidence — click through to the per-run reports.
+
+<p align="center"><img src="benchmarks/xbow-bench/assets/progression.svg" alt="XBOW-Bench pwn rate over three iterations: v0 62% → v1 83% → v2 92%" width="640"></p>
+
+- 🏆 **XBOW-Bench (XBEN-24) — [92% · 100/109](benchmarks/xbow-bench)** across 104 benchmarks, up **62% → 83% → 92%** over three iterations with **zero regressions**. Unaided (no README hint): **91/91 = 100%**. → *full analysis, difficulty/hint breakdown, and 104 per-run reports.*
+- 🧃 **OWASP Juice Shop — [38 confirmed findings](benchmarks/juice-shop)** in a single autonomous run, across **16 vulnerability classes** — from a **critical SQLi auth-bypass to admin** to business-logic fraud (negative-quantity checkout, self-credit wallet) — plus 5 suspected CVE leads. → *full analysis + the evidence report for every finding.*
 
 ## ✨ Features
 
@@ -152,11 +162,21 @@ The standard REST API can't pass a session to a scan. The **[`tools/burp-audit-e
 
 > **Division of labour:** the agent = emergent logic (IDOR chains, mass-assignment, business logic); Burp = mechanical injection breadth (A03 SQLi/XSS) + passive. Overlap is de-duped; imported High+ findings are re-tested by the agent.
 
+<p align="center"><img src="assets/burp-scan.png" alt="Authenticated Burp active scan driven by VERDICT — net-new issues merged and AI re-verified" width="900"></p>
+
 ## 🖥 WebUI
 
 One target = one page. Left: **SITE TREE** (URL hierarchy + scan badges). Top: progress bar. Right tabs: **Screen** (screenshot + APIs + findings), **Findings** (filter + inline evidence viewer), **APIs**, **Diagnostic log** (live), **💬 Ask** (read-only Q&A over the assessment).
 
-From `/` (the **projects list**) you can **launch and control runs**: **+ New** opens a full manifest editor — target, scope mode, model tiering, **custom headers** (name/value), **login URL**, **target-URL list import** (CSV / one-per-line), **max screens**, HTTP Basic, auth roles — and the server spawns the CLI as a child process. Stop / Resume per run. Expose with `--host 0.0.0.0` **and** `--password` / `VERDICT_WEB_PASSWORD`.
+<p align="center"><img src="assets/webui-findings.png" alt="VERDICT WebUI — findings panel, severity-filtered, with the inline request/response evidence viewer" width="900"></p>
+
+Progress, findings, screenshots and the diagnostic log stream in live over WebSocket as the agent works — the UI is a pure projection of an append-only event log:
+
+<p align="center"><img src="assets/webui-log.png" alt="VERDICT WebUI — the live diagnostic log of a finished assessment" width="900"></p>
+
+From `/` (the **projects list**) you can **launch and control runs**: **+ New** opens a full manifest editor — target, scope mode, model tiering, **custom headers** (name/value), **login URL**, **target-URL list import** (CSV / one-per-line), **max screens**, HTTP Basic, auth roles — and the server spawns the CLI as a child process. Stop / Resume per run. Two roles (**operator** = full · **viewer** = read-only). Expose with `--host 0.0.0.0` **and** env `VERDICT_WEB_PASSWORD` (+ `VERDICT_WEB_PASSWORD_VIEWER`).
+
+<p align="center"><img src="assets/webui-new.png" alt="VERDICT WebUI — the New Assessment launch form (scope, model tiering, auth roles)" width="460"></p>
 
 ## 🎯 Detection coverage
 
