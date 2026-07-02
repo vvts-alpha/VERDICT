@@ -84,7 +84,7 @@
 
 捕捉済み Issue の蓄積をクリア（`{ "status": "cleared" }`）。Burp の SiteMap や進行中 Audit は消さない。
 
-## 想定フロー（AMRAAM 連携）
+## 想定フロー（VERDICT 連携）
 
 ```
 0. (任意) POST /reset            run 前にクリア。または開始時刻を since= に使う
@@ -99,4 +99,4 @@
 - `audit_mode` は active/passive のみ。scan configuration ファイルは渡せない（scope 等は起動時 `--config-file`）。
 - resource pool はデフォルト固定（スロットリングは起動時 config）。
 - Issue → 投入リクエスト/ロールの相関は自動では付かない（Issue にタグが無い）。各 Issue の evidence(request) に
-  Cookie/Bearer 値が含まれるので、AMRAAM 側は自分が投入した raw と突き合わせて識別する。
+  Cookie/Bearer 値が含まれるので、VERDICT 側は自分が投入した raw と突き合わせて識別する。

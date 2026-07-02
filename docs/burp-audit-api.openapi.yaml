@@ -1,6 +1,6 @@
 openapi: 3.0.3
 info:
-  title: AMRAAM Audit REST — Burp 拡張 API
+  title: VERDICT Audit REST — Burp 拡張 API
   version: 0.1.0
   description: >
     Burp Suite Professional の Montoya 拡張が立てる REST API。認証済みの生 HTTP リクエストを

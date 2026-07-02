@@ -72,7 +72,7 @@ export interface BurpScanRequest {
   logins?: Array<{ username: string; password: string }>;
   /** operator 提供の CustomConfiguration(JSON 文字列)を named config に重ねる(後勝ち)。
    *  例: 普段使う scan policy(監査ポリシー)/ セッション注入の session-handling rule。
-   *  スキーマはバージョン依存なので AMRAAM は生成せず、Burp から export した設定をそのまま渡す
+   *  スキーマはバージョン依存なので VERDICT は生成せず、Burp から export した設定をそのまま渡す
    *  (値は呼び出し側で {{COOKIE}}/{{BEARER}} を差し込み済み)。 */
   customConfigs?: string[];
 }

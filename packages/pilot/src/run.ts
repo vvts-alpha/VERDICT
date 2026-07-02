@@ -269,7 +269,7 @@ export function roleLabel(role: string, descriptions?: Map<string, string>): str
 export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
   const launchBase = {
     headless: opts.headless ?? true,
-    // x-amraam マーカーは driver 側で「同一オリジンのみ」に付く(クロスオリジンは付けない=第三者を壊さない)。
+    // x-verdict マーカーは driver 側で「同一オリジンのみ」に付く(クロスオリジンは付けない=第三者を壊さない)。
     // スコープは別概念で、別ドメイン/API を含めて広げてよい(診断は http 経路で in-scope なら何でも叩ける)。
     ...(opts.browserPath ? { executablePath: opts.browserPath } : {}),
     ...(opts.noSandbox ? { args: ["--no-sandbox"] } : {}),
@@ -382,7 +382,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     allow: (u) => isInScope(u, opts.scope),
     minDelayMs: opts.rateMs ?? 250,
     headers: {
-      "x-amraam": "assessment",
+      "x-verdict": "assessment",
       // サイト全体の Basic: raw http 経路にも Authorization を注入(Digest はブラウザ経路のみ対応)。
       ...(opts.httpBasic ? { authorization: `Basic ${Buffer.from(`${opts.httpBasic.user}:${opts.httpBasic.pass}`, "utf8").toString("base64")}` } : {}),
       ...(opts.customHeaders ?? {}), // operator のカスタムヘッダ(WAF 回避等)を raw http 経路にも付与

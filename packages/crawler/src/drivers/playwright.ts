@@ -61,7 +61,7 @@ export interface PlaywrightDriverOptions {
   navTimeoutMs?: number;
   settleMs?: number;
   maxBodySample?: number;
-  /** x-amraam マーカーを付ける URL の **追加** 絞り込み(任意)。マーカーは常に「同一オリジン(+遷移)」
+  /** x-verdict マーカーを付ける URL の **追加** 絞り込み(任意)。マーカーは常に「同一オリジン(+遷移)」
    *  だけに付く(クロスオリジンには絶対付けない = 第三者 CDN/解析/別ドメイン API を CORS preflight で壊さない)。
    *  この述語を渡すと、その同一オリジン要求の中でさらに true のものだけに限定できる(既定=全許可)。
    *  ※ スコープ(評価対象)とは別概念: スコープは別ドメイン/API を含めて広げてよい。 */
@@ -69,7 +69,7 @@ export interface PlaywrightDriverOptions {
 }
 
 /** ブラウザ由来トラフィックを識別するためのマーカーヘッダ(同一オリジンには無害、クロスオリジンは preflight 化)。 */
-const MARKER_HEADER = "x-amraam";
+const MARKER_HEADER = "x-verdict";
 const MARKER_VALUE = "assessment";
 
 interface SettledOptions {
@@ -189,7 +189,7 @@ export class PlaywrightDriver implements Driver {
       maxBodySample: options.maxBodySample ?? 4096,
     });
     await context.addInitScript(INIT_SCRIPT);
-    // x-amraam マーカーは **同一オリジン(+ドキュメント遷移)** のリクエストにだけ付ける。クロスオリジンには
+    // x-verdict マーカーは **同一オリジン(+ドキュメント遷移)** のリクエストにだけ付ける。クロスオリジンには
     // 一切付けない(= スコープに別ドメイン/API を含めても、ブラウザが第三者を CORS preflight で壊さない)。
     // スコープとマーカーは別概念: スコープ=何を評価してよいか(別ドメイン・API 込みで広げてOK)、
     // マーカー=識別ヘッダで、同一オリジンなら preflight 不要なので常に無害。markerAllow で更に絞れる(既定=全許可)。
@@ -211,7 +211,7 @@ export class PlaywrightDriver implements Driver {
           }
         }
         if (sameOrigin && (hasExtra || markerAllow(req.url()))) {
-          // 同一オリジンのみ: operator のカスタムヘッダ + x-amraam マーカーを付与(CORS preflight 化しない)。
+          // 同一オリジンのみ: operator のカスタムヘッダ + x-verdict マーカーを付与(CORS preflight 化しない)。
           const headers: Record<string, string> = { ...req.headers() };
           if (hasExtra) Object.assign(headers, extraHeaders);
           if (markerAllow(req.url())) headers[MARKER_HEADER] = MARKER_VALUE;
@@ -435,7 +435,7 @@ export class PlaywrightDriver implements Driver {
    * ブラウザ XSS *実行* 検出。`url`(ペイロード内包)へ navigate し、ペイロードが実際に走ったかを見る。
    * HTTP 応答の反映を見る probe_xss では原理的に捉えられない **DOM-based / innerHTML-sink XSS** 用
    * (例: Juice Shop の検索 `#/search?q=…` は q を innerHTML へ描画 → サーバ応答には出ず browser 内で実行)。
-   * 検出シグナル: ペイロードが (1) `window.__amraam_xss = marker` を立てる(`<img onerror>`/`<svg onload>` 等が発火)
+   * 検出シグナル: ペイロードが (1) `window.__verdict_xss = marker` を立てる(`<img onerror>`/`<svg onload>` 等が発火)
    * か (2) `alert/confirm/prompt` で marker を出す。どちらか1つでも実行確証。
    */
   async detectXssExecution(url: string, marker: string): Promise<{ executed: boolean; signal: string }> {
@@ -454,7 +454,7 @@ export class PlaywrightDriver implements Driver {
       // SPA がルートを評価し q を innerHTML へ反映 → img.onerror / svg.onload が走るのを待つ。
       await new Promise<void>((resolve) => setTimeout(resolve, Math.max(this.opts.settleMs, 900)));
       const g = await this.page
-        .evaluate(() => String((globalThis as { __amraam_xss?: unknown }).__amraam_xss ?? ""))
+        .evaluate(() => String((globalThis as { __verdict_xss?: unknown }).__verdict_xss ?? ""))
         .catch(() => "");
       const viaGlobal = g.includes(marker);
       const viaDialog = dialog.includes(marker);
@@ -463,7 +463,7 @@ export class PlaywrightDriver implements Driver {
         executed,
         signal: executed
           ? viaGlobal
-            ? `XSS EXECUTED — sink fired (onerror/onload set window.__amraam_xss=${g})`
+            ? `XSS EXECUTED — sink fired (onerror/onload set window.__verdict_xss=${g})`
             : `XSS EXECUTED — dialog(alert/confirm/prompt): ${dialog}`
           : "no execution — payload was not run by the browser (escaped / not a live sink)",
       };
@@ -654,7 +654,7 @@ export class PlaywrightDriver implements Driver {
    */
   async exerciseInputs(opts: { aggressive: boolean; allow: (url: string) => boolean; cap?: number }): Promise<{ exercised: number; discovered: string[] }> {
     const origin = this.page.url();
-    const MARK = "amraam-probe";
+    const MARK = "verdict-probe";
     const cap = opts.cap ?? 12;
     const discovered = new Set<string>();
     let exercised = 0;

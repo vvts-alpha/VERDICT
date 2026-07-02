@@ -1,6 +1,6 @@
 // 画面インベントリ(Screen.apis = XHR/fetch ∪ HTMLフォームPOST)→ OpenAPI 3.0 定義への純粋な projection。
-// 目的: AMRAAM が ground truth として持つ「全エンドポイント × 全パラメータ」を Burp の API scanning へ明示的に渡す。
-// (Burp の site map は URL 集約でパラメータが落ちるので、AMRAAM が定義として宣言する方が完全)。
+// 目的: VERDICT が ground truth として持つ「全エンドポイント × 全パラメータ」を Burp の API scanning へ明示的に渡す。
+// (Burp の site map は URL 集約でパラメータが落ちるので、VERDICT が定義として宣言する方が完全)。
 
 import type { JsonShape, Screen } from "./types/index.js";
 
@@ -88,9 +88,9 @@ export function buildOpenApi(screens: ReadonlyArray<Screen>, opts: BuildOpenApiO
   return {
     openapi: "3.0.3",
     info: {
-      title: opts.title ?? `AMRAAM discovered API — ${opts.baseUrl}`,
+      title: opts.title ?? `VERDICT discovered API — ${opts.baseUrl}`,
       version: opts.version ?? "1.0.0",
-      description: `${opCount} operation(s) across ${Object.keys(paths).length} path(s), discovered by AMRAAM (XHR/fetch + HTML form POSTs).`,
+      description: `${opCount} operation(s) across ${Object.keys(paths).length} path(s), discovered by VERDICT (XHR/fetch + HTML form POSTs).`,
     },
     servers: [{ url: opts.baseUrl.replace(/\/+$/, "") }],
     paths,

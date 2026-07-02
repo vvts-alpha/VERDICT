@@ -68,7 +68,7 @@ export class FetchHttpClient implements HttpClient {
   /** 実際に送信されるヘッダ(既定 user-agent + opts.headers + 呼び出し時)。証拠に「リクエスト全体」を残す用。 */
   effectiveHeaders(reqHeaders?: Record<string, string>): Record<string, string> {
     return {
-      "user-agent": this.opts.userAgent ?? "amraam-scanner/0.1",
+      "user-agent": this.opts.userAgent ?? "verdict-scanner/0.1",
       ...(this.opts.headers ?? {}),
       ...(reqHeaders ?? {}),
     };
@@ -90,7 +90,7 @@ export class FetchHttpClient implements HttpClient {
     try {
       const dispatcher = await this.getDispatcher();
       const reqHeaders: Record<string, string> = {
-        "user-agent": this.opts.userAgent ?? "amraam-scanner/0.1",
+        "user-agent": this.opts.userAgent ?? "verdict-scanner/0.1",
         ...(this.opts.headers ?? {}),
         ...(req.headers ?? {}),
       };

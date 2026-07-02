@@ -41,7 +41,7 @@ test("buildReportModel projects stats, findings, and screen inventory", () => {
     const store = seed(dir);
     const m = buildReportModel(store.loadAssessment("a-1")!);
     store.close();
-    assert.equal(m.brand, "AMRAAM");
+    assert.equal(m.brand, "VERDICT");
     assert.equal(m.stats.findings.total, 1);
     assert.equal(m.stats.findings.bySeverity.high, 1);
     assert.equal(m.findings[0]!.sourceName, "exposed_file");

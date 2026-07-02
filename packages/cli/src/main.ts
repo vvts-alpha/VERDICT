@@ -69,7 +69,7 @@ commands:
             roles can be given inline via --attended admin,userA,userB (no manifest needed / overrides). bare --attended uses the manifest's auth.roles
             ※ Burp integration (env by default, overridable by args): [--burp-proxy [url]] route all traffic through Burp (env BURP_PROXY if no value).
               [--burp-scan [--burp-api url]] after diagnosis, also run a Burp active scan against the same run → merge results → AI re-verifies the High+ imports (connection via env BURP_API/BURP_API_KEY/BURP_RESOURCE_POOL). both off by default. [--no-burp-verify] skips the verify phase.
-                 ※ set env BURP_AUDIT_API=http://<host>:1338 (+ BURP_AUDIT_TOKEN) to route --burp-scan through the AMRAAM Audit REST extension instead: it submits the AUTHENTICATED raw requests (session in the request) so it scans behind login — see tools/burp-audit-ext/.
+                 ※ set env BURP_AUDIT_API=http://<host>:1338 (+ BURP_AUDIT_TOKEN) to route --burp-scan through the VERDICT Audit REST extension instead: it submits the AUTHENTICATED raw requests (session in the request) so it scans behind login — see tools/burp-audit-ext/.
   burp-scan --id <id> [--burp-api <url>] [--api-key <key>] [--config "<named config>"]... [--resource-pool <name>] [--manifest <m.json>] [--max-min <n>] [--poll <sec>] [--no-burp-verify] [--model <m>] [--out <dir>]
             launch a Burp Pro active scan via its REST API → poll to completion → import issues (no XML export needed) → AI re-verifies the High+ imports. connection via env (BURP_API/BURP_API_KEY/BURP_RESOURCE_POOL) → overridable by args.
             target URLs = the in-scope screens the AI mapped for that run (= the AI decides the targets). checks/speed = Burp's named config.
@@ -99,8 +99,8 @@ commands:
             Phase2 business logic: hypothesis generation (LLM) → verify IDOR etc. with evidence discipline
   serve   [--port <n>] [--host <h>] [--out <dir>] [--web-root <dir>] [--no-web] [--password <pw>] [--viewer-password <pw>] [--no-auth] [--no-launch]
             start the observability WebUI + state API/WS (default 127.0.0.1:4317. expose to LAN with --host 0.0.0.0)
-            two roles gate the WebUI/API/WS (/login + signed cookie): operator = env AMRAAM_WEB_PASSWORD / --password (full: New/Resume/Stop/mutate);
-            viewer = env AMRAAM_WEB_PASSWORD_VIEWER / --viewer-password (read-only). ENV preferred over args. --no-auth disables the gate
+            two roles gate the WebUI/API/WS (/login + signed cookie): operator = env VERDICT_WEB_PASSWORD / --password (full: New/Resume/Stop/mutate);
+            viewer = env VERDICT_WEB_PASSWORD_VIEWER / --viewer-password (read-only). ENV preferred over args. --no-auth disables the gate
             the WebUI "+ New" launches pilot/assess by spawning the CLI as a child; --no-launch disables run launching
   report  --id <id> [--format md,html,pdf,csv] [--browser-path <bin>] [--no-sandbox] [--out <dir>]
             generate the diagnosis report from findings (by severity + repro + evidence + scope basis).
@@ -275,7 +275,7 @@ async function cmdReport(args: string[]): Promise<void> {
     written.push(p);
   }
   if (formats.includes("pdf")) {
-    const browserPath = values["browser-path"] ?? process.env.VERITAS_BROWSER_PATH;
+    const browserPath = values["browser-path"] ?? (process.env.VERDICT_BROWSER_PATH ?? process.env.VERITAS_BROWSER_PATH);
     const pdf = await htmlToPdf(html!, {
       ...(browserPath ? { executablePath: browserPath } : {}),
       ...(values["no-sandbox"] ? { noSandbox: true } : {}),
@@ -452,7 +452,7 @@ async function cmdCrawl(args: string[]): Promise<void> {
   const driver = await PlaywrightDriver.launch({
     userDataDir: profileDir,
     headless: !values.headed && !loginUrl,
-    executablePath: values["browser-path"] ?? process.env.VERITAS_BROWSER_PATH,
+    executablePath: values["browser-path"] ?? (process.env.VERDICT_BROWSER_PATH ?? process.env.VERITAS_BROWSER_PATH),
     args: values["no-sandbox"] ? ["--no-sandbox"] : undefined,
   });
 
@@ -729,7 +729,7 @@ async function cmdAssess(args: string[]): Promise<void> {
   const driver = await PlaywrightDriver.launch({
     userDataDir: profileDir,
     headless: !headed,
-    executablePath: values["browser-path"] ?? process.env.VERITAS_BROWSER_PATH,
+    executablePath: values["browser-path"] ?? (process.env.VERDICT_BROWSER_PATH ?? process.env.VERITAS_BROWSER_PATH),
     args: values["no-sandbox"] ? ["--no-sandbox"] : undefined,
     ...(httpBasic ? { httpCredentials: { username: httpBasic.user, password: httpBasic.pass } } : {}),
   });
@@ -992,7 +992,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
   const attended = !!values.attended || (resume && manifestHasManualRole(manifest)); // 手動マルチセッション認証(必ず headed)
   const headed = attended || (!values.headless && !!values.headed);
   if (attended && values.headless) console.log("⚠ --attended needs a headed browser for manual login (--headless ignored)");
-  const browserPath = values["browser-path"] ?? process.env.VERITAS_BROWSER_PATH;
+  const browserPath = values["browser-path"] ?? (process.env.VERDICT_BROWSER_PATH ?? process.env.VERITAS_BROWSER_PATH);
   const surveyOnly = !!values["survey-only"];
 
   let id: string;
@@ -1130,7 +1130,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
             onBurpScanPhase: async ({ keepWarm, cookie, bearer }: { keepWarm: () => Promise<void>; cookie: string; bearer: string }): Promise<void> => {
               const burpState = store.loadAssessment(id);
               if (!burpState) return;
-              // BURP_AUDIT_API が設定されてれば AMRAAM Audit REST(1338, セッション内包)を使う。無ければ標準 REST(1337)。
+              // BURP_AUDIT_API が設定されてれば VERDICT Audit REST(1338, セッション内包)を使う。無ければ標準 REST(1337)。
               const auditConn = resolveBurpAudit();
               if (auditConn) {
                 await runBurpAuditOnRun(store, id, burpState, runsDir, {
@@ -1314,11 +1314,12 @@ async function cmdServe(args: string[]): Promise<void> {
     console.error("warning: webui dist not found (build @veritas/webui first); serving API/WS only");
   }
   // WebUI 認証(2ロール): operator=全権 / viewer=閲覧のみ。ENV 主・引数はフォールバック。--no-auth で無効化。
-  //   operator: --password / env AMRAAM_WEB_PASSWORD   viewer: --viewer-password / env AMRAAM_WEB_PASSWORD_VIEWER
-  const operatorPw = values["no-auth"] ? undefined : (process.env.AMRAAM_WEB_PASSWORD ?? values.password);
-  const viewerPw = values["no-auth"] ? undefined : (process.env.AMRAAM_WEB_PASSWORD_VIEWER ?? values["viewer-password"]);
+  //   operator: --password / env VERDICT_WEB_PASSWORD   viewer: --viewer-password / env VERDICT_WEB_PASSWORD_VIEWER
+  //   旧名 AMRAAM_WEB_PASSWORD[_VIEWER] も fallback として受け付ける(既存 .env を壊さない)。
+  const operatorPw = values["no-auth"] ? undefined : (process.env.VERDICT_WEB_PASSWORD ?? process.env.AMRAAM_WEB_PASSWORD ?? values.password);
+  const viewerPw = values["no-auth"] ? undefined : (process.env.VERDICT_WEB_PASSWORD_VIEWER ?? process.env.AMRAAM_WEB_PASSWORD_VIEWER ?? values["viewer-password"]);
   if (!operatorPw && viewerPw) {
-    console.error("error: a viewer password was set without an operator password — set AMRAAM_WEB_PASSWORD (or --password) too.");
+    console.error("error: a viewer password was set without an operator password — set VERDICT_WEB_PASSWORD (or --password) too.");
     process.exit(1);
   }
   const authPasswords = operatorPw ? { operator: operatorPw, ...(viewerPw ? { viewer: viewerPw } : {}) } : undefined;
@@ -1345,7 +1346,7 @@ async function cmdServe(args: string[]): Promise<void> {
   );
   if (host === "0.0.0.0") {
     console.log("  ⚠ listening on all interfaces. from the LAN: http://<this-machine-ip>:" + srv.port + "/");
-    if (!authPasswords) console.log("  ⚠ exposed without auth. gate the WebUI with env AMRAAM_WEB_PASSWORD (operator) [+ AMRAAM_WEB_PASSWORD_VIEWER].");
+    if (!authPasswords) console.log("  ⚠ exposed without auth. gate the WebUI with env VERDICT_WEB_PASSWORD (operator) [+ VERDICT_WEB_PASSWORD_VIEWER].");
   }
   console.log("Ctrl-C to stop");
   let stopping = false;
@@ -1388,7 +1389,7 @@ async function cmdShots(args: string[]): Promise<void> {
     fail(`assessment ${id} not found in ${dbPath}`);
   }
 
-  const browserPath = values["browser-path"] ?? process.env.VERITAS_BROWSER_PATH;
+  const browserPath = values["browser-path"] ?? (process.env.VERDICT_BROWSER_PATH ?? process.env.VERITAS_BROWSER_PATH);
   const artifactsDir = join(runsDir, id, "artifacts");
   console.log(`▶ shots ${id}: ${state.screens.length} screens (reusing the run's browser-profile)`);
   const driver = await PlaywrightDriver.launch({
@@ -1605,7 +1606,7 @@ function resolveBurpRest(v: { "burp-api"?: string; "api-key"?: string; "resource
 }
 
 // operator 提供の Burp CustomConfiguration を読み込んで重ねる(named config の後勝ち)。スキーマはバージョン
-// 依存なので AMRAAM は生成せず、Burp から export した JSON をそのまま渡す。値は {{COOKIE}}/{{BEARER}} を live
+// 依存なので VERDICT は生成せず、Burp から export した JSON をそのまま渡す。値は {{COOKIE}}/{{BEARER}} を live
 // セッションで差し替える(置換後に JSON 妥当性チェック)。
 //   - BURP_SCAN_CONFIG_FILE: 普段使う scan policy(監査ポリシー = ScanPolicy.json 等)
 //   - BURP_SESSION_CONFIG_FILE: セッション注入の session-handling rule(認証下スキャン)
@@ -1808,8 +1809,8 @@ async function verifyImportedBurp(
   }
 }
 
-// ── AMRAAM Audit REST(別ポート 1338)経由のスキャン ──
-// 標準 REST(1337)と違い「認証済みの生リクエストをそのまま投入」する(セッション内包)。AMRAAM が
+// ── VERDICT Audit REST(別ポート 1338)経由のスキャン ──
+// 標準 REST(1337)と違い「認証済みの生リクエストをそのまま投入」する(セッション内包)。VERDICT が
 // inventory の in-scope エンドポイントを live Cookie/Bearer 込みの生リクエストにして送る → Burp が認証下を能動監査。
 
 /** JsonShape → 具体的なボディ例(reqSchema からダミー値)。Burp の insertion point 用。 */
@@ -1863,7 +1864,7 @@ function collectAuditRequests(state: AssessmentState): Array<{ method: string; u
   return specs.slice(0, 300);
 }
 
-/** AMRAAM Audit REST 経由でスキャン(submit→poll→issues→merge→verify→report)。非致命。 */
+/** VERDICT Audit REST 経由でスキャン(submit→poll→issues→merge→verify→report)。非致命。 */
 async function runBurpAuditOnRun(
   store: AssessmentStore,
   id: string,
@@ -2086,7 +2087,7 @@ async function cmdManifest(args: string[]): Promise<void> {
   type Role = { name: string; description?: string; username?: string; password?: string; cookieFile?: string };
 
   try {
-    console.log("\n=== AMRAAM scope-manifest generator ===");
+    console.log("\n=== VERDICT scope-manifest generator ===");
     console.log("authorized targets only. press Enter for the default at each prompt.\n");
 
     let target = "";

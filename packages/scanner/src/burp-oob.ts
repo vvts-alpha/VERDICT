@@ -1,6 +1,6 @@
-// AMRAAM Audit REST 拡張(同 1338)の OOB(Burp Collaborator)ルートのクライアント。
+// VERDICT Audit REST 拡張(同 1338)の OOB(Burp Collaborator)ルートのクライアント。
 // ブラインド SSRF/XXE/SQLi/OS コマンドインジェクション等を out-of-band で確証するために使う:
-//   ① oobPayload() で一意ドメインを発行 → AMRAAM が標的の注入点に埋める
+//   ① oobPayload() で一意ドメインを発行 → VERDICT が標的の注入点に埋める
 //   ② oobPoll() で interaction(DNS/HTTP/SMTP コールバック)を回収 → 来れば確証
 // conn は Audit REST と同じ(同一拡張・同一ポート)。
 

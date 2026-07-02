@@ -77,7 +77,7 @@ export function StatusBar({
   const { canWrite, authEnabled, role } = useRole();
   return (
     <header className="statusbar">
-      <a className="brand" href="?" title="Back to projects">AMRAAM</a>
+      <a className="brand" href="?" title="Back to projects">VERDICT</a>
       {authEnabled ? (
         <span className={`rolebadge ${role}`} title={canWrite ? "operator — full access" : "viewer — read-only"}>
           {role}

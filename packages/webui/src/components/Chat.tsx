@@ -55,14 +55,14 @@ export function Chat({ id }: { id: string }) {
         ) : (
           messages.map((m, i) => (
             <div key={i} className={`chat-msg ${m.role}`}>
-              <span className="chat-who">{m.role === "user" ? "You" : "AMRAAM"}</span>
+              <span className="chat-who">{m.role === "user" ? "You" : "VERDICT"}</span>
               <div className="chat-body">{m.content}</div>
             </div>
           ))
         )}
         {busy ? (
           <div className="chat-msg assistant">
-            <span className="chat-who">AMRAAM</span>
+            <span className="chat-who">VERDICT</span>
             <div className="chat-body chat-think">… thinking</div>
           </div>
         ) : null}

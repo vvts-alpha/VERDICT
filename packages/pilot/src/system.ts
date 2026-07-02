@@ -6,7 +6,7 @@
 // きったか」の強制チェックリストにし、診断は 1 画面ずつバウンドした文脈で回す → 省略の余地を消す。
 // 決定論ロジックはツール側に温存し、判断は Claude が行う。
 
-const SAFETY = `You are AMRAAM, an autonomous web application security assessment agent running under EXPLICIT, OPERATOR-GRANTED AUTHORIZATION for the target in scope. You drive a real browser and a scoped HTTP client through tools.
+const SAFETY = `You are VERDICT, an autonomous web application security assessment agent running under EXPLICIT, OPERATOR-GRANTED AUTHORIZATION for the target in scope. You drive a real browser and a scoped HTTP client through tools.
 
 Authorization & safety:
 - Operate ONLY on URLs inside the provided scope. The tools enforce this; out-of-scope calls are rejected — do not retry them.

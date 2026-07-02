@@ -1,6 +1,6 @@
-// AMRAAM Audit REST 拡張(別ポート、既定 1338)のクライアント。tools/burp-audit-ext/ の API を叩く。
+// VERDICT Audit REST 拡張(別ポート、既定 1338)のクライアント。tools/burp-audit-ext/ の API を叩く。
 // 標準 Burp REST(1337)と違い、認証済みの生 HTTP リクエストをそのまま投入する(セッションはリクエスト内包)。
-// → AMRAAM が live Cookie/Bearer を載せた生リクエストを送れば認証下を能動スキャンできる。
+// → VERDICT が live Cookie/Bearer を載せた生リクエストを送れば認証下を能動スキャンできる。
 
 import type { BurpIssue } from "./burp.js";
 

@@ -29,7 +29,7 @@ export interface ServerOptions {
   onLog?: (msg: string) => void;
   /** 設定すると WebUI/API/WS を認証ゲート(/login フォーム + 署名 Cookie)。operator は全権、
    *  viewer は read-only(全 POST と attended を 403)。未設定なら従来どおり無認証。
-   *  cmdServe が --password / --viewer-password / env AMRAAM_WEB_PASSWORD[_VIEWER] で渡す。 */
+   *  cmdServe が --password / --viewer-password / env VERDICT_WEB_PASSWORD[_VIEWER] で渡す。 */
   authPasswords?: AuthConfig;
   /** 設定すると WebUI から run を起動/停止/再開できる(server が CLI を子プロセスで spawn)。
    *  未設定なら /api/run 等は無効。cmdServe が CLI パス等を DI。 */
@@ -517,10 +517,10 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptio
     serveStatic(res, opts.webRoot, url);
     return;
   }
-  sendJson(res, 200, { service: "amraam-server", runsDir: opts.runsDir });
+  sendJson(res, 200, { service: "verdict-server", runsDir: opts.runsDir });
 }
 
-const CHAT_SYSTEM = `You are a security-assessment assistant embedded in AMRAAM's web UI. Answer the operator's questions about THIS assessment using ONLY the assessment data provided below (findings, screens, scope, stats). Cite finding ids (e.g. f-003) and screen ids when relevant. Be concise and concrete. If something is not in the data, say so plainly — do NOT invent vulnerabilities, severities, or facts. For risk/impact or remediation you may reason generally, but ground claims in the recorded evidence.`;
+const CHAT_SYSTEM = `You are a security-assessment assistant embedded in VERDICT's web UI. Answer the operator's questions about THIS assessment using ONLY the assessment data provided below (findings, screens, scope, stats). Cite finding ids (e.g. f-003) and screen ids when relevant. Be concise and concrete. If something is not in the data, say so plainly — do NOT invent vulnerabilities, severities, or facts. For risk/impact or remediation you may reason generally, but ground claims in the recorded evidence.`;
 
 /** assessment state を Claude への文脈テキストに整形(findings 本体 + 画面一覧 + scope)。 */
 function buildChatContext(state: AssessmentState): string {

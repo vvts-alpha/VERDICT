@@ -85,7 +85,7 @@ export function Index() {
   return (
     <div className="idx">
       <header className="idxhead">
-        <span className="brand">AMRAAM</span>
+        <span className="brand">VERDICT</span>
         <span className="idxtitle">Projects</span>
         <span className="idxcount">{rows ? `${rows.length}` : ""}</span>
         {authEnabled ? (

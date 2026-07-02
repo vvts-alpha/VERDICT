@@ -133,7 +133,7 @@ export function buildReportModel(state: AssessmentState, now: Date = new Date(),
 
   return {
     id: state.id,
-    brand: "AMRAAM",
+    brand: "VERDICT",
     target,
     phase: state.phase,
     startedAt: state.budget.startedAt,

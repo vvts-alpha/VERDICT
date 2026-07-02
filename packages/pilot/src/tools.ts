@@ -1386,9 +1386,9 @@ export function buildTools(s: PilotSession) {
       { url: z.string(), param: z.string().optional() },
       async ({ url, param }) => {
         const tok = `domX${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`;
-        // 実行時に window.__amraam_xss=tok を立て、alert でも出す(どちらか1つでも検出)。img.onerror は innerHTML 挿入で発火。
-        const payload = `"><img src=x onerror="window.__amraam_xss='${tok}';alert('${tok}')">`;
-        const benign = `amraam${tok}safe`;
+        // 実行時に window.__verdict_xss=tok を立て、alert でも出す(どちらか1つでも検出)。img.onerror は innerHTML 挿入で発火。
+        const payload = `"><img src=x onerror="window.__verdict_xss='${tok}';alert('${tok}')">`;
+        const benign = `verdict${tok}safe`;
         const buildUrl = (val: string): string | null => {
           try {
             if (url.includes("{{XSS}}")) return url.replace(/\{\{XSS\}\}/g, encodeURIComponent(val));
@@ -1787,9 +1787,9 @@ export function buildTools(s: PilotSession) {
       },
       async ({ store, renderUrl, renderBrowser, renderAsRole }) => {
         const tok = `stoX${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`;
-        const payload = `"><img src=x onerror="window.__amraam_xss='${tok}'">`;
-        const benign = `amraam${tok}safe`;
-        const sig = `onerror="window.__amraam_xss='${tok}'"`; // HTTP 反映の確証= 未エスケープのこの片が render に出ること
+        const payload = `"><img src=x onerror="window.__verdict_xss='${tok}'">`;
+        const benign = `verdict${tok}safe`;
+        const sig = `onerror="window.__verdict_xss='${tok}'"`; // HTTP 反映の確証= 未エスケープのこの片が render に出ること
         const effectMarker = renderBrowser ? tok : sig; // ブラウザ実行なら tok、HTTP 反映なら未エスケープ片
         if (!isInScope(store.url, s.scope) || !isInScope(renderUrl, s.scope)) return txt("BLOCKED: store/render url out of scope");
         // render を別ロールで覗く(cross-user stored XSS の確証)。roleSessions に無ければ現在のセッションのまま。
@@ -1891,7 +1891,7 @@ export function buildTools(s: PilotSession) {
         };
         const baseHeaders: Record<string, string> = {};
         for (const [k, v] of Object.entries(headers ?? {})) if (!dropHeaders.has(k.toLowerCase())) baseHeaders[k] = v;
-        const evil = "https://amraam-csrf.example";
+        const evil = "https://verdict-csrf.example";
         const crossOrigin = { origin: evil, referer: `${evil}/` };
         const fire = async (hdr: Record<string, string>, bdy: string | null, kind: "negative_control" | "positive_replay", tag: string) => {
           const req: HttpRequest = { method: method.toUpperCase(), url, headers: hdr, body: bdy };
@@ -1935,7 +1935,7 @@ export function buildTools(s: PilotSession) {
     ),
     tool(
       "probe_oob",
-      "Confirm a BLIND / out-of-band vuln via Burp Collaborator: blind SSRF, blind XXE, blind SQLi (DNS/HTTP exfil), OS command injection, header SSRF (X-Forwarded-Host / Referer / Host), email/webhook SSRF — anything where the EFFECT is the SERVER making an external request, not a visible response. Requires the AMRAAM Audit REST extension with Collaborator enabled (BURP_AUDIT_API). Put a {{OOB}} placeholder where the callback host belongs (a URL field, an XXE SYSTEM entity `<!ENTITY x SYSTEM \"http://{{OOB}}/\">`, a hostname, a header value). The tool generates a unique Collaborator host, injects it (in-scope target request), and polls ~waitSec for a DNS/HTTP/SMTP callback FROM the target; a callback = the server reached our host out-of-band = confirmed. Records a benign control + the injected request → negativeControl + positiveReplays evidenceIds for record_finding(category ssrf / rce as appropriate). NOTE: callbacks can lag seconds; nothing back after waitSec = not confirmed (try other params/headers/schemes).",
+      "Confirm a BLIND / out-of-band vuln via Burp Collaborator: blind SSRF, blind XXE, blind SQLi (DNS/HTTP exfil), OS command injection, header SSRF (X-Forwarded-Host / Referer / Host), email/webhook SSRF — anything where the EFFECT is the SERVER making an external request, not a visible response. Requires the VERDICT Audit REST extension with Collaborator enabled (BURP_AUDIT_API). Put a {{OOB}} placeholder where the callback host belongs (a URL field, an XXE SYSTEM entity `<!ENTITY x SYSTEM \"http://{{OOB}}/\">`, a hostname, a header value). The tool generates a unique Collaborator host, injects it (in-scope target request), and polls ~waitSec for a DNS/HTTP/SMTP callback FROM the target; a callback = the server reached our host out-of-band = confirmed. Records a benign control + the injected request → negativeControl + positiveReplays evidenceIds for record_finding(category ssrf / rce as appropriate). NOTE: callbacks can lag seconds; nothing back after waitSec = not confirmed (try other params/headers/schemes).",
       { method: z.string(), url: z.string(), headers: z.record(z.string()).optional(), body: z.string().nullable().optional(), waitSec: z.number().optional(), note: z.string().optional() },
       async ({ method, url, headers, body, waitSec, note }) => {
         if (!s.oob) return txt("OOB NOT AVAILABLE: set BURP_AUDIT_API (+ enable Collaborator in Burp) to use probe_oob. Without it, blind SSRF/XXE/SQLi cannot be confirmed out-of-band.");
@@ -1963,7 +1963,7 @@ export function buildTools(s: PilotSession) {
             validator: "claude-pilot-oob",
             kind,
             request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
-            response: { ...res, body: `[AMRAAM-OOB] ${resultBody}` },
+            response: { ...res, body: `[VERDICT-OOB] ${resultBody}` },
             note: note ? `${note} (oob)` : "oob",
           });
           return ev.id;
@@ -1971,7 +1971,7 @@ export function buildTools(s: PilotSession) {
         let controlEv: string;
         try {
           // negative control: コールバックしない良性ホストを注入(interaction が出ないこと)。
-          controlEv = await inject(`amraam-oob-noref-${payload.id.slice(0, 8)}.invalid`, "negative_control", "control: benign host, no callback expected");
+          controlEv = await inject(`verdict-oob-noref-${payload.id.slice(0, 8)}.invalid`, "negative_control", "control: benign host, no callback expected");
           // 本注入: collaborator host を埋めて送信。
           await inject(payload.host, "positive_replay", `injected Collaborator host ${payload.host} (id ${payload.id}); polling for callback…`);
         } catch (e) {

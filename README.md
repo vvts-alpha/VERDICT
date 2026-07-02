@@ -1,6 +1,6 @@
 <div align="center">
 
-# AMRAAM 🚀
+# VERDICT 🚀
 
 ### Autonomous web / API pentest agent
 
@@ -16,7 +16,7 @@ drives Burp for breadth, and reaches the authenticated surface other tools miss.
 ![tests](https://img.shields.io/badge/tests-passing-success)
 ![status](https://img.shields.io/badge/status-active-blue)
 
-[Quickstart](#-quickstart) · [How it works](#-how-it-works) · [Why AMRAAM](#-why-amraam) · [Burp](#-burp-integration) · [WebUI](#-webui)
+[Quickstart](#-quickstart) · [How it works](#-how-it-works) · [Why VERDICT](#-why-amraam) · [Burp](#-burp-integration) · [WebUI](#-webui)
 
 </div>
 
@@ -24,7 +24,7 @@ drives Burp for breadth, and reaches the authenticated surface other tools miss.
 
 > ⚠️ **Authorized testing only.** Every network action passes a scope gate; out-of-scope is denied, not attempted.
 
-AMRAAM runs a real browser and a scoped HTTP client through tools that **Claude operates** — survey → methodology → diagnosis → (multi-step logic) → (Burp) → report. It is **staged on purpose** so the model can't "skim and skip", and **evidence-disciplined** so a finding is `confirmed` only when it actually reproduces. Everything streams to a live WebUI.
+VERDICT runs a real browser and a scoped HTTP client through tools that **Claude operates** — survey → methodology → diagnosis → (multi-step logic) → (Burp) → report. It is **staged on purpose** so the model can't "skim and skip", and **evidence-disciplined** so a finding is `confirmed` only when it actually reproduces. Everything streams to a live WebUI.
 
 ## ✨ Features
 
@@ -77,15 +77,15 @@ flowchart LR
 
 Each stage is a **single `query()`** with a tool allow-list, so the model works one bounded context at a time. Model tiering routes high-value screens to a deep model (e.g. Opus) and survey / static screens to a fast one (e.g. Sonnet). `--survey-only` / `--resume` / `--attended` adjust the flow.
 
-## 🧠 Why AMRAAM
+## 🧠 Why VERDICT
 
-| | What others do | What AMRAAM does |
+| | What others do | What VERDICT does |
 |---|---|---|
 | **Coverage** | "scan the site" → the model skims and skips | Stages + a coverage gate make completeness a *contract*, not luck |
 | **False positives** | a pile of maybe-bugs to triage | `confirmed` is only set after a failing control + ≥2 stable replays |
 | **Authenticated surface** | scanner can't carry the session → 401s | session **in the request** (Burp Audit REST) + Bearer propagation |
 | **Breadth vs depth** | one tool, one tradeoff | AI depth (IDOR/authz/logic) × Burp breadth (injection), merged + re-verified |
-| **Ground truth** | rely on Burp's lossy auto-discovery | AMRAAM holds the auth + every param and **declares** them (OpenAPI / raw requests) |
+| **Ground truth** | rely on Burp's lossy auto-discovery | VERDICT holds the auth + every param and **declares** them (OpenAPI / raw requests) |
 | **Overfitting** | hardcoded heuristics | standard techniques + LLM judgement — no app-specific vocabulary baked in |
 
 ## 🛠 Commands
@@ -138,12 +138,12 @@ node packages/cli/dist/main.js pilot --manifest m.json --burp-proxy
 # active scan after diagnosis → merge net-new → AI re-verify High+
 node packages/cli/dist/main.js pilot --manifest m.json --burp-scan       # standard REST (1337), unauth crawl+audit
 
-# 🔐 authenticated active scan (recommended) — AMRAAM Audit REST extension (port 1338)
+# 🔐 authenticated active scan (recommended) — VERDICT Audit REST extension (port 1338)
 export BURP_AUDIT_API=http://127.0.0.1:1338 BURP_AUDIT_TOKEN=<secret>
 node packages/cli/dist/main.js pilot --manifest m.json --burp-scan       # → routes through the extension automatically
 ```
 
-The standard REST API can't pass a session to a scan. The **[`tools/burp-audit-ext/`](tools/burp-audit-ext/) Montoya extension** sidesteps that: AMRAAM submits the **authenticated raw request itself** (cookie + Bearer baked in), so Burp audits *behind login*, with no crawl explosion. `BURP_AUDIT_API` flips `--burp-scan` onto this path; otherwise it falls back to the standard REST. Build it with `gradle shadowJar` and load the jar in Burp.
+The standard REST API can't pass a session to a scan. The **[`tools/burp-audit-ext/`](tools/burp-audit-ext/) Montoya extension** sidesteps that: VERDICT submits the **authenticated raw request itself** (cookie + Bearer baked in), so Burp audits *behind login*, with no crawl explosion. `BURP_AUDIT_API` flips `--burp-scan` onto this path; otherwise it falls back to the standard REST. Build it with `gradle shadowJar` and load the jar in Burp.
 
 > **Division of labour:** the agent = emergent logic (IDOR chains, mass-assignment, business logic); Burp = mechanical injection breadth (A03 SQLi/XSS) + passive. Overlap is de-duped; imported High+ findings are re-tested by the agent.
 
@@ -151,11 +151,11 @@ The standard REST API can't pass a session to a scan. The **[`tools/burp-audit-e
 
 One target = one page. Left: **SITE TREE** (URL hierarchy + scan badges). Top: progress bar. Right tabs: **Screen** (screenshot + APIs + findings), **Findings** (filter + inline evidence viewer), **APIs**, **Diagnostic log** (live), **💬 Ask** (read-only Q&A over the assessment).
 
-From `/` (the **projects list**) you can **launch and control runs**: **+ New** opens a full manifest editor — target, scope mode, model tiering, **custom headers** (name/value), **login URL**, **target-URL list import** (CSV / one-per-line), **max screens**, HTTP Basic, auth roles — and the server spawns the CLI as a child process. Stop / Resume per run. Expose with `--host 0.0.0.0` **and** `--password` / `AMRAAM_WEB_PASSWORD`.
+From `/` (the **projects list**) you can **launch and control runs**: **+ New** opens a full manifest editor — target, scope mode, model tiering, **custom headers** (name/value), **login URL**, **target-URL list import** (CSV / one-per-line), **max screens**, HTTP Basic, auth roles — and the server spawns the CLI as a child process. Stop / Resume per run. Expose with `--host 0.0.0.0` **and** `--password` / `VERDICT_WEB_PASSWORD`.
 
 ## 🎯 Detection coverage
 
-OWASP-mapped: **A01** access control (IDOR/BOLA, auth-bypass) · **A03** injection (SQLi, reflected XSS, path-traversal) · **A04** business logic (price/qty tampering, mass-assignment, workflow bypass) · **A07** auth (JWT alg:none / claim tampering, predictable cookies) · **A10** SSRF / open-redirect · plus info-disclosure and header audit. Deep payload breadth (XSS variants, SSTI, desync) is delegated to **Burp**; AMRAAM imports and re-verifies.
+OWASP-mapped: **A01** access control (IDOR/BOLA, auth-bypass) · **A03** injection (SQLi, reflected XSS, path-traversal) · **A04** business logic (price/qty tampering, mass-assignment, workflow bypass) · **A07** auth (JWT alg:none / claim tampering, predictable cookies) · **A10** SSRF / open-redirect · plus info-disclosure and header audit. Deep payload breadth (XSS variants, SSTI, desync) is delegated to **Burp**; VERDICT imports and re-verifies.
 
 ## ⚙️ Setup & requirements
 
@@ -198,6 +198,6 @@ server   webui ──────────┴── core   (types · SQLite s
 
 <div align="center">
 
-**AMRAAM** — autonomous · evidence-disciplined · authenticated-deep web/API pentest.
+**VERDICT** — autonomous · evidence-disciplined · authenticated-deep web/API pentest.
 
 </div>
