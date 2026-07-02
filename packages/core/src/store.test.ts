@@ -47,6 +47,29 @@ test("createAssessment writes an empty assessment to state.sqlite (M0 完了条�
   });
 });
 
+test("two writable connections on the same file both write (server + spawned pilot share state.sqlite)", () => {
+  withTempDb((dbPath) => {
+    const a = AssessmentStore.open(dbPath);
+    const { id } = a.createAssessment({
+      target: { kind: "single_url", url: "https://example.com/", followLinks: true, maxDepth: 2 },
+      scope: deriveScopeFromSingleUrl("https://example.com/"),
+      budget: defaultBudget(),
+    });
+    const b = AssessmentStore.open(dbPath); // 別コネクション(= spawn された pilot に相当)
+    // 交互に書き込む。BEGIN IMMEDIATE + busy_timeout により "database is locked" で落ちず両方成功する。
+    assert.doesNotThrow(() => {
+      a.setPaused(id, true, "A");
+      b.setPaused(id, false, "B");
+      a.setPaused(id, true, "A again");
+    });
+    const loaded = b.loadAssessment(id);
+    assert.ok(loaded, "state reloads from the second connection");
+    assert.ok(loaded.events.length >= 2, "pause events from both connections are persisted");
+    a.close();
+    b.close();
+  });
+});
+
 test("state is durable across reopen", () => {
   withTempDb((dbPath) => {
     const store = AssessmentStore.open(dbPath);

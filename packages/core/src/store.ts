@@ -525,9 +525,12 @@ export class AssessmentStore {
     }
   }
 
-  /** トランザクション境界。node:sqlite はネスト非対応なので内部ヘルパは tx を開かない。 */
+  /** トランザクション境界。node:sqlite はネスト非対応なので内部ヘルパは tx を開かない。
+   *  BEGIN IMMEDIATE で開始時に書き込みロックを取得する — deferred BEGIN だと read→write の昇格時に
+   *  他プロセス(server↔spawn された pilot)と競合し、busy_timeout を無視して即 "database is locked" に
+   *  なる(昇格待ちはデッドロックの恐れがあるため SQLite が待たない)。IMMEDIATE なら busy_timeout が効き待機する。 */
   private tx<T>(fn: () => T): T {
-    this.db.exec("BEGIN");
+    this.db.exec("BEGIN IMMEDIATE");
     try {
       const result = fn();
       this.db.exec("COMMIT");

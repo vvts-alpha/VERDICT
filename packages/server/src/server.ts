@@ -266,14 +266,29 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
     store.close();
     sendJson(res, 200, state ? buildStateView(state) : { ok: true });
   };
+  // 書き込み系はここで防御: DB が(spawn された pilot との競合で)一時的にロックされ書けなくても、
+  // store を閉じて 503 を返すだけにする — 例外を投げるとリクエストハンドラ経由でサーバごと落ちるため。
+  const mutateAndReply = (id: string, store: AssessmentStore, fn: () => void): void => {
+    try {
+      fn();
+    } catch (e) {
+      try {
+        store.close();
+      } catch {
+        /* 既にクローズ済み等は無視 */
+      }
+      sendJson(res, 503, { error: `state store busy, retry shortly: ${String(e).slice(0, 120)}` });
+      return;
+    }
+    replyView(id, store);
+  };
 
   let m = url.match(/^\/api\/assessments\/([^/]+)\/(pause|resume)$/);
   if (m) {
     const id = decodeURIComponent(m[1] ?? "");
     const store = openStore(id);
     if (!store) return sendJson(res, 404, { error: "not found" });
-    store.setPaused(id, m[2] === "pause", "via WebUI");
-    return replyView(id, store);
+    return mutateAndReply(id, store, () => store.setPaused(id, m![2] === "pause", "via WebUI"));
   }
 
   m = url.match(/^\/api\/assessments\/([^/]+)\/handoffs\/([^/]+)\/resolve$/);
@@ -282,9 +297,10 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
     const handoffId = decodeURIComponent(m[2] ?? "");
     const store = openStore(id);
     if (!store) return sendJson(res, 404, { error: "not found" });
-    const handoff = store.loadAssessment(id)?.handoffs.find((h) => h.id === handoffId);
-    if (handoff) store.upsertHandoff(id, { ...handoff, status: "resolved", resolvedAt: new Date().toISOString() });
-    return replyView(id, store);
+    return mutateAndReply(id, store, () => {
+      const handoff = store.loadAssessment(id)?.handoffs.find((h) => h.id === handoffId);
+      if (handoff) store.upsertHandoff(id, { ...handoff, status: "resolved", resolvedAt: new Date().toISOString() });
+    });
   }
 
   m = url.match(/^\/api\/assessments\/([^/]+)\/screens\/([^/]+)\/exclude$/);
@@ -293,8 +309,7 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
     const screenId = decodeURIComponent(m[2] ?? "");
     const store = openStore(id);
     if (!store) return sendJson(res, 404, { error: "not found" });
-    store.setScreenScanStatus(id, screenId, "excluded");
-    return replyView(id, store);
+    return mutateAndReply(id, store, () => store.setScreenScanStatus(id, screenId, "excluded"));
   }
 
   sendJson(res, 404, { error: "unknown control endpoint" });
