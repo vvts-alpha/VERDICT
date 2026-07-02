@@ -12,10 +12,10 @@ import java.util.Map;
 
 /**
  * Burp Collaborator を使った OOB(out-of-band)相互作用の薄いラッパ。
- * - generate(): 一意ペイロード(ドメイン)を発行。AMRAAM が標的の注入点(SSRF url / XXE SYSTEM /
+ * - generate(): 一意ペイロード(ドメイン)を発行。VERDICT が標的の注入点(SSRF url / XXE SYSTEM /
  *   blind-SQLi の DNS exfil / メール / X-Forwarded-Host 等)に埋める。
  * - poll():     Collaborator サーバから interaction(DNS/HTTP/SMTP)を回収して **自前で蓄積**し、全件返す
- *   (getAllInteractions が「新着のみ」を返す実装に備える)。AMRAAM 側で since/id で絞る。
+ *   (getAllInteractions が「新着のみ」を返す実装に備える)。VERDICT 側で since/id で絞る。
  * Collaborator が無効/利用不可(プロジェクト設定で off 等)なら available()=false。
  */
 public final class OobManager {

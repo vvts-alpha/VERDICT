@@ -49,7 +49,7 @@ public final class ApiServer {
     }
 
     public void start() throws IOException {
-        // host = 127.0.0.1(既定)or 0.0.0.0(別マシンの AMRAAM から到達させる場合。AUTH_TOKEN 併用推奨)。
+        // host = 127.0.0.1(既定)or 0.0.0.0(別マシンの VERDICT から到達させる場合。AUTH_TOKEN 併用推奨)。
         server = new MicroHttpServer(host, port, this::dispatch);
         server.start();
     }
@@ -207,7 +207,7 @@ public final class ApiServer {
         List<AuditIssue> issues = new ArrayList<>();
         for (IssueStore.Entry e : store.query(since, host)) issues.add(e.issue);
 
-        Path tmp = Files.createTempFile("amraam-burp-report", html ? ".html" : ".xml");
+        Path tmp = Files.createTempFile("verdict-burp-report", html ? ".html" : ".xml");
         try {
             api.scanner().generateReport(issues, html ? ReportFormat.HTML : ReportFormat.XML, tmp);
             byte[] bytes = Files.readAllBytes(tmp);
@@ -217,7 +217,7 @@ public final class ApiServer {
         }
     }
 
-    // ── OOB(Burp Collaborator)── AMRAAM がブラインド SSRF/XXE/SQLi 等の確証に使う。
+    // ── OOB(Burp Collaborator)── VERDICT がブラインド SSRF/XXE/SQLi 等の確証に使う。
     // POST /oob/payload → 一意ドメイン発行 / GET /oob/interactions?since=&id= → コールバック回収。
     private void handleOobPayload(MicroHttpServer.Response resp) throws IOException {
         if (oob == null || !oob.available()) {
@@ -275,7 +275,7 @@ public final class ApiServer {
 
     // バンドルした OpenAPI を Swagger UI(CDN)で描画。オフラインでも /openapi.yaml は生で取れる。
     private static final String SWAGGER_HTML =
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>AMRAAM Audit REST</title>"
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>VERDICT Audit REST</title>"
         + "<link rel=\"stylesheet\" href=\"https://unpkg.com/swagger-ui-dist/swagger-ui.css\"></head>"
         + "<body><div id=\"swagger-ui\"></div>"
         + "<script src=\"https://unpkg.com/swagger-ui-dist/swagger-ui-bundle.js\"></script>"

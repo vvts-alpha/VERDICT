@@ -1,1 +1,1 @@
-rootProject.name = "amraam-burp-audit"
+rootProject.name = "verdict-burp-audit"

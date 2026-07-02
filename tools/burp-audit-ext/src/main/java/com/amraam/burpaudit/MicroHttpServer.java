@@ -17,7 +17,7 @@ import java.util.concurrent.Executors;
 /**
  * 依存ゼロの最小 HTTP/1.1 サーバ(java.net.ServerSocket のみ。connection-close per request)。
  * Burp の拡張クラスローダは com.sun.net.httpserver(jdk.httpserver モジュール)を解決できないため、
- * java.base だけで動くこれを使う。AMRAAM(行儀の良いクライアント)向けの小さな API 用。
+ * java.base だけで動くこれを使う。VERDICT(行儀の良いクライアント)向けの小さな API 用。
  */
 public final class MicroHttpServer {
 
@@ -88,7 +88,7 @@ public final class MicroHttpServer {
         socket.setReuseAddress(true);
         socket.bind(new InetSocketAddress(host, port));
         running = true;
-        Thread t = new Thread(this::acceptLoop, "amraam-audit-http");
+        Thread t = new Thread(this::acceptLoop, "verdict-audit-http");
         t.setDaemon(true);
         t.start();
     }

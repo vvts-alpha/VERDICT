@@ -11,7 +11,7 @@ import java.util.Properties;
 
 /**
  * 拡張の設定(host / port / token)。Windows の GUI Burp には env が伝わりにくいので、
- * **jar の隣の amraam-audit.properties** を主軸にする(初回に雛形を自動生成)。
+ * **jar の隣の verdict-audit.properties** を主軸にする(初回に雛形を自動生成)。
  * 優先順位: 設定ファイル > 環境変数(SCAN_API_HOST/SCAN_API_PORT/AUTH_TOKEN)> 既定。
  */
 public final class Config {
@@ -51,15 +51,15 @@ public final class Config {
     public static Path writeTemplateIfMissing(Class<?> anchor) {
         Path home = pathOrNull(System.getProperty("user.home"));
         if (home == null) return null;
-        Path file = home.resolve(".amraam-audit.properties");
+        Path file = home.resolve(".verdict-audit.properties");
         // 既にどこかに設定があるなら雛形は書かない。
         if (Files.exists(file)) return null;
         for (Path cand : candidates(anchor)) {
             if (cand != null && Files.isRegularFile(cand)) return null;
         }
         String tpl = ""
-            + "# AMRAAM Audit REST 設定。編集したら Burp で拡張を Reload。\n"
-            + "# bind 先。別マシンの AMRAAM から叩くなら 0.0.0.0(token 必須)。\n"
+            + "# VERDICT Audit REST 設定。編集したら Burp で拡張を Reload。\n"
+            + "# bind 先。別マシンの VERDICT から叩くなら 0.0.0.0(token 必須)。\n"
             + "host=127.0.0.1\n"
             + "# listen ポート。\n"
             + "port=1338\n"
@@ -75,10 +75,10 @@ public final class Config {
 
     private static Path[] candidates(Class<?> anchor) {
         // 優先順: 明示 env パス > ユーザホーム(Burp の temp コピーに左右されない正準) > jar の隣(保険)。
-        Path envPath = pathOrNull(System.getenv("AMRAAM_AUDIT_CONFIG"));
+        Path envPath = pathOrNull(System.getenv("VERDICT_AUDIT_CONFIG"));
         Path home = pathOrNull(System.getProperty("user.home"));
-        Path homeCfg = home != null ? home.resolve(".amraam-audit.properties") : null;
-        Path jarSide = jarDir(anchor) != null ? jarDir(anchor).resolve("amraam-audit.properties") : null;
+        Path homeCfg = home != null ? home.resolve(".verdict-audit.properties") : null;
+        Path jarSide = jarDir(anchor) != null ? jarDir(anchor).resolve("verdict-audit.properties") : null;
         return new Path[] { envPath, homeCfg, jarSide };
     }
 

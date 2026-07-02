@@ -12,10 +12,10 @@ API 仕様は `API.md`(本ディレクトリ)。
 
 ## Prebuilt jar(ビルド不要・すぐ使う）
 
-`prebuilt/amraam-burp-audit.jar` をそのまま Burp にロードできる(Gson 同梱の fat jar、`montoya-api:2026.4` でコンパイル済み）。
+`prebuilt/verdict-burp-audit.jar` をそのまま Burp にロードできる(Gson 同梱の fat jar、`montoya-api:2026.4` でコンパイル済み）。
 
 - **既定は `127.0.0.1:1338` + 認証なし**(config も env も無い場合）= **localhost 限定なので安全**。同一マシンの VERDICT からだけ叩ける。
-- **別マシン(WSL→Windows 等)から叩くなら**、初回ロード時にユーザホームへ生成される `~/.amraam-audit.properties` を編集 → `host=0.0.0.0` + `token=<秘密>` を設定 → 拡張を Reload(0.0.0.0 公開時は token 必須）。
+- **別マシン(WSL→Windows 等)から叩くなら**、初回ロード時にユーザホームへ生成される `~/.verdict-audit.properties` を編集 → `host=0.0.0.0` + `token=<秘密>` を設定 → 拡張を Reload(0.0.0.0 公開時は token 必須）。
 - ソース(`src/`）を変更したら `gradle shadowJar` で焼き直すこと(この prebuilt は**手動更新の便宜バイナリ**で、ソースと自動同期はしない）。
 
 ## ビルド
@@ -24,7 +24,7 @@ API 仕様は `API.md`(本ディレクトリ)。
 
 ```bash
 cd tools/burp-audit-ext
-gradle shadowJar           # → build/libs/amraam-burp-audit.jar (Gson 同梱の fat jar)
+gradle shadowJar           # → build/libs/verdict-burp-audit.jar (Gson 同梱の fat jar)
 ```
 
 **`montoya-api:2026.4` でコンパイル検証済み**(javac で全クラス生成・`AuditExtension implements BurpExtension` 確認）。
@@ -33,7 +33,7 @@ gradle shadowJar           # → build/libs/amraam-burp-audit.jar (Gson 同梱�
 ## Burp へのロード
 
 1. Burp → **Extensions → Installed → Add**
-2. Extension type: **Java**、Select file: `build/libs/amraam-burp-audit.jar`
+2. Extension type: **Java**、Select file: `build/libs/verdict-burp-audit.jar`
 3. 出力に `VERDICT Audit REST listening on http://127.0.0.1:1338` が出れば OK
 
 ### オプション(env、Burp 起動プロセスに渡す)

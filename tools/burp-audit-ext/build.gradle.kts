@@ -21,7 +21,7 @@ java {
 }
 
 tasks.shadowJar {
-    archiveBaseName.set("amraam-burp-audit")
+    archiveBaseName.set("verdict-burp-audit")
     archiveClassifier.set("")
     archiveVersion.set("")
     // Gson の名前衝突を避けたい場合は relocate を有効化(任意):

@@ -9,16 +9,16 @@ import java.io.IOException;
 import java.nio.file.Path;
 
 /**
- * AMRAAM Audit REST — Montoya 拡張のエントリ。
+ * VERDICT Audit REST — Montoya 拡張のエントリ。
  * - Scanner の AuditIssueHandler を登録して、検出 issue を発生時刻 + req/resp つきで蓄積する。
- * - 設定(host/port/token)は jar 隣の amraam-audit.properties から読む(初回に雛形を自動生成)。
+ * - 設定(host/port/token)は jar 隣の verdict-audit.properties から読む(初回に雛形を自動生成)。
  * - REST API(POST /scan, GET /status, /issues, /report, /docs, /openapi.yaml, POST /reset)を立てる。
  */
 public class AuditExtension implements BurpExtension {
 
     @Override
     public void initialize(MontoyaApi api) {
-        api.extension().setName("AMRAAM Audit REST");
+        api.extension().setName("VERDICT Audit REST");
 
         IssueStore store = new IssueStore();
         api.scanner().registerAuditIssueHandler(new AuditIssueHandler() {
@@ -47,7 +47,7 @@ public class AuditExtension implements BurpExtension {
             ApiServer server = new ApiServer(api, store, registry, oob, cfg.host, cfg.port, cfg.token);
             server.start();
             api.logging().logToOutput(
-                "AMRAAM Audit REST listening on http://" + cfg.host + ":" + cfg.port
+                "VERDICT Audit REST listening on http://" + cfg.host + ":" + cfg.port
                 + (cfg.token != null ? " (X-Scan-Token required)" : " (no auth)")
                 + "  — docs: /docs , spec: /openapi.yaml , oob: /oob/payload");
             api.extension().registerUnloadingHandler(server::stop);
