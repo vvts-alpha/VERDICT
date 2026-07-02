@@ -15,7 +15,8 @@ drives Burp for breadth, and reaches the authenticated surface other tools miss.
 ![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)
 ![LLM](https://img.shields.io/badge/LLM-Claude%20(CLI%20sub)-D97757?logo=anthropic&logoColor=white)
 ![Playwright](https://img.shields.io/badge/Browser-Playwright%20chromium-2EAD33?logo=playwright&logoColor=white)
-![tests](https://img.shields.io/badge/tests-passing-success)
+[![CI](https://github.com/veritas-rt/UmbraHands/actions/workflows/ci.yml/badge.svg)](https://github.com/veritas-rt/UmbraHands/actions/workflows/ci.yml)
+[![XBOW-Bench](https://img.shields.io/badge/XBOW--Bench-92%25%20(100%2F109)-2ea043)](benchmarks/xbow-bench)
 ![status](https://img.shields.io/badge/status-active-blue)
 
 [Quickstart](#-quickstart) · [How it works](#-how-it-works) · [Why VERDICT](#-why-verdict) · [Burp](#-burp-integration) · [WebUI](#-webui)
