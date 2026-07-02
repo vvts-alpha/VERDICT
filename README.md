@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="assets/verdict-banner.png" alt="VERDICT — Verified Exploitation, Reconnaissance & Diagnosis · Intrusion Confirmation Testing" width="920" />
+
 # VERDICT 🚀
 
 ### Autonomous web / API pentest agent
