@@ -14,12 +14,15 @@ browser-profiles/
 *.sqlite-shm
 *.sqlite-wal
 
-# 資格情報を含む実 manifest(scope_manifest.example.json だけ残す)
+# 資格情報を含む実 manifest(templates/scope_manifest.example.json だけ残す)
 scope_manifest.json
 scope_manifest_*.json
 scope_manifest.*.json
 !scope_manifest.example.json
 *.manifest.json
+
+# プレゼン deck の成果物(decks/generate_*_deck.py から再生成可能。バイナリは追跡しない)
+decks/*.pptx
 vault.json
 .env
 
