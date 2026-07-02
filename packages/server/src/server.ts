@@ -374,6 +374,12 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptio
       handleLogout(res);
       return;
     }
+    // ログイン画面が参照する公開ブランドアセット(ロゴ・favicon)は未認証でも配信する
+    //   — でないとゲートが 302 /login に飛ばし、ログイン画面のロゴ/favicon が壊れる。
+    if (req.method === "GET" && opts.webRoot && (url === "/verdict-title.png" || url === "/favicon.png")) {
+      serveStatic(res, opts.webRoot, url);
+      return;
+    }
     const r = roleForReq(req, cfg, now);
     if (!r) {
       if (url.startsWith("/api/") || req.method === "POST") {
