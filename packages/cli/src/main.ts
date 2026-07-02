@@ -50,7 +50,8 @@ commands:
   manifest [--out <file.json>] [--force]   (alias: init)
             interactive scope-manifest generator: answer the prompts to produce the JSON pilot/assess read
             (target / in·out-of-scope hosts·path / rate / crawl / model / auth roles. password echo is masked)
-  pilot   --manifest <file.json> | --url <url> [--model <m>] [--fast-model <m>] [--max-turns <n>] [--rate <ms>] [--headed] [--focus "<text>"] [--browser-path <bin>] [--no-sandbox] [--out <dir>]
+  pilot   --manifest <file.json> | --url <url> [--model <m>] [--fast-model <m>] [--max-turns <n>] [--max-screens <n>] [--max-survey-screens <n>] [--rate <ms>] [--headed] [--focus "<text>"] [--browser-path <bin>] [--no-sandbox] [--out <dir>]
+            --max-screens caps how many screens get diagnosed (default 40); --max-survey-screens caps how many the survey maps (default unlimited — stops exploring once reached)
             ★Claude-led: Claude drives the tools (browser/http/login/record) to autonomously explore, verify, and record
             --focus "<text>": operator emphasis injected as the TOP priority of the A04 scenario stage (not per-screen diagnosis). e.g. "決済フローと /api/orders の IDOR を重点的に"
             uses the manifest's auth.roles via the login(role) tool. more flexible than the deterministic pipeline (no metered API / Max subscription)
@@ -956,6 +957,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       rate: { type: "string" },
       "max-turns": { type: "string" },
       "max-screens": { type: "string" },
+      "max-survey-screens": { type: "string" },
       focus: { type: "string" }, // 操作者の重点ヒント(自由文)。シナリオ段の最優先目的として注入(per-screen には混ぜない)
       "no-input-sweep": { type: "boolean" }, // 各画面で入力欄を benign 値で送信して新ルート/API を発見(既定 on)。立てると無効
       "safe-forms": { type: "boolean" }, // 入力スイープで POST フォームを送信しない(GET/検索のみ=標的にデータを書かない)
@@ -1107,6 +1109,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       ...(values["login-url"] ? { loginUrl: values["login-url"] } : {}),
       ...(values["control-url"] ? { controlUrl: values["control-url"] } : {}),
       ...(values["max-screens"] ? { maxScreens: Number.parseInt(values["max-screens"], 10) } : {}),
+      ...(values["max-survey-screens"] ? { maxSurveyScreens: Number.parseInt(values["max-survey-screens"], 10) } : {}),
       ...(roleCookieFiles.size ? { roleCookieFiles } : {}),
       ...(roleDescriptions.size ? { roleDescriptions } : {}),
       fastModel: values["fast-model"] ?? "claude-sonnet-4-6", // fast モデル既定 = Sonnet(survey/methodology/低価値画面 → model tiering を既定 ON)

@@ -64,6 +64,8 @@ export interface RunPilotOptions {
   noSandbox?: boolean;
   /** 診断する画面数の上限(既定 40)。 */
   maxScreens?: number;
+  /** survey が写像する画面数の上限(--max-survey-screens)。到達したら探索停止。未設定=無制限。 */
+  maxSurveyScreens?: number;
   /** 既存 run の再開: survey/methodology をスキップし、未診断(非 terminal)画面だけ診断する。 */
   resume?: boolean;
   /** 全量抽出(画面調査): survey の動的間引き(ignore_paths)を無効化し、全画面をマップする。
@@ -426,6 +428,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     frontier: new Set(),
     ignorePaths: [],
     exhaustive: !!opts.exhaustiveSurvey,
+    ...(opts.maxSurveyScreens != null ? { maxSurveyScreens: opts.maxSurveyScreens } : {}),
     lockToSeeds: !!opts.lockToSeeds,
     inputSweep: opts.inputSweep ?? true,
     aggressiveForms: opts.aggressiveForms ?? true,

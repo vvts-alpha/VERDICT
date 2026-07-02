@@ -34,6 +34,8 @@ export interface StartRunInput {
     loginUrl?: string;
     /** 診断する画面数の上限(既定 40)。0/未指定で既定。 */
     maxScreens?: number;
+    /** survey が写像する画面数の上限。到達したら探索停止。未指定=無制限。 */
+    maxSurveyScreens?: number;
     /** 操作者の重点ヒント(自由文)。シナリオ段の最優先目的として注入される(--focus)。 */
     focus?: string;
     /** pilot のみ: 診断後に Burp 能動スキャンも実施(接続は env BURP_API)。 */
@@ -88,6 +90,7 @@ export class Supervisor {
     if (o.attended) args.push("--attended");
     if (o.loginUrl) args.push("--login-url", o.loginUrl);
     if (o.maxScreens != null) args.push("--max-screens", String(o.maxScreens));
+    if (o.maxSurveyScreens != null) args.push("--max-survey-screens", String(o.maxSurveyScreens));
     if (o.focus) args.push("--focus", o.focus);
     if (input.command === "pilot" && o.burpScan) args.push("--burp-scan");
     if (input.command === "pilot" && o.burpProxy) args.push("--burp-proxy");

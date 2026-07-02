@@ -80,6 +80,10 @@ export interface PilotSession {
   ignorePaths: string[];
   /** 全量抽出モード(--exhaustive)。true なら ignore_paths は無効(全画面マップ)。 */
   exhaustive: boolean;
+  /** survey が写像する画面数の上限(--max-survey-screens)。到達したら探索を止める(frontier を空に)。未設定=無制限。 */
+  maxSurveyScreens?: number;
+  /** 上限到達フラグ(recordObservation が立て、survey_status が「これ以上探索しない」を伝える)。 */
+  surveyCapped?: boolean;
   /** URL リストのハードロック。true なら recordObservation で発見リンクを frontier に積まない
    *  (横断クロールせず、シード URL だけをマップする)。 */
   lockToSeeds: boolean;
@@ -627,8 +631,18 @@ function recordObservation(s: PilotSession, o: Observation): { screen: Screen; i
   const here = stripHash(o.finalUrl);
   s.visited.add(here);
   s.frontier.delete(here);
-  // 画面 + その API は記録済み(上の ingest)。ハードロックなら発見リンクは積まない(frontierLinks が [])。
-  for (const abs of frontierLinks(o, s)) s.frontier.add(abs);
+  // 探索上限(--max-survey-screens): 到達したら frontier を空にし、以降は発見リンクを積まない
+  //   (これ以上写像しない → survey_status のフロンティアが空になりモデルが survey_done を呼ぶ)。
+  if (s.maxSurveyScreens != null && s.inv.screens().length >= s.maxSurveyScreens) {
+    if (!s.surveyCapped) {
+      s.surveyCapped = true;
+      s.frontier.clear();
+      s.store.appendEvent(s.assessmentId, { type: "note", payload: { message: `🧭 survey cap reached (${s.maxSurveyScreens} screens) — stopping exploration; remaining links not followed` } });
+    }
+  } else {
+    // 画面 + その API は記録済み(上の ingest)。ハードロックなら発見リンクは積まない(frontierLinks が [])。
+    for (const abs of frontierLinks(o, s)) s.frontier.add(abs);
+  }
   return { screen, isNew };
 }
 
@@ -818,6 +832,8 @@ export function buildTools(s: PilotSession) {
             frontier: [...s.frontier].slice(0, 40),
             ignoring: s.ignorePaths,
             exhaustive: s.exhaustive,
+            ...(s.maxSurveyScreens != null ? { maxSurveyScreens: s.maxSurveyScreens } : {}),
+            ...(s.surveyCapped ? { capReached: true, note: `screen cap (${s.maxSurveyScreens}) reached — exploration stopped; call survey_done (after logging in for each role if any are still un-authed).` } : {}),
           }),
         );
       },

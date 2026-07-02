@@ -60,6 +60,7 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
   const [headersList, setHeadersList] = useState<Array<{ name: string; value: string }>>([]);
   const [loginUrl, setLoginUrl] = useState(""); // 手動ログインの入口 URL(attended)
   const [maxScreens, setMaxScreens] = useState(""); // 診断する画面数の上限(空=既定 40)
+  const [maxSurveyScreens, setMaxSurveyScreens] = useState(""); // survey が写像する画面数の上限(空=無制限)
 
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -146,6 +147,7 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
     if (command === "pilot" && anyManual) options.attended = true;
     if (loginUrl.trim()) options.loginUrl = loginUrl.trim();
     if (command === "pilot" && maxScreens) options.maxScreens = Number.parseInt(maxScreens, 10);
+    if (command === "pilot" && maxSurveyScreens) options.maxSurveyScreens = Number.parseInt(maxSurveyScreens, 10);
     if (command === "pilot" && focus.trim()) options.focus = focus.trim();
 
     try {
@@ -236,6 +238,12 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
           <label className="nf-field" title="how many screens to diagnose (default 40). raise for large apps.">
             <span>Max screens</span>
             <input value={maxScreens} onChange={(e) => setMaxScreens(e.target.value)} placeholder="40" inputMode="numeric" />
+          </label>
+        ) : null}
+        {command === "pilot" ? (
+          <label className="nf-field" title="cap how many screens the survey maps (empty = unlimited). bounds exploration on large sites.">
+            <span>Max survey screens</span>
+            <input value={maxSurveyScreens} onChange={(e) => setMaxSurveyScreens(e.target.value)} placeholder="(unlimited)" inputMode="numeric" />
           </label>
         ) : null}
       </div>
