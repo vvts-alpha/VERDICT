@@ -782,33 +782,34 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         handled.add(sc.screenId);
         if ((await diagnoseOne(sc)) === "break") break;
       }
-      // ── ドレイン ── 診断中に input sweep / browser_navigate が新規 enroll した queued 画面を拾い切る。
-      //    for(screens) は **開始時スナップショット** なので、診断中に台帳へ積まれた画面は固定リストから漏れて
-      //    queued のまま残る(= WebUI が「scanned 79/81」になる正体)。設計意図「台帳の queued を全部 terminal に」
-      //    を満たすため、台帳を都度引き直して scannable かつ未処理の画面を maxScan / pause まで潰し切る。
-      //    上限 maxScan は全体の hard budget として維持(input sweep が掘り続けても暴走しない)。
-      let drained = 0;
-      while (!session.done && handled.size < maxScan) {
-        const live = opts.store.loadAssessment(opts.assessmentId);
-        if (!live) break;
-        const scanById = new Map(live.screenScans.map((s) => [s.screenId, s] as const));
-        const next = live.screens.find((s) => {
-          if (handled.has(s.screenId)) return false;
-          const scan = scanById.get(s.screenId);
-          return !!scan && isScannable(scan);
-        });
-        if (!next) break;
-        if (drained === 0)
-          opts.onText?.("🔁 draining screens discovered mid-diagnosis (input sweep / new routes) so coverage closes");
-        drained += 1;
-        handled.add(next.screenId);
-        if ((await diagnoseOne(next)) === "break") break;
-      }
-      if (drained > 0)
-        opts.store.appendEvent(opts.assessmentId, {
-          type: "note",
-          payload: { message: `🔁 drained ${drained} screen(s) discovered during diagnosis (coverage closed: no queued screens stranded)` },
-        });
+      // ── ドレイン(再利用可能) ── input sweep / browser_navigate / **後段の scenario・fingerprint** が新規 enroll
+      //    した queued 画面を拾い切る。for(screens) は開始時スナップショットなので、その後に台帳へ積まれた画面は
+      //    固定リストから漏れ queued のまま残る(= 「scanned 2/5」の正体)。設計意図「台帳の queued を全部 terminal に」
+      //    を満たすため、台帳を都度引き直して scannable かつ未処理の画面を maxScan / pause まで潰し切る。段ごとに呼ぶ。
+      const drainQueued = async (): Promise<void> => {
+        let drained = 0;
+        while (!session.done && handled.size < maxScan) {
+          const live = opts.store.loadAssessment(opts.assessmentId);
+          if (!live) break;
+          const scanById = new Map(live.screenScans.map((s) => [s.screenId, s] as const));
+          const next = live.screens.find((s) => {
+            if (handled.has(s.screenId)) return false;
+            const scan = scanById.get(s.screenId);
+            return !!scan && isScannable(scan);
+          });
+          if (!next) break;
+          if (drained === 0) opts.onText?.("🔁 draining screens discovered mid-run (input sweep / new routes / scenario navigation) so coverage closes");
+          drained += 1;
+          handled.add(next.screenId);
+          if ((await diagnoseOne(next)) === "break") break;
+        }
+        if (drained > 0)
+          opts.store.appendEvent(opts.assessmentId, {
+            type: "note",
+            payload: { message: `🔁 drained ${drained} screen(s) discovered during the run (coverage closed: no queued screens stranded)` },
+          });
+      };
+      await drainQueued();
       session.currentScreenId = null;
 
       // ── STAGE 4: シナリオ(A04 横断ロジック) ── 画面診断の後に1回。real id・auth 確証・実挙動を継承して
@@ -861,6 +862,12 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
           shouldStop: () => session.fingerprintDone || session.done,
         });
       }
+
+      // ── 最終ドレイン ── scenario / fingerprint 段が新規 enroll した queued 画面を report 前に診断し切る。
+      //    (診断段後のドレインは、後段のナビゲーションが掘った画面を捕捉できないため。例: --focus の TOCTOU 探索が
+      //     /admin_panel 等を発見 → queued のまま report に落ちて「scanned 2/5」になっていた。)
+      await drainQueued();
+      session.currentScreenId = null;
     }
 
     // ── Burp スキャン・フェーズ ── 診断/シナリオの後、report に落とす前に、**セッション生存中**に実行する。
