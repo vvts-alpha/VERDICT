@@ -1,7 +1,19 @@
 // fingerprintTech: レスポンスのヘッダ/Cookie/meta/script-src から技術スタックを構造化抽出する純関数の検証。
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { fingerprintTech, formatTechInventory } from "./fingerprint.js";
+import { fingerprintTech, formatTechInventory, stackAttackHints } from "./fingerprint.js";
+
+test("stackAttackHints maps detected stack to attack classes (Flask/Jinja → SSTI, PHP → LFI/deser)", () => {
+  const flask = stackAttackHints([
+    { kind: "framework", name: "Werkzeug", version: "2.0.1", source: "server", evidence: "" },
+    { kind: "framework", name: "Flask (Jinja2)", version: null, source: "cookie", evidence: "" },
+  ]);
+  assert.ok(flask.some((h) => /SSTI/i.test(h)), "Flask/Jinja should imply SSTI");
+  const php = stackAttackHints([{ kind: "language", name: "PHP", version: "7.4.3", source: "x-powered-by", evidence: "" }]);
+  assert.ok(php.some((h) => /LFI|php:\/\/filter|deserial/i.test(h)), "PHP should imply LFI/deserialization");
+  // 無関係なスタックはヒントなし(構造ベース計画のまま)。
+  assert.deepEqual(stackAttackHints([{ kind: "server", name: "nginx", version: "1.20", source: "server", evidence: "" }]), []);
+});
 
 test("extracts server / language / framework from headers and cookies", () => {
   const c = fingerprintTech([

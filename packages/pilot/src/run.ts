@@ -11,7 +11,8 @@ import { isInScope, isScannable, recordTokens } from "@veritas/core";
 import type { LoginCreds } from "@veritas/crawler";
 import { InventoryBuilder, PlaywrightDriver, smartLogin } from "@veritas/crawler";
 import { ClaudeCliClient } from "@veritas/llm";
-import { EvidenceStore, FetchHttpClient } from "@veritas/scanner";
+import { EvidenceStore, FetchHttpClient, fingerprintTech, stackAttackHints } from "@veritas/scanner";
+import type { TechSample } from "@veritas/scanner";
 import type { BurpAuditConn } from "@veritas/scanner";
 import { join } from "node:path";
 import { buildTools, STAGE_TOOLS, dedupKey, isAuthWalled, loadCookieFile, sessionLooksDead, stripHash } from "./tools.js";
@@ -646,12 +647,54 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       });
     }
 
+    // ── 早期フィンガープリント(方法論の前) ── スタックを検出し、tech-aware な攻撃計画ヒントを作る。
+    //    A06 の fingerprint 段は診断の"後"なので計画に間に合わない。ここで root/login/先頭画面を軽く GET し
+    //    (deterministic・LLM 不使用)、検出スタック→狙う攻撃クラスを methodology の goal に注入する。
+    let techClause = "";
+    if (doMethodology && !session.done) {
+      try {
+        const seeds: string[] = [opts.targetUrl];
+        if (opts.loginUrl) seeds.push(opts.loginUrl);
+        for (const sc of session.inv.screens().slice(0, 2)) {
+          const u = sc.observedUrls[0];
+          if (u) seeds.push(u);
+        }
+        const samples: TechSample[] = [];
+        const seen = new Set<string>();
+        for (const u of seeds) {
+          if (seen.has(u) || samples.length >= 3) continue;
+          seen.add(u);
+          try {
+            const r = await http.send({ method: "GET", url: u, headers: session.currentCookie ? { cookie: session.currentCookie } : {}, body: null });
+            samples.push({ url: u, headers: r.headers, body: r.body });
+          } catch {
+            /* best-effort */
+          }
+        }
+        const components = fingerprintTech(samples);
+        if (components.length > 0) {
+          const hints = stackAttackHints(components);
+          const stackStr = components.map((c) => (c.version ? `${c.name} ${c.version}` : c.name)).join(", ");
+          opts.store.appendEvent(opts.assessmentId, {
+            type: "note",
+            payload: { message: `🔎 early fingerprint (pre-plan): ${stackStr}${hints.length ? ` → ${hints.length} stack-specific attack hint(s) fed into planning` : ""}` },
+          });
+          techClause =
+            `DETECTED TECH STACK (fingerprinted BEFORE planning): ${stackStr}.\n` +
+            (hints.length ? `Stack-specific attack surface — BAKE these classes into the relevant per-screen plans:\n${hints.map((h) => `  - ${h}`).join("\n")}\n` : "") +
+            `\n`;
+        }
+      } catch {
+        /* fingerprint 失敗は計画をブロックしない */
+      }
+    }
+
     // ── STAGE 2: 方法論(全画面の攻撃計画) ── survey-only はスキップ。resume は未完のときだけ実行。
     if (doMethodology && !session.done) {
       opts.store.setPhase(opts.assessmentId, "phase1_label");
       turns += await runStage({
         system: METHODOLOGY_PROMPT,
-        goal: `${session.inv.screens().length} screens were mapped. Call get_inventory, then record_methodology for EVERY screen, then methodology_done.`,
+        goal: `${techClause}${session.inv.screens().length} screens were mapped. Call get_inventory, then record_methodology for EVERY screen, then methodology_done.`,
         allowed: STAGE_TOOLS.methodology,
         maxTurns: Math.min(maxTurns, 30),
         model: fastModel, // 方法論も fast(構造化された計画立案)

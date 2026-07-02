@@ -141,3 +141,30 @@ export function formatTechInventory(components: ReadonlyArray<TechComponent>): s
       (c.knownVuln ? `  ⚠ KNOWN: ${c.knownVuln}` : ""),
   );
 }
+
+/** 検出スタック → 狙うべき攻撃クラスのヒント(deterministic, pentest 知識)。methodology を tech-aware にするため
+ *  early fingerprint の結果を計画に注入する用。空配列 = 特有のヒントなし(構造ベースの計画のまま)。 */
+export function stackAttackHints(components: ReadonlyArray<TechComponent>): string[] {
+  const hay = components.map((c) => `${c.name} ${c.kind}`).join(" | ").toLowerCase();
+  const hints: string[] = [];
+  const add = (re: RegExp, hint: string): void => {
+    if (re.test(hay)) hints.push(hint);
+  };
+  add(
+    /jinja|flask|django|twig|freemarker|velocity|thymeleaf|handlebars|nunjucks|mako|smarty|\berb\b/,
+    "TEMPLATE ENGINE present → run probe_ssti on EVERY reflected/rendered param (even when HTML-escaped); SSTI is RCE-class here, so plan ssti on any screen with reflected input.",
+  );
+  add(
+    /\bphp\b|laravel|codeigniter|symfony/,
+    "PHP → plan path-traversal/LFI (incl. php://filter source read), type-juggling on loose compares (==, auth checks), and unserialize() deserialization on any serialized/base64 input.",
+  );
+  add(/rails|ruby/, "Rails/Ruby → plan mass-assignment (inject extra model attrs e.g. role/admin), ERB SSTI, and Marshal deserialization.");
+  add(
+    /express|node\.js|next\.js|nest/,
+    "Node/Express → plan prototype pollution (__proto__/constructor in JSON & query), NoSQL injection ($gt/$ne/$where operators), and SSTI if pug/handlebars render user input.",
+  );
+  add(/spring|\bjava\b|tomcat|jsp|servlet/, "Java/Spring → plan SpEL SSTI (${...} / #{...} / T(...)), Java deserialization, and probe exposed /actuator (env/heapdump) endpoints.");
+  add(/wordpress|drupal|joomla/, "CMS → probe known-CVE endpoints (xmlrpc.php, wp-json/, admin-ajax.php) and enumerate plugin/theme versions for CVEs.");
+  add(/asp\.net|\biis\b|kestrel/, "ASP.NET/IIS → plan ViewState (__VIEWSTATE) deserialization, path-traversal, and Razor SSTI.");
+  return hints;
+}

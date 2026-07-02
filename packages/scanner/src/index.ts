@@ -40,7 +40,7 @@ export { submitAudit, getAuditStatusAll, getAuditIssues, resetAudit, auditIssues
 export type { BurpAuditConn, AuditSubmit, AuditHostStatus } from "./burp-audit.js";
 export { oobStatus, oobPayload, oobPoll } from "./burp-oob.js";
 export type { OobInteraction } from "./burp-oob.js";
-export { fingerprintTech, formatTechInventory } from "./fingerprint.js";
+export { fingerprintTech, formatTechInventory, stackAttackHints } from "./fingerprint.js";
 export type { TechComponent, TechKind, TechSample } from "./fingerprint.js";
 export { lookupCves, formatCveResults } from "./cve-lookup.js";
 export type { CveMatch, CveLookupResult, CveLookupOptions, FetchLike } from "./cve-lookup.js";
