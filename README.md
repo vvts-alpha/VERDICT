@@ -18,7 +18,7 @@ drives Burp for breadth, and reaches the authenticated surface other tools miss.
 ![tests](https://img.shields.io/badge/tests-passing-success)
 ![status](https://img.shields.io/badge/status-active-blue)
 
-[Quickstart](#-quickstart) · [How it works](#-how-it-works) · [Why VERDICT](#-why-amraam) · [Burp](#-burp-integration) · [WebUI](#-webui)
+[Quickstart](#-quickstart) · [How it works](#-how-it-works) · [Why VERDICT](#-why-verdict) · [Burp](#-burp-integration) · [WebUI](#-webui)
 
 </div>
 
