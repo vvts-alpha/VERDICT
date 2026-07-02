@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/verdict-banner.png" alt="VERDICT — Verified Exploitation, Reconnaissance & Diagnosis · Intrusion Confirmation Testing" width="920" />
+<img src="assets/verdict-main.png" alt="VERDICT — Verified Exploitation, Reconnaissance & Diagnosis · Intrusion Confirmation Testing" width="920" />
 
 # VERDICT 🚀
 
@@ -29,6 +29,8 @@ drives Burp for breadth, and reaches the authenticated surface other tools miss.
 VERDICT runs a real browser and a scoped HTTP client through tools that **Claude operates** — survey → methodology → diagnosis → (multi-step logic) → (Burp) → report. It is **staged on purpose** so the model can't "skim and skip", and **evidence-disciplined** so a finding is `confirmed` only when it actually reproduces. Everything streams to a live WebUI.
 
 ## ✨ Features
+
+<p align="center"><img src="assets/verdict-banner.png" alt="VERDICT — Reconnaissance · Exploitation · Diagnosis · Intrusion Confirmation · Reporting" width="900" /></p>
 
 - 🧠 **Claude-led, staged** — survey → methodology → per-screen diagnosis. Bounded queries stop the model from eliding work.
 - 🔬 **Evidence discipline** — `confirmed` requires a negative control that fails **+ ≥2 stable positive replays**. Catch-all 200s / flaky responses are auto-refuted. FP reduced *by construction*.
