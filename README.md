@@ -20,7 +20,7 @@ drives Burp for breadth, and reaches the authenticated surface other tools miss.
 [![Juice Shop](https://img.shields.io/badge/OWASP%20Juice%20Shop-38%20findings-c0392b)](benchmarks/juice-shop)
 ![status](https://img.shields.io/badge/status-active-blue)
 
-[Quickstart](#-quickstart) · [Benchmarks](#-benchmarks) · [How it works](#-how-it-works) · [Why VERDICT](#-why-verdict) · [Burp](#-burp-integration) · [WebUI](#-webui)
+[Quickstart](#-quickstart) · [Benchmarks](#-benchmarks) · [How it works](#-how-it-works) · [Why VERDICT](#-why-verdict) · [Complex auth](#-complex-auth-sso--mfa) · [Burp](#-burp-integration) · [WebUI](#-webui)
 
 </div>
 
@@ -38,6 +38,7 @@ VERDICT runs a real browser and a scoped HTTP client through tools that **Claude
 
 - 🏆 **XBOW-Bench (XBEN-24) — [92% · 100/109](benchmarks/xbow-bench)** across 104 benchmarks, up **62% → 83% → 92%** over three iterations with **zero regressions**. Unaided (no README hint): **91/91 = 100%**. → *full analysis, difficulty/hint breakdown, and 104 per-run reports.*
 - 🧃 **OWASP Juice Shop — [38 confirmed findings](benchmarks/juice-shop)** in a single autonomous run, across **16 vulnerability classes** — from a **critical SQLi auth-bypass to admin** to business-logic fraud (negative-quantity checkout, self-credit wallet) — plus 5 suspected CVE leads. → *full analysis + the evidence report for every finding.*
+- 🌐 **Beyond benchmarks** — VERDICT has also produced **confirmed, evidence-backed findings against live bug-bounty targets**. Specific programs and reports are withheld under coordinated disclosure — the benchmarks above are the reproducible proof.
 
 ## ✨ Features
 
@@ -141,6 +142,26 @@ node packages/cli/dist/main.js <command> [options]      # after pnpm -r build
 ```
 
 **Auth = operator-provided material only.** Credentials → `smartLogin` auto-discovers the form. A cookie file → injected as-is (for walls the agent can't auto-login). MFA/CAPTCHA without a cookie file → `--attended` (human logs into a live headed session). **The agent never fabricates or steals cookies**, and **never auto-hits logout** (it would kill the session). `roles[0]` is primary; multiple roles drive multi-role authz diff.
+
+## 🔐 Complex auth (SSO / MFA)
+
+Apps behind **Microsoft / Okta SSO**, **MFA / TOTP**, or **CAPTCHA / Arkose** defeat every auto-login scanner — the flow leaves the target origin for an IdP and back, through walls no form-filler can clear. This is the **third auth tier**, the interactive complement to creds→`smartLogin` and pre-captured `cookieFile`: **you** do exactly the login, the **agent** does the rest.
+
+VERDICT holds **one real browser per role** — a live persistent context each, not a shared browser with swapped cookies. You log in **only the roles you need**, by hand, and from that point VERDICT **inherits each authenticated session** and drives its full pipeline on it — survey → methodology → diagnosis → scenario — across every role you supply.
+
+**Configure** — at launch, set each role's mode to **manual (Sessions tab)** in the WebUI, or pass **`--attended`** (`--attended admin,user1,user2` to name roles inline) on the CLI:
+
+<p align="center"><img src="assets/webui-new-creds.png" alt="New Assessment form — three auth roles (admin/user1/user2) each set to 'manual (Sessions tab)', making the run attended" width="640"></p>
+
+**Log in, live** — open the **Sessions** tab. Each role gets its own tab (red dot = awaiting login) rendering a **live screencast of the target's login page inside the WebUI**; your mouse / keyboard / paste are relayed straight into the real browser over CDP, so you clear SSO redirects, MFA and CAPTCHA yourself. Click **Done (logged in)** and VERDICT takes over that role. All role tabs are open at once and awaited together:
+
+<p align="center"><img src="assets/webui-sessions.png" alt="WebUI Sessions tab — three role tabs awaiting login, a URL bar, and a live screencast of the target login page with a 'Done (logged in)' button" width="1100"></p>
+
+> **Note** — the WebUI screencast drives the target's *own* login page. Logins that spawn a **separate OAuth pop-up window** or an **OS-level dialog / file-picker** are the known limit of the screencast path — use the headed CLI path for those, where you're on the real OS window. *CLI equivalent:* `pilot --attended` opens a headed Chromium window per role — log in and press Enter at the terminal prompt for each.
+
+**Cookies and tokens are never fabricated.** Everything the agent uses comes straight out of *your* real session — VERDICT reads the live context's cookie + Bearer after you're done and rides that session for both browser and raw-HTTP probes. The scope gate still guards every agent action; only your manual takeover navigation is scope-exempt, because SSO/IdP hops are cross-origin by design.
+
+> **Deploy note** — the Sessions tab is operator-only (viewers are blocked), but it's a live remote-control surface — front `serve` with a tunnel/VPN rather than exposing it on an open `0.0.0.0`.
 
 ## 🐝 Burp integration
 
