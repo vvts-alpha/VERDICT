@@ -14,6 +14,15 @@ export async function postControl(path: string): Promise<void> {
   }
 }
 
+/** JSON body 付きの制御 POST(一括 exclude 等)。結果は WS push で UI に反映される。 */
+export async function postControlBody(path: string, body: unknown): Promise<void> {
+  try {
+    await fetch(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  } catch {
+    /* WS が次の tick で再同期 */
+  }
+}
+
 /** ?id= があればそのアセスメントを表示。無ければ null → App は一覧(Index)を表示する。 */
 export function useAssessmentId(): string | null {
   return new URLSearchParams(window.location.search).get("id");

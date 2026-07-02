@@ -312,6 +312,42 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
     return mutateAndReply(id, store, () => store.setScreenScanStatus(id, screenId, "excluded"));
   }
 
+  // 一括 exclude(サイトツリーの親ノード = 部分木をまとめて除外)。body = { screenIds: [...] }。
+  m = url.match(/^\/api\/assessments\/([^/]+)\/exclude-screens$/);
+  if (m) {
+    const id = decodeURIComponent(m[1] ?? "");
+    const store = openStore(id);
+    if (!store) return sendJson(res, 404, { error: "not found" });
+    let body = "";
+    let tooBig = false;
+    req.on("data", (c) => {
+      body += c;
+      if (body.length > 256 * 1024) {
+        tooBig = true;
+        req.destroy();
+      }
+    });
+    req.on("end", () => {
+      if (tooBig) return;
+      let ids: string[] = [];
+      try {
+        const j = JSON.parse(body) as { screenIds?: unknown };
+        ids = Array.isArray(j.screenIds) ? j.screenIds.filter((x): x is string => typeof x === "string") : [];
+      } catch {
+        try {
+          store.close();
+        } catch {
+          /* noop */
+        }
+        return sendJson(res, 400, { error: "invalid JSON body" });
+      }
+      mutateAndReply(id, store, () => {
+        for (const sid of ids) store.setScreenScanStatus(id, sid, "excluded");
+      });
+    });
+    return;
+  }
+
   sendJson(res, 404, { error: "unknown control endpoint" });
 }
 

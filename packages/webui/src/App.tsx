@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { postControl, useAssessmentId, useStateView } from "./api";
+import { postControl, postControlBody, useAssessmentId, useStateView } from "./api";
 import { StatusBar } from "./components/StatusBar";
 import { HandoffBar } from "./components/HandoffBar";
 import { Progress } from "./components/Progress";
@@ -66,7 +66,12 @@ export function App() {
       />
       <Progress view={view} />
       <div className="body">
-        <SiteTree tree={view.tree} selected={selectedScreen?.screenId ?? null} onSelect={onSelect} />
+        <SiteTree
+          tree={view.tree}
+          selected={selectedScreen?.screenId ?? null}
+          onSelect={onSelect}
+          onExclude={(ids) => void postControlBody(`/api/assessments/${view.id}/exclude-screens`, { screenIds: ids })}
+        />
         <main className="scroll">
           <div className="tabs">
             <button type="button" className={tab === "screen" ? "active" : ""} onClick={() => setTab("screen")}>

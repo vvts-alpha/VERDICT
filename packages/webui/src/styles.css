@@ -61,6 +61,10 @@ body { background: var(--bg); color: var(--fg); font-size: 13px; }
 .rolebadge.viewer { color: var(--muted); background: #232831; }
 .logout { margin-left: 10px; font-size: 11px; color: var(--muted); text-decoration: none; }
 .logout:hover { color: var(--fg); text-decoration: underline; }
+.tree-exclude { margin-left: auto; font-size: 10px; line-height: 1; padding: 1px 5px; border-radius: 6px; opacity: 0;
+  background: transparent; border: 1px solid var(--line); color: var(--muted); cursor: pointer; white-space: nowrap; }
+.node:hover .tree-exclude { opacity: 1; }
+.tree-exclude:hover { color: var(--err); border-color: var(--err); }
 .rundot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); margin-right: 7px;
   vertical-align: middle; animation: pulse 1.1s ease-in-out infinite; }
 .idxtable td.ctl { text-align: right; white-space: nowrap; }
