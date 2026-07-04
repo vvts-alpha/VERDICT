@@ -1,4 +1,4 @@
-// DESIGN §7.4 — 攻撃仮説(=「方針」)。WebUI の HYPOTHESES に表示される単位。
+// DESIGN §7.4 — attack hypothesis (= a "line of attack"). The unit displayed in the WebUI's HYPOTHESES.
 
 export type HypoStatus = "queued" | "testing" | "confirmed" | "refuted" | "blocked";
 
@@ -18,11 +18,11 @@ export interface Hypothesis {
   id: string;
   screenId: string;
   class: HypothesisClass;
-  /** 「他人の order_id を閲覧できる」 */
+  /** e.g. "can view another user's order_id" */
   statement: string;
-  /** 具体手順 */
+  /** Concrete steps */
   testPlan: string;
   status: HypoStatus;
-  /** EvidenceStore の証拠 id 群 */
+  /** Evidence ids in the EvidenceStore */
   evidenceIds: string[];
 }

@@ -1,4 +1,4 @@
-// pickBurpConfigs: survey の surface 規模から Burp named config を自動選択するヒューリスティック。
+// pickBurpConfigs: heuristic that auto-selects a Burp named config from the survey's surface size.
 
 import { strict as assert } from "node:assert";
 import { test } from "node:test";

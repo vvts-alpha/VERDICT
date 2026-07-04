@@ -1,17 +1,17 @@
-// HTML → PDF(Chromium 印刷)。レポートの PDF 出力に使う。既存の playwright-core を再利用するので
-// 新規依存はゼロ。ローカル描画なのでスコープゲートは通さない(ネットワーク行為ではない)。
+// HTML → PDF (Chromium print). Used for report PDF output. Reuses the existing playwright-core, so
+// zero new dependencies. Local rendering, so it doesn't pass the scope gate (it's not a network action).
 
 export interface HtmlToPdfOptions {
-  /** chromium 実体のパス(未指定なら playwright 既定。CLI の --browser-path / VERITAS_BROWSER_PATH 由来)。 */
+  /** Path to the chromium binary (defaults to playwright's default; from the CLI --browser-path / VERITAS_BROWSER_PATH). */
   executablePath?: string;
-  /** コンテナ実行では true(--no-sandbox)。 */
+  /** true for container runs (--no-sandbox). */
   noSandbox?: boolean;
-  /** 用紙(既定 "A4")。 */
+  /** Paper size (default "A4"). */
   format?: string;
   landscape?: boolean;
 }
 
-/** HTML 文字列を A4 PDF にして Buffer で返す。画像は self-contained(inline)前提。 */
+/** Render an HTML string to an A4 PDF and return it as a Buffer. Images are assumed self-contained (inline). */
 export async function htmlToPdf(html: string, opts: HtmlToPdfOptions = {}): Promise<Buffer> {
   const { chromium } = await import("playwright-core");
   const browser = await chromium.launch({

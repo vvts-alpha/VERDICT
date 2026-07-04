@@ -1,4 +1,4 @@
-// @veritas/scanner — Phase2: 汎用 validator カタログ + 証拠規律。
+// @veritas/scanner — Phase2: general-purpose validator catalog + evidence discipline.
 
 export type { HttpClient, HttpRequest, HttpResponse, MultipartSpec, FetchHttpClientOptions, FakeResponder } from "./http.js";
 export { FetchHttpClient, FakeHttpClient } from "./http.js";

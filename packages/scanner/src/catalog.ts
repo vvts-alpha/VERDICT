@@ -1,4 +1,4 @@
-// 汎用 validator カタログ。applicable() で画面/API に応じ該当チェックのみ起動(§7.3)。
+// General-purpose validator catalog. applicable() launches only the relevant checks based on the screen/API (§7.3).
 
 import type { Validator } from "./validator.js";
 import { exposedFile } from "./validators/exposed-file.js";

@@ -1,5 +1,5 @@
-// cors_misconfig — 任意 Origin を Access-Control-Allow-Origin に反映するか。
-// negative control = Origin 無しの同一リクエスト(反映されないはず)。静的 `*`+credentials も catch-all で除外。
+// cors_misconfig — whether an arbitrary Origin is reflected into Access-Control-Allow-Origin.
+// negative control = the same request without an Origin (it should not be reflected). Static `*`+credentials is also excluded as catch-all.
 
 import type { HttpRequest, HttpResponse } from "../http.js";
 import { concretizeApiUrl, type Probe, type ProbeEval, type ScanTarget, type Validator } from "../validator.js";

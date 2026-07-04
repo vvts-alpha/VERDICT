@@ -1,6 +1,6 @@
-// DESIGN §7.4 — auth-diff(マルチロール / ロール比較)。2 ロールで同一 API を叩き認可境界越えを検出。
-// low-priv ロールが high-priv と同一実体を取得できる → privilege_escalation / IDOR を confirmed。
-// ロール資格情報(headers)は M6 の人手ログイン or vault 由来(取得は operator)。
+// DESIGN §7.4 — auth-diff (multi-role / role comparison). Hit the same API with 2 roles to detect an authorization-boundary crossing.
+// A low-priv role can fetch the same entity as high-priv → confirms privilege_escalation / IDOR.
+// Role credentials (headers) come from M6 manual login or a vault (obtained by the operator).
 
 import type { Screen } from "@veritas/core";
 import type { EvidenceStore, HttpClient, HttpResponse } from "@veritas/scanner";
@@ -10,7 +10,7 @@ const MIN_BYTES = 16;
 
 export interface RoleContext {
   name: string;
-  /** そのロールの認証ヘッダ(Cookie/Authorization 等)。証拠保存時はマスクされる。 */
+  /** That role's auth headers (Cookie/Authorization, etc.). Masked when recorded as evidence. */
   headers: Record<string, string>;
 }
 
@@ -22,14 +22,14 @@ export interface AuthDiffOutcome {
 
 const DENIED_RE = /(sign[\s-]?in|log[\s-]?in|forbidden|unauthorized|access denied|ログイン|権限|認証が必要)/i;
 
-/** 200 + 実体あり + 否認系文言が無い(= 実際にアクセスできている)。ページHTML/JSON 両対応。 */
+/** 200 + substantive body + no denial wording (= actually accessible). Handles both page HTML and JSON. */
 function accessible(res: HttpResponse): boolean {
   return res.status === 200 && res.body.trim().length >= MIN_BYTES && !DENIED_RE.test(res.body.slice(0, 2000));
 }
 
 /**
- * 認証付き GET API を high/low 2 ロールで叩く。high が実体を返し、low が **同一実体**を 2 回安定取得 →
- * 認可境界越え(confirmed)。high baseline + 2 low replays を証拠化(証拠規律の精神を踏襲)。
+ * Hit an authenticated GET API with 2 roles (high/low). If high returns the entity and low stably fetches the **same entity** twice →
+ * an authorization-boundary crossing (confirmed). Records high baseline + 2 low replays as evidence (following the spirit of evidence discipline).
  */
 export async function authDiffScreen(
   screen: Screen,
@@ -40,7 +40,7 @@ export async function authDiffScreen(
 ): Promise<AuthDiffOutcome> {
   const target = makeTarget(screen);
   if (!target) return { status: "blocked", reason: "no concrete observed URL", evidenceIds: [] };
-  // 比較対象: 認証付き GET API を優先、無ければ post-login のページ URL(server-rendered 対応)
+  // Comparison target: prefer an authenticated GET API; otherwise the post-login page URL (handles server-rendered)
   let url: string | null = null;
   let label = "";
   const api = screen.apis.find((a) => a.auth !== "none" && a.method.toUpperCase() === "GET");

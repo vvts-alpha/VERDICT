@@ -1,11 +1,11 @@
-// テスト用の決定論クライアント。固定文字列 / 関数 / 配列(順に消費、最後を反復)で応答。
+// Deterministic client for tests. Responds with a fixed string / function / array (consumed in order, last one repeated).
 
 import type { LlmClient, LlmRequest, LlmResponse } from "./types.js";
 
 export type FakeResponder = string | ((req: LlmRequest) => string);
 
 export class FakeLlmClient implements LlmClient {
-  /** これまでに受けたリクエスト(アサーション用) */
+  /** Requests received so far (for assertions) */
   readonly calls: LlmRequest[] = [];
   private readonly scripted: FakeResponder[];
   private readonly fallback: FakeResponder;

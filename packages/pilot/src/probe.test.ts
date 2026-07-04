@@ -1,10 +1,10 @@
-// probe_paths のセッション自滅ガード: logout/signout 系は絶対に踏まない(認証診断を全滅させるため)。
+// probe_paths self-destruct guard: never hit logout/signout paths (they wipe out all auth diagnosis).
 
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import { isSessionDestroyingPath } from "./tools.js";
 
-test("logout/signout 系はセッション破壊として検出", () => {
+test("logout/signout paths are detected as session-destroying", () => {
   for (const p of [
     "/logout",
     "/manage/logout",
@@ -23,15 +23,15 @@ test("logout/signout 系はセッション破壊として検出", () => {
   }
 });
 
-test("通常パスは誤検知しない", () => {
+test("ordinary paths are not false-flagged", () => {
   for (const p of [
     "/login",
     "/dashboard",
     "/api/users",
-    "/logout-history", // logout を含むが末尾境界でない
+    "/logout-history", // contains "logout" but not at a trailing boundary
     "/about/logoutpolicy",
     "/account/settings",
-    "/blog/sign-out-best-practices", // ハイフン続き(境界外)
+    "/blog/sign-out-best-practices", // hyphen continues (out of boundary)
   ]) {
     assert.equal(isSessionDestroyingPath(p), false, `${p} should NOT be flagged`);
   }

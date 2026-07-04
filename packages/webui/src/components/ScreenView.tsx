@@ -4,7 +4,7 @@ import { useRole } from "../api";
 
 const SEV_ORDER: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
 
-// ツリーで選んだ 1 画面の詳細。順序は「ページの情報(スクショ→概要→API/params)→ その画面の findings」。
+// Details of the one screen selected in the tree. Order: "page info (screenshot → overview → API/params) → this screen's findings".
 export function ScreenView({ view, screen, onExclude }: { view: StateView; screen?: Screen; onExclude: (id: string) => void }) {
   const { canWrite } = useRole();
   if (!screen) {
@@ -30,7 +30,7 @@ export function ScreenView({ view, screen, onExclude }: { view: StateView; scree
         {screen.screenType} · {screen.authState} · <span className="mono">{screen.screenId}</span>
       </div>
 
-      {/* ① ページのスクショ */}
+      {/* 1. Page screenshot */}
       {screen.screenshot ? (
         <img
           className="sv-shot"
@@ -43,7 +43,7 @@ export function ScreenView({ view, screen, onExclude }: { view: StateView; scree
         </div>
       )}
 
-      {/* ② ページ概要(取れていれば) */}
+      {/* 2. Page overview (if available) */}
       {screen.description ? (
         <div className="sv-section">
           <h4>Overview</h4>
@@ -61,7 +61,7 @@ export function ScreenView({ view, screen, onExclude }: { view: StateView; scree
         </div>
       ) : null}
 
-      {/* ③ APIs / params(ページの情報) */}
+      {/* 3. APIs / params (page info) */}
       {screen.apis.length > 0 ? (
         <div className="sv-section">
           <h4>APIs</h4>
@@ -112,7 +112,7 @@ export function ScreenView({ view, screen, onExclude }: { view: StateView; scree
         </div>
       ) : null}
 
-      {/* ④ 最後に、この画面の findings */}
+      {/* 4. Finally, this screen's findings */}
       {fs.length > 0 ? (
         <div className="sv-section sv-findings">
           <h4>Findings on this screen ({fs.length})</h4>

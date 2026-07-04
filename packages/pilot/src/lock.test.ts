@@ -1,5 +1,5 @@
-// URL リスト固定(lockToSeeds)の frontier 抑止: ロック時は発見リンクを一切積まない。
-// 非ロック時は従来どおり in-scope・非logout・未訪問・非ignore のリンクだけ積む。
+// URL-list lock (lockToSeeds) frontier suppression: when locked, never enqueue any discovered links.
+// When not locked, enqueue as before only in-scope, non-logout, unvisited, non-ignored links.
 
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
@@ -51,7 +51,7 @@ test("locked stays empty even with brand-new in-scope links", () => {
   assert.deepEqual(frontierLinks(fresh, s), []);
 });
 
-// ── SPA hash ルーティング ──
+// ── SPA hash routing ──
 test("stripHash keeps SPA routes (#/.., #!/..) but drops plain fragments", () => {
   assert.equal(stripHash("https://x/#/search"), "https://x/#/search"); // route kept
   assert.equal(stripHash("https://x/#!/login"), "https://x/#!/login"); // hashbang route kept

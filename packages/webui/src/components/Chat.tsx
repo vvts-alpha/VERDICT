@@ -1,5 +1,5 @@
-// 💬 Ask — その assessment(findings/screens/scope)について Claude に質問する読み取り Q&A。
-// POST /api/assessments/:id/chat に会話履歴を送り、回答を表示する。履歴はクライアント保持。
+// 💬 Ask — a read-only Q&A that asks Claude about this assessment (findings/screens/scope).
+// POST the conversation history to /api/assessments/:id/chat and show the answer. History is held client-side.
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { useRole } from "../api";
 

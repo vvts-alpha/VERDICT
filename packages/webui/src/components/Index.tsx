@@ -1,5 +1,5 @@
-// プロジェクト(アセスメント)一覧。`/`(?id 無し)で表示。各行クリックで ?id=<id> へ。
-// "+ New" で run を起動、各行で Stop/Resume(server が CLI を spawn する制御面)。
+// Project (assessment) list. Shown at `/` (no ?id). Clicking a row goes to ?id=<id>.
+// "+ New" launches a run; each row has Stop/Resume (the control plane where the server spawns the CLI).
 import { useEffect, useState, type MouseEvent } from "react";
 import type { TargetInput } from "@veritas/core";
 import { NewAssessment } from "./NewAssessment";

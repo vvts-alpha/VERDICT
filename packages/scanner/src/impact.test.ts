@@ -1,4 +1,4 @@
-// impactOracle: 各 impact シグナルの発火 + 2段の FP 抑制(placeholder / anti-ambient)+ cross-user + CTF既定OFF を検証。
+// impactOracle: verifies each impact signal firing + two-stage FP suppression (placeholder / anti-ambient) + cross-user + CTF-default-OFF.
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import { impactOracle, formatImpact } from "./impact.js";

@@ -1,5 +1,5 @@
-// e2e: FakeDriver の擬似サイトを BFS クロール → dedup → 画面/API を JSON 化し、
-// store のカバレッジ台帳に自動エンロールされることを browser なしで検証(M1 完了条件相当)。
+// e2e: BFS-crawl FakeDriver's mock site → dedup → serialize screens/APIs to JSON, and verify
+// they auto-enroll in the store's coverage ledger — all without a browser (≈ the M1 completion criteria).
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -91,7 +91,7 @@ test("crawl dedups screens, extracts APIs, and writes screen_inventory.json", as
       { store, assessmentId: "a-test" },
     );
 
-    // 5 ページ訪問 → dedup で 4 画面(home / products / product detail / login)
+    // 5 pages visited → dedup to 4 screens (home / products / product detail / login)
     assert.equal(result.stats.visited, 5);
     assert.equal(result.stats.screens, 4);
 
@@ -109,7 +109,7 @@ test("crawl dedups screens, extracts APIs, and writes screen_inventory.json", as
     const login = result.screens.find((s) => s.urlTemplate === "/login");
     assert.equal(login?.screenType, "auth");
 
-    // store 連携: phase + カバレッジ台帳に全画面が自動エンロール
+    // store integration: phase + all screens auto-enrolled in the coverage ledger
     const state = store.loadAssessment("a-test");
     assert.ok(state);
     assert.equal(state.phase, "phase1_recon");
@@ -120,7 +120,7 @@ test("crawl dedups screens, extracts APIs, and writes screen_inventory.json", as
     assert.equal(cov.byStatus.queued, 4);
     assert.equal(cov.complete, false);
 
-    // 優先度: login(auth,65) > detail(idor,45) > home(dashboard,12) > products(other,0)
+    // priority: login(auth,65) > detail(idor,45) > home(dashboard,12) > products(other,0)
     const tmplById = new Map(state.screens.map((s) => [s.screenId, s.urlTemplate]));
     assert.deepEqual(
       prioritizeScreens(state).map((p) => tmplById.get(p.screenId)),

@@ -5,37 +5,60 @@ interface Ev {
   response?: { status?: number; finalUrl?: string; headers?: Record<string, string> } | null;
   meta?: { kind?: string; note?: string } | null;
   body?: string;
-  requestRaw?: string | null; // リクエスト全体(生 HTTP)
+  requestRaw?: string | null; // full request (raw HTTP)
   responseRaw?: string | null;
 }
 
 const HDR_KEYS = ["content-type", "location", "set-cookie", "www-authenticate", "access-control-allow-origin"];
 
-// finding が引用する evId をクリック→ req/resp(headers マスク済)をインライン表示。証拠を UI で検証。
+// Click an evId cited by a finding → show req/resp (headers masked) inline. MULTIPLE items can be open at once
+// (so a finding's negative control + its positive replays sit side by side); "expand all" opens them together.
 export function EvidenceList({ assessmentId, evidenceIds }: { assessmentId: string; evidenceIds: string[] }) {
-  const [open, setOpen] = useState<string | null>(null);
+  const [open, setOpen] = useState<Set<string>>(() => new Set());
   const [data, setData] = useState<Record<string, Ev>>({});
 
+  const fetchEv = (ev: string): void => {
+    if (data[ev]) return; // already loaded
+    fetch(`/api/assessments/${encodeURIComponent(assessmentId)}/evidence/${encodeURIComponent(ev)}`)
+      .then((r) => r.json())
+      .then((d: Ev) => setData((prev) => ({ ...prev, [ev]: d })))
+      .catch(() => setData((prev) => ({ ...prev, [ev]: {} })));
+  };
+
   const toggle = (ev: string): void => {
-    if (open === ev) {
-      setOpen(null);
+    const willOpen = !open.has(ev);
+    setOpen((prev) => {
+      const next = new Set(prev);
+      if (willOpen) next.add(ev);
+      else next.delete(ev);
+      return next;
+    });
+    if (willOpen) fetchEv(ev);
+  };
+
+  const allOpen = evidenceIds.length > 0 && evidenceIds.every((ev) => open.has(ev));
+  const toggleAll = (): void => {
+    if (allOpen) {
+      setOpen(new Set());
       return;
     }
-    setOpen(ev);
-    if (!data[ev]) {
-      fetch(`/api/assessments/${encodeURIComponent(assessmentId)}/evidence/${encodeURIComponent(ev)}`)
-        .then((r) => r.json())
-        .then((d: Ev) => setData((prev) => ({ ...prev, [ev]: d })))
-        .catch(() => setData((prev) => ({ ...prev, [ev]: {} })));
-    }
+    setOpen(new Set(evidenceIds));
+    for (const ev of evidenceIds) fetchEv(ev);
   };
 
   return (
     <div className="evlist">
-      <div className="evlabel muted">evidence ({evidenceIds.length})</div>
+      <div className="evlabel muted">
+        evidence ({evidenceIds.length})
+        {evidenceIds.length > 1 ? (
+          <button type="button" className="evtoggleall" onClick={toggleAll}>
+            {allOpen ? "collapse all" : "expand all"}
+          </button>
+        ) : null}
+      </div>
       {evidenceIds.map((ev) => {
         const d = data[ev];
-        const isOpen = open === ev;
+        const isOpen = open.has(ev);
         const hdrs = d?.response?.headers ?? {};
         const hdrLine = HDR_KEYS.filter((k) => hdrs[k]).map((k) => `${k}: ${hdrs[k]}`).join("  ·  ");
         return (
@@ -52,7 +75,7 @@ export function EvidenceList({ assessmentId, evidenceIds }: { assessmentId: stri
                   <div className="evreq mono">
                     <span className="evarrow">▷ request</span>
                     {d.requestRaw ? (
-                      // リクエスト全体(生 HTTP: request line + 全ヘッダ + body)
+                      // full request (raw HTTP: request line + all headers + body)
                       <pre className="evpre">{d.requestRaw}</pre>
                     ) : (
                       <>

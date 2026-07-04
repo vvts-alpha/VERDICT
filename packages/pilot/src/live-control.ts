@@ -1,6 +1,6 @@
-// attended×LiveHands の子(pilot)側。serve に**逆接続**(Node 24 グローバル WebSocket クライアント)し、
-// role ごとの CDP screencast を上げ、操作者入力を流す。手動ログイン完了は操作者の「Done」で解決する
-// (= 従来のターミナル Enter ゲートの置換)。docs/LIVE_TAKEOVER.md。
+// The child (pilot) side of attended×LiveHands. Connects **back** to serve (the Node 24 global WebSocket client),
+// streams a per-role CDP screencast up, and relays operator input down. Manual-login completion is resolved by the
+// operator's "Done" (= replacing the old terminal Enter gate). docs/LIVE_TAKEOVER.md.
 import type { PlaywrightDriver } from "@veritas/crawler";
 
 type Cdp = Awaited<ReturnType<PlaywrightDriver["cdpSession"]>>;
@@ -107,7 +107,7 @@ export class LiveControl {
         }
         void this.onMessage(m);
       };
-      ws.onclose = (): void => resolve(); // 接続できなくても run は進める
+      ws.onclose = (): void => resolve(); // the run proceeds even if the connection fails
       ws.onerror = (): void => resolve();
     });
   }
@@ -120,7 +120,7 @@ export class LiveControl {
     this.send({ t: "sessions", roles: [...this.roles.entries()].map(([role, c]) => ({ role, url: c.driver.currentUrl() })) });
   }
 
-  /** role の生コンテキストを登録し、screencast を受けられるようにする。 */
+  /** Register the role's raw context so it can receive a screencast. */
   async register(role: string, driver: PlaywrightDriver): Promise<void> {
     await this.connected;
     const cdp = await driver.cdpSession();
@@ -133,7 +133,7 @@ export class LiveControl {
     this.sendSessions();
   }
 
-  /** その role の操作者「Done」を待つ(attended のログインゲート。Enter の置換)。 */
+  /** Wait for that role's operator "Done" (the attended login gate; replaces Enter). */
   waitForDone(role: string): Promise<void> {
     const rc = this.roles.get(role);
     if (!rc) return Promise.resolve();

@@ -1,10 +1,11 @@
-// Burp 取り込み後の検証フェーズ: Burp 能動スキャンの High+ finding を AI が能動再テストして確証/反証する。
-// Burp スキャナは FP(特に SSTI/XSS/desync/reflected 系)を出すので、取り込んだ High 以上を 1 件ずつ
-// AI が自分の http_request で再現(negative control + >=2 stable positive = 証拠規律)し、効果で判定する。
-// 反証してもレポートからは消さない(severity 据え置き + 注記のみ)。確証は [burp✓]、反証は [burp?] に印を付ける。
+// Post-Burp-import verification phase: the AI actively re-tests Burp active-scan High+ findings to confirm/refute them.
+// Burp's scanner produces false positives (especially SSTI/XSS/desync/reflected classes), so for each imported High+
+// the AI reproduces it with its own http_request (negative control + >=2 stable positives = evidence discipline) and
+// judges by the effect. A refutation does NOT remove it from the report (severity kept + note only). Confirmations are
+// marked [burp✓], refutations [burp?].
 //
-// 自己完結: 診断ステージの重い PilotSession(driver/inventory…)に依存せず、http クライアントと evidence だけで回す。
-// runBurpScanOnRun / burp-import(REST/XML どちらの取り込み経路)からも呼べる。
+// Self-contained: does not depend on the diagnosis stage's heavy PilotSession (driver/inventory…) — runs on just the
+// http client and evidence store. Callable from runBurpScanOnRun / burp-import (either the REST or XML import path).
 
 import { createSdkMcpServer, query, tool } from "@anthropic-ai/claude-agent-sdk";
 import type { HookCallback } from "@anthropic-ai/claude-agent-sdk";
@@ -18,16 +19,17 @@ export interface VerifyBurpDeps {
   store: AssessmentStore;
   assessmentId: string;
   scope: ScopePolicy;
-  /** スコープゲート済み http クライアント(必要なら認証ヘッダを内包)。 */
+  /** Scope-gated http client (carries auth headers if needed). */
   http: FetchHttpClient;
-  /** runs/<id>/artifacts に紐づく EvidenceStore(再テストの req/resp を記録)。 */
+  /** EvidenceStore bound to runs/<id>/artifacts (records the re-test req/resp). */
   evidence: EvidenceStore;
-  /** Burp finding が引用する元 req/resp を読むための artifacts ディレクトリ。 */
+  /** artifacts directory for reading the original req/resp a Burp finding cites. */
   artifactsDir: string;
-  /** 認証下 finding を再現するための Cookie ヘッダ(任意。無ければ未認証で検証)。 */
+  /** Cookie header for reproducing authenticated findings (optional; without it, verification runs unauthenticated). */
   cookie?: string;
-  /** Bearer JWT(任意)。Juice Shop 等は /profile を Bearer で検証するので、これが無いと再テストが 401/「Blocked」で
-   *  弾かれ「再現できず」と誤判定する(SSTI/XSS 再検証が失敗していた根因)。cookie と併せて Authorization に載せる。 */
+  /** Bearer JWT (optional). Apps like Juice Shop verify /profile via Bearer, so without it the re-test is rejected with
+   *  401/"Blocked" and wrongly judged "could not reproduce" (the root cause of failing SSTI/XSS re-verification). Sent on
+   *  Authorization together with the cookie. */
   bearer?: string;
   model?: string;
   maxTurnsPerFinding?: number;
@@ -42,8 +44,8 @@ export interface VerifyBurpResult {
 }
 
 const HIGH_PLUS = new Set<Severity>(["high", "critical"]);
-// onlyVeritasToolsHook が真の境界。だが preset が提示する組み込み系をここで隠さないとモデルが ToolSearch 等を
-// 叩いて拒否され続ける(ターン浪費)。run.ts の DISALLOWED と揃える。
+// onlyVeritasToolsHook is the real boundary. But unless we hide the built-ins the preset surfaces here, the model keeps
+// hitting ToolSearch etc. and getting denied (wasting turns). Kept in sync with run.ts's DISALLOWED.
 const DISALLOWED = [
   "Bash", "BashOutput", "KillShell", "Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "Glob", "Grep", "WebFetch", "WebSearch",
   "Task", "Agent", "ToolSearch", "TodoWrite", "Skill", "Monitor", "Workflow", "EnterPlanMode", "ExitPlanMode", "SendMessage",
@@ -78,7 +80,7 @@ Then call verdict EXACTLY ONCE:
 - refuted: you could NOT reproduce it (control == positive, behaviour absent, or unstable). The finding is KEPT for manual review; you are only flagging that automated re-test failed.
 Be skeptical: when uncertain, choose refuted. Keep it to a handful of requests.`;
 
-/** Burp finding の説明末尾 "@ <url>" から対象エンドポイントを抽出。無ければ null。 */
+/** Extract the target endpoint from the "@ <url>" tail of a Burp finding's description. null if absent. */
 export function endpointOf(f: Finding): string | null {
   const m = /@\s+(https?:\/\/\S+)\s*$/.exec(f.description.trim());
   return m?.[1] ?? null;
@@ -93,8 +95,8 @@ function pick(h: Record<string, string>, keys: string[]): Record<string, string>
 }
 
 /**
- * Burp 由来の High+ finding を AI が能動再テストして確証/反証する。冪等(既に印の付いた finding は飛ばす)。
- * 反証しても severity は据え置き(注記のみ)。確証=[burp✓] / 反証=[burp?] に印を付け、AI の再テスト証拠を添える。
+ * The AI actively re-tests Burp-derived High+ findings to confirm/refute them. Idempotent (skips already-marked findings).
+ * A refutation keeps severity unchanged (note only). Marks confirm=[burp✓] / refute=[burp?] and attaches the AI's re-test evidence.
  */
 export async function verifyBurpFindings(deps: VerifyBurpDeps): Promise<VerifyBurpResult> {
   const all = deps.store.loadAssessment(deps.assessmentId)?.findings ?? [];
@@ -103,7 +105,7 @@ export async function verifyBurpFindings(deps: VerifyBurpDeps): Promise<VerifyBu
       HIGH_PLUS.has(f.severity) &&
       f.source.kind === "validator" &&
       f.source.validatorName === "burp" &&
-      !/\[burp[✓?]\]/.test(f.title), // 既に検証済みは飛ばす(冪等)
+      !/\[burp[✓?]\]/.test(f.title), // already-verified are skipped (idempotent)
   );
   const result: VerifyBurpResult = { checked: 0, confirmed: 0, refuted: 0 };
   if (targets.length === 0) return result;
@@ -119,8 +121,9 @@ export async function verifyBurpFindings(deps: VerifyBurpDeps): Promise<VerifyBu
 }
 
 /**
- * Burp finding 1 件を AI が能動再テストして確証/反証する共通本体(High+ 検証と sub-High 深堀の両方が使う)。
- * confirmSeverity を渡すと、確証時に severity をそこへ **引き上げる**(info で取り込んだ反射点が実 XSS だった等)。
+ * Shared core that has the AI actively re-test a single Burp finding to confirm/refute it (used by both High+ verification
+ * and sub-High deep-dive). Passing confirmSeverity **raises** severity to it on confirmation (e.g. a reflection imported as
+ * info that turned out to be real XSS).
  */
 async function deepDiveOne(
   deps: VerifyBurpDeps,
@@ -129,8 +132,8 @@ async function deepDiveOne(
   opts: { confirmSeverity?: Severity } = {},
 ): Promise<"confirmed" | "refuted"> {
     const endpoint = endpointOf(f);
-    // verdict ツールが書き込むこのフィンディング 1 件分の結果。
-    // ※ クロージャ越しに書き換わるので holder オブジェクトにする(TS の flow-narrowing 回避)。
+    // The result for this one finding, written by the verdict tool.
+    // NB: it's mutated across the closure, so use a holder object (avoids TS flow-narrowing).
     const box: { outcome: "confirmed" | "refuted" | null; note: string; ev: string[] } = { outcome: null, note: "", ev: [] };
 
     const burpEvidence = tool(
@@ -166,8 +169,8 @@ async function deepDiveOne(
         const req: HttpRequest = {
           method: method.toUpperCase(),
           url,
-          // 認証下 finding(/profile の JWT none・SSTI 等)を再現できるよう、cookie + Bearer をデフォルトで載せる
-          // (モデルが headers で上書きすれば優先)。これが無いと Juice Shop は 401/「Blocked illegal activity」を返す。
+          // Send cookie + Bearer by default so authenticated findings (/profile JWT none, SSTI, etc.) can be reproduced
+          // (the model's headers override if it sets them). Without this, Juice Shop returns 401/"Blocked illegal activity".
           headers: {
             ...(deps.cookie ? { cookie: deps.cookie } : {}),
             ...(deps.bearer ? { authorization: `Bearer ${deps.bearer}` } : {}),
@@ -241,7 +244,7 @@ async function deepDiveOne(
             else if (block.type === "tool_use") deps.onTool?.(block.name, block.input);
           }
         }
-        if (box.outcome) break; // verdict が出たら即終了(1 件 1 判定)
+        if (box.outcome) break; // stop as soon as a verdict is in (one verdict per finding)
       }
     } catch (e) {
       deps.onText?.(`⚠ verify ${f.id} ended early: ${String(e instanceof Error ? e.message : e).slice(0, 140)}`);
@@ -252,7 +255,7 @@ async function deepDiveOne(
       /* generator already done */
     }
 
-    // verdict が出ないまま終わった(maxTurns 等)→ 反証扱い(再現できなかった=注記のみ)。
+    // Ended without a verdict (maxTurns etc.) → treated as refuted (could not reproduce = note only).
     const finalOutcome: "confirmed" | "refuted" = box.outcome ?? "refuted";
     const note = box.note || (box.outcome ? "" : "no verdict reached within the re-test budget");
     annotate(deps, f, finalOutcome, note, box.ev, finalOutcome === "confirmed" ? opts.confirmSeverity : undefined);
@@ -260,9 +263,9 @@ async function deepDiveOne(
 }
 
 export interface TriageDeepDiveResult {
-  /** sub-High の Burp リード総数(モデルに提示した一覧の件数) */
+  /** total number of sub-High Burp leads (the count of the list shown to the model) */
   listed: number;
-  /** モデルが深堀を選んだ件数 */
+  /** number the model selected for deep-dive */
   selected: number;
   confirmed: number;
   refuted: number;
@@ -277,10 +280,10 @@ Each row carries a heuristic hint «lead/priority» — treat it as a suggestion
 Pick ONLY the rows genuinely worth a deep active re-test — favour those that plausibly lead to a concrete, high-impact effect; skip pure hygiene and trivial disclosures. Then call select_leads(ids, reason) EXACTLY ONCE. Be selective: a handful, not all of them.`;
 
 /**
- * 新フェーズ「タイトル一覧 → 有望なものをモデルが選択 → 深堀」。
- * verifyBurpFindings が触らない **sub-High の Burp リード** を一覧でモデルに見せ(各行にヒューリスティック
- * ヒント付き)、選ばせた分だけ deepDiveOne で能動再テスト(証拠規律)する。確証ならヒント相当へ severity 引き上げ。
- * 全部 verify しない=操作者の方針どおり「有望そうなものだけ深堀」。
+ * New phase: "list titles → the model picks the promising ones → deep-dive".
+ * Shows the model a list of the **sub-High Burp leads** that verifyBurpFindings doesn't touch (each row with a heuristic
+ * hint), and actively re-tests (evidence discipline) only the ones it picks via deepDiveOne. On confirmation, raises severity
+ * to the hint's level. It does NOT verify all of them — per the operator's policy, "only deep-dive the promising ones".
  */
 export async function triageAndDeepDiveBurp(
   deps: VerifyBurpDeps,
@@ -292,7 +295,7 @@ export async function triageAndDeepDiveBurp(
       f.source.kind === "validator" &&
       f.source.validatorName === "burp" &&
       !HIGH_PLUS.has(f.severity) &&
-      !/\[burp[✓?]\]/.test(f.title), // 既に検証済みは飛ばす(冪等)
+      !/\[burp[✓?]\]/.test(f.title), // already-verified are skipped (idempotent)
   );
   const res: TriageDeepDiveResult = { listed: leads.length, selected: 0, confirmed: 0, refuted: 0 };
   if (leads.length === 0) return res;
@@ -306,7 +309,7 @@ export async function triageAndDeepDiveBurp(
     })
     .join("\n");
 
-  // ── 選択フェーズ(1 クエリ) ── モデルが一覧を見て深堀対象を選ぶ。
+  // ── Selection phase (1 query) ── the model reviews the list and picks deep-dive targets.
   const picked: { ids: string[]; reason: string } = { ids: [], reason: "" };
   const selectLeads = tool(
     "select_leads",
@@ -379,8 +382,8 @@ export async function triageAndDeepDiveBurp(
 
 const SEV_RANK: Record<Severity, number> = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
 
-/** finding に検証結果の印と注記を付ける。confirmed=[burp✓] / refuted=[burp?]。
- *  newSeverity 指定時は確証された sub-High リードの severity を **上方向にだけ** 引き上げる(info→high 等)。 */
+/** Attach the verification mark and note to a finding. confirmed=[burp✓] / refuted=[burp?].
+ *  When newSeverity is given, raise the severity of a confirmed sub-High lead **upward only** (info→high, etc.). */
 function annotate(
   deps: VerifyBurpDeps,
   f: Finding,
@@ -392,7 +395,7 @@ function annotate(
   const cur = deps.store.loadAssessment(deps.assessmentId)?.findings.find((x) => x.id === f.id) ?? f;
   const mark = outcome === "confirmed" ? "[burp✓]" : "[burp?]";
   const title = cur.title.replace(/^\[burp\]/, mark);
-  // 確証され、かつヒント severity が現状より高ければ引き上げる(過小評価された info 取り込みを是正)。下げはしない。
+  // If confirmed and the hint severity is higher than the current one, raise it (correcting an under-rated info import). Never lowers.
   const bumped = outcome === "confirmed" && newSeverity && SEV_RANK[newSeverity] > SEV_RANK[cur.severity] ? newSeverity : cur.severity;
   const head =
     outcome === "confirmed"

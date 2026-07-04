@@ -1,7 +1,7 @@
-// Burp issue(XML or REST 由来)を既存 run へマージする共通ロジック。
-// 既存 finding と (粗カテゴリ × 正規化エンドポイント) で重複排除し、スコープ外は捨てる。
-// CLI(burp-import / burp-scan)と server(アップロード取り込み API)の両方がこれを使う。
-// 層を壊さないため、エンドポイント正規化(crawler の normalizePath)は依存注入(pathTemplate)で受ける。
+// Shared logic for merging Burp issues (from XML or REST) into an existing run.
+// Deduplicated against existing findings by (coarse category × normalized endpoint); out-of-scope is dropped.
+// Both the CLI (burp-import / burp-scan) and the server (upload-import API) use this.
+// To keep the layering intact, endpoint normalization (crawler's normalizePath) is injected (pathTemplate).
 
 import type { AssessmentStore, Finding, ScopePolicy, Severity } from "@veritas/core";
 import { isInScope } from "@veritas/core";
@@ -13,9 +13,9 @@ const SEV_RANK: Record<Severity, number> = { info: 0, low: 1, medium: 2, high: 3
 const maxSeverity = (a: Severity, b: Severity): Severity => (SEV_RANK[b] > SEV_RANK[a] ? b : a);
 
 export interface MergeBurpOptions {
-  /** finding id の接頭辞(既定 "b")。burp-import="b" / burp-scan も "b"。 */
+  /** Prefix for the finding id (default "b"). burp-import="b" / burp-scan is also "b". */
   prefix?: string;
-  /** エンドポイントをテンプレ化して重複排除キーに使う(既定: 恒等)。CLI/server は normalizePath を渡す。 */
+  /** Templatize the endpoint for use as the dedup key (default: identity). CLI/server pass normalizePath. */
   pathTemplate?: (path: string) => string;
 }
 
@@ -25,7 +25,7 @@ export interface MergeBurpResult {
   oos: number;
 }
 
-/** state は findings(既存重複判定)と scope(in-scope 判定)だけ参照する。 */
+/** From state we only read findings (existing-dup check) and scope (in-scope check). */
 export function mergeBurpIssues(
   store: Pick<AssessmentStore, "upsertFinding">,
   id: string,
@@ -53,7 +53,7 @@ export function mergeBurpIssues(
   let skipped = 0;
   let oos = 0;
 
-  // 1) in-scope のみ残す(URL/パスを確定)。out-of-scope は捨てる。
+  // 1) Keep only in-scope (resolve URL/path). Drop out-of-scope.
   const inScope: Array<{ issue: BurpIssue; url: string; path: string }> = [];
   for (const issue of issues) {
     let url: string;
@@ -75,8 +75,8 @@ export function mergeBurpIssues(
     inScope.push({ issue, url, path });
   }
 
-  // 2) issue 名でグループ化。Burp は同一 issue(例 "CORS: arbitrary origin trusted")を URL ごとに吐くので、
-  //    per-URL の重複を **1 finding(影響 URL リスト付き)** に畳む。レポートの水増し(53→実質~20)を解消する。
+  // 2) Group by issue name. Burp emits the same issue (e.g. "CORS: arbitrary origin trusted") once per URL, so
+  //    collapse the per-URL duplicates into **one finding (with a list of affected URLs)**. Removes report inflation (53 → effectively ~20).
   const groups = new Map<string, Array<{ issue: BurpIssue; url: string; path: string }>>();
   for (const it of inScope) {
     const g = groups.get(it.issue.name) ?? [];
@@ -84,7 +84,7 @@ export function mergeBurpIssues(
     groups.set(it.issue.name, g);
   }
 
-  // 3) グループごとに 1 finding(既存 claude-pilot finding と (粗カテゴリ × パス) で重複排除)。
+  // 3) One finding per group (deduplicated against existing claude-pilot findings by (coarse category × path)).
   for (const members of groups.values()) {
     const first = members[0]!;
     const key = keyOf(coarseCategory(first.issue.name), first.path);
@@ -96,7 +96,7 @@ export function mergeBurpIssues(
     added += 1;
     const severity = members.map((m) => burpSeverity(m.issue.severity)).reduce(maxSeverity);
     const urls = [...new Set(members.map((m) => m.url))];
-    // 代表 URL は文末 "@ <url>" に置く(verifyBurpFindings の endpointOf 抽出を壊さない)。残りは前置の注記に列挙。
+    // Put the representative URL at the end as "@ <url>" (don't break verifyBurpFindings' endpointOf extraction). List the rest in a preceding note.
     const more = urls.length > 1 ? ` [+${urls.length - 1} more URL(s): ${urls.slice(1, 6).join(", ")}${urls.length > 6 ? ", …" : ""}]` : "";
     const ev = evidence.record({
       screenId: "burp",
@@ -113,7 +113,7 @@ export function mergeBurpIssues(
       severity,
       source: { kind: "validator", validatorName: "burp" },
       description: `${(first.issue.detail || first.issue.background).slice(0, 600)}${more} @ ${first.url}`,
-      reproSteps: "Burp が検出。証拠に request/response(Cookie/Authorization は伏字)。",
+      reproSteps: "Detected by Burp. Evidence contains the request/response (Cookie/Authorization redacted).",
       evidenceIds: [ev.id],
       scopeBasis: "burp scan (in-scope)",
     });

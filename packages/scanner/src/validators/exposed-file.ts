@@ -1,4 +1,4 @@
-// exposed_file — 機微ファイルの公開露出(.git/config 等)。origin 直下のパスをプローブ。
+// exposed_file — public exposure of sensitive files (.git/config etc.). Probes paths directly under the origin.
 
 import type { HttpRequest, HttpResponse } from "../http.js";
 import type { Probe, ProbeEval, Validator } from "../validator.js";

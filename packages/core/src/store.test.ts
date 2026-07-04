@@ -1,5 +1,5 @@
-// AssessmentStore の round-trip / event-log 不変条件を検証。
-// 実行: pnpm --filter @veritas/core test  (node:test + tsx、native 依存なし)
+// Verifies AssessmentStore's round-trip / event-log invariants.
+// Run: pnpm --filter @veritas/core test  (node:test + tsx, no native dependency)
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -24,7 +24,7 @@ function withTempDb<T>(fn: (dbPath: string) => T): T {
   }
 }
 
-test("createAssessment writes an empty assessment to state.sqlite (M0 完了条件)", () => {
+test("createAssessment writes an empty assessment to state.sqlite (M0 completion criterion)", () => {
   withTempDb((dbPath) => {
     const store = AssessmentStore.open(dbPath);
     const state = store.createAssessment({
@@ -42,7 +42,7 @@ test("createAssessment writes an empty assessment to state.sqlite (M0 完了条�
     assert.equal(state.events[0]?.type, "assessment_created");
     store.close();
 
-    // ファイルが実体として書かれている
+    // The file is actually written to disk
     assert.ok(existsSync(dbPath), "state.sqlite should exist on disk");
   });
 });
@@ -55,8 +55,8 @@ test("two writable connections on the same file both write (server + spawned pil
       scope: deriveScopeFromSingleUrl("https://example.com/"),
       budget: defaultBudget(),
     });
-    const b = AssessmentStore.open(dbPath); // 別コネクション(= spawn された pilot に相当)
-    // 交互に書き込む。BEGIN IMMEDIATE + busy_timeout により "database is locked" で落ちず両方成功する。
+    const b = AssessmentStore.open(dbPath); // a second connection (= the spawned pilot)
+    // Write alternately. With BEGIN IMMEDIATE + busy_timeout, both succeed without failing on "database is locked".
     assert.doesNotThrow(() => {
       a.setPaused(id, true, "A");
       b.setPaused(id, false, "B");
@@ -113,19 +113,19 @@ test("every state transition appends a sequenced event", () => {
       labels: ["idor-candidate", "pii"],
     };
     store.upsertScreen(id, screen);
-    store.upsertScreen(id, { ...screen, description: "Order detail (refined)" }); // 2回目 → updated
+    store.upsertScreen(id, { ...screen, description: "Order detail (refined)" }); // second time → updated
 
     const hypo: Hypothesis = {
       id: "h-0001",
       screenId: "s-0001",
       class: "idor",
-      statement: "他人の order_id を閲覧できる",
-      testPlan: "別アカウントの order_id を id に入れて GET",
+      statement: "can view another user's order_id",
+      testPlan: "GET with another account's order_id in id",
       status: "queued",
       evidenceIds: [],
     };
     store.upsertHypothesis(id, hypo);
-    store.upsertHypothesis(id, { ...hypo, status: "testing" }); // status 遷移
+    store.upsertHypothesis(id, { ...hypo, status: "testing" }); // status transition
 
     const loaded = store.loadAssessment(id);
     assert.ok(loaded);
@@ -145,7 +145,7 @@ test("every state transition appends a sequenced event", () => {
       "hypothesis_status_changed",
     ]);
 
-    // seq は 1 始まりで単調増加
+    // seq is monotonically increasing, starting at 1
     assert.deepEqual(
       loaded.events.map((e) => e.seq),
       [1, 2, 3, 4, 5, 6],

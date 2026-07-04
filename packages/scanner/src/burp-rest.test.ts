@@ -1,4 +1,4 @@
-// Burp REST の issue_events → BurpIssue マッピング(取り込み経路に乗せる)。pure 部分を固定。
+// Burp REST issue_events → BurpIssue mapping (rides the import path). Pins the pure part.
 
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
@@ -6,7 +6,7 @@ import { restIssuesToBurpIssues, parseTaskId, dedupSeedUrls } from "./burp-rest.
 
 const b64 = (s: string): string => Buffer.from(s, "utf8").toString("base64");
 
-test("parseTaskId: bare '3' も '/v0.1/scan/3' も拾う(実機の Location は bare)", () => {
+test("parseTaskId: picks up both bare '3' and '/v0.1/scan/3' (the on-device Location is bare)", () => {
   assert.equal(parseTaskId("3"), "3");
   assert.equal(parseTaskId("/v0.1/scan/42"), "42");
   assert.equal(parseTaskId("http://127.0.0.1:1337/v0.1/scan/7"), "7");
@@ -14,7 +14,7 @@ test("parseTaskId: bare '3' も '/v0.1/scan/3' も拾う(実機の Location は 
   assert.equal(parseTaskId("none"), null);
 });
 
-test("issue_found を BurpIssue 形にマップ(severity/host/path/detail + 証拠の base64 復号 + Cookie 伏字)", () => {
+test("maps issue_found to the BurpIssue shape (severity/host/path/detail + base64-decode evidence + redact Cookie)", () => {
   const events = [
     {
       type: "issue_found",
@@ -42,7 +42,7 @@ test("issue_found を BurpIssue 形にマップ(severity/host/path/detail + 証�
   assert.equal(i.host, "https://app.example.com");
   assert.equal(i.path, "/search");
   assert.equal(i.severity, "high");
-  assert.equal(i.detail, "SQLi in q"); // タグ除去
+  assert.equal(i.detail, "SQLi in q"); // tags stripped
   assert.match(i.request, /GET \/search/);
   assert.match(i.request, /Cookie: <redacted>/); // 資格情報は伏字
   assert.match(i.response, /error in SQL syntax/);

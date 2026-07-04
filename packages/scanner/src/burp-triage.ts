@@ -1,34 +1,34 @@
-// Burp の Information/Low/Medium issue は、それ単体だと低レートでも **実脆弱性の入口**(反射点→XSS、
-// 外部通信→SSRF、緩い CORS→データ窃取…)になりやすい。verifyImportedBurp は High+ しか再検証しないので、
-// それ未満は素通りする。ここはその素通り層を **名前ベースで triage** し、「有望なリードだけ」を浮かび上がらせる
-// 純関数(ネットワーク不要)。全部を verify せず、操作者/後段の verify が着目すべき候補を提示するのが目的。
+// Burp's Information/Low/Medium issues, even on their own at low severity, are often **entry points to real vulns** (reflection point → XSS,
+// external comms → SSRF, loose CORS → data theft…). verifyImportedBurp only re-verifies High+, so
+// anything below that passes through untouched. This module triages that pass-through layer **by name** and surfaces "only the promising leads",
+// a pure function (no network). The goal is not to verify everything, but to present the candidates the operator / downstream verify should focus on.
 
 import type { BurpIssue } from "./burp.js";
 
 export type LeadPriority = "high" | "medium" | "low";
 
 export interface BurpLead {
-  /** 入口が指す実脆弱性クラス(probe 名と対応) */
+  /** the real-vuln class this entry point points to (corresponds to the probe name) */
   lead: string;
   priority: LeadPriority;
-  /** なぜ有望か(1 行) */
+  /** why it's promising (one line) */
   why: string;
-  /** 確証のための次アクション(既存 probe ツール等) */
+  /** the next action to confirm (existing probe tool, etc.) */
   probe: string;
-  /** この lead にマップした Burp issue 名(重複排除済) */
+  /** the Burp issue names mapped to this lead (deduplicated) */
   names: string[];
-  /** 該当 issue インスタンス総数(URL ごとに重複する Burp の数え方) */
+  /** total count of matching issue instances (Burp's per-URL counting) */
   count: number;
-  /** 代表 URL(最大 5 件) */
+  /** representative URLs (up to 5) */
   sampleUrls: string[];
 }
 
 const PRIORITY_RANK: Record<LeadPriority, number> = { high: 3, medium: 2, low: 1 };
 
-/** issue 名 → リード規則(上から順に最初の一致を採用)。hygiene 系(cookie flag / TLS / charset 等)は
- *  「入口」ではないので **意図的に拾わない**(triage を信号高く保つ)。 */
+/** issue name → lead rule (first match top-to-bottom wins). Hygiene items (cookie flag / TLS / charset etc.) are
+ *  not "entry points", so they are **intentionally not picked up** (keeps the triage high-signal). */
 const LEAD_RULES: Array<{ re: RegExp; lead: string; priority: LeadPriority; why: string; probe: string }> = [
-  // ── XSS 系(反射点・stored 反射・DOM sink)= 最有望 ──
+  // ── XSS family (reflection points, stored reflection, DOM sink) = most promising ──
   {
     re: /cross-site scripting \(stored\)|input returned in response \(stored\)|stored.*\bxss\b/i,
     lead: "xss-stored",
@@ -50,7 +50,7 @@ const LEAD_RULES: Array<{ re: RegExp; lead: string; priority: LeadPriority; why:
     why: "reflection point — payload may break out of its HTML/JS context",
     probe: "probe_xss / probe_dom_xss",
   },
-  // ── SSRF / OOB(外部通信が観測された)= 当たりに近い ──
+  // ── SSRF / OOB (external comms observed) = close to a hit ──
   {
     re: /external service interaction|out-of-band|\bssrf\b|server-side request/i,
     lead: "ssrf",
@@ -58,7 +58,7 @@ const LEAD_RULES: Array<{ re: RegExp; lead: string; priority: LeadPriority; why:
     why: "server reached an external host (DNS/HTTP) — strong SSRF/OOB signal",
     probe: "probe_oob (Collaborator)",
   },
-  // ── インジェクション示唆 ──
+  // ── injection hints ──
   {
     re: /suspicious input transformation|sql statement|serialized object|expression language|template/i,
     lead: "injection",
@@ -66,7 +66,7 @@ const LEAD_RULES: Array<{ re: RegExp; lead: string; priority: LeadPriority; why:
     why: "input transformed/echoed in a dangerous sink — injection candidate",
     probe: "probe_params / probe_oob",
   },
-  // ── CORS(緩いオリジン信頼)= クレデンシャル付きならデータ窃取 ──
+  // ── CORS (loose origin trust) = data theft if credentialed ──
   {
     re: /cross-origin resource sharing|\bcors\b/i,
     lead: "cors",
@@ -74,7 +74,7 @@ const LEAD_RULES: Array<{ re: RegExp; lead: string; priority: LeadPriority; why:
     why: "arbitrary/loose origin trusted — cross-site data theft if responses are credentialed",
     probe: "http_request with Origin: https://evil.example then check ACAO/ACAC",
   },
-  // ── CSRF(state 変更が anti-CSRF 無し) ──
+  // ── CSRF (state change without anti-CSRF) ──
   {
     re: /cross-site request forgery|\bcsrf\b/i,
     lead: "csrf",
@@ -82,7 +82,7 @@ const LEAD_RULES: Array<{ re: RegExp; lead: string; priority: LeadPriority; why:
     why: "state-changing request without an anti-CSRF token",
     probe: "probe_csrf",
   },
-  // ── オープンリダイレクト / リンク操作 ──
+  // ── open redirect / link manipulation ──
   {
     re: /open redirect|unvalidated redirect|link manipulation/i,
     lead: "open-redirect",
@@ -90,7 +90,7 @@ const LEAD_RULES: Array<{ re: RegExp; lead: string; priority: LeadPriority; why:
     why: "redirect/link target is user-controlled",
     probe: "probe_redirect",
   },
-  // ── 弱い CSP(注入 XSS を止められない=増幅器) ──
+  // ── weak CSP (can't stop injected XSS = amplifier) ──
   {
     re: /content security policy.*(untrusted script|form hijack|unsafe|allows)/i,
     lead: "csp-weak",
@@ -98,7 +98,7 @@ const LEAD_RULES: Array<{ re: RegExp; lead: string; priority: LeadPriority; why:
     why: "weak CSP won't block injected script — amplifies any reflected/stored XSS lead",
     probe: "pair with an XSS lead on the same origin",
   },
-  // ── アップロード機能(型/パス/拡張子バイパス面) ──
+  // ── upload feature (type/path/extension bypass surface) ──
   {
     re: /file upload/i,
     lead: "upload",
@@ -106,7 +106,7 @@ const LEAD_RULES: Array<{ re: RegExp; lead: string; priority: LeadPriority; why:
     why: "upload surface — content-type / extension / path-traversal bypass to test",
     probe: "manual upload probe (type/path/overwrite)",
   },
-  // ── API スペック露出(テスト面が増える) ──
+  // ── API spec exposure (increases the test surface) ──
   {
     re: /openapi|swagger|graphql|wsdl|api definition/i,
     lead: "api-surface",
@@ -114,7 +114,7 @@ const LEAD_RULES: Array<{ re: RegExp; lead: string; priority: LeadPriority; why:
     why: "API spec exposed — enumerate the endpoints it documents and test them",
     probe: "fetch the spec → probe_paths the listed endpoints",
   },
-  // ── ソース/設定の開示 ──
+  // ── source/config disclosure ──
   {
     re: /source code disclosure|backup file|\.bak\b|configuration file|directory listing/i,
     lead: "info-disclosure",
@@ -122,7 +122,7 @@ const LEAD_RULES: Array<{ re: RegExp; lead: string; priority: LeadPriority; why:
     why: "leaked source/config/listing aids targeting and may expose secrets",
     probe: "fetch & review for secrets / hidden endpoints",
   },
-  // ── 低優先の手掛かり ──
+  // ── low-priority clues ──
   {
     re: /private ip address|internal ip/i,
     lead: "recon",
@@ -153,8 +153,8 @@ export interface BurpLeadClass {
   probe: string;
 }
 
-/** Burp issue 名(または "[burp] …" を剥がした finding タイトル)→ リード分類。未分類/hygiene は null。
- *  triage の集約と、選択フェーズのヒント表示・確証時の severity 引き上げの両方から使う単一の真実。 */
+/** Burp issue name (or a finding title with "[burp] …" stripped) → lead classification. null for unclassified/hygiene.
+ *  The single source of truth used both by the triage aggregation and by the selection-phase hint display / severity bump on confirmation. */
 export function classifyBurpName(name: string): BurpLeadClass | null {
   for (const r of LEAD_RULES) if (r.re.test(name)) return { lead: r.lead, priority: r.priority, why: r.why, probe: r.probe };
   return null;
@@ -165,7 +165,7 @@ function matchRule(name: string): (typeof LEAD_RULES)[number] | null {
   return null;
 }
 
-/** issue の URL(host+path)を組み立てる(triage の表示用、scope 判定は呼び出し側で済ませる前提)。 */
+/** Build the issue's URL (host+path) (for triage display; the scope check is assumed already done by the caller). */
 function issueUrl(i: BurpIssue): string {
   try {
     return new URL(i.path || "/", i.host).toString();
@@ -175,14 +175,14 @@ function issueUrl(i: BurpIssue): string {
 }
 
 /**
- * Burp issue 群(通常は High 未満=verify が触らない層を渡す)を triage し、有望リードを
- * lead クラスごとに集約して priority 降順・count 降順で返す。hygiene 系は除外される。
+ * Triage a set of Burp issues (usually the below-High layer that verify doesn't touch) and return the promising leads
+ * aggregated per lead class, sorted priority-desc then count-desc. Hygiene items are excluded.
  */
 export function triageBurpInfo(issues: ReadonlyArray<BurpIssue>): BurpLead[] {
   const byLead = new Map<string, BurpLead & { _names: Set<string>; _urls: string[] }>();
   for (const issue of issues) {
     const rule = matchRule(issue.name);
-    if (!rule) continue; // hygiene / 未分類は無視
+    if (!rule) continue; // ignore hygiene / unclassified
     let agg = byLead.get(rule.lead);
     if (!agg) {
       agg = {
@@ -218,7 +218,7 @@ export function triageBurpInfo(issues: ReadonlyArray<BurpIssue>): BurpLead[] {
   return leads;
 }
 
-/** triage 結果を人間可読の複数行に整形(CLI ログ / イベント note 用)。 */
+/** Format the triage result into human-readable lines (for CLI logs / event notes). */
 export function formatBurpLeads(leads: ReadonlyArray<BurpLead>): string[] {
   return leads.map(
     (l) =>

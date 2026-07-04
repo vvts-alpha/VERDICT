@@ -12,7 +12,7 @@ const COLOR: Record<string, string> = {
   error: "var(--err)",
 };
 
-// 進捗バー(scan 状態の内訳)+ 今診断中の画面 + 直近ログ。run 中の現在地が一目で分かる。
+// Progress bar (breakdown of scan status) + the screen being diagnosed now + the latest log. See where the run is at a glance.
 export function Progress({ view }: { view: StateView }) {
   const by = new Map(view.screenScans.map((s) => [s.screenId, s.status] as const));
   const counts: Record<string, number> = {};

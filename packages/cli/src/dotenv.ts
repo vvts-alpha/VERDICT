@@ -1,10 +1,11 @@
-// 依存無しの最小 .env ローダ。CLI 起動時に cwd の .env を読み、まだ未設定の環境変数だけ反映する
-// (shell で export 済みの値が優先)。BURP_API / BURP_PROXY 等をファイルで持てるようにする。
+// Minimal dependency-free .env loader. On CLI startup, reads .env from cwd and applies only the
+// environment variables that aren't set yet (values already exported in the shell take precedence).
+// Lets BURP_API / BURP_PROXY etc. be kept in a file.
 
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
-/** .env テキスト → KEY/VALUE。`export` 接頭辞・`#` コメント・前後クォートを許容。最初の `=` で分割。 */
+/** .env text -> KEY/VALUE. Allows an `export` prefix, `#` comments, and surrounding quotes. Splits on the first `=`. */
 export function parseDotEnv(text: string): Record<string, string> {
   const out: Record<string, string> = {};
   for (const raw of text.split(/\r?\n/)) {
@@ -21,7 +22,7 @@ export function parseDotEnv(text: string): Record<string, string> {
   return out;
 }
 
-/** cwd の .env を読み、未設定の環境変数だけ process.env に反映する。読み込んだキー名を返す。 */
+/** Reads .env from cwd and applies only the unset environment variables to process.env. Returns the loaded key names. */
 export function loadDotEnv(dir: string = process.cwd(), file = ".env"): string[] {
   const path = join(dir, file);
   if (!existsSync(path)) return [];

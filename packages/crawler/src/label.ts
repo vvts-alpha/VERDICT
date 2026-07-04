@@ -1,5 +1,5 @@
-// DESIGN §6.5 — LLM ラベリング(構造化出力 + 型バリデート)。M1 のルールラベルを LLM で上書き/補強。
-// LLM 失敗・不正出力時はルールラベル(M1)に fallback する。
+// DESIGN §6.5 — LLM labeling (structured output + type validation). The LLM overrides/augments the M1 rule labels.
+// On LLM failure / malformed output, fall back to the rule labels (M1).
 
 import { z } from "zod";
 import type { AssessmentStore, Screen } from "@veritas/core";
@@ -87,7 +87,7 @@ export function parseScreenLabel(text: string): ParseResult {
   return { ok: true, label: parsed.data };
 }
 
-/** 検証済みラベルを Screen に適用(labels は rule+LLM の和集合、description/screenType は LLM 優先)。 */
+/** Apply a validated label to a Screen (labels = union of rule + LLM; description/screenType prefer the LLM). */
 export function applyLabel(screen: Screen, label: ScreenLabel): Screen {
   const refine = new Map((label.params ?? []).map((p) => [p.name, p.guessedType]));
   return {
@@ -107,7 +107,7 @@ export interface LabelOptions {
   timeoutMs?: number;
 }
 
-/** 1 画面を LLM でラベリング。失敗時は元のルールラベル画面を返す(usedFallback=true)。 */
+/** Label one screen with the LLM. On failure, return the original rule-labeled screen (usedFallback=true). */
 export async function labelScreen(
   screen: Screen,
   client: LlmClient,
@@ -143,8 +143,8 @@ export interface LabelInventoryResult {
 }
 
 /**
- * インベントリ全画面を順次ラベリング(レート配慮で逐次。並列は将来)。
- * store 連携時は phase を phase1_label にし、各画面を upsertScreen で更新。
+ * Label every screen in the inventory sequentially (serial to respect rate limits; parallelism is future work).
+ * When wired to the store, set phase to phase1_label and update each screen via upsertScreen.
  */
 export async function labelInventory(
   screens: Screen[],

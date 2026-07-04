@@ -1,8 +1,8 @@
-// テスト/デモ用のインメモリ driver。browser なしでパイプライン全体を決定論的に回せる。
+// In-memory driver for tests/demos. Runs the whole pipeline deterministically without a browser.
 
 import type { Driver, Observation } from "../types.js";
 
-/** URL をキーにしたページ定義(未指定フィールドは空でデフォルト)。 */
+/** Page definitions keyed by URL (unspecified fields default to empty). */
 export type FakeSite = Record<string, Partial<Observation>>;
 
 function stripTrailingSlash(u: string): string {

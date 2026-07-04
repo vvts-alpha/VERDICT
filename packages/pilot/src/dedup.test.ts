@@ -1,5 +1,5 @@
-// finding dedup の回帰テスト。実ラン(ユーザー報告)で出た 21 件の生 findings が、
-// (class × endpoint × param) キーで「別物だけ」に畳まれることを検証する。
+// Regression test for finding dedup. Verifies that the 21 raw findings from a real run (user-reported)
+// collapse under the (class × endpoint × param) key down to only the distinct ones.
 
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
@@ -30,9 +30,9 @@ test("normEndpoint folds concrete ids and {id} templates together", () => {
 });
 
 test("the 21 real raw findings dedupe to 8 distinct holes", () => {
-  // [vulnClass, endpoint, param]  — ユーザー報告の実データを Claude が渡すであろう形に割当
+  // [vulnClass, endpoint, param]  — real user-reported data, shaped as Claude would likely pass it
   const raw: Array<[string, string, string | undefined]> = [
-    // ── /search?q= の Reflected XSS(言い換え 13 件)→ 1 ──
+    // ── Reflected XSS on /search?q= (13 wording variants) → 1 ──
     ["Reflected XSS", "/search", "q"],
     ["Reflected XSS (CWE-79)", "/search", "q"],
     ["Reflected Cross-Site Scripting (XSS)", "/search", "q"],
@@ -46,10 +46,10 @@ test("the 21 real raw findings dedupe to 8 distinct holes", () => {
     ["Reflected XSS", "/search", "q"],
     ["Reflected Cross-Site Scripting (XSS)", "/search", "q"],
     ["Reflected XSS", "/search", "q"],
-    // ── 別物たち ──
+    // ── the distinct ones ──
     ["Path Traversal / Arbitrary File Read (CWE-22)", "/download", "file"],
     ["Broken Access Control (IDOR)", "/addresses/{id}", undefined], // addresses read
-    ["IDOR / BOLA", "/orders/o10", undefined], // orders read(3 件 → 1)
+    ["IDOR / BOLA", "/orders/o10", undefined], // orders read (3 entries → 1)
     ["IDOR / BOLA (Broken Object Level Authorization)", "/orders/o11", undefined],
     ["Broken Access Control (IDOR/BOLA)", "/orders/{id}", undefined],
     ["IDOR / Broken Object Level Authorization (write)", "/addresses/12/edit", undefined], // write-IDOR
@@ -62,7 +62,7 @@ test("the 21 real raw findings dedupe to 8 distinct holes", () => {
   assert.equal(raw.length, 22); // 13 XSS + 9 others as listed
   assert.equal(keys.size, 8, [...keys].sort().join("\n"));
 
-  // /search XSS は全部 1 キー
+  // all /search XSS collapse to 1 key
   const searchKeys = new Set(
     raw.filter(([, e]) => e === "/search").map(([c, e, p]) => dedupKey(c, e, p, base)),
   );
@@ -70,8 +70,8 @@ test("the 21 real raw findings dedupe to 8 distinct holes", () => {
 });
 
 test("canonical categories are idempotent and dedupe stably", () => {
-  // record_finding は正準カテゴリ enum を渡す → coarseClass は冪等でなければならない
-  // (特に xss-stored が xss-reflected に誤畳みされない)。
+  // record_finding passes the canonical category enum → coarseClass must be idempotent
+  // (in particular xss-stored must not be mis-folded into xss-reflected).
   for (const c of CATEGORIES) {
     assert.equal(coarseClass(c), c, `coarseClass(${c}) should be idempotent`);
   }

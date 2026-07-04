@@ -1,23 +1,23 @@
-// DESIGN §4.4 / §7.1 / §8.2 — Phase2 のカバレッジ台帳。
+// DESIGN §4.4 / §7.1 / §8.2 — the Phase2 coverage ledger.
 //
-// Screen(§6.6 の Phase1 契約 = screen_inventory.json)は不変の成果物なので汚さない。
-// スキャン状態は per-screen の別レコード(ScreenScan)として持ち、
-// 「検出した全画面に漏れなくスキャンしきる」ことを構造的に保証する。
+// A Screen (the §6.6 Phase1 contract = screen_inventory.json) is an immutable artifact, so don't taint it.
+// Scan state is kept as a separate per-screen record (ScreenScan), structurally guaranteeing that
+// "every discovered screen is scanned to completion, none missed".
 
 export type ScreenScanStatus =
-  | "queued" // 検出済・未スキャン(自動エンロール直後)
-  | "scanning" // サブエージェントが処理中
-  | "clean" // スキャン済・findings なし(terminal)
-  | "finding" // スキャン済・confirmed findings あり(terminal)
-  | "suspected" // スキャン済・suspected リードのみ(confirmed なし)。診断は完了 = terminal、人手確認待ち
-  | "blocked" // 認証/スコープ/handoff 待ちで着手不能(非 terminal)
-  | "excluded" // 人間がスキャン対象から除外(terminal)
-  | "error"; // 失敗。再試行枠が残る限り再着手可
+  | "queued" // discovered, not yet scanned (right after auto-enrollment)
+  | "scanning" // being processed by a sub-agent
+  | "clean" // scanned, no findings (terminal)
+  | "finding" // scanned, confirmed findings present (terminal)
+  | "suspected" // scanned, only suspected leads (no confirmed). Diagnosis is done = terminal, awaiting manual verification
+  | "blocked" // can't proceed, waiting on auth/scope/handoff (non-terminal)
+  | "excluded" // excluded from scanning by a human (terminal)
+  | "error"; // failed; can be retried while retry budget remains
 
 export interface ScreenScan {
   screenId: string;
   status: ScreenScanStatus;
-  /** error からの累積試行回数 */
+  /** Cumulative attempt count from errors */
   attempts: number;
   hypothesisIds: string[];
   findingIds: string[];
@@ -26,16 +26,16 @@ export interface ScreenScan {
   updatedAt: string;
 }
 
-/** coverage() の派生ビュー。WebUI バッジ(§8.2)と停止条件(§4.4①)が読む。 */
+/** Derived view of coverage(). Read by the WebUI badge (§8.2) and the stop condition (§4.4①). */
 export interface Coverage {
   total: number;
   byStatus: Record<ScreenScanStatus, number>;
   /** clean + finding + suspected + excluded */
   terminal: number;
-  /** total - terminal(queued / scanning / error / blocked の合計) */
+  /** total - terminal (sum of queued / scanning / error / blocked) */
   remaining: number;
-  /** いま着手できる画面数(queued + 再試行枠の残る error)。blocked / scanning は除く */
+  /** Number of screens workable now (queued + error with retry budget left). Excludes blocked / scanning */
   scannable: number;
-  /** total > 0 かつ remaining === 0 → coverage_complete(§4.4①) */
+  /** total > 0 and remaining === 0 → coverage_complete (§4.4①) */
   complete: boolean;
 }

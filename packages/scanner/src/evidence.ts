@@ -1,22 +1,22 @@
-// DESIGN §4.3 — EvidenceStore。req/resp 対を artifacts/<screen_id>/<evidence_id>/ に保存。
-// 認証ヘッダ(Authorization/Cookie 等)は値をマスクして保存(§6.2 の原則)。
+// DESIGN §4.3 — EvidenceStore. Saves each req/resp pair under artifacts/<screen_id>/<evidence_id>/.
+// Auth headers (Authorization/Cookie etc.) are saved with their values masked (§6.2 principle).
 
 import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { HttpRequest, HttpResponse } from "./http.js";
 
 export interface EvidenceArtifact {
-  /** 生 HTTP リクエスト全体(秘匿ヘッダは redacted 済)。 */
+  /** The whole raw HTTP request (sensitive headers already redacted). */
   request: string | null;
-  /** 生 HTTP レスポンス全体(headers + body, redacted 済。maxResponseBytes で切り詰め)。 */
+  /** The whole raw HTTP response (headers + body, already redacted; truncated at maxResponseBytes). */
   response: string | null;
-  /** response が maxResponseBytes を超えて切り詰められたか。 */
+  /** Whether the response was truncated for exceeding maxResponseBytes. */
   truncated: boolean;
 }
 
 /**
- * artifacts/<screenId>/<evidenceId>/ を探して raw HTTP request/response を読む(レポート埋め込み用)。
- * evidenceId は一意なので screen をまたいで探索する。見つからなければ null。
+ * Search artifacts/<screenId>/<evidenceId>/ and read the raw HTTP request/response (for embedding in the report).
+ * evidenceId is unique, so we search across screens. Returns null if not found.
  */
 export function readEvidenceArtifact(artifactsDir: string, evidenceId: string, maxResponseBytes = 16384): EvidenceArtifact | null {
   if (!existsSync(artifactsDir)) return null;
@@ -73,7 +73,7 @@ function maskHeaders(headers: Record<string, string> = {}): Record<string, strin
   return out;
 }
 
-/** {method,url,headers,body} → 生 HTTP リクエスト(リクエスト全体。再現/コピペ可)。 */
+/** {method,url,headers,body} → raw HTTP request (the whole request; reproducible / copy-pasteable). */
 function rawHttpRequest(req: { method: string; url: string; headers?: Record<string, string>; body?: string | null }): string {
   let host = "";
   let target = req.url;
@@ -82,7 +82,7 @@ function rawHttpRequest(req: { method: string; url: string; headers?: Record<str
     host = u.host;
     target = `${u.pathname}${u.search}` || "/";
   } catch {
-    /* 相対/異形 URL はそのまま */
+    /* leave relative/malformed URLs as-is */
   }
   const lines = [`${req.method} ${target} HTTP/1.1`];
   if (host) lines.push(`Host: ${host}`);
@@ -90,7 +90,7 @@ function rawHttpRequest(req: { method: string; url: string; headers?: Record<str
   return `${lines.join("\n")}\n\n${req.body ?? ""}`;
 }
 
-/** status+headers+body → 生 HTTP レスポンス。 */
+/** status+headers+body → raw HTTP response. */
 function rawHttpResponse(res: { status: number; headers?: Record<string, string>; body: string }): string {
   const lines = [`HTTP/1.1 ${res.status}`];
   for (const [k, v] of Object.entries(res.headers ?? {})) lines.push(`${k}: ${v}`);
@@ -124,7 +124,7 @@ export class EvidenceStore {
     writeFileSync(join(dir, "request.json"), JSON.stringify(safeRequest, null, 2));
     writeFileSync(join(dir, "response.json"), JSON.stringify(safeResponse, null, 2));
     writeFileSync(join(dir, "response.body.txt"), input.response.body);
-    // リクエスト全体 / レスポンス全体を生 HTTP でも保存(headers は masked。再現/コピペ用)。
+    // Also save the whole request / whole response as raw HTTP (headers masked; for reproduction / copy-paste).
     writeFileSync(join(dir, "request.http.txt"), rawHttpRequest(safeRequest));
     writeFileSync(join(dir, "response.http.txt"), rawHttpResponse({ status: safeResponse.status, headers: safeResponse.headers, body: input.response.body }));
     writeFileSync(

@@ -1,7 +1,7 @@
-// 技術スタックのフィンガープリント(deterministic, LLM 不使用)。レスポンスのヘッダ/Cookie/meta/script-src
-// から server・middleware・language・framework・CMS・frontend ライブラリの「名前+バージョン」を構造化抽出する。
-// 既知脆弱性の照合のうち **JS ライブラリは VULN_JS_LIBS カタログで決定的に**付与し、server/middleware/language は
-// バージョンだけ集めて pilot の A06 ステージ(LLM の CVE 知識)が評価する。collect が信頼でき、評価が知識依存。
+// Technology-stack fingerprinting (deterministic, no LLM). From the response's headers/Cookie/meta/script-src
+// it structurally extracts the "name + version" of server, middleware, language, framework, CMS, and frontend libraries.
+// Of the known-vuln matching, **JS libraries are annotated deterministically via the VULN_JS_LIBS catalog**, while server/middleware/language
+// just collect versions, evaluated by pilot's A06 stage (the LLM's CVE knowledge). Collection is reliable; evaluation is knowledge-dependent.
 
 import { VULN_JS_LIBS, versionLeq } from "./passive.js";
 
@@ -10,13 +10,13 @@ export type TechKind = "server" | "language" | "framework" | "cms" | "frontend-l
 export interface TechComponent {
   kind: TechKind;
   name: string;
-  /** 取れた版(例 "2.4.41")。banner だけで版が無ければ null。 */
+  /** the version obtained (e.g. "2.4.41"). null if there's only a banner with no version. */
   version: string | null;
-  /** 検出元(header 名 / "cookie" / "meta generator" / "script src")。 */
+  /** detection source (header name / "cookie" / "meta generator" / "script src"). */
   source: string;
-  /** 生の手がかり(レポート/証拠の根拠)。 */
+  /** the raw clue (basis for the report/evidence). */
   evidence: string;
-  /** 既知脆弱版に合致した場合のメモ(JS ライブラリ catalog のみ。空なら未照合=LLM 段で評価)。 */
+  /** note when it matches a known-vulnerable version (JS library catalog only; empty means unmatched = evaluated at the LLM stage). */
   knownVuln?: string;
 }
 
@@ -34,21 +34,21 @@ function splitBanner(v: string): { name: string; version: string | null } {
   return { name: first, version: null };
 }
 
-// ヘッダ → 種別(banner を splitBanner で名前+版に割る)
+// header → kind (splitBanner splits the banner into name+version)
 const BANNER_HEADERS: { header: string; kind: TechKind }[] = [
   { header: "server", kind: "server" },
   { header: "x-powered-by", kind: "framework" },
   { header: "via", kind: "server" },
 ];
 
-// 版を直接持つヘッダ(値そのものが版)
+// headers that carry the version directly (the value itself is the version)
 const VERSION_VALUE_HEADERS: { header: string; kind: TechKind; name: string }[] = [
   { header: "x-aspnet-version", kind: "framework", name: "ASP.NET" },
   { header: "x-aspnetmvc-version", kind: "framework", name: "ASP.NET MVC" },
   { header: "x-generator", kind: "cms", name: "(generator)" },
 ];
 
-// Set-Cookie 名 → フレームワーク/言語(版は出ないが「何で出来ているか」が分かる)
+// Set-Cookie name → framework/language (no version, but reveals "what it's built with")
 const COOKIE_TECH: { re: RegExp; kind: TechKind; name: string }[] = [
   { re: /\bPHPSESSID\b/i, kind: "language", name: "PHP" },
   { re: /\bJSESSIONID\b/i, kind: "language", name: "Java (servlet container)" },
@@ -69,8 +69,8 @@ function scriptRefs(body: string): string[] {
 }
 
 /**
- * 1 件以上のレスポンス sample から技術コンポーネントを抽出・重複排除して返す。
- * JS ライブラリは VULN_JS_LIBS と照合し、既知脆弱版なら knownVuln を付ける(決定的)。
+ * Extract and deduplicate technology components from one or more response samples.
+ * JS libraries are matched against VULN_JS_LIBS; a known-vulnerable version gets a knownVuln annotation (deterministic).
  */
 export function fingerprintTech(samples: ReadonlyArray<TechSample>): TechComponent[] {
   const byKey = new Map<string, TechComponent>();
@@ -81,18 +81,18 @@ export function fingerprintTech(samples: ReadonlyArray<TechSample>): TechCompone
 
   for (const s of samples) {
     const h = s.headers;
-    // banner ヘッダ(Server / X-Powered-By / Via)
+    // banner headers (Server / X-Powered-By / Via)
     for (const { header, kind } of BANNER_HEADERS) {
       const v = h[header];
       if (!v) continue;
-      // X-Powered-By は "PHP/7.4.3" や "Express" など複数値もある
+      // X-Powered-By may have multiple values like "PHP/7.4.3" or "Express"
       for (const part of v.split(",")) {
         const { name, version } = splitBanner(part);
         if (!name) continue;
         add({ kind, name, version, source: header, evidence: `${header}: ${v}`.slice(0, 200) });
       }
     }
-    // 版が値そのもののヘッダ
+    // headers whose value is the version itself
     for (const { header, kind, name } of VERSION_VALUE_HEADERS) {
       const v = h[header];
       if (v && /\d/.test(v)) {
@@ -100,7 +100,7 @@ export function fingerprintTech(samples: ReadonlyArray<TechSample>): TechCompone
         add({ kind, name: nm, version: splitBanner(v).version ?? v.trim().slice(0, 40), source: header, evidence: `${header}: ${v}`.slice(0, 200) });
       }
     }
-    // Set-Cookie 名 → フレームワーク家系
+    // Set-Cookie name → framework lineage
     const setCookie = h["set-cookie"] ?? "";
     if (setCookie) {
       for (const c of COOKIE_TECH) {
@@ -113,7 +113,7 @@ export function fingerprintTech(samples: ReadonlyArray<TechSample>): TechCompone
       const { name, version } = splitBanner(meta[1]);
       add({ kind: "cms", name: name || meta[1], version, source: "meta generator", evidence: `<meta generator>: ${meta[1]}`.slice(0, 200) });
     }
-    // frontend ライブラリ(script src のファイル名から名前+版。既知脆弱版なら knownVuln)
+    // frontend libraries (name+version from the script src filename; knownVuln if a known-vulnerable version)
     for (const ref of scriptRefs(s.body)) {
       for (const lib of VULN_JS_LIBS) {
         const m = lib.re.exec(ref);
@@ -133,7 +133,7 @@ export function fingerprintTech(samples: ReadonlyArray<TechSample>): TechCompone
   return [...byKey.values()];
 }
 
-/** TechComponent[] を人間可読の表に整形(LLM プロンプト / レポート用)。 */
+/** Format TechComponent[] into a human-readable table (for the LLM prompt / report). */
 export function formatTechInventory(components: ReadonlyArray<TechComponent>): string[] {
   return components.map(
     (c) =>
@@ -142,8 +142,8 @@ export function formatTechInventory(components: ReadonlyArray<TechComponent>): s
   );
 }
 
-/** 検出スタック → 狙うべき攻撃クラスのヒント(deterministic, pentest 知識)。methodology を tech-aware にするため
- *  early fingerprint の結果を計画に注入する用。空配列 = 特有のヒントなし(構造ベースの計画のまま)。 */
+/** Detected stack → hints for the attack classes to target (deterministic, pentest knowledge). Used to inject the early
+ *  fingerprint result into the plan so the methodology is tech-aware. Empty array = no specific hints (keep the structure-based plan). */
 export function stackAttackHints(components: ReadonlyArray<TechComponent>): string[] {
   const hay = components.map((c) => `${c.name} ${c.kind}`).join(" | ").toLowerCase();
   const hints: string[] = [];

@@ -1,4 +1,4 @@
-// ignore_paths のパターン照合: 前方一致 + `*` ワイルドカード。低価値 CMS コンテンツ木の間引き用。
+// ignore_paths pattern matching: prefix match + `*` wildcard. For pruning low-value CMS content trees.
 
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
@@ -6,26 +6,26 @@ import { pathIsIgnored } from "./tools.js";
 
 const base = "https://www.example.gv.at/";
 
-test("空パターンは常に false(間引き無効=全量抽出)", () => {
+test("empty patterns are always false (pruning disabled = exhaustive extraction)", () => {
   assert.equal(pathIsIgnored("/artikel/x", [], base), false);
 });
 
-test("前方一致(末尾スラッシュ配下)", () => {
+test("prefix match (under a trailing slash)", () => {
   const pats = ["/artikel/", "/news/"];
   assert.equal(pathIsIgnored("https://www.example.gv.at/artikel/12345", pats, base), true);
   assert.equal(pathIsIgnored("/news/2026/foo", pats, base), true);
   assert.equal(pathIsIgnored("/account/edit", pats, base), false);
 });
 
-test("`*` ワイルドカード", () => {
+test("`*` wildcard", () => {
   const pats = ["/en/kultur/*", "/p*/detail"];
   assert.equal(pathIsIgnored("/en/kultur/museum", pats, base), true);
   assert.equal(pathIsIgnored("/produkt/detail", pats, base), true);
   assert.equal(pathIsIgnored("/en/wohnen/x", pats, base), false);
 });
 
-test("機能面のパスは誤って間引かない(前方一致の境界)", () => {
+test("functional paths aren't pruned by mistake (prefix-match boundary)", () => {
   const pats = ["/news/"];
-  assert.equal(pathIsIgnored("/newsletter/signup", pats, base), false); // /news/ ではない
+  assert.equal(pathIsIgnored("/newsletter/signup", pats, base), false); // not /news/
   assert.equal(pathIsIgnored("/api/news", pats, base), false);
 });

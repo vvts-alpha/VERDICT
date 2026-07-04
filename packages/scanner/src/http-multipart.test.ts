@@ -1,5 +1,5 @@
-// FetchHttpClient の multipart 送信が **CRLF/boundary 正しい** ことを、localhost のエコーサーバで実証する
-// (LLM 手書きだと LF になり python-multipart 等に弾かれる問題の回帰防止)。外部ネットは使わない。
+// Prove that FetchHttpClient's multipart send is **CRLF/boundary-correct** using a localhost echo server
+// (regression guard for the issue where an LLM hand-writing it produces LF and gets rejected by python-multipart etc.). No external network.
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import { createServer } from "node:http";
@@ -11,7 +11,7 @@ test("multipart upload is sent with correct boundary + CRLF (undici FormData)", 
     req.on("data", (c) => chunks.push(c as Buffer));
     req.on("end", () => {
       res.setHeader("x-req-content-type", req.headers["content-type"] ?? "");
-      res.end(Buffer.concat(chunks).toString("latin1")); // 生リクエストボディをそのままエコー
+      res.end(Buffer.concat(chunks).toString("latin1")); // echo the raw request body as-is
     });
   });
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
@@ -28,16 +28,16 @@ test("multipart upload is sent with correct boundary + CRLF (undici FormData)", 
         files: [{ name: "image", filename: "evil.svg", contentType: "image/svg+xml", base64: Buffer.from(svg, "utf8").toString("base64") }],
       },
     });
-    // サーバが見た Content-Type は multipart + boundary(undici が自動設定)。
+    // The Content-Type the server saw is multipart + boundary (set automatically by undici).
     assert.match(res.headers["x-req-content-type"] ?? "", /^multipart\/form-data; boundary=/);
-    // 生ボディは CRLF 区切り(これが手書きだと LF になる肝)。
+    // The raw body is CRLF-delimited (the crux — hand-writing this yields LF).
     assert.ok(res.body.includes("\r\n"), "multipart parts must be CRLF-delimited");
     assert.ok(!/[^\r]\n/.test(res.body), "no bare LF between multipart lines");
-    // ファイルパートのヘッダ + 中身 + フィールドが揃っている。
+    // The file part's headers + content + the field are all present.
     assert.match(res.body, /Content-Disposition: form-data; name="image"; filename="evil\.svg"/);
     assert.match(res.body, /Content-Type: image\/svg\+xml/);
     assert.ok(res.body.includes("file:///etc/passwd"), "the XXE payload body is present");
-    assert.match(res.body, /Content-Disposition: form-data; name="name"\r\n\r\namraam/); // フィールド name=value
+    assert.match(res.body, /Content-Disposition: form-data; name="name"\r\n\r\namraam/); // field name=value
   } finally {
     server.close();
   }

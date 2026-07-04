@@ -1,4 +1,4 @@
-// fingerprintTech: レスポンスのヘッダ/Cookie/meta/script-src から技術スタックを構造化抽出する純関数の検証。
+// fingerprintTech: test of the pure function that structurally extracts the tech stack from the response's headers/Cookie/meta/script-src.
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import { fingerprintTech, formatTechInventory, stackAttackHints } from "./fingerprint.js";
@@ -11,7 +11,7 @@ test("stackAttackHints maps detected stack to attack classes (Flask/Jinja → SS
   assert.ok(flask.some((h) => /SSTI/i.test(h)), "Flask/Jinja should imply SSTI");
   const php = stackAttackHints([{ kind: "language", name: "PHP", version: "7.4.3", source: "x-powered-by", evidence: "" }]);
   assert.ok(php.some((h) => /LFI|php:\/\/filter|deserial/i.test(h)), "PHP should imply LFI/deserialization");
-  // 無関係なスタックはヒントなし(構造ベース計画のまま)。
+  // An unrelated stack yields no hints (keeps the structure-based plan).
   assert.deepEqual(stackAttackHints([{ kind: "server", name: "nginx", version: "1.20", source: "server", evidence: "" }]), []);
 });
 

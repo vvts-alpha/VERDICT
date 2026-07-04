@@ -1,5 +1,5 @@
-// DESIGN §6.1 / §6.7 — BFS クロール本体。frontier を scope/depth/budget で打ち切り、
-// 新規 dedup_key が N 連続ゼロで停止。発見画面は store 経由でカバレッジ台帳に自動エンロール。
+// DESIGN §6.1 / §6.7 — BFS crawl core. The frontier is bounded by scope/depth/budget, and it stops
+// after N consecutive screens with zero new dedup_key. Discovered screens auto-enroll in the coverage ledger via the store.
 
 import type { AssessmentStore, Screen } from "@veritas/core";
 import { recordRequests } from "@veritas/core";
@@ -22,13 +22,13 @@ interface FrontierItem {
 }
 
 export interface CrawlHooks {
-  /** 渡すと、発見画面を upsertScreen(→ カバレッジ台帳に自動エンロール)し phase を phase1_recon に。 */
+  /** If provided, upsertScreen each discovered screen (→ auto-enroll in the coverage ledger) and set phase to phase1_recon. */
   store?: AssessmentStore;
   assessmentId?: string;
   onScreen?: (screen: Screen, isNew: boolean) => void;
-  /** 2 パス目(認証済み再クロール)で既存画面を引き継ぐ(dedup + screenId 継続)。 */
+  /** Carry over existing screens on the 2nd pass (authenticated re-crawl) — dedup + screenId continuity. */
   seedScreens?: Screen[];
-  /** 能動探索(§7.2): 新規画面ごとにブラウザを操作し、発火 API と新 URL を返す。 */
+  /** Active exploration (§7.2): drive the browser on each new screen, returning fired APIs and new URLs. */
   explore?: (observation: Observation) => Promise<{ apis: CapturedExchange[]; urls: string[] }>;
 }
 
@@ -88,7 +88,7 @@ export async function crawl(
     try {
       observation = await driver.visit(item.url);
     } catch {
-      continue; // 取得失敗はスキップ(M1)。詰まり検出/handoff は M6
+      continue; // skip fetch failures (M1); stuck detection / handoff is M6
     }
     visitedCount += 1;
 
@@ -97,8 +97,8 @@ export async function crawl(
     if (hooks.store && hooks.assessmentId) hooks.store.upsertScreen(hooks.assessmentId, screen);
     hooks.onScreen?.(screen, isNew);
 
-    // 詰まり検出(§6.3): CAPTCHA/MFA/challenge/429 → HumanHandoff 起票。壁の先へは降りない
-    // が、フロンティアの他経路は継続(non-blocking)。Cookie 注入はしない。
+    // Stuck detection (§6.3): CAPTCHA/MFA/challenge/429 → raise a HumanHandoff. Don't descend past the wall,
+    // but keep going on the other frontier paths (non-blocking). No cookie injection.
     const stuck = detectStuck(observation);
     if (stuck) {
       if (hooks.store && hooks.assessmentId && !handoffUrls.has(observation.finalUrl)) {
@@ -118,7 +118,7 @@ export async function crawl(
     }
 
     if (config.followLinks && item.depth < config.maxDepth) {
-      // 能動探索: 新規画面でフォーム送信等を実行し、発火 API を画面へ、新 URL を frontier へ。
+      // Active exploration: on a new screen, submit forms etc., adding fired APIs to the screen and new URLs to the frontier.
       if (isNew && hooks.explore) {
         try {
           const ex = await hooks.explore(observation);
@@ -136,7 +136,7 @@ export async function crawl(
             if (!visited.has(u) && isInScope(u, config.scope)) queue.push({ url: u, depth: item.depth + 1 });
           }
         } catch {
-          /* 探索失敗は無視して継続 */
+          /* ignore exploration failures and continue */
         }
       }
       for (const href of [...observation.links, ...observation.virtualRoutes]) {

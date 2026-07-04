@@ -1,16 +1,16 @@
 import type { StateView } from "@veritas/core";
 
-// 作戦 / Scenarios タブ — エージェントが「画面ごとに何を、どう攻めるつもりか(methodology の作戦)」と
-// 「A04 横断シナリオの結果」を read-only で projection する。データ源は events(📋 PLAN / ✓ coverage /
-// 🧩 scenario stage の note)+ findings。スキーマ変更なし。
+// Scenarios tab — a read-only projection of "what the agent intends to attack per screen, and how (the methodology plan)"
+// and "the results of A04 cross-screen scenarios". Data source is events (📋 PLAN / ✓ coverage /
+// 🧩 scenario stage notes) + findings. No schema change.
 //
-// 注: PLAN の note は本文 200 字で切られているので plan は部分表示。
+// Note: a PLAN note's body is truncated at 200 chars, so the plan is shown partially.
 
 const PLAN_RE = /^📋 PLAN (s-\d+): \[([^\]]*)\]\s*([\s\S]*)$/;
 const COV_RE = /^✓ (s-\d+) → (finding|clean) \[([^\]]*)\]/;
 const FOCUS_RE = /^🧩 scenario stage: operator focus → ([\s\S]*)$/;
 
-// A04(横断ロジック)系カテゴリ — scenario 段の成果として別枠表示する。
+// A04 (cross-screen logic) categories — shown separately as the output of the scenario stage.
 const A04 = new Set(["price-tampering", "qty-tampering", "workflow-bypass", "mass-assignment"]);
 
 type Plan = { screenId: string; classes: string[]; plan: string };
@@ -53,7 +53,7 @@ export function Scenarios({ view, onJump }: { view: StateView; onJump: (screenId
   const urlOf = new Map(view.screens.map((s) => [s.screenId, s.urlTemplate]));
   const screenIds = [...new Set([...plans.keys(), ...covs.keys()])].sort();
 
-  // A04 横断シナリオの成果 = scenario カテゴリ or 画面なし(cross-screen)の finding。
+  // Output of A04 cross-screen scenarios = findings in a scenario category, or with no screen (cross-screen).
   const scen = view.findings.filter((f) => {
     const cat = /^\[([^\]]+)\]/.exec(f.title)?.[1] ?? "";
     return A04.has(cat) || f.screenId == null;
@@ -61,7 +61,7 @@ export function Scenarios({ view, onJump }: { view: StateView; onJump: (screenId
 
   return (
     <section className="scenarios-tab">
-      <h2>Scenarios / 作戦</h2>
+      <h2>Scenarios</h2>
       {focus ? (
         <div className="focus-banner" title="operator --focus, injected as the top priority of the scenario stage">
           🎯 Operator focus: <b>{focus}</b>

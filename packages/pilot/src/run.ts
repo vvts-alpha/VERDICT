@@ -1,8 +1,9 @@
-// Claude 主導の 3 ステージ・オーケストレータ。
+// Claude-led 3-stage orchestrator.
 //
-// 一度に全部投げると AI は省略するので、調査 → 方法論 → 診断 に分節して query() を分けて回す。
-// 各ステージは allowedTools でツールを絞り、phase を進める。診断は screens を 1 枚ずつバウンドした
-// 文脈で回す(= カバレッジ台帳の queued を全部 terminal にする)ので、画面の取りこぼしが構造的に出ない。
+// If everything is thrown at once the AI elides work, so we segment into survey -> methodology -> diagnosis,
+// running query() separately per stage. Each stage narrows the tools via allowedTools and advances the phase.
+// Diagnosis runs the screens one at a time in a bounded context (= driving every queued entry in the coverage
+// ledger to terminal), so screens can't be structurally missed.
 
 import { createSdkMcpServer, query } from "@anthropic-ai/claude-agent-sdk";
 import type { HookCallback } from "@anthropic-ai/claude-agent-sdk";
@@ -25,93 +26,93 @@ export interface RunPilotOptions {
   assessmentId: string;
   targetUrl: string;
   scope: ScopePolicy;
-  /** 複数シード(診断対象 URL のリスト)。survey はこれら全てを起点にする。未指定なら [targetUrl] 相当。 */
+  /** Multiple seeds (list of URLs to diagnose). survey starts from all of them. If unset, equivalent to [targetUrl]. */
   seedUrls?: string[];
-  /** URL リストのハードロック: survey はシードだけをマップし、発見リンクを辿らない(横断クロールしない)。
-   *  診断はマップされた画面 = シード + 各画面が叩く API に限定される。「対象がガッチガチに URL 固定」用。 */
+  /** Hard-lock to the URL list: survey maps only the seeds and does not follow discovered links (no crawling across).
+   *  Diagnosis is limited to the mapped screens = seeds + the APIs each screen calls. For "target is rigidly URL-locked". */
   lockToSeeds?: boolean;
-  /** サイト全体を覆う HTTP Basic/Digest 認証(operator 提供)。ブラウザは httpCredentials で自動応答、
-   *  raw http(FetchHttpClient)には Authorization: Basic を注入(Digest はブラウザ経路のみ)。 */
+  /** Site-wide HTTP Basic/Digest auth (operator-provided). The browser auto-responds via httpCredentials,
+   *  and raw http (FetchHttpClient) gets Authorization: Basic injected (Digest is browser-path only). */
   httpBasic?: { user: string; pass: string };
-  /** operator 提供のカスタムヘッダ(WAF 回避・案件指定の必須ヘッダ等)。ブラウザ(同一オリジンのみ)+
-   *  raw http 経路の両方に付与する。 */
+  /** Operator-provided custom headers (WAF evasion / engagement-mandated required headers, etc.). Applied to both
+   *  the browser (same-origin only) and the raw http path. */
   customHeaders?: Record<string, string>;
   profileDir: string;
   artifactsDir: string;
   roleCreds: Map<string, LoginCreds>;
-  /** ロール名 → 事前取得 Cookie ファイルのパス(資格情報の代わり。自動ログイン不能な壁向け)。 */
+  /** Role name -> path of a pre-captured cookie file (in place of credentials; for walls that can't be auto-logged-in). */
   roleCookieFiles?: Map<string, string>;
-  /** ロール名 → 権限の自由記述(例: "全権管理者" / "一般ユーザ(読取のみ)")。
-   *  エージェントが auth-diff で高/低権限を見分けるための文脈。秘密ではないが state には永続しない。 */
+  /** Role name -> free-text privilege description (e.g. "full admin" / "regular user (read-only)").
+   *  Context for the agent to tell high/low privilege apart in auth-diff. Not secret, but not persisted in state. */
   roleDescriptions?: Map<string, string>;
-  /** 診断の「深い」モデル(創発が要る高価値画面)。例 claude-opus-4-8。未指定なら SDK 既定。 */
+  /** The "deep" model for diagnosis (high-value screens that need emergent reasoning). e.g. claude-opus-4-8. If unset, SDK default. */
   model?: string;
-  /** survey/methodology/login と低価値画面の「速い」モデル(例 claude-sonnet-4-6)。
-   *  未指定なら model と同じ(= モデル使い分け無し・挙動不変)。指定すると Opus/Sonnet を tier 化。 */
+  /** The "fast" model for survey/methodology/login and low-value screens (e.g. claude-sonnet-4-6).
+   *  If unset, same as model (= no model tiering, behaviour unchanged). Setting it tiers Opus/Sonnet. */
   fastModel?: string;
-  /** 診断後の A04 シナリオ(画面横断の多段ロジック濫用)ステージを実行するか。既定 true。
-   *  取引面(カート/注文/決済/クーポン/送金/権限変更)が無ければ自動スキップ。deep モデル固定。 */
+  /** Whether to run the post-diagnosis A04 scenario (cross-screen multi-step logic abuse) stage. Default true.
+   *  Auto-skipped if there is no transactional surface (cart/order/checkout/coupon/transfer/privilege change). Pinned to the deep model. */
   scenarioPass?: boolean;
-  /** シナリオ段に常駐の既定シナリオ(資格情報ハント等の横断目的)を注入するか。既定 true。--no-default-scenarios で off。 */
+  /** Whether to inject the standing default scenarios (cross-cutting objectives like credential hunting) into the scenario stage. Default true. Off with --no-default-scenarios. */
   defaultScenarios?: boolean;
-  /** A06 フィンガープリント(版収集→既知 CVE 評価)ステージを実行するか。既定 true。--no-fingerprint で off。 */
+  /** Whether to run the A06 fingerprint (version collection -> known-CVE assessment) stage. Default true. Off with --no-fingerprint. */
   fingerprintPass?: boolean;
-  /** A06 で検出版をオンライン CVE DB(OSV/NVD)へ照会するか。既定 false(第三者への egress = opt-in)。--cve-lookup で on。 */
+  /** Whether to query an online CVE DB (OSV/NVD) for detected versions in A06. Default false (egress to a third party = opt-in). On with --cve-lookup. */
   cveLookup?: boolean;
   maxTurns?: number;
   rateMs?: number;
   headless?: boolean;
   browserPath?: string;
   noSandbox?: boolean;
-  /** 診断する画面数の上限(既定 40)。 */
+  /** Cap on the number of screens to diagnose (default 40). */
   maxScreens?: number;
-  /** survey が写像する画面数の上限(--max-survey-screens)。到達したら探索停止。未設定=無制限。 */
+  /** Cap on the number of screens survey maps (--max-survey-screens). Stops exploration once reached. Unset = unlimited. */
   maxSurveyScreens?: number;
-  /** 既存 run の再開: survey/methodology をスキップし、未診断(非 terminal)画面だけ診断する。 */
+  /** Resume an existing run: skip survey/methodology and diagnose only the un-diagnosed (non-terminal) screens. */
   resume?: boolean;
-  /** 全量抽出(画面調査): survey の動的間引き(ignore_paths)を無効化し、全画面をマップする。
-   *  未指定なら ignore_paths が有効(モデルが低価値な CMS コンテンツ木などを自分で間引いて frontier 爆発を抑える)。 */
+  /** Exhaustive (screen survey): disable survey's dynamic pruning (ignore_paths) and map every screen.
+   *  If unset, ignore_paths is active (the model prunes low-value CMS content trees etc. itself to curb frontier blow-up). */
   exhaustiveSurvey?: boolean;
-  /** 調査のみ: survey ステージだけ実行し、methodology/診断をしない(screens/スクショ/API は出す、finding は出さない)。
-   *  後で `resume` で診断に繋げられる(map now / diagnose later)。 */
+  /** Survey only: run just the survey stage, no methodology/diagnosis (emits screens/screenshots/APIs, no findings).
+   *  Can later be chained into diagnosis via `resume` (map now / diagnose later). */
   surveyOnly?: boolean;
-  /** Burp 等の上流プロキシ(例 http://127.0.0.1:8080)。指定時のみ HTTP+ブラウザを経由。未指定=現状通り。 */
+  /** Upstream proxy such as Burp (e.g. http://127.0.0.1:8080). Routes HTTP + browser through it only when set. Unset = as-is. */
   burpProxy?: string;
-  /** 認証セッション維持: 診断中、この分数を超えて間が空いたら画面の合間にトップへ navigate して
-   *  cookie を再同期する(0 で無効)。sliding/短命トークンの stale 化対策。既定 4 分。 */
+  /** Keep the auth session alive: during diagnosis, if the gap between screens exceeds this many minutes, navigate to
+   *  the top page and re-sync cookies (0 disables). Guards against sliding/short-lived tokens going stale. Default 4 min. */
   keepAliveMinutes?: number;
-  /** attended(手動マルチセッション認証): ロールごとに headed 永続コンテキストを 1 つ起動し、
-   *  人手でログイン(CAPTCHA/MFA/Arkose も突破)させてから調査・診断を回す。診断はロール別ライブ
-   *  Cookie を使う。CAPTCHA/MFA・絶対TTL 失効など 自動ログイン/Cookieファイルで越えられない壁向け。 */
+  /** attended (manual multi-session auth): launch one headed persistent context per role and have a human log in
+   *  (clearing CAPTCHA/MFA/Arkose too) before running survey/diagnosis. Diagnosis uses each role's live
+   *  cookie. For walls that auto-login / cookie files can't cross (CAPTCHA/MFA, absolute-TTL expiry, etc.). */
   attended?: boolean;
-  /** attended で窓を開くロール名の全集合(manifest の auth.roles[].name)。資格情報も Cookie ファイルも
-   *  持たない「純手動」ロールもここに含めれば窓が開く(手動 N アカウント)。未指定なら creds/cookie のキーから導出。 */
+  /** The full set of role names to open windows for in attended (manifest's auth.roles[].name). "Purely manual" roles
+   *  with neither credentials nor a cookie file also get a window if included here (manual N accounts). If unset, derived from creds/cookie keys. */
   attendedRoles?: string[];
-  /** attended のロール別プロファイルの親ディレクトリ(各ロールは <dir>/<role>)。既定は profileDir の隣 `profiles/`。 */
+  /** Parent directory of the per-role attended profiles (each role is <dir>/<role>). Default is `profiles/` next to profileDir. */
   attendedProfilesDir?: string;
-  /** attended で各ロール窓を最初に開く URL(手動ログインの入口)。未指定なら targetUrl。 */
+  /** The URL each role window opens first in attended (the manual-login entry point). If unset, targetUrl. */
   loginUrl?: string;
-  /** attended の人手操作待ち: メッセージを表示し、operator が Enter を押したら解決する。
-   *  CLI が readline で供給(pilot パッケージは TTY を仮定しない)。attended では必須(controlUrl 指定時は不要)。 */
+  /** attended wait for human action: show a message and resolve when the operator presses Enter.
+   *  Supplied by the CLI via readline (the pilot package assumes no TTY). Required in attended (not needed when controlUrl is set). */
   promptOperator?: (message: string) => Promise<void>;
-  /** attended×LiveHands: serve に逆接続して role セッションを WebUI に screencast する。
-   *  指定時は headless で起動し、手動ログイン完了は操作者の「Done」で解決(ターミナル Enter 不要)。 */
+  /** attended x LiveHands: reverse-connect to serve to screencast the role sessions to the WebUI.
+   *  When set, launches headless and resolves manual-login completion via the operator's "Done" (no terminal Enter needed). */
   controlUrl?: string;
   onText?: (text: string) => void;
   onTool?: (name: string, input: unknown) => void;
-  /** 診断/シナリオの後、**セッションを保ったまま**実行する追加スキャンのフック(Burp 能動スキャン等)。
-   *  指定時のみ phase2_burpscan を report の前に挟む。keepWarm() を定期的に呼べば authed セッションを維持できる
-   *  (長い Burp スキャン中にトークン/Cookie が stale 化しないように)。driver はこの時点でまだ生きている。 */
+  /** Hook for an extra scan to run **while the session is still held** after diagnosis/scenarios (Burp active scan, etc.).
+   *  Only when set does it insert phase2_burpscan before report. Calling keepWarm() periodically keeps the authed session alive
+   *  (so tokens/cookies don't go stale during a long Burp scan). The driver is still alive at this point. */
   onBurpScanPhase?: (ctx: { keepWarm: () => Promise<void>; cookie: string; bearer: string }) => Promise<void>;
-  /** OOB(Burp Collaborator)接続。設定すると診断中に probe_oob が使える(ブラインド SSRF/XXE/SQLi の確証)。
-   *  CLI が BURP_AUDIT_API/BURP_AUDIT_TOKEN から解決して渡す。未設定なら probe_oob は not-available。 */
+  /** OOB (Burp Collaborator) connection. When set, probe_oob is usable during diagnosis (confirming blind SSRF/XXE/SQLi).
+   *  The CLI resolves it from BURP_AUDIT_API/BURP_AUDIT_TOKEN and passes it. If unset, probe_oob is not-available. */
   oob?: BurpAuditConn;
-  /** 操作者の重点ヒント(自由文)。**シナリオ段の最優先目的**として注入する(per-screen 診断には混ぜない)。
-   *  例 "決済フローと /api/orders の IDOR を重点的に。クーポン/価格改ざんも"。emphasis であって排他ではない。 */
+  /** Operator emphasis hint (free text). Injected as the **top-priority objective of the scenario stage** (not mixed into per-screen diagnosis).
+   *  e.g. "focus on the checkout flow and IDOR on /api/orders. Coupon/price tampering too." Emphasis, not exclusion. */
   focus?: string;
-  /** 入力欄スイープ: browser_navigate のたびにフォーム/検索を benign 値で送信して新ルート/API を発見(既定 on）。 */
+  /** Input sweep: on every browser_navigate, submit forms/searches with benign values to discover new routes/APIs (default on). */
   inputSweep?: boolean;
-  /** 入力スイープで POST フォームも送信する(=標的にデータを書く)。既定 true。false なら GET/検索のみ。 */
+  /** In the input sweep, also submit POST forms (= writes data to the target). Default true. If false, GET/search only. */
   aggressiveForms?: boolean;
 }
 
@@ -119,29 +120,30 @@ export interface PilotResult {
   findings: PilotSession["findings"];
   summary: string;
   turns: number;
-  /** この run で使ったトークン(input+output+cache の合計)。 */
+  /** Tokens used by this run (input+output+cache total). */
   tokensUsed: number;
-  /** この run の概算コスト(USD。サブスクなら API 換算の目安)。 */
+  /** Approximate cost of this run (USD; for a subscription, an API-equivalent estimate). */
   costUsd: number;
 }
 
-// disallowedTools は「モデルに見せない」リスト。onlyVeritasToolsHook が真の境界(全 non-veritas を deny)だが、
-// ここに **挙げていない組み込みツールは claude_code preset がモデルに提示する** → モデルが ToolSearch/TodoWrite/Task
-// 等を叩いて PreToolUse 拒否され、ターンとログを浪費する(実 run で頻発)。なので preset の組み込み系を網羅して隠す。
+// disallowedTools is the "don't show the model" list. onlyVeritasToolsHook is the real boundary (deny all non-veritas),
+// but **built-in tools not listed here are presented to the model by the claude_code preset** -> the model calls
+// ToolSearch/TodoWrite/Task etc., gets PreToolUse-denied, and wastes turns and log space (frequent in real runs). So we
+// enumerate and hide the preset's built-ins.
 const DISALLOWED = [
   // file / exec / web
   "Bash", "BashOutput", "KillShell", "Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "Glob", "Grep", "WebFetch", "WebSearch",
-  // agentic / meta(これが「tools search が使えない」の犯人。隠せばモデルは叩きに行かない)
+  // agentic / meta (this is the culprit behind "tools search unusable". Hide them and the model won't reach for them)
   "Task", "Agent", "ToolSearch", "TodoWrite", "Skill", "Monitor", "Workflow", "EnterPlanMode", "ExitPlanMode", "SendMessage",
   "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "TaskStop", "TaskOutput", "CronCreate", "CronList", "CronDelete",
 ];
 
-/** pilot は veritas の MCP ツールだけで回す(bounded 設計)。だが SDK は Bash/Read 以外にも Task/Agent/
- *  Monitor/Skill/ToolSearch/TaskCreate… を公開しており、bypassPermissions 下ではモデルがそれらを呼べてしまう
- *  (Monitor/Skill は実質 shell 実行 = Bash 禁止のすり抜け、Agent は無制限サブエージェント生成)。
- *  PreToolUse フックで mcp__veritas__* 以外を一律 deny する。disallowedTools の列挙に依存しない allowlist で、
- *  bypassPermissions 下でも PreToolUse の deny は効く(SDK 仕様)。新ツールが増えても自動で塞がる。 */
-/** pilot で呼んでよいツールか(veritas の MCP ツールのみ許可)。Task/Agent/Monitor/Skill/ToolSearch 等は false。 */
+/** pilot runs on veritas MCP tools only (bounded design). But the SDK exposes Task/Agent/
+ *  Monitor/Skill/ToolSearch/TaskCreate... beyond Bash/Read, and under bypassPermissions the model can call them
+ *  (Monitor/Skill are effectively shell execution = a Bash-ban bypass, Agent spawns unbounded sub-agents).
+ *  The PreToolUse hook denies anything that isn't mcp__veritas__*. It's an allowlist that doesn't depend on the
+ *  disallowedTools enumeration, and PreToolUse deny works even under bypassPermissions (SDK behaviour). New tools are auto-blocked. */
+/** Whether a tool may be called in pilot (veritas MCP tools only). Task/Agent/Monitor/Skill/ToolSearch etc. are false. */
 export function isPilotAllowedTool(name: string): boolean {
   return name.startsWith("mcp__veritas__");
 }
@@ -158,8 +160,8 @@ const onlyVeritasToolsHook: HookCallback = async (input) => {
   };
 };
 
-/** 診断のモデル使い分け: 認証下 / object-ref・id param / idor-candidate 等ラベル / 認証付き API を持つ
- *  「高価値画面」は deep(例 opus)で診断、入力の無い静的画面は fast(例 sonnet)。 */
+/** Model tiering for diagnosis: "high-value screens" — authenticated / object-ref & id params / labels like
+ *  idor-candidate / screens with authenticated APIs — are diagnosed on deep (e.g. opus); input-less static screens on fast (e.g. sonnet). */
 function screenIsHighValue(sc: Screen): boolean {
   if (sc.authState === "post-login") return true;
   if (sc.labels.some((l) => /idor|pii|upload|admin|payment|auth/i.test(l))) return true;
@@ -168,9 +170,9 @@ function screenIsHighValue(sc: Screen): boolean {
   return false;
 }
 
-/** resume 時に「前回 run で survey / methodology がどこまで終わったか」を判定する純関数。
- *  survey_done マーカーはモデルが呼ばず出ないことがある(maxTurns で stage 終了)ので、
- *  phase(recon を越えている=phase1_label 以降)と methodology の 📋 PLAN イベントも OR で見る。 */
+/** Pure function that decides how far survey / methodology got in the previous run (for resume).
+ *  The survey_done marker may not appear because the model didn't call it (the stage ended on maxTurns), so we
+ *  also OR in the phase (past recon = phase1_label or later) and methodology's 📋 PLAN events. */
 export function resumeStageState(
   prev: { phase: string; events: ReadonlyArray<{ type: string; payload: unknown }> } | null,
 ): { surveyDone: boolean; methodologyDone: boolean } {
@@ -187,32 +189,32 @@ export function resumeStageState(
   return { surveyDone, methodologyDone };
 }
 
-/** Claude(サブスク CLI / SDK)の利用上限・トークン枯渇エラーかを判定する純関数。
- *  該当したら「スキップして次へ」ではなく run を一時停止(resume 可能)させる。
- *  ネットワーク先(診断対象)由来の 429 はこの経路(LLM 呼び出しの失敗)には来ないので誤検知しない。
- *  一過性の overloaded(529)は含めない — リトライで回復するので止めるべきではない。 */
+/** Pure function that decides whether an error is a Claude (subscription CLI / SDK) usage-limit / token-exhaustion error.
+ *  On a match we pause the run (resumable) rather than "skip and move on".
+ *  A 429 from the network target (the site under diagnosis) doesn't reach this path (an LLM-call failure), so no false positive.
+ *  Transient overloaded (529) is excluded — a retry recovers, so we shouldn't stop. */
 export function isClaudeUsageLimit(text: string): boolean {
   const s = (text || "").toLowerCase();
   return (
     /usage limit|usage_limit/.test(s) ||
-    /session limit/.test(s) || // 「You've hit your session limit …」(claude CLI のサブスク上限)
+    /session limit/.test(s) || // "You've hit your session limit ..." (claude CLI subscription cap)
     /limit reached/.test(s) ||
-    /hit your\b[\s\S]{0,30}\blimit/.test(s) || // 「(you've) hit your session/usage limit」
-    /\blimit\b[\s\S]{0,40}\bresets?\b/.test(s) || // 「… limit · resets 12:50am」(limit と resets の共起)
+    /hit your\b[\s\S]{0,30}\blimit/.test(s) || // "(you've) hit your session/usage limit"
+    /\blimit\b[\s\S]{0,40}\bresets?\b/.test(s) || // "... limit · resets 12:50am" (limit and resets co-occur)
     /rate.?limit/.test(s) ||
     /too many requests/.test(s) ||
     /\b429\b/.test(s) ||
     /quota/.test(s) ||
-    /resets?\s+(at\b|\d)/.test(s) || // 「reset at …」/「resets 12:50am」両方
+    /resets?\s+(at\b|\d)/.test(s) || // both "reset at ..." and "resets 12:50am"
     /insufficient (credit|quota|balance|funds)/.test(s) ||
     /out of (credit|tokens)/.test(s)
   );
 }
 
-/** epoch(秒 or ミリ秒)を「(resets <ISO>)」に整形。判別不能なら空文字。 */
+/** Format an epoch (seconds or milliseconds) as "(resets <ISO>)". Empty string if indeterminate. */
 function fmtReset(epoch: unknown): string {
   if (typeof epoch !== "number" || !Number.isFinite(epoch) || epoch <= 0) return "";
-  const ms = epoch < 1e12 ? epoch * 1000 : epoch; // 秒なら ms に正規化
+  const ms = epoch < 1e12 ? epoch * 1000 : epoch; // normalize seconds to ms
   try {
     return ` (resets ${new Date(ms).toISOString()})`;
   } catch {
@@ -221,13 +223,13 @@ function fmtReset(epoch: unknown): string {
 }
 
 /**
- * SDK メッセージの**構造化フィールド**から利用上限を判定する一次シグナル(文字列マッチより堅い)。
- * 該当時は pause 理由文字列を、非該当は null を返す。順に強い順:
- *  1. `rate_limit_event` … 専用イベント。`status==='rejected'` = 今まさに弾かれている(+ 復帰時刻)。
- *  2. `assistant.error` …  `'rate_limit' | 'billing_error'`(`'overloaded'` は一過性なので**含めない**)。
- *  3. `result.api_error_status` … HTTP 429。
- * これで「You've hit your session limit …」のような文言ゆれに依存せず確定できる。throw 経路だけは
- * 文字列しか無いので isClaudeUsageLimit() をフォールバックに残す。
+ * Primary signal that decides a usage limit from the SDK message's **structured fields** (sturdier than string matching).
+ * Returns a pause-reason string on a match, null otherwise. In order of strength:
+ *  1. `rate_limit_event` ... a dedicated event. `status==='rejected'` = being rejected right now (+ recovery time).
+ *  2. `assistant.error` ...  `'rate_limit' | 'billing_error'` (`'overloaded'` is transient, so **excluded**).
+ *  3. `result.api_error_status` ... HTTP 429.
+ * This pins it down without relying on wording variants like "You've hit your session limit ...". Only the throw path
+ * has just a string, so isClaudeUsageLimit() stays as a fallback.
  */
 export function usageLimitFromMessage(msg: unknown): string | null {
   const m = msg as { type?: string; error?: string; rate_limit_info?: Record<string, unknown>; api_error_status?: number | null };
@@ -237,7 +239,7 @@ export function usageLimitFromMessage(msg: unknown): string | null {
     if (info.status === "rejected") {
       return `rate_limit_event: ${String(info.rateLimitType ?? "rate limit")} rejected${fmtReset(info.resetsAt)}`;
     }
-    return null; // allowed / allowed_warning は止めない
+    return null; // allowed / allowed_warning don't stop the run
   }
   if (m.type === "assistant" && (m.error === "rate_limit" || m.error === "billing_error")) {
     return `assistant error: ${m.error}`;
@@ -248,19 +250,23 @@ export function usageLimitFromMessage(msg: unknown): string | null {
   return null;
 }
 
-/** SDK usage(assistant/result どちらの形でも)を input+output+cache の合計トークンに畳む。 */
+/** Collapse SDK usage into "tokens processed" = fresh input + output + newly-cached input.
+ *  EXCLUDES cache_read_input_tokens on purpose: in a multi-turn agent loop the cached system/context prefix is re-read
+ *  (and re-reported) on EVERY turn, so summing it counts the same tokens once per turn — a ~10x inflation on a 40-turn
+ *  screen (this is why a run showed ~38M against a 5M cap). cache_read is also near-free under the prompt cache. Counting
+ *  only fresh input + cache-creation + output yields the unique tokens actually processed. */
 export function usageTokens(u: Record<string, number> | undefined): number {
-  return u ? (u.input_tokens ?? 0) + (u.output_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) : 0;
+  return u ? (u.input_tokens ?? 0) + (u.output_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) : 0;
 }
 
-/** 1 ステージのトークン計上値。result(cumulative)を読めたらそれを採用し、読めなければ(done ツールでの
- *  早期 break / maxTurns)assistant 各ターンの積算でフォールバックする。max を取るのは取りこぼし保険。 */
+/** Token tally for one stage. If the result (cumulative) can be read, use it; otherwise (early break on the done tool /
+ *  maxTurns) fall back to the per-turn assistant accumulation. Taking the max is insurance against dropping tokens. */
 export function stageTokenDelta(assistantTokens: number, resultTokens: number, sawResult: boolean): number {
   return sawResult ? Math.max(resultTokens, assistantTokens) : assistantTokens;
 }
 
-/** operator 向け表示用のロールラベル。description があれば 「role」(説明) の形にして、
- *  手動ログイン窓で「どのアカウントでログインすべきか(管理者/一般 等)」が分かるようにする。 */
+/** Role label for operator-facing display. If a description exists, render it as 'role' (description) so the
+ *  manual-login window makes clear which account to log in as (admin / regular, etc.). */
 export function roleLabel(role: string, descriptions?: Map<string, string>): string {
   const d = descriptions?.get(role);
   return d ? `'${role}' (${d})` : `'${role}'`;
@@ -269,19 +275,19 @@ export function roleLabel(role: string, descriptions?: Map<string, string>): str
 export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
   const launchBase = {
     headless: opts.headless ?? true,
-    // x-verdict マーカーは driver 側で「同一オリジンのみ」に付く(クロスオリジンは付けない=第三者を壊さない)。
-    // スコープは別概念で、別ドメイン/API を含めて広げてよい(診断は http 経路で in-scope なら何でも叩ける)。
+    // The x-verdict marker is added driver-side "same-origin only" (never cross-origin = doesn't break third parties).
+    // Scope is a separate concept and may widen to include other domains/APIs (diagnosis can hit anything in-scope over the http path).
     ...(opts.browserPath ? { executablePath: opts.browserPath } : {}),
     ...(opts.noSandbox ? { args: ["--no-sandbox"] } : {}),
     ...(opts.burpProxy ? { proxy: opts.burpProxy } : {}),
-    // サイト全体の Basic/Digest: Playwright が 401 を自動応答(全 driver 起動=attended ロール窓含む)。
+    // Site-wide Basic/Digest: Playwright auto-responds to 401 (across all launched drivers = including attended role windows).
     ...(opts.httpBasic ? { httpCredentials: { username: opts.httpBasic.user, password: opts.httpBasic.pass } } : {}),
-    // operator のカスタムヘッダ(WAF 回避等)。同一オリジンのみに付く(driver 側でゲート)。
+    // Operator's custom headers (WAF evasion etc.). Applied same-origin only (gated driver-side).
     ...(opts.customHeaders && Object.keys(opts.customHeaders).length ? { extraHeaders: opts.customHeaders } : {}),
   };
 
-  // ── attended: ロールごとに headed 永続コンテキストを 1 つ起動し、人手でログインさせる ──
-  //    生きたセッションをロール別に保持し、診断は login() で driver/cookie を swap して使う。
+  // ── attended: launch one headed persistent context per role and have a human log in ──
+  //    Keep the live session per role; diagnosis swaps driver/cookie via login() to use them.
   let driver: PlaywrightDriver;
   let roleSessions: Map<string, RoleSession> | undefined;
   let primaryRole = "";
@@ -290,14 +296,14 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
   if (opts.attended) {
     if (!opts.promptOperator && !opts.controlUrl)
       throw new Error("attended mode requires promptOperator (Enter-confirm) or controlUrl (WebUI login)");
-    // 窓を開くロール: 明示の attendedRoles を最優先(純手動ロールも含む)。無ければ creds/cookie のキーから。
+    // Roles to open windows for: explicit attendedRoles take precedence (including purely-manual roles). Otherwise from creds/cookie keys.
     const roles = [
       ...new Set([...(opts.attendedRoles ?? []), ...opts.roleCreds.keys(), ...(opts.roleCookieFiles?.keys() ?? [])]),
     ];
-    if (roles.length === 0) roles.push("primary"); // ロール未設定でも単一の手動セッションは張れる
+    if (roles.length === 0) roles.push("primary"); // even with no roles set, a single manual session can be established
     const baseDir = opts.attendedProfilesDir ?? join(opts.profileDir, "..", "profiles");
     roleSessions = new Map();
-    // controlUrl 指定時は WebUI でログインするので headless(サーバに画面不要)。
+    // With controlUrl set, login happens in the WebUI, so headless (the server needs no display).
     const viaWeb = !!opts.controlUrl;
     if (viaWeb) liveControl = new LiveControl(opts.controlUrl!, opts.onText);
     opts.onText?.(
@@ -305,8 +311,8 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         ? `👤 attended (WebUI): ${roles.length} session(s) — log in via the Sessions tab`
         : `👤 attended: launching ${roles.length} headed session(s) per role (manual login)`,
     );
-    // 各 role を起動し認証を解決する。cookie→注入 / creds→smartLogin(失敗時 manual へ) / 無材料→manual。
-    // viaWeb の manual は後でまとめて登録し Done を並行待ち(N タブ同時)。CLI(非 viaWeb)は従来どおり順次 Enter。
+    // Launch each role and resolve auth. cookie -> inject / creds -> smartLogin (manual on failure) / no material -> manual.
+    // viaWeb manual roles are registered together later and their Done awaited in parallel (N tabs at once). CLI (non-viaWeb) is sequential Enter as before.
     const manual: Array<{ role: string; driver: PlaywrightDriver }> = [];
     const earlyLlm = viaWeb ? new ClaudeCliClient({ defaultModel: opts.fastModel ?? "claude-sonnet-4-6" }) : undefined;
     for (const role of roles) {
@@ -325,7 +331,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
           opts.onText?.(`⚠ role '${role}' cookie file error: ${String(e).slice(0, 120)}`);
         }
       } else if (viaWeb && creds && earlyLlm) {
-        // 資格情報あり → 自動ログイン。失敗(CAPTCHA/MFA)時は manual タブにフォールバック。
+        // Credentials present -> auto-login. On failure (CAPTCHA/MFA) fall back to a manual tab.
         await d.gotoUrl(opts.loginUrl ?? opts.targetUrl);
         let ok = false;
         try {
@@ -349,7 +355,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         manual.push({ role, driver: d });
         deferred = true;
       } else {
-        // CLI attended: 従来どおり 1 ロールずつ Enter で確認。
+        // CLI attended: confirm one role at a time with Enter, as before.
         await d.gotoUrl(opts.loginUrl ?? opts.targetUrl);
         await opts.promptOperator!(`▶ Please log in manually in the browser window for role ${roleLabel(role, opts.roleDescriptions)} (clear CAPTCHA/MFA too). Press Enter when done…`);
       }
@@ -359,7 +365,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         opts.onText?.(`✅ role ${roleLabel(role, opts.roleDescriptions)} session established (cookie ${cookie ? "present" : "absent"})`);
       }
     }
-    // viaWeb の manual ロールを全部登録 → Done を**並行**待ち(N タブが一斉に出る) → セッション確定。
+    // Register all viaWeb manual roles -> await Done **in parallel** (N tabs appear at once) -> sessions established.
     if (liveControl && manual.length > 0) {
       opts.onText?.(`🖥 ${manual.length} session(s) need manual login — open the Sessions tab, log in each, then press Done.`);
       for (const m of manual) await liveControl.register(m.role, m.driver);
@@ -383,15 +389,15 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     minDelayMs: opts.rateMs ?? 250,
     headers: {
       "x-verdict": "assessment",
-      // サイト全体の Basic: raw http 経路にも Authorization を注入(Digest はブラウザ経路のみ対応)。
+      // Site-wide Basic: inject Authorization on the raw http path too (Digest is browser-path only).
       ...(opts.httpBasic ? { authorization: `Basic ${Buffer.from(`${opts.httpBasic.user}:${opts.httpBasic.pass}`, "utf8").toString("base64")}` } : {}),
-      ...(opts.customHeaders ?? {}), // operator のカスタムヘッダ(WAF 回避等)を raw http 経路にも付与
+      ...(opts.customHeaders ?? {}), // apply operator's custom headers (WAF evasion etc.) to the raw http path too
     },
     ...(opts.burpProxy ? { proxy: opts.burpProxy } : {}),
   });
 
-  // モデル使い分け: deep = 診断の高価値画面(opus 等)、fast = survey/methodology/login/低価値画面(sonnet 等)。
-  // fastModel 未指定なら deep と同じ = tier 無し(挙動不変)。
+  // Model tiering: deep = high-value diagnosis screens (opus etc.), fast = survey/methodology/login/low-value screens (sonnet etc.).
+  // If fastModel is unset, same as deep = no tiering (behaviour unchanged).
   const deepModel = opts.model;
   const fastModel = opts.fastModel ?? opts.model;
 
@@ -408,8 +414,8 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     roleCookieFiles: opts.roleCookieFiles ?? new Map(),
     roleDescriptions: opts.roleDescriptions ?? new Map(),
     loginLlm: new ClaudeCliClient({ defaultModel: fastModel ?? "claude-sonnet-4-6" }),
-    currentCookie: primaryCookie, // attended は primary ロールの生 Cookie で開始(通常は "")
-    currentBearer: "", // login() がロールごとに localStorage の Bearer JWT を載せる
+    currentCookie: primaryCookie, // attended starts with the primary role's live cookie (normally "")
+    currentBearer: "", // login() loads each role's localStorage Bearer JWT
     currentRole: primaryRole,
     findings: [],
     findCounter: 0,
@@ -423,7 +429,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     done: false,
     doneSummary: "",
     paused: false,
-    model: fastModel, // login ツール(smartLogin)は機械的 → fast モデル
+    model: fastModel, // the login tool (smartLogin) is mechanical -> fast model
     inv: new InventoryBuilder(),
     visited: new Set(),
     frontier: new Set(),
@@ -433,7 +439,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     lockToSeeds: !!opts.lockToSeeds,
     inputSweep: opts.inputSweep ?? true,
     aggressiveForms: opts.aggressiveForms ?? true,
-    cveLookup: opts.cveLookup ?? false, // opt-in: 第三者 CVE DB への egress は明示 on の時だけ
+    cveLookup: opts.cveLookup ?? false, // opt-in: egress to a third-party CVE DB only when explicitly on
     plans: new Map(),
     currentScreenId: null,
     screenVerdict: null,
@@ -446,8 +452,8 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     ...(roleSessions ? { roleSessions } : {}),
   };
 
-  // 複数シード: target 以外のシード URL を frontier に積んで survey の起点にする
-  // (ハードロックでも初期シードは積む。以降の発見リンク拡張だけ recordObservation が抑止する)。
+  // Multiple seeds: push seed URLs other than target onto the frontier as survey starting points
+  // (even under hard-lock the initial seeds are pushed; only later discovered-link expansion is suppressed by recordObservation).
   const seedList = [...new Set([opts.targetUrl, ...(opts.seedUrls ?? [])])];
   for (const u of seedList) {
     if (stripHash(u) !== stripHash(opts.targetUrl)) session.frontier.add(stripHash(u));
@@ -461,24 +467,24 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         return d ? `${r} (${d})` : r;
       })
       .join(", ") || "none";
-  const maxTurns = opts.maxTurns ?? 80; // CLI 既定と一致(main.ts も 80)。WebUI 空欄→CLI 既定で 80 に揃う。
+  const maxTurns = opts.maxTurns ?? 80; // matches the CLI default (main.ts is also 80). WebUI blank -> CLI default lands on 80.
 
-  // ── resume: 既存 run から再シード(survey/methodology はスキップ、未診断画面だけ診断) ──
+  // ── resume: reseed from an existing run (skip survey/methodology, diagnose only un-diagnosed screens) ──
   const prev = opts.resume ? opts.store.loadAssessment(opts.assessmentId) : null;
   const resumeStatus = prev ? new Map(prev.screenScans.map((s) => [s.screenId, s.status] as const)) : null;
   if (prev) {
-    session.inv.seed(prev.screens); // screenId 採番 + dedup を継続
-    session.currentCookie = await driver.sessionCookieHeader(); // run の認証セッション(browser-profile)を再利用
-    session.currentBearer = (await driver.bearerToken().catch(() => null)) ?? ""; // SPA の Bearer JWT も再利用
+    session.inv.seed(prev.screens); // continue screenId numbering + dedup
+    session.currentCookie = await driver.sessionCookieHeader(); // reuse the run's auth session (browser-profile)
+    session.currentBearer = (await driver.bearerToken().catch(() => null)) ?? ""; // reuse the SPA's Bearer JWT too
     session.currentRole = [...opts.roleCreds.keys()][0] ?? "";
-    // 方法論プランをイベントログ(📋 PLAN <id>: …)から復元
+    // Restore methodology plans from the event log (📋 PLAN <id>: ...)
     for (const e of prev.events) {
       if (e.type === "note") {
         const m = /📋 PLAN (s-\d+): (.+)/.exec(e.payload.message);
         if (m && m[1] && m[2]) session.plans.set(m[1], m[2]);
       }
     }
-    // 既存 findings を引き継ぎ(id 採番継続 + dedup キー best-effort で二重報告を抑止)
+    // Carry over existing findings (continue id numbering + best-effort dedup key to suppress double-reporting)
     for (const f of prev.findings) {
       session.findings.push(f);
       const num = Number.parseInt(f.id.replace(/^f-/, ""), 10);
@@ -494,16 +500,16 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     });
   }
 
-  // トークン使用量: 各 query() の result からトークンを拾い、run の budget(累計)に貯めて永続化。
+  // Token usage: pick tokens from each query()'s result, accumulate into the run's budget (cumulative), and persist.
   let budget = (prev ?? opts.store.loadAssessment(opts.assessmentId))?.budget ?? null;
-  let runTokens = 0; // この run の増分(サマリ表示用)
+  let runTokens = 0; // this run's increment (for the summary display)
   let costUsd = 0;
 
-  // トークン/利用上限の枯渇でステージが落ちたら、スキップして次画面へ進めず run を一時停止する。
-  //   done=true で以降の全ステージ/画面を止め、paused=true で最終処理が report に落とさない(resume 可能)。
-  //   利用枠が回復したら `pilot --resume --id <id>`(WebUI の ▶ resume)で未診断の queued 画面から続けられる。
+  // If a stage dies from token/usage-limit exhaustion, pause the run rather than skipping to the next screen.
+  //   done=true stops all subsequent stages/screens; paused=true keeps the final step from dropping to report (resumable).
+  //   Once the quota recovers, `pilot --resume --id <id>` (the WebUI's ▶ resume) continues from the un-diagnosed queued screens.
   const pauseRun = (detail: string): void => {
-    if (session.paused) return; // 二重計上しない
+    if (session.paused) return; // don't double-count
     session.done = true;
     session.paused = true;
     session.doneSummary = `⏸ paused — Claude usage/token limit reached. Resume when it resets: pilot --resume --id ${opts.assessmentId}`;
@@ -515,7 +521,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     opts.store.setPaused(opts.assessmentId, true, "Claude usage/token limit reached");
   };
 
-  // 1 ステージ = 1 query()。stage の done フラグが立つか、Claude が手を止めたら抜ける。
+  // One stage = one query(). Exit when the stage's done flag is set or Claude stops on its own.
   const runStage = async (p: {
     system: string;
     goal: string;
@@ -525,9 +531,9 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     shouldStop: () => boolean;
   }): Promise<number> => {
     let turns = 0;
-    // トークン計上: result メッセージ(query 終了時の cumulative usage)は shouldStop の早期 break より
-    // 後に来るため、done ツールで stage を畳むとほぼ毎回読めず 0 のままだった。そこで assistant 各ターンの
-    // usage を積算しておき(早期 break でも残る)、result を読めた場合だけ authoritative な合計で上書きする。
+    // Token tally: the result message (cumulative usage at query end) arrives after shouldStop's early break, so
+    // collapsing the stage with a done tool almost always left it unread at 0. So we accumulate per-turn assistant
+    // usage (which survives an early break) and only overwrite with the authoritative total when the result is readable.
     const tally = usageTokens;
     let assistantTokens = 0;
     let resultTokens = 0;
@@ -539,7 +545,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         allowedTools: p.allowed.map((n) => `mcp__veritas__${n}`),
         disallowedTools: DISALLOWED,
         permissionMode: "bypassPermissions",
-        // veritas MCP ツール以外(Task/Agent/Monitor/Skill/ToolSearch/… 含む)を PreToolUse で全拒否する allowlist。
+        // allowlist that PreToolUse-denies everything other than veritas MCP tools (incl. Task/Agent/Monitor/Skill/ToolSearch/...).
         hooks: { PreToolUse: [{ hooks: [onlyVeritasToolsHook] }] },
         ...(p.model ? { model: p.model } : {}),
         systemPrompt: { type: "preset", preset: "claude_code", append: p.system },
@@ -548,8 +554,8 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     });
     try {
       for await (const msg of q) {
-        // 構造化フィールドを一次シグナルに(rate_limit_event / assistant.error / api_error_status 429)。
-        // 検出したら pauseRun が done=true を立て、下の `session.done` チェックでこの stage を抜ける。
+        // Use structured fields as the primary signal (rate_limit_event / assistant.error / api_error_status 429).
+        // On detection pauseRun sets done=true, and the `session.done` check below exits this stage.
         const structuredLimit = usageLimitFromMessage(msg);
         if (structuredLimit) pauseRun(structuredLimit.slice(0, 160));
         if (msg.type === "assistant") {
@@ -569,7 +575,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
           sawResult = true;
           resultTokens = tally(r.usage);
           costUsd += r.total_cost_usd ?? 0;
-          // エラー結果(throw ではなく result で返るケース)。error_max_turns は正常な打ち切りなので除外。
+          // Error result (returned via result rather than a throw). error_max_turns is a normal cutoff, so excluded.
           if ((r.is_error || (r.subtype && r.subtype !== "success")) && r.subtype !== "error_max_turns") {
             const detail = `${r.subtype ?? "error"} ${r.result ?? ""}`.trim();
             if (isClaudeUsageLimit(detail)) pauseRun(detail.slice(0, 160));
@@ -578,9 +584,9 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         if (p.shouldStop() || session.done) break;
       }
     } catch (err) {
-      // ステージが throw で落ちた場合。トークン/利用上限の枯渇なら **スキップせず一時停止**(resume 可能)。
-      // それ以外(maxTurns / 一過性 SDK エラー)は従来どおり best-effort で次の画面/ステージへ。
-      // この時点で発火済みのツール(record_finding 等)は既に store に反映されているので finding は失われない。
+      // When a stage dies with a throw. If it's token/usage-limit exhaustion, **pause instead of skipping** (resumable).
+      // Otherwise (maxTurns / transient SDK error) proceed best-effort to the next screen/stage as before.
+      // Tools already fired by this point (record_finding etc.) are already reflected in the store, so no finding is lost.
       const m = String(err instanceof Error ? err.message : err).slice(0, 160);
       if (isClaudeUsageLimit(m)) {
         pauseRun(m);
@@ -594,14 +600,14 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     } catch {
       /* generator already done */
     }
-    // stage 終了後に 1 回だけ計上(早期 break / maxTurns / 正常終了 のどれでも漏らさない)。
-    // result を読めたらその cumulative を採用、無ければ assistant 積算でフォールバック。
+    // Tally once after the stage ends (never dropped on early break / maxTurns / normal finish).
+    // If the result is readable use its cumulative; otherwise fall back to the assistant accumulation.
     const delta = stageTokenDelta(assistantTokens, resultTokens, sawResult);
     if (delta > 0) {
       runTokens += delta;
       if (budget) {
         budget = recordTokens(budget, delta);
-        opts.store.updateBudget(opts.assessmentId, budget); // WebUI/status にライブ反映
+        opts.store.updateBudget(opts.assessmentId, budget); // live-reflect to WebUI/status
       }
     }
     return turns;
@@ -609,32 +615,32 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
 
   let turns = 0;
   try {
-    // resume = いま走り始めた = もう停止中ではない。前回トークン枯渇で立てた「⏸ paused」を解除する
-    //   (これが残っていると WebUI が稼働中なのに paused 表示のままになる)。
+    // resume = we just started running = no longer paused. Clear the "⏸ paused" set on the previous token exhaustion
+    //   (if it lingers, the WebUI keeps showing paused while actually running).
     if (opts.resume && opts.store.isPaused(opts.assessmentId)) {
       opts.store.setPaused(opts.assessmentId, false, "resumed");
     }
-    // resume 時に survey/methodology が前回どこまで進んだかを events から判定する。
-    // ※ survey-only も「完了」だが phase は phase1_recon のままなので phase では中断と区別できない。
-    //   survey_done が出す "SURVEY done" マーカーと、methodology の "📋 PLAN" イベントで判定する。
+    // On resume, decide from events how far survey/methodology got last time.
+    // Note: survey-only is also "done" but the phase stays phase1_recon, so phase can't distinguish it from an interruption.
+    //   Decide via the "SURVEY done" marker survey_done emits and methodology's "📋 PLAN" events.
     const { surveyDone: surveyDonePrev, methodologyDone: methodologyDonePrev } = resumeStageState(prev);
-    const doSurvey = !opts.resume || !surveyDonePrev; // resume でも survey 未完なら調査から
+    const doSurvey = !opts.resume || !surveyDonePrev; // even on resume, if survey is incomplete start from survey
     const doMethodology = !opts.surveyOnly && (!surveyDonePrev || !methodologyDonePrev);
 
     if (doSurvey) {
-      // ── STAGE 1: 調査(写像のみ) ── resume で survey 未完なら既存 screens を seed したまま継続。
+      // ── STAGE 1: survey (mapping only) ── on resume with survey incomplete, continue with the existing screens seeded.
       if (opts.resume) opts.onText?.("↻ survey was incomplete, resuming from recon");
       opts.store.setPhase(opts.assessmentId, "phase1_recon");
-      // ロールがあるなら「フロンティアが空 ≠ 完了」— 認証後サーフェスを必ずマップさせる(survey_done は認証ゲート付き)。
+      // If there are roles, "empty frontier ≠ done" — force mapping the post-login surface (survey_done is auth-gated).
       const authClause =
         rolesLine === "none"
           ? ""
           : ` CRITICAL: an empty frontier is NOT a reason to call survey_done while roles are still unauthenticated. After mapping the public surface you MUST login(role) for EACH role (${rolesLine}), confirm the response shows a cookie/bearer is present, and navigate the authenticated pages it unlocks (orders / basket / wallet / admin / settings / etc.) so they enter the inventory. survey_done is GATED on having an active authenticated session and will be refused otherwise.`;
       const surveyGoal = opts.lockToSeeds
-        ? // URL リスト固定: シードだけをマップし、横断クロールしない。
+        ? // URL-list lock: map only the seeds, no crawling across.
           `URL-list mode — LOCKED. Diagnose ONLY these exact URLs; do NOT follow links or explore beyond this list:\n${seedList.map((u, i) => `  ${i + 1}. ${u}`).join("\n")}\nFor EACH url: browser_navigate to it (its screen and the APIs it calls are recorded automatically). Log in as needed — roles for login(): ${rolesLine}. When survey_status shows the frontier empty (all ${seedList.length} mapped), call survey_done.${authClause}`
         : seedList.length > 1
-          ? // 複数シード(横断あり): 各シードを起点にスコープ面をマップ。
+          ? // Multiple seeds (with crawling): map the scope surface starting from each seed.
             `Map the in-scope surface starting from these ${seedList.length} seed URLs:\n${seedList.map((u) => `  - ${u}`).join("\n")}\nIn-scope hosts: ${opts.scope.inScopeHosts.join(", ")}. Roles for login(): ${rolesLine}. Visit each seed, follow links, log in as each role, and keep going until survey_status shows the frontier empty. Then survey_done.${authClause}`
           : `Map the entire in-scope surface of ${opts.targetUrl}. In-scope hosts: ${opts.scope.inScopeHosts.join(", ")}. Roles for login(): ${rolesLine}. Start at the target, follow links, log in as each role, and keep going until survey_status shows the frontier empty. Then survey_done.${authClause}`;
       turns += await runStage({
@@ -642,14 +648,14 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         goal: surveyGoal,
         allowed: STAGE_TOOLS.survey,
         maxTurns,
-        model: fastModel, // 調査は機械的 → fast
+        model: fastModel, // survey is mechanical -> fast
         shouldStop: () => session.surveyDone || session.done,
       });
     }
 
-    // ── 早期フィンガープリント(方法論の前) ── スタックを検出し、tech-aware な攻撃計画ヒントを作る。
-    //    A06 の fingerprint 段は診断の"後"なので計画に間に合わない。ここで root/login/先頭画面を軽く GET し
-    //    (deterministic・LLM 不使用)、検出スタック→狙う攻撃クラスを methodology の goal に注入する。
+    // ── Early fingerprint (before methodology) ── detect the stack and produce tech-aware attack-plan hints.
+    //    The A06 fingerprint stage runs *after* diagnosis, too late for planning. Here we lightly GET root/login/first screens
+    //    (deterministic, no LLM) and inject detected-stack -> target-attack-classes into the methodology goal.
     let techClause = "";
     if (doMethodology && !session.done) {
       try {
@@ -685,11 +691,11 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
             `\n`;
         }
       } catch {
-        /* fingerprint 失敗は計画をブロックしない */
+        /* fingerprint failure must not block planning */
       }
     }
 
-    // ── STAGE 2: 方法論(全画面の攻撃計画) ── survey-only はスキップ。resume は未完のときだけ実行。
+    // ── STAGE 2: methodology (attack plan for every screen) ── survey-only skips it. resume runs it only when incomplete.
     if (doMethodology && !session.done) {
       opts.store.setPhase(opts.assessmentId, "phase1_label");
       turns += await runStage({
@@ -697,16 +703,16 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         goal: `${techClause}${session.inv.screens().length} screens were mapped. Call get_inventory, then record_methodology for EVERY screen, then methodology_done.`,
         allowed: STAGE_TOOLS.methodology,
         maxTurns: Math.min(maxTurns, 30),
-        model: fastModel, // 方法論も fast(構造化された計画立案)
+        model: fastModel, // methodology is fast too (structured plan authoring)
         shouldStop: () => session.methodologyDone || session.done,
       });
     }
 
-    // ── STAGE 3: 診断(1 画面ずつ。台帳の queued を潰し切る) ── ※ survey-only ならスキップ
+    // ── STAGE 3: diagnosis (one screen at a time; drive every queued ledger entry to done) ── skipped if survey-only
     if (!opts.surveyOnly && !session.done) {
       opts.store.setPhase(opts.assessmentId, "phase2_scan");
-      // resume 時は terminal(clean/finding/excluded)を**先に**飛ばし、未診断だけを maxScreens まで回す。
-      // ※ slice を先にすると先頭が全部 terminal の場合に queued を見ずに 0 件で終わる(バグだった)。
+      // On resume, skip terminal (clean/finding/excluded) **first**, then run only the un-diagnosed up to maxScreens.
+      // Note: slicing first ends with 0 without looking at queued when the head is all terminal (this was a bug).
       const TERMINAL = new Set(["clean", "finding", "suspected", "excluded"]);
       const candidates = resumeStatus
         ? session.inv.screens().filter((sc) => !TERMINAL.has(resumeStatus.get(sc.screenId) ?? "queued"))
@@ -715,20 +721,20 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       opts.onText?.(
         `🔬 diagnosing ${screens.length} screen(s)${resumeStatus ? ` of ${candidates.length} queued` : ""}${candidates.length > screens.length ? ` (capped at ${opts.maxScreens ?? 40}; resume again or raise --max-screens for the rest)` : ""}`,
       );
-      // 複数エンドポイントの画面は IDOR 確定までに >25 turn 要る。25 だと記録直前で頭打ちしていた。
+      // Screens with multiple endpoints need >25 turns to confirm IDOR. At 25 it capped out just before recording.
       const perScreen = Math.min(maxTurns, 40);
 
-      // ── 認証セッション維持(A) ── 画面の合間に間が空いたらトップへ navigate して cookie を再同期。
-      //   sliding/短命トークンが生 HTTP 経路で stale 化するのを防ぐ。currentCookie が無い(unauth)なら何もしない。
-      //   attended は 1 ロールごとに生コンテキストを保持しているので、全ロールを巡回して再同期し、
-      //   ログイン画面に戻された(失効)ロールは operator に再ログインを求める(死活検知 → handoff)。
+      // ── Keep the auth session alive (A) ── if the gap between screens grows, navigate to top and re-sync cookies.
+      //   Prevents sliding/short-lived tokens going stale on the raw HTTP path. Does nothing without currentCookie (unauth).
+      //   attended holds a live context per role, so cycle through all roles to re-sync, and for a role bounced back to
+      //   the login page (expired) ask the operator to re-login (liveness detection -> handoff).
       const keepAliveMs = (opts.keepAliveMinutes ?? (opts.attended ? 1 : 4)) * 60_000;
       let lastTouch = Date.now();
       const keepAttendedWarm = async (): Promise<void> => {
         if (!roleSessions) return;
         for (const [role, rs] of roleSessions) {
           try {
-            await rs.driver.gotoUrl(opts.targetUrl); // 各ロールの生コンテキストをトップへ(Set-Cookie 追従)
+            await rs.driver.gotoUrl(opts.targetUrl); // each role's live context to top (follow Set-Cookie)
             const snap = await rs.driver.snapshot();
             if (sessionLooksDead(snap) && opts.promptOperator) {
               opts.onText?.(`🔴 role ${roleLabel(role, opts.roleDescriptions)} session appears to have expired (bounced back to the login page)`);
@@ -737,7 +743,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
             const fresh = await rs.driver.sessionCookieHeader();
             if (fresh) {
               rs.cookie = fresh;
-              if (role === session.currentRole) session.currentCookie = fresh; // アクティブロールは http 経路も更新
+              if (role === session.currentRole) session.currentCookie = fresh; // for the active role, update the http path too
             }
           } catch (e) {
             opts.onText?.(`⚠ keepalive '${role}' failed: ${String(e).slice(0, 100)}`);
@@ -758,8 +764,8 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         }
         if (!session.currentCookie) return;
         try {
-          await driver.gotoUrl(opts.targetUrl); // browser 経路でトップへ(Set-Cookie ローテーションに追従)
-          const fresh = await driver.sessionCookieHeader(); // 生 HTTP 経路の cookie も再同期
+          await driver.gotoUrl(opts.targetUrl); // to top via the browser path (follow Set-Cookie rotation)
+          const fresh = await driver.sessionCookieHeader(); // re-sync the raw HTTP path cookie too
           if (fresh) session.currentCookie = fresh;
           opts.store.appendEvent(opts.assessmentId, {
             type: "note",
@@ -771,35 +777,35 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         lastTouch = Date.now();
       };
 
-      // 1 画面を診断する(primary パスとドレインの両方から呼ぶ共通本体)。"break" で外側ループを止める。
+      // Diagnose one screen (shared body called from both the primary path and the drain). "break" stops the outer loop.
       const diagnoseOne = async (sc: Screen): Promise<"continue" | "break"> => {
         await keepSessionWarm();
         session.currentScreenId = sc.screenId;
         session.screenDone = false;
         session.screenVerdict = null;
-        session.screenProbes = 0; // カバレッジ・ゲートの裏取り用に画面ごとリセット
+        session.screenProbes = 0; // reset per screen for the coverage-gate cross-check
         opts.store.setScreenScanStatus(opts.assessmentId, sc.screenId, "scanning");
         turns += await runStage({
           system: DIAGNOSE_PROMPT,
           goal: `Diagnose screen ${sc.screenId} (${sc.urlTemplate}). Call get_screen for its detail and plan, test that plan with evidence discipline, then screen_done.`,
           allowed: STAGE_TOOLS.diagnose,
           maxTurns: perScreen,
-          model: screenIsHighValue(sc) ? deepModel : fastModel, // 高価値画面だけ deep(opus)
+          model: screenIsHighValue(sc) ? deepModel : fastModel, // only high-value screens go deep (opus)
           shouldStop: () => session.screenDone || session.done,
         });
-        // トークン/利用上限の枯渇で中断した場合: この画面は **未診断のまま** queued に戻し(clean にしない)、
-        // 一時停止して抜ける。resume すれば queued の画面(この画面と未着手の残り)から再開できる。
+        // If interrupted by token/usage-limit exhaustion: return this screen to queued **still un-diagnosed** (not clean),
+        // pause, and exit. On resume it continues from the queued screens (this one and the untouched rest).
         if (session.paused) {
           opts.store.setScreenScanStatus(opts.assessmentId, sc.screenId, "queued");
           return "break";
         }
-        // 台帳は **実際に記録された finding の確度** で terminal を決める(confirmed→finding / suspected→suspected /
-        //   無し→clean)。screenVerdict は record_finding が維持する権威値(upgrade-only、モデルの screen_done 自己申告では上書きしない)。
+        // The ledger decides terminal by the **confidence of the finding actually recorded** (confirmed->finding / suspected->suspected /
+        //   none->clean). screenVerdict is the authoritative value record_finding maintains (upgrade-only; the model's screen_done self-report never overwrites it).
         const status = session.screenVerdict === "finding" ? "finding" : session.screenVerdict === "suspected" ? "suspected" : "clean";
         opts.store.setScreenScanStatus(opts.assessmentId, sc.screenId, status);
 
-        // ── 認証壁サーキットブレーカ ── 全プローブが 401 で何も通らない(2xx ゼロ・finding ゼロ)なら、
-        //    これ以上画面を回しても無駄。止めて operator に認証設定(httpBasic/creds/cookie)を促す。
+        // ── Auth-wall circuit breaker ── if every probe returns 401 and nothing gets through (zero 2xx, zero findings),
+        //    running more screens is pointless. Stop and prompt the operator to set auth (httpBasic/creds/cookie).
         if (isAuthWalled(session)) {
           const msg = `🛑 auth wall: ${session.httpAuthWall}/${session.httpProbes} probes returned 401 and 0 got through — stopping. Set auth (httpBasic / credentials / cookie) and resume.`;
           opts.onText?.(msg);
@@ -822,16 +828,17 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
 
       const handled = new Set<string>();
       const maxScan = opts.maxScreens ?? 40;
-      // primary パス: 開始時スナップショット(優先度順)を回す。
+      // primary path: run the start-time snapshot (in priority order).
       for (const sc of screens) {
         if (session.done) break;
         handled.add(sc.screenId);
         if ((await diagnoseOne(sc)) === "break") break;
       }
-      // ── ドレイン(再利用可能) ── input sweep / browser_navigate / **後段の scenario・fingerprint** が新規 enroll
-      //    した queued 画面を拾い切る。for(screens) は開始時スナップショットなので、その後に台帳へ積まれた画面は
-      //    固定リストから漏れ queued のまま残る(= 「scanned 2/5」の正体)。設計意図「台帳の queued を全部 terminal に」
-      //    を満たすため、台帳を都度引き直して scannable かつ未処理の画面を maxScan / pause まで潰し切る。段ごとに呼ぶ。
+      // ── Drain (reusable) ── pick up every queued screen newly enrolled by the input sweep / browser_navigate /
+      //    **the later scenario & fingerprint stages**. for(screens) is a start-time snapshot, so screens added to the
+      //    ledger afterward fall out of that fixed list and stay queued (= the "scanned 2/5" symptom). To honour the design
+      //    intent "drive every queued ledger entry to terminal", re-load the ledger each time and clear scannable, unhandled
+      //    screens up to maxScan / pause. Called after each stage.
       const drainQueued = async (): Promise<void> => {
         let drained = 0;
         while (!session.done && handled.size < maxScan) {
@@ -858,17 +865,17 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       await drainQueued();
       session.currentScreenId = null;
 
-      // ── STAGE 4: シナリオ(A04 横断ロジック) ── 画面診断の後に1回。real id・auth 確証・実挙動を継承して
-      //    多段の workflow 濫用(クーポン/価格・数量改ざん/手順スキップ/権限昇格)を狙う。deep モデル固定。
-      //    「取引フローがあるか」の文脈判断は **LLM に委ねる**(脆い語彙正規表現を置かない): get_inventory を
-      //    見てモデルが workflow を見つけ、無ければ即 scenario_done で締める。--no-scenario で無効化可。
+      // ── STAGE 4: scenario (A04 cross-screen logic) ── once, after per-screen diagnosis. Inherit real ids / confirmed auth /
+      //    observed behaviour to target multi-step workflow abuse (coupon / price & qty tampering / step skip / privilege escalation). Pinned to the deep model.
+      //    Leave the contextual call "is there a transactional flow" **to the LLM** (no brittle lexical regex): the model reads
+      //    get_inventory, finds workflows, and if there are none closes immediately with scenario_done. Disable with --no-scenario.
       if (opts.scenarioPass !== false && !session.done) {
         session.scenarioDone = false;
-        // 操作者の重点ヒント(--focus)は **このシナリオ段で実行**する(横断・目的志向なので per-screen 診断ではなくここが適切)。
+        // The operator emphasis hint (--focus) is **carried out in this scenario stage** (cross-cutting/objective-driven, so here rather than per-screen diagnosis is right).
         const focusClause = opts.focus
           ? `OPERATOR FOCUS (highest priority): ${opts.focus}\nTreat this as the PRIMARY objective of THIS stage. Build and test the scenario(s) it implies FIRST, and do NOT call scenario_done until you have ACTIVELY attempted the focus (log in, probe the relevant endpoints, build probe_scenario control/exploit flows for it). After the focus is covered, also handle any other obvious multi-step workflows. `
           : "";
-        // 既定シナリオ(standing objectives): --focus とは別に毎回必ず追う横断目的(資格情報ハント等)。
+        // Default scenarios (standing objectives): cross-cutting goals pursued every time regardless of --focus (credential hunting etc.).
         const defaultsOn = opts.defaultScenarios !== false && DEFAULT_SCENARIOS.length > 0;
         const defaultClause = defaultsOn
           ? `STANDING OBJECTIVES — pursue every one of these THIS stage, regardless of operator focus or whether any workflow exists:\n${DEFAULT_SCENARIOS.map((s, i) => `  ${i + 1}. [${s.key}] ${s.directive}`).join("\n")}\n\n`
@@ -883,18 +890,18 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
           goal: `${focusClause}${defaultClause}Per-screen diagnosis is done. Call get_inventory, then (a) carry out the STANDING OBJECTIVES above, and (b) decide FROM THE INVENTORY whether this app has any multi-step / state-changing workflow worth abusing (e.g. a cart→checkout→order flow, a coupon/voucher redemption, a fund/points transfer, a multi-step registration/approval, a role/privilege change). For each workflow: log in, walk the legitimate flow once, then build probe_scenario(control, exploit, effectMarker) threading captured ids via {{var}}, and record_finding only on a confirmed verdict. Call scenario_done ONLY after the standing objectives AND every workflow have been covered${defaultsOn ? " (if there are no workflows, still finish the standing objectives before scenario_done)" : opts.focus ? " (if there is none beyond the operator focus, finish the focus first)" : " — if there is no workflow and nothing else to do, call scenario_done"}.`,
           allowed: STAGE_TOOLS.scenario,
           maxTurns: Math.min(maxTurns, 40),
-          model: deepModel, // workflow の発見・構築は最難の推論 → deep 固定
+          model: deepModel, // discovering and building workflows is the hardest reasoning -> pinned deep
           shouldStop: () => session.scenarioDone || session.done,
         });
       }
 
-      // ── STAGE: フィンガープリント(A06 既知脆弱コンポーネント) ── 技術スタックの版を集め、既知 CVE/EOL を当てる。
-      //    収集は決定的(fingerprint_scan がヘッダ/Cookie/meta/script から版抽出)、CVE 評価は deep モデルの知識依存。
-      //    WebFetch 禁止なので外部 CVE DB は引かず、findings は「version-based・要確認」として正直に記録する。
+      // ── STAGE: fingerprint (A06 known-vulnerable components) ── collect tech-stack versions and match known CVE/EOL.
+      //    Collection is deterministic (fingerprint_scan extracts versions from headers/cookies/meta/script), CVE assessment relies on the deep model's knowledge.
+      //    WebFetch is banned, so no external CVE DB is queried; findings are recorded honestly as "version-based, needs confirmation".
       if (opts.fingerprintPass !== false && !session.done) {
         session.fingerprintDone = false;
         opts.onText?.(`🔎 fingerprint stage: collecting tech/version banners → ${session.cveLookup ? "online CVE-DB (OSV/NVD)" : "model-knowledge"} CVE assessment (A06)`);
-        // CVE DB 照会が off のときは cve_lookup を提示しない(無駄ターン防止)。
+        // When CVE DB lookup is off, don't offer cve_lookup (avoids wasted turns).
         const fpTools = session.cveLookup ? STAGE_TOOLS.fingerprint : STAGE_TOOLS.fingerprint.filter((t) => t !== "cve_lookup");
         const cveClause = session.cveLookup
           ? "After fingerprint_scan, call cve_lookup with the detected components to get AUTHORITATIVE CVE ids from OSV/NVD, and cite those ids. "
@@ -904,21 +911,21 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
           goal: `Per-screen diagnosis and scenarios are done. Inventory the technology stack: call fingerprint_scan on ${opts.targetUrl} (plus a couple of representative in-scope URLs / the main JS bundle). ${cveClause}record_finding(category vulnerable-component) for every component with a real known issue — name the CVE, cite the version evidence (the banner/script that revealed it), set severity by the worst known issue, and state plainly it is version-based unless actively confirmed. Skip patched/current versions. Call fingerprint_done when every detected component has been assessed.`,
           allowed: fpTools,
           maxTurns: Math.min(maxTurns, 25),
-          model: deepModel, // 版↔CVE の対応付けは知識集約的 → deep 固定
+          model: deepModel, // mapping version <-> CVE is knowledge-intensive -> pinned deep
           shouldStop: () => session.fingerprintDone || session.done,
         });
       }
 
-      // ── 最終ドレイン ── scenario / fingerprint 段が新規 enroll した queued 画面を report 前に診断し切る。
-      //    (診断段後のドレインは、後段のナビゲーションが掘った画面を捕捉できないため。例: --focus の TOCTOU 探索が
-      //     /admin_panel 等を発見 → queued のまま report に落ちて「scanned 2/5」になっていた。)
+      // ── Final drain ── diagnose queued screens newly enrolled by the scenario / fingerprint stages before report.
+      //    (The post-diagnosis drain can't catch screens dug up by the later navigation. e.g. --focus's TOCTOU probing
+      //     found /admin_panel etc. -> it fell to report still queued and became "scanned 2/5".)
       await drainQueued();
       session.currentScreenId = null;
     }
 
-    // ── Burp スキャン・フェーズ ── 診断/シナリオの後、report に落とす前に、**セッション生存中**に実行する。
-    //    (従来は runPilot 返却 → driver 破棄 → cmdPilot で Burp、だったので authed 面が取れなかった)。
-    //    keepWarm でトップへ navigate + Cookie 再同期し、長いスキャン中もセッションを維持する。
+    // ── Burp scan phase ── after diagnosis/scenarios, before dropping to report, run it **while the session is alive**.
+    //    (Previously runPilot returned -> driver disposed -> cmdPilot ran Burp, so the authed surface couldn't be reached.)
+    //    keepWarm navigates to top + re-syncs cookies to keep the session alive through a long scan.
     if (!opts.surveyOnly && !session.done && opts.onBurpScanPhase) {
       opts.store.setPhase(opts.assessmentId, "phase2_burpscan");
       opts.onText?.("🐝 burp scan phase — active scan with the auth session kept warm");
@@ -944,10 +951,10 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       }
     }
 
-    // survey-only は phase1_recon のまま(全 screen queued=未診断)→ 後で resume できる。
+    // survey-only stays at phase1_recon (all screens queued = un-diagnosed) -> can be resumed later.
     if (session.paused) {
-      // トークン枯渇で一時停止 = まだ未完。phase を report に落とさず(診断フェーズのまま)残し、
-      // queued 画面を resume で続けられるようにする。WebUI は control_changed で「⏸ paused」を表示。
+      // Paused on token exhaustion = still incomplete. Don't drop the phase to report (keep the diagnosis phase),
+      // so queued screens can be continued on resume. The WebUI shows "⏸ paused" via control_changed.
       opts.store.appendEvent(opts.assessmentId, {
         type: "note",
         payload: { message: `⏸ run paused (token/usage limit) — ${session.inv.screens().length} screens mapped; resume to finish diagnosis` },
@@ -955,7 +962,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     } else if (!opts.surveyOnly) {
       opts.store.setPhase(opts.assessmentId, "report");
     } else {
-      // survey-only が(クラッシュせず)正常終了 = 調査は完了扱い。resume が recon ではなく診断へ進めるよう印を残す。
+      // survey-only finished normally (no crash) = survey is treated as complete. Leave a marker so resume advances to diagnosis, not recon.
       opts.store.appendEvent(opts.assessmentId, {
         type: "note",
         payload: { message: `🗺  SURVEY done (survey-only): ${session.inv.screens().length} screens` },
@@ -964,7 +971,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
   } finally {
     liveControl?.close();
     if (roleSessions) {
-      // attended は各ロールのコンテキストを閉じる(primary は roleSessions に含まれるので二重 close しない)。
+      // attended closes each role's context (primary is included in roleSessions, so it isn't double-closed).
       for (const rs of roleSessions.values()) await rs.driver.close().catch(() => {});
     } else {
       await driver.close();

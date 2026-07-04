@@ -1,4 +1,4 @@
-// smartLogin: ログイン画面/項目の自動発見 + 成否判定。browser/LLM 不要(Fake)。
+// smartLogin: auto-discovery of the login screen/fields + success/failure decision. No browser/LLM needed (Fake).
 
 import { test } from "node:test";
 import assert from "node:assert/strict";

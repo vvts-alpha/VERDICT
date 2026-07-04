@@ -1,5 +1,5 @@
-// auth_required — クロールで認証付き(cookie/bearer)に観測された API が、未認証で実体を返すか。
-// 0-byte 200 ガード(空 200 は到達とみなさない)= 過去の教訓を反映。
+// auth_required — whether an API observed during the crawl as authenticated (cookie/bearer) returns real content when unauthenticated.
+// 0-byte-200 guard (an empty 200 is not counted as reached) = reflects a past lesson.
 
 import type { HttpRequest, HttpResponse } from "../http.js";
 import { concretizeApiUrl, type Probe, type ProbeEval, type Validator } from "../validator.js";
@@ -16,10 +16,10 @@ export const authRequired: Validator = {
     const probes: Probe[] = [];
     for (const api of target.screen.apis) {
       if (api.auth === "none") continue;
-      if (api.method.toUpperCase() !== "GET") continue; // M4 は GET のみ(破壊的回避)
+      if (api.method.toUpperCase() !== "GET") continue; // M4 is GET-only (avoid destructive requests)
       const url = concretizeApiUrl(target.origin, api.urlTemplate, target.screen);
       if (!url) continue;
-      probes.push({ id: `${api.method} ${api.urlTemplate}`, request: { method: "GET", url } }); // 認証ヘッダ無し
+      probes.push({ id: `${api.method} ${api.urlTemplate}`, request: { method: "GET", url } }); // no auth headers
     }
     return probes;
   },

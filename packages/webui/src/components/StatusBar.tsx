@@ -3,14 +3,14 @@ import type { StateView } from "@veritas/core";
 import type { ConnState } from "../api";
 import { useRole } from "../api";
 
-// Burp Pro の XML レポートをアップロードして net-new issue を取り込む(CLI burp-import の API 版)。
-// 成功すると server が upsertFinding → WS イベントを出すので、findings は自動で増える。
+// Upload a Burp Pro XML report to import net-new issues (the API version of the CLI burp-import).
+// On success, the server calls upsertFinding → emits WS events, so findings grow automatically.
 function BurpImport({ id }: { id: string }) {
   const fileRef = useRef<HTMLInputElement>(null);
   const [status, setStatus] = useState<string>("");
   async function onPick(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
-    e.target.value = ""; // 同じファイルを連続で選べるようにリセット
+    e.target.value = ""; // reset so the same file can be picked again in a row
     if (!file) return;
     setStatus(`⏳ importing ${file.name}…`);
     try {
@@ -41,8 +41,8 @@ function BurpImport({ id }: { id: string }) {
   );
 }
 
-// レポート / 画面一覧のダウンロード。GET エンドポイントなので Cookie が自動送出される。
-// html/pdf は新タブでプレビュー(inline)、md/csv は添付 DL(server が Content-Disposition を付与)。
+// Download the report / screen inventory. These are GET endpoints, so cookies are sent automatically.
+// html/pdf preview in a new tab (inline); md/csv download as attachments (the server sets Content-Disposition).
 function DownloadMenu({ id, canWrite }: { id: string; canWrite: boolean }) {
   const rep = (f: string): string => `/api/assessments/${encodeURIComponent(id)}/report?format=${f}`;
   const inv = (f: string): string => `/api/assessments/${encodeURIComponent(id)}/inventory?format=${f}`;

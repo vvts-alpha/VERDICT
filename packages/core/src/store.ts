@@ -1,11 +1,11 @@
-// DESIGN §4.1 / §10 — AssessmentState の SQLite ストア(state.sqlite)。
+// DESIGN §4.1 / §10 — the SQLite store for AssessmentState (state.sqlite).
 //
-// 設計上の不変条件: すべての状態遷移は append-only な events として追記される。
-// 派生コレクション(screens/hypotheses/findings/handoffs)は正規化テーブルに upsert し、
-// 同一トランザクション内で対応する StateEvent を必ず記録する。
+// Design invariant: every state transition is appended as an append-only event.
+// Derived collections (screens/hypotheses/findings/handoffs) are upserted into normalized tables,
+// always recording the corresponding StateEvent in the same transaction.
 //
-// Node 24 組み込みの node:sqlite を使用 → native 依存なし。同期 API は単一プロセスの
-// 作業記憶ストアに最適。
+// Uses Node 24's built-in node:sqlite → no native dependency. The synchronous API is ideal for a
+// single-process working-memory store.
 
 import { DatabaseSync } from "node:sqlite";
 
@@ -131,13 +131,13 @@ interface AssessmentRow {
 export interface CreateAssessmentParams {
   target: TargetInput;
   scope: ScopePolicy;
-  /** 省略時は defaultBudget() */
+  /** Defaults to defaultBudget() */
   budget?: BudgetState;
-  /** 省略時は newAssessmentId() */
+  /** Defaults to newAssessmentId() */
   id?: string;
 }
 
-/** id 配列をマージ(重複排除、既存順を保持)。 */
+/** Merge id arrays (dedupe, preserving existing order). */
 function unionIds(base: string[], add?: string[]): string[] {
   if (!add || add.length === 0) return base;
   return Array.from(new Set([...base, ...add]));
@@ -148,15 +148,15 @@ export class AssessmentStore {
 
   constructor(db: DatabaseSync) {
     this.db = db;
-    // server と spawn された pilot が同じ state.sqlite を同時に開く。busy_timeout を最初に設定して、
-    // WAL 設定/スキーマ適用/書き込みがロックに当たっても即エラーせず待つ(= "database is locked" 回避)。
+    // The server and the spawned pilot open the same state.sqlite concurrently. Set busy_timeout first so
+    // WAL setup / schema apply / writes wait rather than erroring immediately on a lock (= avoid "database is locked").
     this.db.exec("PRAGMA busy_timeout = 5000;");
     this.db.exec("PRAGMA journal_mode = WAL;");
     this.db.exec("PRAGMA foreign_keys = ON;");
     this.db.exec(SCHEMA);
   }
 
-  /** ファイル(または ":memory:")を開き、スキーマを適用したストアを返す。 */
+  /** Open a file (or ":memory:") and return a store with the schema applied. */
   static open(dbPath: string): AssessmentStore {
     return new AssessmentStore(new DatabaseSync(dbPath));
   }
@@ -206,7 +206,7 @@ export class AssessmentStore {
     });
   }
 
-  /** 任意のイベントを追記(セマンティックなメソッドで表せない自由記述など)。 */
+  /** Append an arbitrary event (e.g. free-form notes not expressible via a semantic method). */
   appendEvent(assessmentId: string, input: StateEventInput): StateEvent {
     return this.tx(() => {
       const ev = this.insertEvent(assessmentId, input);
@@ -219,7 +219,7 @@ export class AssessmentStore {
     this.tx(() => this.setPhaseInternal(assessmentId, to));
   }
 
-  /** pause / resume(WebUI 操作 §8.3)。control_changed イベントを追記。 */
+  /** pause / resume (WebUI action §8.3). Appends a control_changed event. */
   setPaused(assessmentId: string, paused: boolean, reason?: string): void {
     this.tx(() => {
       this.insertEvent(assessmentId, { type: "control_changed", payload: { paused, reason } });
@@ -227,7 +227,7 @@ export class AssessmentStore {
     });
   }
 
-  /** 直近の control_changed から pause 中かを返す(crawl/scan ループの軽量チェック用)。 */
+  /** Return whether paused per the latest control_changed (for a lightweight crawl/scan-loop check). */
   isPaused(assessmentId: string): boolean {
     const row = this.db
       .prepare(
@@ -242,7 +242,7 @@ export class AssessmentStore {
     }
   }
 
-  /** halted フェーズへ遷移し、停止理由を halted イベントとして残す。 */
+  /** Transition to the halted phase and record the stop reason as a halted event. */
   halt(assessmentId: string, reason: StopReason, detail?: string): void {
     this.tx(() => {
       this.setPhaseInternal(assessmentId, "halted");
@@ -301,8 +301,8 @@ export class AssessmentStore {
           ? { type: "screen_updated", payload: { screenId: screen.screenId } }
           : { type: "screen_discovered", payload: { screenId: screen.screenId } },
       );
-      // カバレッジ台帳へ自動エンロール: 検出した画面は必ず queued で登録され、取りこぼされない。
-      // 既にエントリがあれば進捗を壊さないよう何もしない。
+      // Auto-enroll into the coverage ledger: a discovered screen is always registered as queued, never missed.
+      // If an entry already exists, do nothing so as not to clobber progress.
       this.db
         .prepare(
           `INSERT INTO screen_scans(assessment_id, screen_id, status, attempts, data, created_at, updated_at)
@@ -417,7 +417,7 @@ export class AssessmentStore {
     });
   }
 
-  /** カバレッジ台帳のステータス遷移。状態が変われば screen_scan_status_changed を追記。 */
+  /** Coverage-ledger status transition. Appends screen_scan_status_changed if the status changed. */
   setScreenScanStatus(
     assessmentId: string,
     screenId: string,
@@ -525,10 +525,10 @@ export class AssessmentStore {
     }
   }
 
-  /** トランザクション境界。node:sqlite はネスト非対応なので内部ヘルパは tx を開かない。
-   *  BEGIN IMMEDIATE で開始時に書き込みロックを取得する — deferred BEGIN だと read→write の昇格時に
-   *  他プロセス(server↔spawn された pilot)と競合し、busy_timeout を無視して即 "database is locked" に
-   *  なる(昇格待ちはデッドロックの恐れがあるため SQLite が待たない)。IMMEDIATE なら busy_timeout が効き待機する。 */
+  /** Transaction boundary. node:sqlite doesn't support nesting, so internal helpers don't open a tx.
+   *  BEGIN IMMEDIATE acquires the write lock up front — with a deferred BEGIN, a read→write upgrade
+   *  contends with other processes (server ↔ spawned pilot) and errors immediately with "database is locked",
+   *  ignoring busy_timeout (SQLite won't wait on an upgrade for fear of deadlock). IMMEDIATE lets busy_timeout wait. */
   private tx<T>(fn: () => T): T {
     this.db.exec("BEGIN IMMEDIATE");
     try {
@@ -541,7 +541,7 @@ export class AssessmentStore {
     }
   }
 
-  /** seq を採番して events に追記。tx 内から呼ぶこと。 */
+  /** Assign a seq and append to events. Call from within a tx. */
   private insertEvent(assessmentId: string, input: StateEventInput): StateEvent {
     const seqRow = this.db
       .prepare("SELECT COALESCE(MAX(seq), 0) + 1 AS n FROM events WHERE assessment_id = ?")

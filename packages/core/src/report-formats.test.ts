@@ -1,4 +1,4 @@
-// レポートの構造化モデル + HTML/CSV/inventory レンダラ。
+// The structured report model + HTML/CSV/inventory renderers.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -47,7 +47,7 @@ test("buildReportModel projects stats, findings, and screen inventory", () => {
     assert.equal(m.findings[0]!.sourceName, "exposed_file");
     assert.deepEqual(m.findings[0]!.evidence.map((e) => e.path), ["artifacts/s-0001/ev-1/", "artifacts/s-0001/ev-2/"]);
     assert.equal(m.findings[0]!.evidence[0]!.request, null); // no loader → path only
-    // 画面一覧: 2 screens, sorted, with scan status mapped
+    // Screen inventory: 2 screens, sorted, with scan status mapped
     assert.equal(m.screens.length, 2);
     assert.equal(m.screens[0]!.screenId, "s-0001");
     assert.equal(m.screens[0]!.scanStatus, "finding");
@@ -94,7 +94,7 @@ test("renderReportHtml is a self-contained document with the finding", () => {
     assert.match(html, /Exposed sensitive file/);
     assert.match(html, /HIGH<\/span>/);
     assert.ok(!html.includes("<script")); // no script injection surface
-    // 目次: nav + 各節 id + finding アンカーへのリンク。
+    // Contents: nav + each section id + links to finding anchors.
     assert.match(html, /<nav class="toc">/);
     assert.match(html, /<a href="#assessment-information">Assessment Information<\/a>/);
     assert.match(html, /<a href="#finding-1">/);

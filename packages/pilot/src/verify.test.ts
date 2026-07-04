@@ -1,5 +1,5 @@
-// burp-verify の純粋部分(対象エンドポイント抽出)を検証。mergeBurpIssues が finding.description を
-// "<detail> @ <url>" 形式で書くので、その末尾 URL を確実に拾えること。
+// Verify the pure part of burp-verify (target endpoint extraction). mergeBurpIssues writes finding.description
+// in the "<detail> @ <url>" form, so make sure the trailing URL is reliably picked up.
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import { endpointOf } from "./verify.js";

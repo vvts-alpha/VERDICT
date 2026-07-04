@@ -1,7 +1,7 @@
-// DESIGN §9 — policy gated な生 HTTP(検証用)。実体は FetchHttpClient、テストは FakeHttpClient。
+// DESIGN §9 — policy-gated raw HTTP (for validation). The real impl is FetchHttpClient; tests use FakeHttpClient.
 
-/** multipart/form-data アップロード指定。undici の FormData が boundary + CRLF + Content-Type を**正しく**生成する
- *  (LLM が生ワイヤを手書きすると CRLF/boundary を外して python-multipart 等に弾かれる問題の解消)。body より優先。 */
+/** multipart/form-data upload spec. undici's FormData generates boundary + CRLF + Content-Type **correctly**
+ *  (fixes the problem where an LLM hand-writing the raw wire drops CRLF/boundary and gets rejected by python-multipart etc.). Takes priority over body. */
 export interface MultipartSpec {
   fields?: Record<string, string>;
   files: Array<{ name: string; filename: string; contentType?: string; base64: string }>;
@@ -12,7 +12,7 @@ export interface HttpRequest {
   url: string;
   headers?: Record<string, string>;
   body?: string | null;
-  /** 指定時は body を無視し、multipart/form-data として送る(ファイルアップロード攻撃 = XXE-SVG / webshell / pickle 用)。 */
+  /** When set, body is ignored and the request is sent as multipart/form-data (for file-upload attacks = XXE-SVG / webshell / pickle). */
   multipart?: MultipartSpec;
 }
 
@@ -29,17 +29,17 @@ export interface HttpClient {
 }
 
 export interface FetchHttpClientOptions {
-  /** スコープゲート(out-of-scope は送信拒否) */
+  /** Scope gate (out-of-scope requests are refused) */
   allow?: (url: string) => boolean;
   timeoutMs?: number;
   maxBodyBytes?: number;
-  /** リクエスト間の最小間隔(保守的レート。WAF 教訓) */
+  /** Minimum interval between requests (conservative rate; WAF lesson) */
   minDelayMs?: number;
   userAgent?: string;
-  /** 全リクエストに付与する既定ヘッダ(認証セッションの cookie 等)。 */
+  /** Default headers added to every request (auth-session cookie, etc.). */
   headers?: Record<string, string>;
-  /** 上流 HTTP プロキシ(例 Burp http://127.0.0.1:8080)。指定時のみ全リクエストを経由。
-   *  未指定なら従来通り(プロキシ周りのコードは一切走らない=挙動不変)。 */
+  /** Upstream HTTP proxy (e.g. Burp http://127.0.0.1:8080). Only when set are all requests routed through it.
+   *  If unset, behaviour is unchanged (none of the proxy code runs = byte-identical). */
   proxy?: string;
 }
 
@@ -50,7 +50,7 @@ export class FetchHttpClient implements HttpClient {
 
   constructor(private readonly opts: FetchHttpClientOptions = {}) {}
 
-  /** proxy 指定時のみ undici ProxyAgent を遅延生成(Burp の傍受 CA は検証スキップ)。失敗しても致命的でない。 */
+  /** Lazily create an undici ProxyAgent only when a proxy is set (skip TLS verification for Burp's intercepting CA). Non-fatal on failure. */
   private async getDispatcher(): Promise<unknown | undefined> {
     if (!this.opts.proxy) return undefined;
     if (!this.dispatcherInit) {
@@ -65,7 +65,7 @@ export class FetchHttpClient implements HttpClient {
     return this.dispatcher ?? undefined;
   }
 
-  /** 実際に送信されるヘッダ(既定 user-agent + opts.headers + 呼び出し時)。証拠に「リクエスト全体」を残す用。 */
+  /** The headers actually sent (default user-agent + opts.headers + per-call). Used to record the "whole request" in evidence. */
   effectiveHeaders(reqHeaders?: Record<string, string>): Record<string, string> {
     return {
       "user-agent": this.opts.userAgent ?? "verdict-scanner/0.1",
@@ -96,8 +96,8 @@ export class FetchHttpClient implements HttpClient {
       };
       let bodyInit: unknown = req.body ?? undefined;
       if (req.multipart) {
-        // undici の FormData で正しい multipart を生成(boundary/CRLF/Content-Type は自動)。呼び出し側の
-        // content-type は上書きさせない(boundary を undici が決めるため)。
+        // Generate correct multipart via undici's FormData (boundary/CRLF/Content-Type are automatic). Don't let the caller's
+        // content-type override it (undici decides the boundary).
         const fd = new FormData();
         for (const [k, v] of Object.entries(req.multipart.fields ?? {})) fd.append(k, v);
         for (const f of req.multipart.files) {
@@ -111,10 +111,10 @@ export class FetchHttpClient implements HttpClient {
         method: req.method,
         headers: reqHeaders,
         body: bodyInit,
-        redirect: "manual", // 認証リダイレクトを「到達」と誤認しない
+        redirect: "manual", // don't mistake an auth redirect for "reached"
         signal: controller.signal,
       };
-      if (dispatcher) init.dispatcher = dispatcher; // Burp 経由(proxy 指定時のみ)
+      if (dispatcher) init.dispatcher = dispatcher; // via Burp (only when a proxy is set)
       const res = await fetch(req.url, init as unknown as RequestInit);
       const max = this.opts.maxBodyBytes ?? 64 * 1024;
       const body = Buffer.from(await res.arrayBuffer()).subarray(0, max).toString("utf8");
@@ -132,7 +132,7 @@ export class FetchHttpClient implements HttpClient {
 
 export type FakeResponder = (req: HttpRequest) => (Partial<HttpResponse> & { status: number });
 
-/** 決定論テスト用。responder が req に応じて status/body/headers を返す。 */
+/** For deterministic tests. The responder returns status/body/headers based on req. */
 export class FakeHttpClient implements HttpClient {
   readonly sent: HttpRequest[] = [];
   constructor(private readonly responder: FakeResponder) {}

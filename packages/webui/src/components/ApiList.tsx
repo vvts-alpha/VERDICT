@@ -1,6 +1,6 @@
 import type { StateView } from "@veritas/core";
 
-// 全画面の API を横断集約(method+endpoint+auth → 参照画面)。API 中心レビュー用タブ。
+// Aggregate APIs across all screens (method+endpoint+auth → referencing screens). Tab for API-centric review.
 export function ApiList({ view, onJump }: { view: StateView; onJump: (screenId: string) => void }) {
   const map = new Map<string, { method: string; url: string; auth: string; screens: string[] }>();
   for (const sc of view.screens) {

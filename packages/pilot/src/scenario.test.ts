@@ -1,5 +1,5 @@
-// probe_scenario の純粋部分: 前段レスポンスから値を抽出(extractValue)し、後段に差し込む(substVars)。
-// 多段 workflow(カゴ作成 → その id を checkout に差し込み)が成立する土台の回帰テスト。
+// The pure part of probe_scenario: extract a value from the earlier response (extractValue) and inject it into the later one (substVars).
+// Regression test for the substrate that makes a multi-step workflow work (create a basket → inject its id into checkout).
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import { substVars, extractValue } from "./tools.js";
@@ -7,8 +7,8 @@ import { substVars, extractValue } from "./tools.js";
 test("substVars replaces {{var}} placeholders (and blanks unknowns)", () => {
   assert.equal(substVars("/rest/basket/{{id}}/checkout", { id: "42" }), "/rest/basket/42/checkout");
   assert.equal(substVars('{"BasketId":{{bid}},"coupon":"{{c}}"}', { bid: "6", c: "X" }), '{"BasketId":6,"coupon":"X"}');
-  assert.equal(substVars("/x/{{missing}}/y", {}), "/x//y"); // 未定義は空
-  assert.equal(substVars("{{ spaced }}", { spaced: "ok" }), "ok"); // 空白許容
+  assert.equal(substVars("/x/{{missing}}/y", {}), "/x//y"); // undefined → empty
+  assert.equal(substVars("{{ spaced }}", { spaced: "ok" }), "ok"); // whitespace tolerated
 });
 
 test("extractValue reads a JSON path (object + array index)", () => {
@@ -19,9 +19,9 @@ test("extractValue reads a JSON path (object + array index)", () => {
 });
 
 test("extractValue falls back to a regex when JSON path misses or body is not JSON", () => {
-  assert.equal(extractValue("set order_id=A39 done", "order_id=([A-Z0-9]+)"), "A39"); // 第1キャプチャ
-  assert.equal(extractValue('{"token":"abc.def.ghi"}', "missing.path"), null); // JSON だがパス無し → regex も無し → null
-  assert.equal(extractValue("plain text 777", "\\d+"), "777"); // キャプチャ無し → マッチ全体
+  assert.equal(extractValue("set order_id=A39 done", "order_id=([A-Z0-9]+)"), "A39"); // first capture group
+  assert.equal(extractValue('{"token":"abc.def.ghi"}', "missing.path"), null); // JSON but path missing → regex also misses → null
+  assert.equal(extractValue("plain text 777", "\\d+"), "777"); // no capture group → whole match
 });
 
 test("extractValue returns null for absent values / invalid regex", () => {

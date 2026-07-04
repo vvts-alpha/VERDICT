@@ -1,14 +1,14 @@
-// Burp Suite Professional REST API (v0.1) クライアント — 能動スキャンをプログラムから起動し、issue を取り込む。
-// 既定 http://127.0.0.1:1337。API キーは URL パスのプレフィックス(/<key>/v0.1/...)。依存無し(Node の global fetch)。
-// 連携はオプトイン・追加のみ(burp-scan コマンドからのみ呼ばれる。未使用なら挙動不変)。
+// Burp Suite Professional REST API (v0.1) client — programmatically start an active scan and import issues.
+// Default http://127.0.0.1:1337. The API key is a URL-path prefix (/<key>/v0.1/...). No dependencies (Node's global fetch).
+// The integration is opt-in and additive only (called only from the burp-scan command; behaviour is unchanged if unused).
 
 import type { BurpIssue } from "./burp.js";
 
 /**
- * survey でマップした surface から最適な Burp スキャン構成(named config)を選ぶ(ヒューリスティック)。
- * クロール戦略は面の広さで、監査深度は規模で決める。--config を明示した時はこれを使わず上書きする。
- * 名前は Burp ビルトインの既定構成(操作者が保存したカスタム構成名でも可。その場合は --config で指定)。
- * 構造的型: screens を持つもの(AssessmentState 互換)なら何でも渡せる(core 依存を避ける)。
+ * Pick the best Burp scan configuration (named config) from the surface mapped during survey (heuristic).
+ * Crawl strategy is decided by surface breadth, audit depth by scale. An explicit --config overrides this instead of using it.
+ * The names are Burp's built-in default configs (an operator-saved custom config name works too; specify it via --config).
+ * Structural typing: anything with screens (AssessmentState-compatible) can be passed (avoids a core dependency).
  */
 export function pickBurpConfigs(state: { screens: ReadonlyArray<{ apis: ReadonlyArray<unknown> }> }): { configs: string[]; reason: string } {
   const screens = state.screens.length;
@@ -35,9 +35,9 @@ export function pickBurpConfigs(state: { screens: ReadonlyArray<{ apis: Readonly
   return { configs, reason: `${screens} screens / ${apis} APIs — ${crawl}; ${audit}` };
 }
 
-/** Burp の seed URL を「パス + クエリ param 名の集合」で畳む。値違い(/login?next=A と ?next=B)を1本に
- *  まとめ、同一エンドポイントへの大量スキャン生成を防ぐ。最初に出た具体 URL を代表に残す(値は Burp が fuzz する)。
- *  ※ hash(#/route)は呼び出し側で除去済み — SPA のルート差は別 URL のまま分けて渡す。 */
+/** Collapse Burp seed URLs by "path + set of query-param names". Value differences (/login?next=A vs ?next=B) fold into one
+ *  to prevent generating a flood of scans against the same endpoint. Keep the first concrete URL as representative (Burp fuzzes the values).
+ *  ※ the hash (#/route) is already stripped by the caller — SPA route differences are passed separately as distinct URLs. */
 export function dedupSeedUrls(urls: ReadonlyArray<string>): string[] {
   const byKey = new Map<string, string>();
   for (const raw of urls) {
@@ -55,25 +55,25 @@ export function dedupSeedUrls(urls: ReadonlyArray<string>): string[] {
 }
 
 export interface BurpScanRequest {
-  /** Burp REST のベース。例 http://127.0.0.1:1337 */
+  /** Burp REST base. e.g. http://127.0.0.1:1337 */
   base: string;
-  /** API キー(User options → Misc → REST API)。URL パスのプレフィックスになる。 */
+  /** API key (User options → Misc → REST API). Becomes the URL-path prefix. */
   apiKey?: string;
-  /** シードURL(スコープ内。Burp はここから crawl + audit する)。 */
+  /** Seed URLs (in scope; Burp crawls + audits from here). */
   urls: string[];
-  /** named scan configuration(複数可)。クロール速度と監査内容を別々のプリセットで重ねられる。
-   *  例: ["Crawl strategy - fastest", "Audit checks - critical issues only"]。
-   *  速度は "Crawl strategy - fastest|faster|normal|more complete|most complete" で、監査の重さは
-   *  "Audit checks - ..." で決める。後勝ちでマージされる。 */
+  /** named scan configuration (multiple allowed). Crawl speed and audit content can be layered from separate presets.
+   *  e.g. ["Crawl strategy - fastest", "Audit checks - critical issues only"].
+   *  Speed is "Crawl strategy - fastest|faster|normal|more complete|most complete"; audit weight is
+   *  decided by "Audit checks - ...". Merged last-wins. */
   configs?: string[];
-  /** Burp の Resource pool 名(任意)。最大同時リクエスト数とリクエスト間ディレイ＝実スループット/throttle。 */
+  /** Burp Resource pool name (optional). Max concurrent requests and inter-request delay = effective throughput/throttle. */
   resourcePool?: string;
-  /** 認証スキャン用の資格情報(任意。Burp がログインフォームを学習して認証下を監査)。 */
+  /** Credentials for authenticated scanning (optional; Burp learns the login form and audits while authenticated). */
   logins?: Array<{ username: string; password: string }>;
-  /** operator 提供の CustomConfiguration(JSON 文字列)を named config に重ねる(後勝ち)。
-   *  例: 普段使う scan policy(監査ポリシー)/ セッション注入の session-handling rule。
-   *  スキーマはバージョン依存なので VERDICT は生成せず、Burp から export した設定をそのまま渡す
-   *  (値は呼び出し側で {{COOKIE}}/{{BEARER}} を差し込み済み)。 */
+  /** Layer operator-provided CustomConfiguration (JSON string) over the named config (last-wins).
+   *  e.g. your usual scan policy (audit policy) / a session-handling rule for session injection.
+   *  The schema is version-dependent, so VERDICT does not generate it; pass the config exported from Burp as-is
+   *  (the caller has already substituted {{COOKIE}}/{{BEARER}} into the values). */
   customConfigs?: string[];
 }
 
@@ -82,17 +82,17 @@ function apiUrl(base: string, apiKey: string | undefined, path: string): string 
   return apiKey ? `${root}/${apiKey}${path}` : `${root}${path}`;
 }
 
-/** POST /v0.1/scan の Location ヘッダ → task id。"/v0.1/scan/3" 形式と bare "3"(実機の版)の両対応。 */
+/** Location header of POST /v0.1/scan → task id. Handles both the "/v0.1/scan/3" form and a bare "3" (the on-device variant). */
 export function parseTaskId(location: string): string | null {
   const m = /(\d+)\s*$/.exec((location ?? "").trim());
   return m && m[1] ? m[1] : null;
 }
 
-/** 能動スキャンを開始 → task_id を返す。Location ヘッダ(無ければ body)から id を拾う。 */
+/** Start an active scan → returns task_id. Picks the id from the Location header (or the body if absent). */
 export async function startBurpScan(req: BurpScanRequest): Promise<string> {
   const body: Record<string, unknown> = { urls: req.urls };
   const scanConfigs: Array<Record<string, unknown>> = (req.configs ?? []).map((name) => ({ type: "NamedConfiguration", name }));
-  // operator の CustomConfiguration は named config の後に重ねる(後勝ち。policy/session rule を最後に効かせる)。
+  // The operator's CustomConfiguration is layered after the named config (last-wins; the policy/session rule takes effect last).
   for (const cfg of req.customConfigs ?? []) scanConfigs.push({ type: "CustomConfiguration", config: cfg });
   if (scanConfigs.length) body.scan_configurations = scanConfigs;
   if (req.resourcePool) body.resource_pool = req.resourcePool;
@@ -119,7 +119,7 @@ export async function startBurpScan(req: BurpScanRequest): Promise<string> {
 export interface BurpScanStatus {
   /** crawling | auditing | succeeded | failed | paused | ... */
   status: string;
-  /** crawl+audit の進捗 0..100。 */
+  /** crawl+audit progress 0..100. */
   progress: number;
   issueEvents: number;
   issues: BurpIssue[];
@@ -135,7 +135,7 @@ interface BurpRestIssue {
   evidence?: unknown;
 }
 
-/** スキャン状態 + これまでに見つかった issue(累積)を取得。 */
+/** Fetch the scan status + the issues found so far (cumulative). */
 export async function getBurpScan(base: string, apiKey: string | undefined, taskId: string): Promise<BurpScanStatus> {
   const res = await fetch(apiUrl(base, apiKey, `/v0.1/scan/${taskId}`));
   if (!res.ok) throw new Error(`Burp REST status failed: ${res.status}`);
@@ -161,7 +161,7 @@ function b64(s: string): string {
   }
 }
 
-/** REST の request/response は {data:<base64>} セグメント配列(または文字列)。デコードして連結する。 */
+/** REST request/response is an array of {data:<base64>} segments (or a string). Decode and concatenate. */
 function reconstruct(segs: unknown): string {
   if (typeof segs === "string") return segs;
   if (!Array.isArray(segs)) return "";
@@ -196,11 +196,11 @@ function firstEvidence(evidence: unknown): { request: string; response: string }
   return { request: "", response: "" };
 }
 
-/** REST の issue_events → 既存 BurpIssue 形(XML 取り込みと同じマージ経路に乗せる)。pure・例外を投げない。 */
+/** REST issue_events → the existing BurpIssue shape (rides the same merge path as XML import). Pure; throws no exceptions. */
 export function restIssuesToBurpIssues(events: ReadonlyArray<{ type?: string; issue?: BurpRestIssue }>): BurpIssue[] {
   const out: BurpIssue[] = [];
   for (const ev of events) {
-    if (ev.type && ev.type !== "issue_found") continue; // issue_resolved 等は無視
+    if (ev.type && ev.type !== "issue_found") continue; // ignore issue_resolved etc.
     const it = ev.issue;
     if (!it || !it.name) continue;
     const { request, response } = firstEvidence(it.evidence);

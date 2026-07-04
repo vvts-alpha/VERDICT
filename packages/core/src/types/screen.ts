@@ -1,4 +1,4 @@
-// DESIGN §6.6 — screen_inventory.json スキーマ(Phase1 が書き Phase2/WebUI が読む唯一の契約)
+// DESIGN §6.6 — screen_inventory.json schema (the sole contract Phase1 writes and Phase2/WebUI read)
 
 export type AuthState = "unauth" | "post-login";
 
@@ -16,7 +16,7 @@ export type ScreenType =
 
 export type ParamLoc = "path" | "query" | "body" | "header";
 
-/** req/res から推定した JSON 形状(再帰) */
+/** JSON shape inferred from req/res (recursive) */
 export type JsonShape =
   | { type: "object"; fields: Record<string, JsonShape> }
   | { type: "array"; items: JsonShape }
@@ -25,9 +25,9 @@ export type JsonShape =
 export interface ApiCall {
   /** GET/POST/... */
   method: string;
-  /** 正規化済 例 /api/orders/{id} */
+  /** Normalized, e.g. /api/orders/{id} */
   urlTemplate: string;
-  /** 認証ヘッダは存在のみ検出。値は保存しない(DESIGN §6.2) */
+  /** Auth header presence-detected only. The value is never stored (DESIGN §6.2) */
   auth: "none" | "bearer" | "cookie";
   reqSchema: JsonShape | null;
   resSchema: JsonShape | null;
@@ -51,21 +51,21 @@ export interface Param {
 }
 
 export interface Screen {
-  /** s-0007 形式 */
+  /** s-0007 format */
   screenId: string;
-  /** 正規化ルート */
+  /** Normalized route */
   urlTemplate: string;
   observedUrls: string[];
   authState: AuthState;
   screenType: ScreenType;
-  /** LLM の意味付け(M1 はルールベース仮) */
+  /** LLM-assigned meaning (M1 is a rule-based placeholder) */
   description: string;
   params: Param[];
   apis: ApiCall[];
-  /** artifacts/<screen_id>.png 等への相対パス */
+  /** Relative path to artifacts/<screen_id>.png etc. */
   screenshot: string;
-  /** dedup キーの一部(DESIGN §6.4) */
+  /** Part of the dedup key (DESIGN §6.4) */
   domSkeletonHash: string;
-  /** 攻撃ヒント 例 ["idor-candidate","pii"] */
+  /** Attack hints, e.g. ["idor-candidate","pii"] */
   labels: string[];
 }

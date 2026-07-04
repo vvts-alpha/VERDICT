@@ -1,15 +1,15 @@
-// DESIGN §4.2 — 最小スコープ判定(純粋)。crawl の遷移と scan の各リクエストが通る。
-// 判定本体(ALLOW/CAUTION/APPROVAL/DENY)は将来 PolicyEngine が担うが、in/out-of-scope の
-// ホスト・パス判定はここに集約し crawler / scanner で共有する。
+// DESIGN §4.2 — minimal scope check (pure). Every crawl transition and scan request passes through it.
+// The full decision (ALLOW/CAUTION/APPROVAL/DENY) will eventually be a PolicyEngine, but the in/out-of-scope
+// host/path decision is centralized here and shared by crawler / scanner.
 
 import type { ScopePolicy } from "./types/index.js";
 
-/** ホストが許可パターンに合致(完全一致 or `*.suffix`)。ポートは無視して判定する
- *  (host="app.example.com:3000" でも `*.example.com` / `app.example.com` に一致させる)。 */
+/** Whether the host matches an allow pattern (exact match or `*.suffix`). Ports are ignored
+ *  (host="app.example.com:3000" still matches `*.example.com` / `app.example.com`). */
 export function hostMatches(host: string, patterns: string[]): boolean {
-  const hostname = host.replace(/:\d+$/, ""); // ポートを除いたホスト名
+  const hostname = host.replace(/:\d+$/, ""); // hostname without the port
   return patterns.some((p) => {
-    if (p === "*") return true; // "unrestricted" モードのワイルドカード(全ホスト一致)
+    if (p === "*") return true; // "unrestricted" mode wildcard (matches every host)
     if (p === host || p === hostname) return true;
     if (p.startsWith("*.")) {
       const apex = p.slice(2); // "example.com"
@@ -20,7 +20,7 @@ export function hostMatches(host: string, patterns: string[]): boolean {
   });
 }
 
-/** 同一オリジン(in-scope hosts)+ パス接頭辞。out-of-scope を優先。 */
+/** Same origin (in-scope hosts) + path prefix. out-of-scope takes precedence. */
 export function isInScope(rawUrl: string, scope: ScopePolicy): boolean {
   let u: URL;
   try {
@@ -40,4 +40,24 @@ export function isInScope(rawUrl: string, scope: ScopePolicy): boolean {
     return false;
   }
   return true;
+}
+
+/**
+ * Parse an operator-supplied target URL, requiring an explicit http(s) scheme. A schemeless target is rejected
+ * with an actionable message instead of the two silent failure modes it otherwise causes downstream:
+ *   - "example.com"      → `new URL()` throws an opaque TypeError, crashing scope derivation before the run starts.
+ *   - "juice.shop:3000"  → `new URL()` misparses "juice.shop:" as the scheme (host=""), yielding a silently empty scope.
+ * Used by deriveScopeFromUrls and the server's /api/run gate so a bad --url / WebUI target fails fast and clearly.
+ */
+export function parseTargetUrl(raw: string): URL {
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    throw new Error(`invalid target URL "${raw}": include a scheme, e.g. https://${raw}`);
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") {
+    throw new Error(`invalid target URL "${raw}": must start with http:// or https://`);
+  }
+  return u;
 }

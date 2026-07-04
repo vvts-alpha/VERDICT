@@ -1,5 +1,5 @@
-// DESIGN §4.1 — append-only イベントログ。
-// すべての状態遷移を StateEvent として追記 → 再生可能・監査可能。
+// DESIGN §4.1 — append-only event log.
+// Every state transition is appended as a StateEvent → replayable and auditable.
 
 import type { Phase } from "./phase.js";
 import type { TargetInput } from "./input.js";
@@ -10,7 +10,7 @@ import type { HandoffReason } from "./handoff.js";
 import type { ScreenScanStatus } from "./screen-scan.js";
 
 interface EventEnvelope<TType extends string, TPayload> {
-  /** アセスメント内で 1 始まりの単調増加 */
+  /** Monotonically increasing within an assessment, starting at 1 */
   seq: number;
   /** ISO-8601 */
   ts: string;
@@ -43,8 +43,8 @@ export type StateEvent =
 
 export type StateEventType = StateEvent["type"];
 
-/** union の各メンバから seq/ts を落とす(ストアが採番する) */
+/** Drop seq/ts from each union member (the store assigns them) */
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
 
-/** appendEvent に渡す入力(seq/ts はストアが付与) */
+/** Input passed to appendEvent (seq/ts are added by the store) */
 export type StateEventInput = DistributiveOmit<StateEvent, "seq" | "ts">;

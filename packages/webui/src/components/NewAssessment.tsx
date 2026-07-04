@@ -11,7 +11,7 @@ interface Role {
   cookieFile: string;
 }
 
-// 選択できるモデル。deep(高価値画面) / fast(survey・低価値画面) の tiering に使う。
+// Selectable models. Used for tiering: deep (high-value screens) / fast (survey, low-value screens).
 const MODELS = [
   { id: "claude-opus-4-8", label: "Opus 4.8" },
   { id: "claude-sonnet-4-6", label: "Sonnet 4.6" },
@@ -28,21 +28,21 @@ function lines(s: string): string[] {
 export function NewAssessment({ onCancel }: { onCancel: () => void }) {
   const [command, setCommand] = useState<"pilot" | "assess">("pilot");
   const [target, setTarget] = useState("");
-  const [model, setModel] = useState("claude-opus-4-8"); // deep 既定 = Opus: 高価値画面/シナリオ/fingerprint
-  const [fastModel, setFastModel] = useState("claude-sonnet-4-6"); // fast 既定 = Sonnet: survey/methodology/低価値画面(= tiering 既定 ON。"none" で単一モデル)
+  const [model, setModel] = useState("claude-opus-4-8"); // deep default = Opus: high-value screens/scenarios/fingerprint
+  const [fastModel, setFastModel] = useState("claude-sonnet-4-6"); // fast default = Sonnet: survey/methodology/low-value screens (= tiering ON by default; "none" = single model)
   const [rate, setRate] = useState("250");
   const [maxTurns, setMaxTurns] = useState("");
-  const [focus, setFocus] = useState(""); // 操作者の重点ヒント → シナリオ段の最優先目的
+  const [focus, setFocus] = useState(""); // operator's emphasis hint → top priority of the scenario stage
   const [headed, setHeaded] = useState(false);
   const [surveyOnly, setSurveyOnly] = useState(false);
   const [exhaustive, setExhaustive] = useState(false);
   const [burpScan, setBurpScan] = useState(false);
   const [burpProxy, setBurpProxy] = useState(false);
-  // attended は per-role の method=manual から導出する(下の Auth roles)。
-  // scope breadth mode (host allow-set の作り方) + 複数シード(ハードリスト)
+  // attended is derived from per-role method=manual (see Auth roles below).
+  // scope breadth mode (how the host allow-set is built) + multiple seeds (a hard list)
   const [scopeMode, setScopeMode] = useState<"same-origin" | "etld" | "unrestricted">("etld");
   const [targetUrls, setTargetUrls] = useState("");
-  const [lockToTargets, setLockToTargets] = useState(false); // URL リスト固定(横断クロールしない)
+  const [lockToTargets, setLockToTargets] = useState(false); // lock to the URL list (no cross-crawling)
   // scope overrides (blank = derive from target on the server)
   const [inHosts, setInHosts] = useState("");
   const [outHosts, setOutHosts] = useState("");
@@ -50,17 +50,17 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
   const [outPaths, setOutPaths] = useState("");
   // crawl
   const [followLinks, setFollowLinks] = useState(true);
-  const [maxDepth, setMaxDepth] = useState("10"); // crawl 既定深さ = 10
+  const [maxDepth, setMaxDepth] = useState("10"); // crawl default depth = 10
   // auth roles
   const [roles, setRoles] = useState<Role[]>([]);
-  // サイト全体を覆う HTTP Basic/Digest(アプリのログイン以前の壁)
+  // Site-wide HTTP Basic/Digest (a wall before the app's own login)
   const [basicUser, setBasicUser] = useState("");
   const [basicPass, setBasicPass] = useState("");
-  // カスタムヘッダ(WAF 回避・案件指定の必須ヘッダ)。name/value 別入力で複数。
+  // Custom headers (WAF bypass / engagement-required headers). Multiple, entered as separate name/value.
   const [headersList, setHeadersList] = useState<Array<{ name: string; value: string }>>([]);
-  const [loginUrl, setLoginUrl] = useState(""); // 手動ログインの入口 URL(attended)
-  const [maxScreens, setMaxScreens] = useState(""); // 診断する画面数の上限(空=既定 40)
-  const [maxSurveyScreens, setMaxSurveyScreens] = useState(""); // survey が写像する画面数の上限(空=無制限)
+  const [loginUrl, setLoginUrl] = useState(""); // entry URL for manual login (attended)
+  const [maxScreens, setMaxScreens] = useState(""); // cap on the number of screens to diagnose (blank = default 40)
+  const [maxSurveyScreens, setMaxSurveyScreens] = useState(""); // cap on the number of screens the survey maps (blank = unlimited)
 
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -70,12 +70,12 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
   const addHeader = (): void => setHeadersList((hs) => [...hs, { name: "", value: "" }]);
   const rmHeader = (i: number): void => setHeadersList((hs) => hs.filter((_, j) => j !== i));
 
-  // URL リストのファイル読込(CSV / 単一リスト)→ Target URLs テキストエリアに展開。
+  // Load a URL list from a file (CSV / a plain list) → expand into the Target URLs textarea.
   const importUrlList = (file: File): void => {
     const reader = new FileReader();
     reader.onload = () => {
       const text = String(reader.result ?? "");
-      // 行ごと → 各行の最初のセル(カンマ/タブ/空白区切り)を URL とみなす。http(s) を含む行だけ採用。
+      // Per line → treat the first cell of each line (comma/tab/space separated) as a URL. Keep only lines containing http(s).
       const urls = text
         .split(/\r?\n/)
         .map((ln) => (ln.split(/[,\t]/)[0] ?? "").trim().replace(/^["']|["']$/g, ""))
@@ -96,6 +96,15 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
       setErr("Target URL is required");
       return;
     }
+    // Require an explicit http(s) scheme. Without it "example.com" throws in new URL() and "host:3000" misparses to an
+    // empty scope downstream, so reject here with a clear message (the server re-validates as the real backstop).
+    try {
+      const u = new URL(target.trim());
+      if (u.protocol !== "http:" && u.protocol !== "https:") throw new Error();
+    } catch {
+      setErr(`Target must start with http:// or https:// (e.g. https://${target.trim()})`);
+      return;
+    }
     setErr(null);
     setBusy(true);
 
@@ -112,14 +121,14 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
       if (r.method === "cookie") return { ...base, ...(r.cookieFile ? { cookieFile: r.cookieFile } : {}) };
       return base; // manual: name(+description) only → logged in via the Sessions tab
     });
-    // manual ロールが1つでもあれば attended(= WebUI ログイン用の制御チャネルを張る)。
+    // If there's even one manual role, it's attended (= open a control channel for logging in via the WebUI).
     const anyManual = named.some((r) => r.method === "manual");
 
     const manifest: Record<string, unknown> = { target: target.trim() };
-    manifest.scopeMode = scopeMode; // host allow-set の広さ(same-origin / etld / unrestricted)
+    manifest.scopeMode = scopeMode; // breadth of the host allow-set (same-origin / etld / unrestricted)
     const extraTargets = lines(targetUrls).filter((u) => u !== target.trim());
-    if (extraTargets.length) manifest.targets = extraTargets; // 追加シード(複数 URL のハードリスト)
-    if (command === "pilot" && lockToTargets) manifest.lockToTargets = true; // 横断クロールせずリストだけ診断
+    if (extraTargets.length) manifest.targets = extraTargets; // extra seeds (a hard list of multiple URLs)
+    if (command === "pilot" && lockToTargets) manifest.lockToTargets = true; // diagnose only the list, no cross-crawling
     if (Object.keys(scope).length) manifest.scope = scope;
     const crawl: Record<string, unknown> = {};
     if (!followLinks) crawl.followLinks = false;
@@ -129,7 +138,7 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
     if (authRoles.length) auth.roles = authRoles;
     if (basicUser.trim() && basicPass) auth.httpBasic = { user: basicUser.trim(), pass: basicPass }; // site-wide Basic/Digest
     if (Object.keys(auth).length) manifest.auth = auth;
-    // カスタムヘッダ(name が入ってるものだけ)→ manifest.http.headers
+    // Custom headers (only those with a name filled in) → manifest.http.headers
     const headers: Record<string, string> = {};
     for (const h of headersList) if (h.name.trim()) headers[h.name.trim()] = h.value;
     if (Object.keys(headers).length) manifest.http = { headers };
@@ -253,7 +262,7 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
           <textarea
             value={focus}
             onChange={(e) => setFocus(e.target.value)}
-            placeholder="e.g. 決済フローと /api/orders の IDOR を重点的に。クーポン/価格改ざんも"
+            placeholder="e.g. Focus on the checkout flow and IDOR in /api/orders. Also coupons / price tampering."
             rows={2}
           />
         </label>

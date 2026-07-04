@@ -1,8 +1,8 @@
-// VERDICT Audit REST 拡張(同 1338)の OOB(Burp Collaborator)ルートのクライアント。
-// ブラインド SSRF/XXE/SQLi/OS コマンドインジェクション等を out-of-band で確証するために使う:
-//   ① oobPayload() で一意ドメインを発行 → VERDICT が標的の注入点に埋める
-//   ② oobPoll() で interaction(DNS/HTTP/SMTP コールバック)を回収 → 来れば確証
-// conn は Audit REST と同じ(同一拡張・同一ポート)。
+// Client for the OOB (Burp Collaborator) routes of the VERDICT Audit REST extension (same 1338).
+// Used to confirm blind SSRF/XXE/SQLi/OS-command-injection etc. out-of-band:
+//   ① oobPayload() issues a unique domain → VERDICT embeds it at the target's injection point
+//   ② oobPoll() collects interactions (DNS/HTTP/SMTP callbacks) → if any arrive, it's confirmed
+// conn is the same as Audit REST (same extension, same port).
 
 import type { BurpAuditConn } from "./burp-audit.js";
 
@@ -14,17 +14,17 @@ function headers(conn: BurpAuditConn): Record<string, string> {
 }
 
 export interface OobInteraction {
-  /** 発行ペイロードの id と一致する相関キー。 */
+  /** correlation key matching the id of the issued payload. */
   id: string;
   /** "DNS" | "HTTP" | "SMTP" */
   type: string;
-  /** epoch ms。 */
+  /** epoch ms. */
   time: number;
-  /** 標的(コールバック元)の IP。 */
+  /** IP of the target (the callback source). */
   clientIp?: string;
 }
 
-/** Collaborator が Burp 側で有効かを返す。available=false なら OOB は使えない。 */
+/** Returns whether Collaborator is enabled on the Burp side. available=false means OOB is unavailable. */
 export async function oobStatus(conn: BurpAuditConn): Promise<{ available: boolean; server: string; error?: string }> {
   const res = await fetch(url(conn, "/oob/status"), { headers: headers(conn) });
   if (!res.ok) throw new Error(`oob /status failed: ${res.status}`);
@@ -32,7 +32,7 @@ export async function oobStatus(conn: BurpAuditConn): Promise<{ available: boole
   return { available: !!j.available, server: j.server ?? "", ...(j.error ? { error: j.error } : {}) };
 }
 
-/** 一意 OOB ペイロードを発行。host=注入用の完全ドメイン, id=interaction との相関キー。 */
+/** Issue a unique OOB payload. host=the full domain to inject, id=the correlation key for interactions. */
 export async function oobPayload(conn: BurpAuditConn): Promise<{ host: string; id: string }> {
   const res = await fetch(url(conn, "/oob/payload"), { method: "POST", headers: headers(conn) });
   if (!res.ok) throw new Error(`oob /payload failed: ${res.status} ${(await res.text().catch(() => "")).slice(0, 200)}`);
@@ -41,7 +41,7 @@ export async function oobPayload(conn: BurpAuditConn): Promise<{ host: string; i
   return { host: j.host, id: j.id };
 }
 
-/** Collaborator から interaction を回収(since=epoch ms 以降 / id 一致で絞る)。 */
+/** Collect interactions from Collaborator (filter by since=epoch ms onward / matching id). */
 export async function oobPoll(conn: BurpAuditConn, opts: { since?: number; id?: string } = {}): Promise<OobInteraction[]> {
   const qs = new URLSearchParams();
   if (opts.since != null) qs.set("since", String(opts.since));

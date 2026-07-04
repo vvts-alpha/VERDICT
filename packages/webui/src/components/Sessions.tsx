@@ -1,12 +1,12 @@
-// attended×LiveHands: 子(pilot)が逆接続した role セッションを screencast 表示し、操作者がログイン → Done。
-// /api/assessments/:id/sessions で role 一覧、/ws/session?id=&role= で frame 受信 + 入力送信。
+// attended×LiveHands: screencast the role sessions that the child (pilot) connected back, so the operator logs in → Done.
+// /api/assessments/:id/sessions for the role list; /ws/session?id=&role= to receive frames + send input.
 import { useEffect, useRef, useState, type KeyboardEvent, type MouseEvent, type ClipboardEvent, type WheelEvent } from "react";
 import { useRole } from "../api";
 
 interface RoleSession {
   role: string;
   url: string;
-  awaiting?: boolean; // true = ログイン待ち(operator 入力が必要)
+  awaiting?: boolean; // true = awaiting login (operator input required)
 }
 
 function mods(e: { altKey: boolean; ctrlKey: boolean; metaKey: boolean; shiftKey: boolean }): number {
@@ -18,12 +18,12 @@ export function Sessions({ id }: { id: string }) {
   const [roles, setRoles] = useState<RoleSession[]>([]);
   const [active, setActive] = useState<string | null>(null);
   const [status, setStatus] = useState("");
-  const [url, setUrl] = useState(""); // ライブセッションを飛ばす URL(真っ白画面からの復帰用)
+  const [url, setUrl] = useState(""); // URL to navigate the live session to (for recovering from a blank page)
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const buttonsRef = useRef(0);
 
-  // role 一覧をポーリング(子が接続/切断すると増減)
+  // Poll the role list (grows/shrinks as the child connects/disconnects)
   useEffect(() => {
     let alive = true;
     const poll = (): void => {
@@ -44,7 +44,7 @@ export function Sessions({ id }: { id: string }) {
     };
   }, [id]);
 
-  // active role の screencast に接続(attended 乗っ取りは operator 限定 = viewer は接続しない)
+  // Connect to the active role's screencast (attended takeover is operator-only = viewers don't connect)
   useEffect(() => {
     if (!active || !canWrite) return;
     const proto = window.location.protocol === "https:" ? "wss" : "ws";
@@ -68,7 +68,7 @@ export function Sessions({ id }: { id: string }) {
         };
         img.src = "data:image/jpeg;base64," + m.data;
       } else if (m.t === "url") {
-        setUrl(m.url); // バックエンドが nav 後に現在 URL を返す
+        setUrl(m.url); // the backend returns the current URL after a nav
       } else if (m.t === "fatal") {
         setStatus(m.message);
       }

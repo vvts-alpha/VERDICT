@@ -1,4 +1,4 @@
-// カバレッジ台帳の不変条件: 全画面の自動エンロール / coverage 集計 / 優先度付け / 再試行 / 完了判定。
+// Coverage-ledger invariants: auto-enrollment of every screen / coverage aggregation / prioritization / retry / completion check.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -114,7 +114,7 @@ test("coverage reaches complete only when every screen is terminal", () => {
       "only the still-queued screen is scannable",
     );
 
-    // s-0004 が一過性失敗 → 再試行枠の間は scannable、使い切ると外れる
+    // s-0004 hits a transient failure → scannable while retry budget remains, dropped once exhausted
     store.setScreenScanStatus(id, "s-0004", "error", { incrementAttempt: true, error: "timeout" });
     state = store.loadAssessment(id);
     assert.ok(state);
@@ -128,7 +128,7 @@ test("coverage reaches complete only when every screen is terminal", () => {
     assert.equal(coverage(state).scannable, 0, "retry budget exhausted -> not scannable");
     assert.equal(coverage(state).complete, false, "exhausted error is not coverage-complete");
 
-    // 最終的に clean に落ち着けば complete
+    // Once it finally settles to clean, it's complete
     store.setScreenScanStatus(id, "s-0004", "clean");
     state = store.loadAssessment(id);
     assert.ok(state);
@@ -143,7 +143,7 @@ test("a 'suspected' screen is terminal — coverage stays reachable (no hang on 
   withStore((store) => {
     const id = seed(store);
     store.setScreenScanStatus(id, "s-0001", "finding", { findingIds: ["f-1"] });
-    store.setScreenScanStatus(id, "s-0002", "suspected"); // 異常リードのみ。診断は完了 = terminal
+    store.setScreenScanStatus(id, "s-0002", "suspected"); // anomaly lead only. Diagnosis done = terminal
     store.setScreenScanStatus(id, "s-0003", "clean");
     store.setScreenScanStatus(id, "s-0004", "suspected");
     const state = store.loadAssessment(id);

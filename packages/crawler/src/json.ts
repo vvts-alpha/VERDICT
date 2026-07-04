@@ -1,4 +1,4 @@
-// DESIGN §6.2 — req/res 本文から JsonShape を推定。
+// DESIGN §6.2 — infer JsonShape from req/res bodies.
 
 import type { JsonShape } from "@veritas/core";
 
@@ -28,7 +28,7 @@ export function inferJsonShapeFromValue(value: unknown): JsonShape {
   }
 }
 
-/** JSON 文字列を JsonShape に。null/空/非 JSON は null。 */
+/** JSON string → JsonShape. null/empty/non-JSON → null. */
 export function inferJsonShape(sample: string | null): JsonShape | null {
   if (sample === null) return null;
   const trimmed = sample.trim();

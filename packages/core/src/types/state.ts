@@ -1,4 +1,4 @@
-// DESIGN §4.1 — AssessmentState。エージェントの作業記憶 = WebUI データソースの単一正規状態。
+// DESIGN §4.1 — AssessmentState. The agent's working memory = the single canonical state that is the WebUI data source.
 
 import type { Phase } from "./phase.js";
 import type { TargetInput } from "./input.js";
@@ -18,16 +18,16 @@ export interface AssessmentState {
   scope: ScopePolicy;
   budget: BudgetState;
   screens: Screen[];
-  /** Phase2 のカバレッジ台帳(検出した各画面のスキャン状態) */
+  /** The Phase2 coverage ledger (scan state of each discovered screen) */
   screenScans: ScreenScan[];
   hypotheses: Hypothesis[];
   findings: Finding[];
   handoffs: HumanHandoff[];
-  /** append-only(再生可能) */
+  /** append-only (replayable) */
   events: StateEvent[];
 }
 
-/** listAssessments 用の軽量サマリ */
+/** Lightweight summary for listAssessments */
 export interface AssessmentSummary {
   id: string;
   phase: Phase;

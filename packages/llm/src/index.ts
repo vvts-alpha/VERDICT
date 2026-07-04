@@ -1,4 +1,4 @@
-// @veritas/llm — Claude クライアント抽象(サブスク認証 CLI)+ JSON 抽出ユーティリティ。
+// @veritas/llm — Claude client abstraction (subscription-auth CLI) + JSON extraction utility.
 
 export type { LlmClient, LlmRequest, LlmResponse } from "./types.js";
 export { extractJson } from "./json.js";

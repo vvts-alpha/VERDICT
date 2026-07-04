@@ -1,10 +1,10 @@
-// Claude クライアントの抽象。実体は ClaudeCliClient(サブスク認証)/ FakeLlmClient(テスト)。
+// Abstraction over the Claude client. Concrete implementations: ClaudeCliClient (subscription auth) / FakeLlmClient (tests).
 
 export interface LlmRequest {
   prompt: string;
   system?: string;
   model?: string;
-  /** ms。未指定はクライアント既定 */
+  /** ms. Unspecified falls back to the client default */
   timeoutMs?: number;
 }
 

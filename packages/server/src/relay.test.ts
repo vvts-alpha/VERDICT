@@ -1,4 +1,4 @@
-// attended×LiveHands 中継ハブ(Relay)を fake WS で検証。子(agent) ⇄ serve ⇄ 操作者(session) の結線。
+// Verify the attended×LiveHands relay hub (Relay) with fake WS. The wiring child (agent) ⇄ serve ⇄ operator (session).
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
@@ -34,25 +34,25 @@ test("relay: agent registers, viewer relays frames in, input out", () => {
   const agent = new FakeWs();
   relay.handleAgent(ws(agent), req("/ws/agent?id=a-1&token=tok"), () => {});
   agent.recv({ t: "sessions", roles: [{ role: "primary", url: "https://x/login" }] });
-  assert.deepEqual(relay.rolesFor("a-1"), [{ role: "primary", url: "https://x/login", awaiting: true }]); // 登録直後はログイン待ち
+  assert.deepEqual(relay.rolesFor("a-1"), [{ role: "primary", url: "https://x/login", awaiting: true }]); // right after registration, awaiting login
 
-  // 操作者がタブを開く → agent に start が飛ぶ + 現在 URL を受け取る
+  // operator opens a tab → start is sent to the agent + receives the current URL
   const viewer = new FakeWs();
   relay.handleSession(ws(viewer), req("/ws/session?id=a-1&role=primary"));
   assert.deepEqual(agent.last(), { t: "start", role: "primary" });
   assert.deepEqual(viewer.last(), { t: "url", url: "https://x/login" });
 
-  // agent の frame が viewer に中継される
+  // the agent's frame is relayed to the viewer
   agent.recv({ t: "frame", role: "primary", data: "JPEG", meta: {} });
   assert.deepEqual(viewer.last(), { t: "frame", role: "primary", data: "JPEG", meta: {} });
 
-  // 操作者の入力(done 等)が agent に転送される
+  // the operator's input (done etc.) is forwarded to the agent
   viewer.recv({ t: "done" });
   assert.deepEqual(agent.last(), { t: "input", role: "primary", msg: { t: "done" } });
-  // done でログイン待ちが解除される(Sessions タブの強調が消える)
+  // done clears awaiting-login (the Sessions tab highlight disappears)
   assert.deepEqual(relay.rolesFor("a-1"), [{ role: "primary", url: "https://x/login", awaiting: false }]);
 
-  // viewer が閉じると stop が agent に飛ぶ
+  // when the viewer closes, stop is sent to the agent
   viewer.close();
   assert.deepEqual(agent.last(), { t: "stop", role: "primary" });
 });

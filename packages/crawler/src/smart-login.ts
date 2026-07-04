@@ -1,6 +1,6 @@
-// DESIGN §6.3 — LLM 補助のログイン。資格情報だけ渡せば、ログインページもフォーム項目も自分で発見する。
-//  発見: ①Phase1 の auth 画面 → ②既知パス/リンク文言 → ③LLM。 項目: ヒューリスティック → LLM。
-//  Cookie 注入ではなく実フォーム入力。CAPTCHA/MFA は needsHuman で返し、呼び出し側が人手へ切替。
+// DESIGN §6.3 — LLM-assisted login. Give it just credentials and it discovers the login page and form fields itself.
+//  Discovery: (1) Phase1 auth screen → (2) known paths / link text → (3) LLM. Fields: heuristic → LLM.
+//  Real form input, not cookie injection. CAPTCHA/MFA is returned as needsHuman; the caller switches to a human.
 
 import { z } from "zod";
 import type { LlmClient } from "@veritas/llm";
@@ -9,7 +9,7 @@ import type { PageSnapshot } from "./drivers/playwright.js";
 import type { FormObservation } from "./types.js";
 import { detectStuck } from "./auth.js";
 
-/** smartLogin が必要とする最小ブラウザ操作(PlaywrightDriver が構造的に満たす。テストは Fake)。 */
+/** Minimal browser operations smartLogin needs (structurally satisfied by PlaywrightDriver; Fake in tests). */
 export interface LoginDriver {
   gotoUrl(url: string): Promise<void>;
   snapshot(): Promise<PageSnapshot>;
@@ -32,7 +32,7 @@ export interface SmartLoginResult {
 
 export interface SmartLoginOptions {
   targetUrl: string;
-  /** Phase1 で見つかった auth 画面の URL(あれば最優先) */
+  /** URL of the auth screen found in Phase1 (top priority if present) */
   loginScreenUrl?: string;
   model?: string;
 }
@@ -70,7 +70,7 @@ function resolveUrl(base: string, href: string): string | null {
   }
 }
 
-/** ヒューリスティックでフォーム項目を特定(password + 近傍の user 欄)。 */
+/** Identify form fields heuristically (password + the nearby user field). */
 export function heuristicFields(form: FormObservation): { username?: string; password?: string } | null {
   const pw = form.fields.find((x) => x.type === "password");
   if (!pw?.name) return null;
@@ -124,7 +124,7 @@ export async function smartLogin(
 ): Promise<SmartLoginResult> {
   const { model } = opts;
 
-  // 1) ログインページの発見
+  // 1) Discover the login page
   await driver.gotoUrl(opts.loginScreenUrl ?? opts.targetUrl);
   let snap = await driver.snapshot();
   let form = passwordForm(snap.forms);
@@ -162,18 +162,18 @@ export async function smartLogin(
   }
   if (!form) return { ok: false, needsHuman: false, reason: "no login form found (links + common paths + LLM)", loginUrl: null };
 
-  // 2) フォーム項目の特定(ヒューリスティック → LLM)
+  // 2) Identify form fields (heuristic → LLM)
   let fields = heuristicFields(form);
   if (!fields?.password) fields = await llmMapFields(llm, form, model);
   if (!fields.password) return { ok: false, needsHuman: false, reason: "could not identify password field", loginUrl };
 
-  // 3) 入力 + 送信
+  // 3) Fill + submit
   if (fields.username) await driver.fill(`[name="${fields.username}"]`, creds.username);
   await driver.fill(`[name="${fields.password}"]`, creds.password);
   const clicked = await driver.clickFirst(SUBMIT_SELECTORS);
   if (!clicked) await driver.pressEnter(`[name="${fields.password}"]`);
 
-  // 4) 成否判定(CAPTCHA/MFA → needsHuman、フォーム残存 → creds 不正)
+  // 4) Success/failure decision (CAPTCHA/MFA → needsHuman; form still present → bad creds)
   const after = await driver.snapshot();
   const stuck = detectStuck({
     requestedUrl: loginUrl ?? opts.targetUrl,

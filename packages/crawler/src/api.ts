@@ -1,4 +1,4 @@
-// DESIGN §6.2 — 傍受 exchange → ApiCall 推定(method, url_template, auth マスク, req/res schema)。
+// DESIGN §6.2 — intercepted exchange → ApiCall inference (method, url_template, auth mask, req/res schema).
 
 import type { ApiCall } from "@veritas/core";
 import type { CapturedExchange } from "./types.js";
@@ -11,7 +11,7 @@ function detectAuth(ex: CapturedExchange): ApiCall["auth"] {
   return "none";
 }
 
-/** XHR/fetch のみを内部 API とみなす(document/script/画像等は除外)。 */
+/** Treat only XHR/fetch as internal APIs (excludes document/script/images etc.). */
 export function isApiExchange(ex: CapturedExchange): boolean {
   const rt = ex.resourceType.toLowerCase();
   return rt === "xhr" || rt === "fetch";
@@ -22,7 +22,7 @@ export function inferApiCall(ex: CapturedExchange): ApiCall {
   try {
     urlTemplate = normalizePath(new URL(ex.url).pathname).template;
   } catch {
-    // パース不能なら生 URL を保持
+    // keep the raw URL if it can't be parsed
   }
   const isJsonResp = ex.responseContentType?.includes("json") ?? false;
   return {
@@ -55,8 +55,8 @@ const SCRIPT_PATTERNS: ScriptPattern[] = [
 const ASSET_RE = /\.(js|mjs|css|png|jpe?g|svg|gif|webp|woff2?|ttf|ico|map|json)$/i;
 
 /**
- * DESIGN §6.2 — ページの JS から API 参照を静的抽出(受動クロールで発火しない API も拾う)。
- * fetch/axios/XHR/`/api` リテラルを正規化 ApiCall 化。auth は不明なので "none"。
+ * DESIGN §6.2 — statically extract API references from a page's JS (catches APIs that passive crawling never fires).
+ * Normalizes fetch/axios/XHR/`/api` literals into ApiCalls. auth is unknown, so "none".
  */
 export function extractApiRefs(scripts: string[], baseUrl: string): ApiCall[] {
   const found = new Map<string, ApiCall>();

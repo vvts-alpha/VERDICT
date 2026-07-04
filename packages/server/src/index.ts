@@ -1,4 +1,4 @@
-// @veritas/server — 状態 API + WebSocket(WebUI バック)。
+// @veritas/server — state API + WebSocket (WebUI backend).
 
 export { startServer } from "./server.js";
 export type { ServerOptions, RunningServer } from "./server.js";

@@ -1,10 +1,10 @@
-// @veritas/crawler — Phase1: クロール + 傍受 + dedup + ルールラベリング → screen_inventory.json。
+// @veritas/crawler — Phase1: crawl + intercept + dedup + rule labeling → screen_inventory.json.
 
-// オーケストレータ
+// Orchestrator
 export { crawl } from "./crawl.js";
 export type { CrawlHooks } from "./crawl.js";
 
-// 観測契約 / 設定
+// Observation contract / config
 export type {
   CapturedExchange,
   CrawlConfig,
@@ -17,7 +17,7 @@ export type {
   Observation,
 } from "./types.js";
 
-// URL 正規化 / スコープ
+// URL normalization / scope
 export {
   classifyPathSegment,
   extractQueryParams,
@@ -28,27 +28,29 @@ export {
 } from "./url.js";
 export type { PathParam, QueryParam, SegmentKind } from "./url.js";
 
-// JSON 形状推定
+// JSON shape inference
 export { inferJsonShape, inferJsonShapeFromValue } from "./json.js";
 
-// API 推定 / 静的抽出
+// API inference / static extraction
 export { apiKey, extractApiRefs, inferApiCall, isApiExchange } from "./api.js";
 
-// DOM 骨格 hash
+// DOM skeleton hash
 export { hashDomSkeleton } from "./dom.js";
 
-// ルールラベリング
+// Rule labeling
 export { classifyScreenType, deriveLabels, describeScreen, guessParamType } from "./labeler.js";
 
-// インベントリ構築 / dedup
+// Inventory build / dedup
 export { buildScreenFromObservation, InventoryBuilder } from "./inventory.js";
 export type { BuiltScreen } from "./inventory.js";
 
-// screen_inventory.json 入出力
+export { parseOpenApiToScreens } from "./openapi-ingest.js";
+
+// screen_inventory.json I/O
 export { buildInventory, readScreenInventory, writeScreenInventory } from "./io.js";
 export type { ScreenInventory } from "./io.js";
 
-// LLM ラベリング(M2)
+// LLM labeling (M2)
 export {
   applyLabel,
   buildLabelPrompt,
@@ -65,24 +67,24 @@ export type {
   ScreenLabel,
 } from "./label.js";
 
-// 認証ハンドオフ(詰まり検出 §6.3)
+// Auth handoff (stuck detection §6.3)
 export { detectStuck } from "./auth.js";
 export type { StuckSignal } from "./auth.js";
 
-// LLM 補助ログイン(資格情報だけでログイン画面/項目を自動発見)
+// LLM-assisted login (auto-discovers the login screen/fields from just credentials)
 export { smartLogin, heuristicFields } from "./smart-login.js";
 export type { LoginDriver, LoginCreds, SmartLoginResult, SmartLoginOptions } from "./smart-login.js";
 
-// 能動探索(§7.2 / §9)— ブラウザを操作して発火 API/状態を引き出す
+// Active exploration (§7.2 / §9) — drive the browser to surface fired APIs/state
 export { exploreScreen, planExplore } from "./explore.js";
 export type { ExploreDriver, ExploreResult, ExplorePlan } from "./explore.js";
 
-// ドライバ
+// Drivers
 export { FakeDriver } from "./drivers/fake.js";
 export type { FakeSite } from "./drivers/fake.js";
 export { PlaywrightDriver } from "./drivers/playwright.js";
 export type { PlaywrightDriverOptions, AutoLoginOptions, CookieInfo } from "./drivers/playwright.js";
 
-// HTML → PDF(レポート PDF 出力。playwright-core 再利用・新規依存なし)
+// HTML → PDF (report PDF output; reuses playwright-core, no new dependency)
 export { htmlToPdf } from "./pdf.js";
 export type { HtmlToPdfOptions } from "./pdf.js";

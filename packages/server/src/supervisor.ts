@@ -1,6 +1,6 @@
-// WebUI から run を起動・停止・再開するためのプロセス・スーパーバイザ。
-// server は CLI を import せず **子プロセスとして spawn** する(CLI = 実行エンジン / server = 制御面)。
-// 子が runs/<id>/state.sqlite を書く → 既存の WS 投影がそのまま進捗をライブ配信する。docs/LIVE_TAKEOVER.md の Phase-1 制御面。
+// Process supervisor for starting/stopping/resuming runs from the WebUI.
+// The server does not import the CLI; it **spawns it as a child process** (CLI = execution engine / server = control plane).
+// The child writes runs/<id>/state.sqlite → the existing WS projection live-streams progress as-is. The Phase-1 control plane in docs/LIVE_TAKEOVER.md.
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -10,16 +10,16 @@ import type { Relay } from "./relay.js";
 
 export interface RunLauncherConfig {
   runsDir: string;
-  /** ビルド済み CLI エントリ(main.js)の絶対パス。cmdServe が DI。 */
+  /** Absolute path to the built CLI entry (main.js). Injected by cmdServe. */
   cliPath: string;
-  /** 子プロセスを起動する node 実体(既定 process.execPath)。 */
+  /** The node executable used to launch child processes (default process.execPath). */
   nodePath: string;
   onLog?: (m: string) => void;
 }
 
 export interface StartRunInput {
   command: "pilot" | "assess";
-  /** AssessManifest 形式の JSON(そのまま runs/<id>/manifest.json に保存)。 */
+  /** JSON in AssessManifest format (saved verbatim to runs/<id>/manifest.json). */
   manifest: unknown;
   options?: {
     model?: string;
@@ -30,17 +30,17 @@ export interface StartRunInput {
     surveyOnly?: boolean;
     exhaustive?: boolean;
     attended?: boolean;
-    /** 手動ログインの入口 URL(attended で各ロール窓が最初に開く先)。 */
+    /** Entry URL for manual login (where each role window first opens in attended mode). */
     loginUrl?: string;
-    /** 診断する画面数の上限(既定 40)。0/未指定で既定。 */
+    /** Upper bound on the number of screens to diagnose (default 40). 0/unset = default. */
     maxScreens?: number;
-    /** survey が写像する画面数の上限。到達したら探索停止。未指定=無制限。 */
+    /** Upper bound on the number of screens survey maps. Stop exploring when reached. Unset = unlimited. */
     maxSurveyScreens?: number;
-    /** 操作者の重点ヒント(自由文)。シナリオ段の最優先目的として注入される(--focus)。 */
+    /** Operator's focus hint (free text). Injected as the top-priority objective of the scenario stage (--focus). */
     focus?: string;
-    /** pilot のみ: 診断後に Burp 能動スキャンも実施(接続は env BURP_API)。 */
+    /** pilot only: also run a Burp active scan after diagnosis (connection via env BURP_API). */
     burpScan?: boolean;
-    /** pilot のみ: 全トラフィックを Burp プロキシ経由(接続は env BURP_PROXY)。 */
+    /** pilot only: route all traffic through the Burp proxy (connection via env BURP_PROXY). */
     burpProxy?: boolean;
   };
 }
@@ -56,26 +56,26 @@ interface RunProc {
 
 export class Supervisor {
   private readonly procs = new Map<string, RunProc>();
-  private controlBase = ""; // ws://127.0.0.1:<port>(listen 後に設定)。attended 時に子へ渡す。
+  private controlBase = ""; // ws://127.0.0.1:<port> (set after listen). Passed to the child in attended mode.
 
   constructor(
     private readonly cfg: RunLauncherConfig,
     private readonly relay?: Relay,
   ) {}
 
-  /** serve の listen 後に呼ぶ。子(pilot)が逆接続する先。 */
+  /** Call after serve's listen. The target the child (pilot) reverse-connects to. */
   setControlBase(base: string): void {
     this.controlBase = base;
   }
 
-  /** manifest を保存し、`<cli> <command> --manifest <f> --id <id> --out <runs>` を spawn。新 id を返す。 */
+  /** Save the manifest and spawn `<cli> <command> --manifest <f> --id <id> --out <runs>`. Returns the new id. */
   start(input: StartRunInput): { id: string } {
     const id = newAssessmentId();
     const dir = join(this.cfg.runsDir, id);
     mkdirSync(dir, { recursive: true });
     const manifestPath = join(dir, "manifest.json");
     writeFileSync(manifestPath, `${JSON.stringify(input.manifest, null, 2)}\n`);
-    // resume が開始時の設定(attended/model/burp 等)を復元できるよう options も永続化する。
+    // Persist options too so resume can restore the start-time settings (attended/model/burp etc.).
     writeFileSync(join(dir, "run.json"), `${JSON.stringify({ command: input.command, options: input.options ?? {} }, null, 2)}\n`);
 
     const args = [this.cfg.cliPath, input.command, "--manifest", manifestPath, "--id", id, "--out", this.cfg.runsDir];
@@ -94,7 +94,7 @@ export class Supervisor {
     if (o.focus) args.push("--focus", o.focus);
     if (input.command === "pilot" && o.burpScan) args.push("--burp-scan");
     if (input.command === "pilot" && o.burpProxy) args.push("--burp-proxy");
-    // attended×LiveHands: 子は serve に逆接続して role セッションを screencast する(token 認証)。
+    // attended×LiveHands: the child reverse-connects to serve and screencasts role sessions (token auth).
     if (input.command === "pilot" && o.attended && this.relay && this.controlBase) {
       const token = randomBytes(16).toString("hex");
       this.relay.issueToken(id, token);
@@ -104,8 +104,8 @@ export class Supervisor {
     return { id };
   }
 
-  /** 既存 run の診断を再開(survey/methodology はスキップ)。開始時の manifest/options を復元して
-   *  認証材料(roleCreds/cookie/httpBasic/attended)を取り戻す(これが無いと resume 後 unauth で 401 連発)。 */
+  /** Resume diagnosis of an existing run (skip survey/methodology). Restore the start-time manifest/options to
+   *  recover the auth material (roleCreds/cookie/httpBasic/attended) (without this, resume floods with 401s while unauthenticated). */
   resume(id: string): void {
     const dir = join(this.cfg.runsDir, id);
     const args = [this.cfg.cliPath, "pilot", "--resume", "--id", id, "--out", this.cfg.runsDir];
@@ -115,15 +115,15 @@ export class Supervisor {
     try {
       o = (JSON.parse(readFileSync(join(dir, "run.json"), "utf8")).options ?? {}) as NonNullable<StartRunInput["options"]>;
     } catch {
-      /* run.json 無し(古い run) → 既定で続行 */
+      /* no run.json (old run) → continue with defaults */
     }
     if (o.model) args.push("--model", o.model);
     if (o.fastModel) args.push("--fast-model", o.fastModel);
-    if (o.burpProxy) args.push("--burp-proxy"); // 値なしフラグ(BURP_PROXY env から読む)
+    if (o.burpProxy) args.push("--burp-proxy"); // valueless flag (reads from BURP_PROXY env)
     if (o.loginUrl) args.push("--login-url", o.loginUrl);
     if (o.maxScreens != null) args.push("--max-screens", String(o.maxScreens));
     if (o.focus) args.push("--focus", o.focus);
-    // attended は新しい control チャネル(token)を発行して窓を WebUI に再オープンさせる。
+    // attended issues a new control channel (token) to reopen the windows in the WebUI.
     if (o.attended && this.relay && this.controlBase) {
       args.push("--attended");
       const token = randomBytes(16).toString("hex");
@@ -133,9 +133,9 @@ export class Supervisor {
     this.spawnChild(id, "pilot --resume", args);
   }
 
-  /** 既存 run に対して Burp 能動スキャン(REST)を起動 → 完了までポーリング → issue を自動取り込み。
-   *  接続は env(BURP_API/BURP_API_KEY/BURP_RESOURCE_POOL)。manifest があれば認証スキャン(application_logins)。
-   *  config は surface から自動選択(pickBurpConfigs)。XML を手で export せずに済むライブ取り込み版。 */
+  /** Launch a Burp active scan (REST) against an existing run → poll until completion → auto-import issues.
+   *  Connection via env (BURP_API/BURP_API_KEY/BURP_RESOURCE_POOL). If a manifest exists, an authenticated scan (application_logins).
+   *  config is auto-selected from the surface (pickBurpConfigs). The live-import version that avoids exporting XML by hand. */
   burpScan(id: string): void {
     const dir = join(this.cfg.runsDir, id);
     const args = [this.cfg.cliPath, "burp-scan", "--id", id, "--out", this.cfg.runsDir];
@@ -144,9 +144,9 @@ export class Supervisor {
     this.spawnChild(id, "burp-scan", args);
   }
 
-  /** アップロードされた Burp XML レポートを既存 run に取り込む(merge → High+ を AI 再検証)。
-   *  server は in-process でマージせず CLI(burp-import)を spawn する(検証フェーズも CLI 側に集約)。
-   *  manifest があれば認証下 finding の再検証に Basic 資格を渡す。 */
+  /** Import an uploaded Burp XML report into an existing run (merge → AI re-verify High+).
+   *  The server does not merge in-process; it spawns the CLI (burp-import) (the verification phase is also consolidated on the CLI side).
+   *  If a manifest exists, pass Basic credentials for re-verifying authenticated findings. */
   burpImport(id: string, reportPath: string): void {
     const dir = join(this.cfg.runsDir, id);
     const args = [this.cfg.cliPath, "burp-import", "--id", id, "--out", this.cfg.runsDir, "--report", reportPath];
@@ -155,8 +155,8 @@ export class Supervisor {
     this.spawnChild(id, "burp-import", args);
   }
 
-  /** 既存 run に対して Burp 能動スキャン(REST)を起動 → 完了までポーリング → issue を自動取り込み。
-   *  Playwright/chromium は SIGTERM に独自ハンドラを付け graceful close が長引く/詰まるため SIGKILL で確実に殺す。 */
+  /** Launch a Burp active scan (REST) against an existing run → poll until completion → auto-import issues.
+   *  Playwright/chromium attach their own SIGTERM handler so graceful close drags on/stalls; kill reliably with SIGKILL. */
   stop(id: string): boolean {
     const rec = this.procs.get(id);
     if (rec && rec.status === "running") {
@@ -186,7 +186,7 @@ export class Supervisor {
 
   private spawnChild(id: string, command: string, args: string[]): void {
     const existing = this.procs.get(id);
-    if (existing && existing.status === "running") return; // 二重起動防止
+    if (existing && existing.status === "running") return; // prevent double launch
     const log = this.cfg.onLog ?? ((): void => {});
     const child = spawn(this.cfg.nodePath, args, { cwd: process.cwd(), env: process.env, stdio: ["ignore", "pipe", "pipe"] });
     const rec: RunProc = { id, command, child, startedAt: new Date().toISOString(), status: "running", exitCode: null };

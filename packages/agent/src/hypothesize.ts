@@ -1,5 +1,5 @@
-// DESIGN §7.4 — 画面の screenType/description/params/apis/labels から攻撃仮説(Hypothesis)を生成。
-// LLM(構造化出力)を主とし、失敗時は object_ref param からルールベースで IDOR 仮説を補完。
+// DESIGN §7.4 — Generate attack hypotheses (Hypothesis) from a screen's screenType/description/params/apis/labels.
+// LLM (structured output) is the primary path; on failure, fall back to rule-based IDOR hypotheses from object_ref params.
 
 import { z } from "zod";
 import type { Hypothesis, Screen } from "@veritas/core";
@@ -69,8 +69,8 @@ function toHypothesis(screen: Screen, draft: z.infer<typeof DraftSchema>): Hypot
   };
 }
 
-/** IDOR 仮説をルールで生成(LLM 不在/失敗時の保険)。
- *  GET API(id付き)を持つ画面、または post-login で object_ref path param を持つページが対象。 */
+/** Generate IDOR hypotheses via rules (a safety net when the LLM is absent/fails).
+ *  Targets screens with a GET API (that has an id), or post-login pages with an object_ref path param. */
 export function ruleHypotheses(screen: Screen): Hypothesis[] {
   const hasIdParam = screen.params.some((p) => p.guessedType === "object_ref" || p.guessedType === "id");
   const hasGetApiWithId = screen.apis.some((a) => a.method.toUpperCase() === "GET" && /\{[^}]+\}/.test(a.urlTemplate));
@@ -91,7 +91,7 @@ export function ruleHypotheses(screen: Screen): Hypothesis[] {
 export interface HypothesizeOptions {
   model?: string;
   timeoutMs?: number;
-  /** LLM を使わずルールのみ(テスト/オフライン) */
+  /** Rules only, without the LLM (test/offline) */
   ruleOnly?: boolean;
 }
 

@@ -25,7 +25,7 @@ test("FakeLlmClient records calls and scripts responses", async () => {
   const client = new FakeLlmClient(['{"first":1}', '{"second":2}']);
   assert.deepEqual(extractJson((await client.complete({ prompt: "a" })).text), { first: 1 });
   assert.deepEqual(extractJson((await client.complete({ prompt: "b" })).text), { second: 2 });
-  // 配列を使い切ったら最後を反復
+  // Once the array is exhausted, the last one repeats
   assert.deepEqual(extractJson((await client.complete({ prompt: "c" })).text), { second: 2 });
   assert.equal(client.calls.length, 3);
   assert.equal(client.calls[0]?.prompt, "a");

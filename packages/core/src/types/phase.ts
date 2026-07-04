@@ -1,4 +1,4 @@
-// DESIGN §4.1 — アセスメントのライフサイクルフェーズ
+// DESIGN §4.1 — assessment lifecycle phases
 
 export type Phase =
   | "init"

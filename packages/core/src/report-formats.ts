@@ -1,5 +1,5 @@
-// レポートの純粋レンダラ: HTML(自己完結) / CSV(findings・screens) / 画面一覧HTML。
-// PDF は HTML を Chromium で印刷する(crawler 側 htmlToPdf)ので、ここでは HTML までを純粋に作る。
+// Pure report renderers: HTML (self-contained) / CSV (findings, screens) / screen-inventory HTML.
+// PDF prints the HTML with Chromium (crawler-side htmlToPdf), so here we purely produce up to the HTML.
 
 import type { Severity } from "./types/index.js";
 import type { ReportModel, ReportScreenRow } from "./report-model.js";
@@ -16,7 +16,7 @@ function esc(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
-/** CSV セル(RFC4180: 区切り/引用符/改行を含むなら "..." で囲み、内側の " は "" に)。 */
+/** CSV cell (RFC4180: quote as "..." if it contains a delimiter/quote/newline, and double inner "). */
 function csvCell(v: string | number): string {
   const s = String(v);
   return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
@@ -79,18 +79,18 @@ function evidenceHtml(e: ReportModel["findings"][number]["evidence"][number]): s
   return parts.join("");
 }
 
-/** 診断レポート(対象情報 + scope + findings + req/resp 証拠)を自己完結 HTML で。PDF はこれを Chromium で印刷。 */
+/** The assessment report (target info + scope + findings + req/resp evidence) as self-contained HTML. PDF prints this with Chromium. */
 export function renderReportHtml(m: ReportModel): string {
   const out: string[] = [];
   out.push(`<h1>${esc(m.brand)} Security Assessment Report</h1>`);
 
-  // confirmed と suspected を分離。headline は confirmed のみ、suspected は別セクション。
+  // Separate confirmed from suspected. Only confirmed are headlined; suspected go in their own section.
   const confirmed = m.findings.filter((f) => f.verdict === "confirmed");
   const suspected = m.findings.filter((f) => f.verdict === "suspected");
   const tocLi = (f: ReportModel["findings"][number]): string =>
     `<li><a href="#finding-${f.index}">${f.index}. <span class="sev" style="color:${SEV_COLOR[f.severity]}">${f.severity.toUpperCase()}</span> ${esc(f.title)}</a></li>`;
 
-  // 目次(クリックで各節 / 各 finding のアンカーへジャンプ)
+  // Contents (click to jump to each section / each finding's anchor)
   out.push(`<nav class="toc"><div class="toctitle">Contents</div><ul>`);
   out.push(`<li><a href="#assessment-information">Assessment Information</a></li>`);
   out.push(`<li><a href="#scope">Scope</a></li>`);
@@ -107,7 +107,7 @@ export function renderReportHtml(m: ReportModel): string {
   }
   out.push(`</ul></nav>`);
 
-  // 対象情報
+  // Target info
   out.push(`<h2 id="assessment-information">Assessment Information</h2><table class="info">`);
   out.push(row("Assessment ID", `<code>${esc(m.id)}</code>`));
   out.push(row("Target", `<code>${esc(m.target)}</code>`));
@@ -120,7 +120,7 @@ export function renderReportHtml(m: ReportModel): string {
   out.push(row("Tooling", esc(m.brand)));
   out.push(`</table>`);
 
-  // スコープ
+  // Scope
   const s = m.scope;
   const hostList = (xs: string[]): string => (xs.length ? xs.map((h) => `<code>${esc(h)}</code>`).join(", ") : "&mdash;");
   out.push(`<h2 id="scope">Scope</h2><table class="info">`);
@@ -131,7 +131,7 @@ export function renderReportHtml(m: ReportModel): string {
   out.push(row("Rate", `${s.rate.requestsPerMinute} req/min, max ${s.rate.maxConcurrent} concurrent`));
   out.push(`</table>`);
 
-  // サマリ
+  // Summary
   out.push(`<h2 id="summary">Summary</h2>`);
   if (confirmed.length === 0) {
     out.push(`<p class="muted"><em>No confirmed findings.</em></p>`);
@@ -145,7 +145,7 @@ export function renderReportHtml(m: ReportModel): string {
   if (suspected.length > 0)
     out.push(`<p class="muted">Plus <b>${suspected.length}</b> suspected lead(s) needing manual verification (listed separately, not counted above).</p>`);
 
-  // 1 件分(confirmed / suspected 共通。suspected は [SUSPECTED] バッジ + anomaly)。
+  // One finding (shared by confirmed / suspected; suspected gets a [SUSPECTED] badge + anomaly).
   const renderF = (f: ReportModel["findings"][number]): void => {
     out.push(`<div class="f" id="finding-${f.index}">`);
     const sus = f.verdict === "suspected" ? `<span class="badge" style="background:#8a6d00">SUSPECTED</span> ` : "";
@@ -162,12 +162,12 @@ export function renderReportHtml(m: ReportModel): string {
     out.push(`</div>`);
   };
 
-  // confirmed findings(req/resp 全文)
+  // confirmed findings (full req/resp)
   if (confirmed.length > 0) {
     out.push(`<h2 id="findings">Findings</h2>`);
     for (const f of confirmed) renderF(f);
   }
-  // suspected(要手動確認・confirmed 集計外)
+  // suspected (needs manual verification; not in the confirmed total)
   if (suspected.length > 0) {
     out.push(`<h2 id="suspected">Suspected (needs manual verification)</h2>`);
     out.push(`<p class="muted">Leads with one concrete anomaly but without control+2-replay confirmation — verify before relying on them.</p>`);
@@ -177,7 +177,7 @@ export function renderReportHtml(m: ReportModel): string {
   return docHtml(`${m.brand} Report ${m.id}`, out.join("\n"));
 }
 
-/** findings.csv — 1 finding 1 行。 */
+/** findings.csv — one finding per row. */
 export function renderFindingsCsv(m: ReportModel): string {
   const header = ["index", "severity", "title", "screen", "source", "scope_basis", "evidence", "repro"];
   const rows = m.findings.map((f) => [
@@ -193,7 +193,7 @@ export function renderFindingsCsv(m: ReportModel): string {
   return csvRows([header, ...rows]);
 }
 
-/** screens.csv — 画面一覧(survey 結果)。 */
+/** screens.csv — the screen inventory (survey results). */
 export function renderScreensCsv(m: ReportModel): string {
   const header = ["screen_id", "url", "type", "auth", "labels", "params", "apis", "scan_status", "screenshot"];
   const rows = m.screens.map((s) => [
@@ -214,7 +214,7 @@ function shotImg(s: ReportScreenRow): string {
   return s.screenshot ? `<img class="shot" src="artifacts/${esc(s.screenshot)}" alt="${esc(s.screenId)}">` : `<span class="muted">—</span>`;
 }
 
-/** inventory.html — 画面一覧(単体エクスポート)。screenshot サムネ + メタ。 */
+/** inventory.html — the screen inventory (standalone export). Screenshot thumbnails + metadata. */
 export function renderInventoryHtml(m: ReportModel): string {
   const out: string[] = [];
   out.push(`<h1>${esc(m.brand)} Screen Inventory</h1>`);

@@ -1,4 +1,4 @@
-// DESIGN §6.3 / §6.4 / §8.3 — 人間ハンドオフ要求(認証 / 承認)。Cookie 注入はしない。
+// DESIGN §6.3 / §6.4 / §8.3 — human-handoff request (auth / approval). No cookie injection.
 
 export type HandoffReason = "auth" | "approval" | "captcha" | "rate_limit" | "other";
 
@@ -7,7 +7,7 @@ export type HandoffStatus = "pending" | "resolved" | "cancelled";
 export interface HumanHandoff {
   id: string;
   reason: HandoffReason;
-  /** 人間にログインさせる対象 URL 等。無ければ null */
+  /** Target URL for the human to log in at, etc. null if none */
   url: string | null;
   message: string;
   status: HandoffStatus;

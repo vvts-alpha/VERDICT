@@ -1,6 +1,6 @@
-// DESIGN §4.2 / §4.5 — PolicyEngine(スコープゲート)が読む構造化スコープ。
+// DESIGN §4.2 / §4.5 — the structured scope the PolicyEngine (scope gate) reads.
 //
-// M0 では型のみ定義する。判定ロジック(PolicyEngine)は後続マイルストン。
+// M0 defines types only. The decision logic (PolicyEngine) is a later milestone.
 
 export type PolicyDecision =
   | "ALLOW"
@@ -14,24 +14,24 @@ export interface RateLimit {
 }
 
 /**
- * スコープ広さ(in-scope ホスト許可集合の作り方)。シード URL からの導出モード。
- * - "same-origin": シードと同一ホスト(exact)のみ。最も厳格。別サブドメイン(api.*)は弾く。
- * - "etld": シードの登録可能ドメイン配下(`*.example.com`)。同一プログラムの API サブドメインを含む。
- * - "unrestricted": ホスト制限なし(`*`)。authorized-targets 原則に反するので明示オプトイン向け。
+ * Scope breadth (how the in-scope host allow-set is built). The derivation mode from seed URLs.
+ * - "same-origin": only the same host as the seed (exact). Strictest; rejects other subdomains (api.*).
+ * - "etld": under the seed's registrable domain (`*.example.com`). Includes the program's API subdomains.
+ * - "unrestricted": no host restriction (`*`). Violates the authorized-targets principle, so it's an explicit opt-in.
  */
 export type ScopeMode = "same-origin" | "etld" | "unrestricted";
 
 export interface ScopePolicy {
-  /** in-scope ホスト(完全一致 or グロブ。M0 は完全一致想定) */
+  /** in-scope hosts (exact match or glob; M0 assumes exact match) */
   inScopeHosts: string[];
   outOfScopeHosts: string[];
-  /** in-scope とみなすパス接頭辞(例 "/") */
+  /** Path prefixes considered in-scope (e.g. "/") */
   inScopePathPrefixes: string[];
   outOfScopePathPrefixes: string[];
-  /** REQUIRES_APPROVAL に倒すパス接頭辞(機微領域) */
+  /** Path prefixes that force REQUIRES_APPROVAL (sensitive areas) */
   approvalPathPrefixes: string[];
-  /** REQUIRES_APPROVAL に倒すメソッド(破壊的: DELETE/PUT/PATCH 等) */
+  /** Methods that force REQUIRES_APPROVAL (destructive: DELETE/PUT/PATCH etc.) */
   approvalMethods: string[];
-  /** デフォルト保守的レート(WAF 教訓。DESIGN §2.2/§4.5) */
+  /** Conservative default rate (WAF lesson. DESIGN §2.2/§4.5) */
   rate: RateLimit;
 }

@@ -1,14 +1,14 @@
-// LLM 出力から JSON を頑健に取り出す。```json フェンス除去 + 最初の {/[ から括弧マッチ。
+// Robustly extract JSON from LLM output. Strips the ```json fence + bracket-matches from the first {/[.
 
 export function extractJson(text: string): unknown {
   const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
   const body = (fence?.[1] ?? text).trim();
 
-  // まず素直にパース
+  // First try a straightforward parse
   try {
     return JSON.parse(body);
   } catch {
-    /* prose に埋もれている可能性 → 括弧マッチで走査 */
+    /* may be buried in prose → scan via bracket matching */
   }
 
   const start = body.search(/[{[]/);

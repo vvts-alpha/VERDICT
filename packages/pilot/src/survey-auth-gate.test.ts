@@ -1,18 +1,18 @@
-// survey_done の認証ゲート: ロールがあるのに認証セッションが立っていなければ survey を閉じさせない。
-// これが無いと、モデルが未認証フロンティアを空にしただけで survey_done を呼べてしまい、
-// post-login サーフェスが丸ごと未マップになって画面数が静かに半減する(60→32 の実バグ)。
+// survey_done auth gate: if roles are configured but no auth session is active, don't let survey close.
+// Without it, the model can call survey_done just by emptying the unauthenticated frontier,
+// leaving the entire post-login surface un-mapped and silently halving the screen count (the real 60→32 bug).
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import { surveyAuthGate } from "./tools.js";
 
 test("gate: roles configured but no active session → refused (the 60→32 anonymous-survey bug)", () => {
-  // attended で primary の currentRole は立つが cookie/bearer は空 = 実体は匿名 → authActive=false
+  // in attended mode the primary's currentRole is set but cookie/bearer are empty = effectively anonymous → authActive=false
   assert.equal(surveyAuthGate(3, false).ok, false);
   assert.equal(surveyAuthGate(1, false).ok, false);
 });
 
 test("gate: roles configured and a session is active → passes", () => {
-  // login() が cookie か Bearer を載せた後
+  // after login() has set a cookie or Bearer
   assert.equal(surveyAuthGate(3, true).ok, true);
 });
 

@@ -1,4 +1,4 @@
-// 実 validator(exposed_file / auth_required / cors)+ scanInventory の store 連携を FakeHttpClient で検証。
+// Verify the real validators (exposed_file / auth_required / cors) + scanInventory's store integration with FakeHttpClient.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -70,7 +70,7 @@ test("exposed_file + auth_required confirm and land in the store + coverage ledg
     assert.equal(state.findings.length, 2);
     assert.ok(state.findings.some((f) => f.source.kind === "validator" && f.source.validatorName === "exposed_file"));
     assert.ok(state.findings.some((f) => f.title.includes("Unauthenticated access")));
-    // 各 finding は negative control + 2 positive = 3 証拠
+    // each finding = negative control + 2 positives = 3 evidence records
     for (const f of state.findings) assert.equal(f.evidenceIds.length, 3);
 
     const scan = state.screenScans.find((x) => x.screenId === "s-0001");
@@ -97,7 +97,7 @@ test("0-byte 200 does not count (guard)", async () => {
 test("catch-all server is refuted, not confirmed", async () => {
   const { ev, dir } = freshEvidence();
   try {
-    // 全パスが 200 + git config 風 body(0-byte ガードは通るが negative control も陽性 → catch-all)
+    // every path returns 200 + git-config-like body (passes the 0-byte guard, but the negative control is also positive → catch-all)
     const http = new FakeHttpClient(() => ({ status: 200, body: "[core]\n\trepositoryformatversion = 0\n" }));
     const r = await scanScreen(screen(), http, ev, new Set());
     const git = r.outcomes.find((o) => o.validator === "exposed_file" && o.probeId === "git-config");
@@ -114,7 +114,7 @@ test("cors_misconfig confirms only when an arbitrary Origin is reflected", async
     const http = new FakeHttpClient((req) => {
       if (new URL(req.url).pathname !== "/api/products/1") return { status: 404, body: "" };
       const origin = req.headers?.["origin"];
-      // Origin が来たらそのまま反映(脆弱)。来なければ反映しない。
+      // If an Origin arrives, reflect it as-is (vulnerable). If not, don't reflect.
       return origin
         ? { status: 200, body: "{}", headers: { "access-control-allow-origin": origin, "access-control-allow-credentials": "true" } }
         : { status: 200, body: "{}" };

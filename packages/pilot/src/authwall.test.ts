@@ -1,4 +1,4 @@
-// 認証壁サーキットブレーカ判定: 全プローブが 401 で何も通らない時だけ true。
+// Auth-wall circuit-breaker decision: true only when all probes are 401 and nothing gets through.
 
 import { strict as assert } from "node:assert";
 import { test } from "node:test";

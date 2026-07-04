@@ -1,8 +1,8 @@
-// DESIGN §6.1 / §6.2 — 本番 driver。Playwright launchPersistentContext + XHR/fetch 傍受 +
-// SPA 仮想ルート採取。playwright-core は遅延 import(import しただけでは browser を要求しない)。
+// DESIGN §6.1 / §6.2 — production driver. Playwright launchPersistentContext + XHR/fetch interception +
+// SPA virtual-route capture. playwright-core is lazily imported (importing it alone doesn't require a browser).
 //
-// in-page で実行されるコールバックは (globalThis as any) 経由で DOM へ触れる
-// → DOM lib を引かず Node 型と衝突させない。
+// Callbacks that run in-page touch the DOM via (globalThis as any)
+// → so we don't pull in the DOM lib and clash with Node types.
 
 import type { BrowserContext, CDPSession, Dialog, Page } from "playwright-core";
 import type { CapturedExchange, Driver, FormObservation, Observation } from "../types.js";
@@ -17,7 +17,7 @@ export interface AutoLoginOptions {
   submitSelector?: string;
 }
 
-/** セッション解析用の Cookie(フラグ付き)。 */
+/** Cookie (with flags) for session analysis. */
 export interface CookieInfo {
   name: string;
   value: string;
@@ -28,7 +28,7 @@ export interface CookieInfo {
   domain: string;
 }
 
-/** smartLogin が使う現在ページのスナップショット。 */
+/** Snapshot of the current page used by smartLogin. */
 export interface PageSnapshot {
   url: string;
   title: string;
@@ -40,35 +40,35 @@ export interface PageSnapshot {
 }
 
 export interface PlaywrightDriverOptions {
-  /** 認証状態を宿す永続プロファイル(DESIGN §6.3 / §10) */
+  /** Persistent profile that holds auth state (DESIGN §6.3 / §10) */
   userDataDir: string;
   headless?: boolean;
-  /** browser バイナリを明示(playwright install 済みなら不要) */
+  /** Explicit browser binary (unnecessary if playwright install has been run) */
   executablePath?: string;
   channel?: string;
-  /** 追加 launch 引数(コンテナ実行では ["--no-sandbox"] が必要なことが多い) */
+  /** Extra launch args (container runs often need ["--no-sandbox"]) */
   args?: string[];
-  /** 上流 HTTP プロキシ(例 Burp http://127.0.0.1:8080)。指定時のみブラウザ通信を経由 + TLS 検証無視。
-   *  未指定なら従来通り(挙動不変)。 */
+  /** Upstream HTTP proxy (e.g. Burp http://127.0.0.1:8080). Only when set does browser traffic route through it + skip TLS verification.
+   *  If unset, behaves as before (byte-identical). */
   proxy?: string;
-  /** サイト全体を覆う HTTP Basic/Digest 認証の資格情報(operator 提供)。指定すると Playwright が
-   *  401 WWW-Authenticate を毎ナビ/リダイレクトで自動応答する(Basic/Digest 両対応・CORS 影響なし)。 */
+  /** Site-wide HTTP Basic/Digest credentials (operator-provided). When set, Playwright auto-responds to
+   *  401 WWW-Authenticate on every navigation/redirect (handles both Basic/Digest, no CORS impact). */
   httpCredentials?: { username: string; password: string };
-  /** operator 提供のカスタムヘッダ(WAF 回避・案件指定の必須ヘッダ等)。マーカーと同じく「同一オリジン
-   *  (+ドキュメント遷移)」のリクエストにだけ付ける(クロスオリジンには付けない=第三者を CORS preflight で
-   *  壊さない)。raw http 経路(FetchHttpClient)には別途載せる。 */
+  /** Operator-provided custom headers (WAF bypass, engagement-mandated headers, etc.). Like the marker, added only to
+   *  "same-origin (+ document navigation)" requests (never cross-origin = don't break third parties via a CORS
+   *  preflight). The raw-http path (FetchHttpClient) adds them separately. */
   extraHeaders?: Record<string, string>;
   navTimeoutMs?: number;
   settleMs?: number;
   maxBodySample?: number;
-  /** x-verdict マーカーを付ける URL の **追加** 絞り込み(任意)。マーカーは常に「同一オリジン(+遷移)」
-   *  だけに付く(クロスオリジンには絶対付けない = 第三者 CDN/解析/別ドメイン API を CORS preflight で壊さない)。
-   *  この述語を渡すと、その同一オリジン要求の中でさらに true のものだけに限定できる(既定=全許可)。
-   *  ※ スコープ(評価対象)とは別概念: スコープは別ドメイン/API を含めて広げてよい。 */
+  /** **Additional** filter (optional) on which URLs get the x-verdict marker. The marker is always added only to
+   *  "same-origin (+ navigation)" (never cross-origin = don't break third-party CDN/analytics/other-domain APIs via a CORS preflight).
+   *  Passing this predicate further restricts it to same-origin requests where it returns true (default = allow all).
+   *  Note: distinct from scope (what may be assessed): scope may broaden to include other domains/APIs. */
   markerAllow?: (url: string) => boolean;
 }
 
-/** ブラウザ由来トラフィックを識別するためのマーカーヘッダ(同一オリジンには無害、クロスオリジンは preflight 化)。 */
+/** Marker header to identify browser-origin traffic (harmless same-origin, triggers a preflight cross-origin). */
 const MARKER_HEADER = "x-verdict";
 const MARKER_VALUE = "assessment";
 
@@ -78,7 +78,7 @@ interface SettledOptions {
   maxBodySample: number;
 }
 
-// --- in-page で実行される関数(serialize されて browser 上で動く) ---
+// --- functions that run in-page (serialized and executed in the browser) ---
 
 const INIT_SCRIPT = (): void => {
   const g = globalThis as any;
@@ -174,13 +174,13 @@ export class PlaywrightDriver implements Driver {
     const { chromium } = await import("playwright-core");
     const context = await chromium.launchPersistentContext(options.userDataDir, {
       headless: options.headless ?? true,
-      // 注意: extraHTTPHeaders で全付与すると、カスタムヘッダがクロスオリジン要求を CORS preflight 化して
-      // 第三者 CDN/解析/別サブドメイン API を壊す。マーカーは下のルーティングで「同一オリジンのみ」に付ける。
+      // Note: adding everything via extraHTTPHeaders would make custom headers turn cross-origin requests into CORS preflights
+      // and break third-party CDN/analytics/other-subdomain APIs. The marker is added "same-origin only" via the routing below.
       ...(options.executablePath ? { executablePath: options.executablePath } : {}),
       ...(options.channel ? { channel: options.channel } : {}),
       ...(options.args ? { args: options.args } : {}),
-      ...(options.proxy ? { proxy: { server: options.proxy }, ignoreHTTPSErrors: true } : {}), // Burp 経由(指定時のみ)
-      ...(options.httpCredentials ? { httpCredentials: options.httpCredentials } : {}), // サイト全体の Basic/Digest(指定時のみ)
+      ...(options.proxy ? { proxy: { server: options.proxy }, ignoreHTTPSErrors: true } : {}), // via Burp (only when set)
+      ...(options.httpCredentials ? { httpCredentials: options.httpCredentials } : {}), // site-wide Basic/Digest (only when set)
     });
     const page = context.pages()[0] ?? (await context.newPage());
     const driver = new PlaywrightDriver(context, page, {
@@ -189,10 +189,10 @@ export class PlaywrightDriver implements Driver {
       maxBodySample: options.maxBodySample ?? 4096,
     });
     await context.addInitScript(INIT_SCRIPT);
-    // x-verdict マーカーは **同一オリジン(+ドキュメント遷移)** のリクエストにだけ付ける。クロスオリジンには
-    // 一切付けない(= スコープに別ドメイン/API を含めても、ブラウザが第三者を CORS preflight で壊さない)。
-    // スコープとマーカーは別概念: スコープ=何を評価してよいか(別ドメイン・API 込みで広げてOK)、
-    // マーカー=識別ヘッダで、同一オリジンなら preflight 不要なので常に無害。markerAllow で更に絞れる(既定=全許可)。
+    // The x-verdict marker is added only to **same-origin (+ document navigation)** requests. Never to cross-origin
+    // at all (= even if scope includes other domains/APIs, the browser won't break third parties via a CORS preflight).
+    // Scope and marker are distinct: scope = what may be assessed (fine to broaden across domains/APIs),
+    // marker = an identifying header, harmless same-origin since it needs no preflight. markerAllow narrows it further (default = allow all).
     const markerAllow = options.markerAllow ?? ((): boolean => true);
     const extraHeaders = options.extraHeaders;
     const hasExtra = !!extraHeaders && Object.keys(extraHeaders).length > 0;
@@ -201,7 +201,7 @@ export class PlaywrightDriver implements Driver {
         const req = route.request();
         let sameOrigin = false;
         if (req.isNavigationRequest()) {
-          sameOrigin = true; // ドキュメント遷移は CORS preflight 対象外 → 付けても安全
+          sameOrigin = true; // document navigation isn't subject to a CORS preflight → safe to add
         } else {
           try {
             const frameUrl = req.frame()?.url() ?? "";
@@ -211,7 +211,7 @@ export class PlaywrightDriver implements Driver {
           }
         }
         if (sameOrigin && (hasExtra || markerAllow(req.url()))) {
-          // 同一オリジンのみ: operator のカスタムヘッダ + x-verdict マーカーを付与(CORS preflight 化しない)。
+          // same-origin only: add the operator's custom headers + the x-verdict marker (doesn't trigger a CORS preflight).
           const headers: Record<string, string> = { ...req.headers() };
           if (hasExtra) Object.assign(headers, extraHeaders);
           if (markerAllow(req.url())) headers[MARKER_HEADER] = MARKER_VALUE;
@@ -266,13 +266,13 @@ export class PlaywrightDriver implements Driver {
   }
 
   /**
-   * networkidle / 固定 settle だけでは、遅延 XHR でレンダリングする SPA を取りこぼす
-   * (描画完了前にスナップショット → 空 skeleton / links・API 欠落 = 「取れるとき/取れないとき」のムラ)。
-   * そこで body の内容量(可視テキスト長 + 要素数)を一定間隔で観測し、**2 回連続で変化しなくなったら
-   * 描画が落ち着いた**とみなして返す(上限 maxMs で打ち切り)。静的ページは ~0.4s で即抜け、
-   * 遅延描画ページだけ必要な分だけ待つ適応待ち。snapshot を後ろにずらすので、その間に解決した
-   * XHR も this.buffer に載り、firedApis の取りこぼしも同時に減る。
-   *   in-page コールバックは (globalThis as any) 経由で DOM へ(crawler tsconfig は dom lib 無し)。
+   * networkidle / a fixed settle alone misses SPAs that render via delayed XHR
+   * (snapshot before render completes → empty skeleton / missing links·APIs = flaky "works sometimes, not others").
+   * So observe body content volume (visible-text length + element count) at a fixed interval and, **once it stops
+   * changing for 2 consecutive samples**, treat rendering as settled and return (capped at maxMs). Static pages
+   * exit in ~0.4s; only lazily-rendered pages wait as long as needed — an adaptive wait. Because it defers the
+   * snapshot, XHRs that resolve in the meantime also land in this.buffer, reducing missed firedApis at the same time.
+   *   In-page callbacks reach the DOM via (globalThis as any) (the crawler tsconfig has no dom lib).
    */
   private async waitForDomStable(maxMs = 4_000, intervalMs = 200): Promise<void> {
     const sig = (): Promise<number> =>
@@ -283,15 +283,15 @@ export class PlaywrightDriver implements Driver {
           if (!b) return 0;
           return (b.innerText ? String(b.innerText).length : 0) + b.getElementsByTagName("*").length;
         })
-        .catch(() => -1); // 評価不能(遷移中など)→ 安定待ちを諦める番兵
+        .catch(() => -1); // sentinel: can't evaluate (mid-navigation etc.) → give up waiting for stability
     const start = Date.now();
     let last = -1;
     let stable = 0;
     while (Date.now() - start < maxMs) {
       const cur = await sig();
-      if (cur < 0) return; // ページ評価不能 → 呼び出し側の固定 settle に委ねる
+      if (cur < 0) return; // page can't be evaluated → defer to the caller's fixed settle
       if (cur > 0 && cur === last) {
-        if (++stable >= 2) return; // 2 連続で不変 → 描画安定とみなす
+        if (++stable >= 2) return; // unchanged for 2 in a row → treat rendering as settled
       } else {
         stable = 0;
         last = cur;
@@ -310,14 +310,14 @@ export class PlaywrightDriver implements Driver {
       });
       status = resp?.status() ?? 0;
     } catch {
-      /* navigation error → 取れた範囲で返す */
+      /* navigation error → return what we managed to capture */
     }
     try {
       await this.page.waitForLoadState("networkidle", { timeout: 5_000 });
     } catch {
-      /* networkidle に達しない SPA はタイムアウト無視 → 下の DOM 安定待ちで描画完了を待つ */
+      /* SPAs that never reach networkidle: ignore the timeout → wait for render via the DOM-stable wait below */
     }
-    await this.waitForDomStable(); // 遅延 XHR レンダリングの取りこぼし対策(描画が止まるまで適応待ち)
+    await this.waitForDomStable(); // guard against missing delayed-XHR rendering (adaptive wait until rendering stops)
     await new Promise<void>((resolve) => setTimeout(resolve, this.opts.settleMs));
 
     const finalUrl = this.page.url();
@@ -333,7 +333,7 @@ export class PlaywrightDriver implements Driver {
     try {
       data = await this.page.evaluate(PAGE_EXTRACT_FN);
     } catch {
-      /* about:blank 等 */
+      /* about:blank etc. */
     }
 
     return {
@@ -352,21 +352,21 @@ export class PlaywrightDriver implements Driver {
   }
 
   /**
-   * 生ブラウザで人間にログインさせる(headed)。Cookie 注入はせず、
-   * 認証状態は永続 userDataDir に宿る(DESIGN §6.3)。waitMs の間に人手でログイン完了させる。
+   * Let a human log in via a real browser (headed). No cookie injection;
+   * auth state lives in the persistent userDataDir (DESIGN §6.3). The human completes login during waitMs.
    */
   async interactiveLogin(loginUrl: string, waitMs: number): Promise<void> {
     try {
       await this.page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: this.opts.navTimeoutMs });
     } catch {
-      /* ログイン URL に到達できなくても待つ */
+      /* wait even if the login URL can't be reached */
     }
     await new Promise<void>((resolve) => setTimeout(resolve, waitMs));
   }
 
   /**
-   * 資格情報でログインフォームを自動入力・送信(DESIGN §6.3 ステップ1)。Cookie 注入ではなく
-   * 実フォームへの入力。CAPTCHA/MFA/失敗を検出したら ok:false(呼び出し側が人手ログインへ切替)。
+   * Auto-fill and submit the login form with credentials (DESIGN §6.3 step 1). Real form input,
+   * not cookie injection. On CAPTCHA/MFA/failure, return ok:false (the caller switches to human login).
    */
   async autoLogin(o: AutoLoginOptions): Promise<{ ok: boolean; reason: string }> {
     try {
@@ -419,24 +419,24 @@ export class PlaywrightDriver implements Driver {
     return { ok: true, reason: `logged in (now at ${finalUrl})` };
   }
 
-  // --- LLM ログイン(smartLogin)用の粒度の細かいブラウザ操作 ---
+  // --- fine-grained browser operations for LLM login (smartLogin) ---
 
   async gotoUrl(url: string): Promise<void> {
     try {
       await this.page.goto(url, { waitUntil: "domcontentloaded", timeout: this.opts.navTimeoutMs });
     } catch {
-      /* 到達できなくても続行 */
+      /* continue even if unreachable */
     }
-    await this.waitForDomStable(); // visit() と同じく描画が落ち着くまで適応待ち
+    await this.waitForDomStable(); // like visit(), an adaptive wait until rendering settles
     await new Promise<void>((resolve) => setTimeout(resolve, this.opts.settleMs));
   }
 
   /**
-   * ブラウザ XSS *実行* 検出。`url`(ペイロード内包)へ navigate し、ペイロードが実際に走ったかを見る。
-   * HTTP 応答の反映を見る probe_xss では原理的に捉えられない **DOM-based / innerHTML-sink XSS** 用
-   * (例: Juice Shop の検索 `#/search?q=…` は q を innerHTML へ描画 → サーバ応答には出ず browser 内で実行)。
-   * 検出シグナル: ペイロードが (1) `window.__verdict_xss = marker` を立てる(`<img onerror>`/`<svg onload>` 等が発火)
-   * か (2) `alert/confirm/prompt` で marker を出す。どちらか1つでも実行確証。
+   * Browser XSS *execution* detection. Navigate to `url` (with the payload embedded) and observe whether the payload actually ran.
+   * For **DOM-based / innerHTML-sink XSS** that probe_xss (which inspects the HTTP response reflection) fundamentally can't catch
+   * (e.g. Juice Shop's search `#/search?q=…` renders q into innerHTML → never appears in the server response, executes in the browser).
+   * Detection signals: the payload either (1) sets `window.__verdict_xss = marker` (an `<img onerror>`/`<svg onload>` etc. fired)
+   * or (2) surfaces the marker via `alert/confirm/prompt`. Either one confirms execution.
    */
   async detectXssExecution(url: string, marker: string): Promise<{ executed: boolean; signal: string }> {
     let dialog = "";
@@ -449,9 +449,9 @@ export class PlaywrightDriver implements Driver {
       try {
         await this.page.goto(url, { waitUntil: "domcontentloaded", timeout: this.opts.navTimeoutMs });
       } catch {
-        /* SPA ハッシュルートは navigation 完了扱いにならないことがある → 続行して描画を待つ */
+        /* SPA hash routes may not count as navigation completion → continue and wait for render */
       }
-      // SPA がルートを評価し q を innerHTML へ反映 → img.onerror / svg.onload が走るのを待つ。
+      // wait for the SPA to evaluate the route and reflect q into innerHTML → img.onerror / svg.onload fires.
       await new Promise<void>((resolve) => setTimeout(resolve, Math.max(this.opts.settleMs, 900)));
       const g = await this.page
         .evaluate(() => String((globalThis as { __verdict_xss?: unknown }).__verdict_xss ?? ""))
@@ -504,7 +504,7 @@ export class PlaywrightDriver implements Driver {
     return false;
   }
 
-  /** ファイルアップロード(<input type=file>)を setInputFiles で実行し、送信する。base64 でバイナリも可。 */
+  /** Upload a file (<input type=file>) via setInputFiles and submit. base64 also supports binary. */
   async uploadFile(
     selector: string,
     filename: string,
@@ -521,7 +521,7 @@ export class PlaywrightDriver implements Driver {
     } catch (e) {
       return { ok: false, note: `setInputFiles failed on ${selector}: ${String(e).slice(0, 120)}` };
     }
-    // 送信: 指定 selector、無ければ submit ボタンを試す。
+    // submit: use the given selector, else try a submit button.
     const submitted = submitSelector
       ? await this.page.click(submitSelector, { timeout: 4000 }).then(() => true).catch(() => false)
       : await this.page.click('button[type="submit"], input[type="submit"], button', { timeout: 3000 }).then(() => true).catch(() => false);
@@ -535,15 +535,15 @@ export class PlaywrightDriver implements Driver {
     await new Promise<void>((resolve) => setTimeout(resolve, this.opts.settleMs));
   }
 
-  /** ログイン後のセッション Cookie を Cookie ヘッダ文字列に(auth-diff のロール用)。 */
+  /** Session cookies after login → a Cookie header string (for auth-diff roles). */
   async sessionCookieHeader(): Promise<string> {
     const cookies = await this.context.cookies().catch(() => []);
     return cookies.map((c) => `${c.name}=${c.value}`).join("; ");
   }
 
-  /** SPA がブラウザ側に保持する Bearer JWT を回収する(local/sessionStorage の慣用キーを走査)。
-   *  Juice Shop 等は cookie ではなく `Authorization: Bearer <localStorage.token>` で XHR/API 認証するため、
-   *  これを拾って http_request/probe_logic に載せないと write 系 API が全部 401 になる。生のトークン文字列を返す。 */
+  /** Recover the Bearer JWT the SPA holds browser-side (scans the common local/sessionStorage keys).
+   *  Juice Shop and the like authenticate XHR/API via `Authorization: Bearer <localStorage.token>` rather than a cookie,
+   *  so without picking this up and putting it on http_request/probe_logic, every write API would 401. Returns the raw token string. */
   async bearerToken(): Promise<string | null> {
     const raw = await this.page
       .evaluate(() => {
@@ -555,7 +555,7 @@ export class PlaywrightDriver implements Driver {
             const v = st.getItem?.(k);
             if (typeof v === "string" && v.length > 20) return v;
           }
-          // 値が JSON で {token:...}/{accessToken:...} に包まれているケースも拾う。
+          // also handles the case where the value is JSON wrapping {token:...}/{accessToken:...}.
           for (let i = 0; i < (st.length ?? 0); i++) {
             const k = st.key?.(i);
             const v = k ? st.getItem(k) : null;
@@ -573,19 +573,19 @@ export class PlaywrightDriver implements Driver {
       })
       .catch(() => null);
     if (!raw) return null;
-    // "Bearer xxx" 形式で入っていることがあるので素のトークンに正規化。JWT らしさ(2つの '.')も軽く確認。
+    // may be stored as "Bearer xxx", so normalize to the bare token. Also lightly check it looks like a JWT (two '.').
     const tok = raw.replace(/^Bearer\s+/i, "").trim();
     return tok.length > 20 ? tok : null;
   }
 
-  /** 現在ページのスクリーンショットを path に保存(WebUI 表示用)。親ディレクトリは自動作成。
-   *  真っ白スクショ対策: 撮る前に描画が落ち着くのを待つ(networkidle → フォント ready → 小休止)。
-   *  settleMs で追加の固定待ちを調整可(既定 700ms)。 */
+  /** Save a screenshot of the current page to path (for WebUI display). Parent directory is created automatically.
+   *  Blank-screenshot guard: wait for rendering to settle before capturing (networkidle → fonts ready → brief pause).
+   *  settleMs tunes the extra fixed wait (default 700ms). */
   async saveScreenshot(path: string, settleMs = 700): Promise<boolean> {
     try {
       await this.page.waitForLoadState("networkidle", { timeout: 4_000 }).catch(() => {});
-      // フォント読み込み完了を待つ(text が消えた真っ白フレームを防ぐ)。直列化のため boolean に畳む。
-      // in-page コールバックは (globalThis as any) 経由で DOM へ(crawler tsconfig は dom lib 無し)。
+      // wait for fonts to finish loading (prevents a blank frame with the text gone). Fold to a boolean for serialization.
+      // in-page callbacks reach the DOM via (globalThis as any) (the crawler tsconfig has no dom lib).
       await this.page
         .evaluate(() => {
           const g = globalThis as any;
@@ -600,7 +600,7 @@ export class PlaywrightDriver implements Driver {
     }
   }
 
-  /** 認証 Cookie をフラグ付きで取得(セッション解析用: HttpOnly/Secure/SameSite/予測可能性)。 */
+  /** Get auth cookies with flags (for session analysis: HttpOnly/Secure/SameSite/predictability). */
   async cookies(): Promise<CookieInfo[]> {
     const cs = await this.context.cookies().catch(() => []);
     return cs.map((c) => ({
@@ -614,12 +614,12 @@ export class PlaywrightDriver implements Driver {
     }));
   }
 
-  /** 永続コンテキストの Cookie を消す(別ロールでログインし直す前に)。 */
+  /** Clear the persistent context's cookies (before re-logging-in as a different role). */
   async clearSession(): Promise<void> {
     await this.context.clearCookies().catch(() => {});
   }
 
-  /** operator が事前取得した Cookie をコンテキストに注入(Cookie ファイル認証用)。 */
+  /** Inject cookies the operator pre-captured into the context (for cookie-file auth). */
   async addCookies(
     cookies: Array<{ name: string; value: string; domain?: string; path?: string; url?: string; httpOnly?: boolean; secure?: boolean }>,
   ): Promise<void> {
@@ -627,18 +627,18 @@ export class PlaywrightDriver implements Driver {
     await this.context.addCookies(cookies as Parameters<BrowserContext["addCookies"]>[0]).catch(() => {});
   }
 
-  /** 現在ページの URL(ログイン後の着地点 = 認証済み再クロールの起点に使う)。 */
+  /** The current page URL (the post-login landing point = start of the authenticated re-crawl). */
   currentUrl(): string {
     return this.page.url();
   }
 
-  /** ライブ遠隔ログイン(attended×LiveHands)用に現在ページの CDP セッションを返す
-   *  (Page.startScreencast + Input.dispatch*)。認証状態は永続 userDataDir に宿る。 */
+  /** Return the current page's CDP session for live remote login (attended×LiveHands)
+   *  (Page.startScreencast + Input.dispatch*). Auth state lives in the persistent userDataDir. */
   async cdpSession(): Promise<CDPSession> {
     return this.context.newCDPSession(this.page);
   }
 
-  /** 傍受バッファを取り出してクリア(操作で発火した API を回収する。能動探索用)。 */
+  /** Take and clear the intercept buffer (collect APIs fired by an interaction; for active exploration). */
   drainApiCalls(): CapturedExchange[] {
     const out = this.buffer.slice();
     this.buffer = [];
@@ -646,11 +646,11 @@ export class PlaywrightDriver implements Driver {
   }
 
   /**
-   * 能動的な入力スイープ: 現在のページのフォーム/入力欄を benign 値で埋めて送信し、出てきた
-   * **新ルート + 発火した XHR/fetch URL** を返す(「入力欄を全部触る」survey 用)。
-   * - aggressive=false なら GET/検索フォームだけ送信(POST は触らない=データを書かない)。true なら POST も送信。
-   * - logout / スコープ外は allow() で弾く(自滅防止)。DELETE/PUT/PATCH フォームは常にスキップ。
-   * - フォーム送信のたびにページが遷移しうるので、毎回 origin へ navigate して状態を復元する。
+   * Active input sweep: fill the current page's forms/input fields with benign values and submit, returning the
+   * **new routes + fired XHR/fetch URLs** that come out (for the "touch every input" survey).
+   * - aggressive=false submits only GET/search forms (never POST = writes no data). true also submits POST.
+   * - logout / out-of-scope are rejected by allow() (self-destruction guard). DELETE/PUT/PATCH forms are always skipped.
+   * - each form submission may navigate the page, so navigate back to origin every time to restore state.
    */
   async exerciseInputs(opts: { aggressive: boolean; allow: (url: string) => boolean; cap?: number }): Promise<{ exercised: number; discovered: string[] }> {
     const origin = this.page.url();
@@ -658,7 +658,7 @@ export class PlaywrightDriver implements Driver {
     const cap = opts.cap ?? 12;
     const discovered = new Set<string>();
     let exercised = 0;
-    this.drainApiCalls(); // 開始前にバッファをクリア
+    this.drainApiCalls(); // clear the buffer before starting
 
     const collect = (before: string): void => {
       const after = this.page.url();
@@ -668,7 +668,7 @@ export class PlaywrightDriver implements Driver {
       }
     };
 
-    // ① フォーム
+    // (1) forms
     const forms = await this.page.$$("form").catch(() => []);
     for (const form of forms) {
       if (exercised >= cap) break;
@@ -679,7 +679,7 @@ export class PlaywrightDriver implements Driver {
         try {
           actionUrl = new URL(action, origin).toString();
         } catch {
-          /* relative/garbage → origin 扱い */
+          /* relative/garbage → treat as origin */
         }
         if (!opts.allow(actionUrl)) continue;
         if (method === "delete" || method === "put" || method === "patch") continue;
@@ -703,18 +703,18 @@ export class PlaywrightDriver implements Driver {
         await this.page.waitForLoadState("networkidle", { timeout: 4000 }).catch(() => {});
         exercised += 1;
         collect(before);
-        await this.gotoUrl(origin); // 復元
+        await this.gotoUrl(origin); // restore
       } catch {
-        /* 次のフォームへ */
+        /* on to the next form */
       }
     }
 
-    // ② フォーム外の単独 search/text 入力(SPA の検索ボックス等は <form> を持たないことが多い)
+    // (2) standalone search/text inputs outside a form (SPA search boxes etc. often have no <form>)
     const loose = await this.page.$$("input[type=search], input[type=text]").catch(() => []);
     for (const el of loose) {
       if (exercised >= cap) break;
       try {
-        if (await el.evaluate((n: { closest: (s: string) => unknown }) => !!n.closest("form")).catch(() => true)) continue; // フォーム内は①で処理済み
+        if (await el.evaluate((n: { closest: (s: string) => unknown }) => !!n.closest("form")).catch(() => true)) continue; // inside a form: already handled in (1)
         await el.fill(MARK).catch(() => {});
         const before = this.page.url();
         await el.press("Enter").catch(() => {});
@@ -723,7 +723,7 @@ export class PlaywrightDriver implements Driver {
         collect(before);
         await this.gotoUrl(origin);
       } catch {
-        /* 次の入力へ */
+        /* on to the next input */
       }
     }
     return { exercised, discovered: [...discovered] };

@@ -1,5 +1,5 @@
-// DESIGN §7.3 / §7.6 — 画面ごとにカタログを回し、confirmed を Finding 化して store に集約。
-// confirmed のみ Finding(証拠規律を通過済み)。カバレッジ台帳の status も finding/clean に更新。
+// DESIGN §7.3 / §7.6 — run the catalog per screen, turn confirmed outcomes into Findings, and aggregate them into the store.
+// Only confirmed outcomes become Findings (they passed evidence discipline). The coverage-ledger status is also updated to finding/clean.
 
 import type { AssessmentStore, Finding, Screen } from "@veritas/core";
 import type { HttpClient } from "./http.js";

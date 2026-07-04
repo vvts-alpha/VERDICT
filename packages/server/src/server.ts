@@ -1,13 +1,13 @@
-// DESIGN §8.1 / §8.4 — 状態 API + WebSocket。
-// AssessmentState を StateView に投影して push。別プロセス(crawler/labeler)が書く state.sqlite を
-// events.seq でポーリングし、新規イベントを差分 push する(in-process イベントが無いため)。
+// DESIGN §8.1 / §8.4 — state API + WebSocket.
+// Project AssessmentState into StateView and push. Poll the state.sqlite that a separate process
+// (crawler/labeler) writes, via events.seq, and push new events as diffs (since there are no in-process events).
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
 
-import { AssessmentStore, buildReportModel, buildStateView, renderFindingsCsv, renderInventoryHtml, renderMarkdown, renderReportHtml, renderScreensCsv } from "@veritas/core";
+import { AssessmentStore, buildReportModel, buildStateView, parseTargetUrl, renderFindingsCsv, renderInventoryHtml, renderMarkdown, renderReportHtml, renderScreensCsv } from "@veritas/core";
 import type { TargetInput, WsMessage } from "@veritas/core";
 import { htmlToPdf } from "@veritas/crawler";
 import { ClaudeCliClient } from "@veritas/llm";
@@ -21,18 +21,18 @@ export interface ServerOptions {
   runsDir: string;
   port?: number;
   host?: string;
-  /** ビルド済み webui(静的配信)。未指定なら API/WS のみ */
+  /** Built webui (served statically). If unset, API/WS only */
   webRoot?: string;
-  /** events ポーリング間隔(ms)。既定 1000 */
+  /** events polling interval (ms). Default 1000 */
   pollMs?: number;
-  /** 接続/push を可観測化するログ(CLI が console.log を渡す。テストは未指定=無音)。 */
+  /** Log to observe connections/pushes (CLI passes console.log; tests leave it unset = silent). */
   onLog?: (msg: string) => void;
-  /** 設定すると WebUI/API/WS を認証ゲート(/login フォーム + 署名 Cookie)。operator は全権、
-   *  viewer は read-only(全 POST と attended を 403)。未設定なら従来どおり無認証。
-   *  cmdServe が --password / --viewer-password / env VERDICT_WEB_PASSWORD[_VIEWER] で渡す。 */
+  /** If set, gate WebUI/API/WS behind auth (/login form + signed Cookie). operator has full rights,
+   *  viewer is read-only (all POST and attended → 403). If unset, no auth as before.
+   *  cmdServe passes it via --password / --viewer-password / env VERDICT_WEB_PASSWORD[_VIEWER]. */
   authPasswords?: AuthConfig;
-  /** 設定すると WebUI から run を起動/停止/再開できる(server が CLI を子プロセスで spawn)。
-   *  未設定なら /api/run 等は無効。cmdServe が CLI パス等を DI。 */
+  /** If set, runs can be started/stopped/resumed from the WebUI (server spawns the CLI as a child process).
+   *  If unset, /api/run etc. are disabled. cmdServe injects the CLI path etc. */
   runLauncher?: RunLauncherConfig;
 }
 
@@ -93,7 +93,7 @@ function listAssessments(runsDir: string): AssessmentSummaryRow[] {
       /* skip unreadable */
     }
   }
-  // 更新が新しい順(= 実行中 / 直近)。一覧の先頭が最新になる。
+  // Newest-updated first (= running / most recent). The head of the list is the latest.
   rows.sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0));
   return rows;
 }
@@ -130,12 +130,12 @@ function serveStatic(res: ServerResponse, webRoot: string, urlPath: string): voi
   res.end("not found");
 }
 
-// DESIGN §8.3 — WebUI 最小操作: pause/resume / handoff resolve / screen exclude。
-// + Phase-1 制御面: run の起動(/api/run) / 停止 / 再開(supervisor 経由)。
+// DESIGN §8.3 — minimal WebUI operations: pause/resume / handoff resolve / screen exclude.
+// + Phase-1 control plane: start a run (/api/run) / stop / resume (via supervisor).
 function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOptions, supervisor?: Supervisor): void {
   const url = req.url ?? "";
 
-  // run 起動: body = { command, manifest, options }。supervisor が CLI を spawn し、新 id を返す。
+  // Start a run: body = { command, manifest, options }. supervisor spawns the CLI and returns a new id.
   if (url === "/api/run") {
     if (!supervisor) return sendJson(res, 400, { error: "run launcher disabled" });
     let body = "";
@@ -158,8 +158,14 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
       if (input.command !== "pilot" && input.command !== "assess") {
         return sendJson(res, 400, { error: "command must be 'pilot' or 'assess'" });
       }
-      if (!input.manifest || typeof input.manifest !== "object" || !(input.manifest as { target?: unknown }).target) {
+      const manifestTarget = (input.manifest as { target?: unknown } | null)?.target;
+      if (!input.manifest || typeof input.manifest !== "object" || !manifestTarget) {
         return sendJson(res, 400, { error: "manifest.target is required" });
+      }
+      try {
+        parseTargetUrl(String(manifestTarget)); // reject a schemeless/non-http(s) target here (else the child crashes or builds an empty scope)
+      } catch (e) {
+        return sendJson(res, 400, { error: e instanceof Error ? e.message : String(e) });
       }
       try {
         const { id } = supervisor.start(input);
@@ -171,7 +177,7 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
     return;
   }
 
-  // run プロセス停止 / 再開(/api/run 名前空間。/api/assessments の pause/resume(状態)とは別物)
+  // Stop / resume the run process (/api/run namespace; distinct from /api/assessments pause/resume (state)).
   const runCtl = url.match(/^\/api\/run\/([^/]+)\/(stop|resume)$/);
   if (runCtl) {
     if (!supervisor) return sendJson(res, 400, { error: "run launcher disabled" });
@@ -185,8 +191,8 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
     return sendJson(res, 200, { ok: true });
   }
 
-  // 既存 run に対して Burp 能動スキャン(REST)を起動 → 完了時に自動取り込み(XML export 不要)。
-  // 子プロセス(burp-scan CLI)が runs/<id>/state.sqlite に findings を upsert → WS 投影で WebUI に反映。
+  // Launch a Burp active scan (REST) against an existing run → auto-import on completion (no XML export needed).
+  // The child process (burp-scan CLI) upserts findings into runs/<id>/state.sqlite → reflected in the WebUI via WS projection.
   const burpCtl = url.match(/^\/api\/run\/([^/]+)\/burp-scan$/);
   if (burpCtl) {
     if (!supervisor) return sendJson(res, 400, { error: "run launcher disabled" });
@@ -197,7 +203,7 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
     return sendJson(res, 200, { ok: true });
   }
 
-  // 💬 Ask: その assessment の findings/screens/scope を文脈に Claude へ質問する(読み取り Q&A)。
+  // 💬 Ask: query Claude with this assessment's findings/screens/scope as context (read-only Q&A).
   const chat = url.match(/^\/api\/assessments\/([^/]+)\/chat$/);
   if (chat) {
     const id = decodeURIComponent(chat[1] ?? "");
@@ -225,9 +231,9 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
     return;
   }
 
-  // Burp Pro の XML レポートをアップロード → 既存 run に取り込み → High+ を AI 再検証。
-  // server は in-process でマージせず、XML を保存して CLI(burp-import)を spawn する(取り込み + 検証は
-  // CLI 側に集約 / server = 制御面)。findings は子が upsert → WS 投影で WebUI に反映。body = 生 XML(大)。
+  // Upload a Burp Pro XML report → import into an existing run → AI re-verify High+.
+  // The server does not merge in-process; it saves the XML and spawns the CLI (burp-import) (import + verification
+  // are consolidated on the CLI side / server = control plane). The child upserts findings → reflected in the WebUI via WS projection. body = raw XML (large).
   const burpImp = url.match(/^\/api\/assessments\/([^/]+)\/burp-import$/);
   if (burpImp) {
     if (!supervisor) return sendJson(res, 400, { error: "run launcher disabled" });
@@ -269,8 +275,8 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
     store.close();
     sendJson(res, 200, state ? buildStateView(state) : { ok: true });
   };
-  // 書き込み系はここで防御: DB が(spawn された pilot との競合で)一時的にロックされ書けなくても、
-  // store を閉じて 503 を返すだけにする — 例外を投げるとリクエストハンドラ経由でサーバごと落ちるため。
+  // Guard writes here: even if the DB is temporarily locked and unwritable (contended by a spawned pilot),
+  // just close the store and return 503 — throwing would take down the whole server via the request handler.
   const mutateAndReply = (id: string, store: AssessmentStore, fn: () => void): void => {
     try {
       fn();
@@ -278,7 +284,7 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
       try {
         store.close();
       } catch {
-        /* 既にクローズ済み等は無視 */
+        /* ignore already-closed etc. */
       }
       sendJson(res, 503, { error: `state store busy, retry shortly: ${String(e).slice(0, 120)}` });
       return;
@@ -315,7 +321,7 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
     return mutateAndReply(id, store, () => store.setScreenScanStatus(id, screenId, "excluded"));
   }
 
-  // 一括 exclude(サイトツリーの親ノード = 部分木をまとめて除外)。body = { screenIds: [...] }。
+  // Bulk exclude (a site-tree parent node = exclude the whole subtree at once). body = { screenIds: [...] }.
   m = url.match(/^\/api\/assessments\/([^/]+)\/exclude-screens$/);
   if (m) {
     const id = decodeURIComponent(m[1] ?? "");
@@ -356,9 +362,9 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
 
 function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptions, supervisor?: Supervisor, relay?: Relay): void {
   const url = req.url ?? "/";
-  // 認証ゲート(authPasswords 設定時のみ)。/login と POST /auth は素通し、それ以外は Cookie 必須。
+  // Auth gate (only when authPasswords is set). /login and POST /auth pass through; everything else requires the Cookie.
   const cfg = opts.authPasswords;
-  let role: Role = "operator"; // 無認証時は全権扱い(従来どおり)
+  let role: Role = "operator"; // when auth is off, treat as full rights (as before)
   if (cfg) {
     const now = Date.now();
     if (req.method === "POST" && (url === "/auth" || url.startsWith("/auth?"))) {
@@ -374,8 +380,8 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptio
       handleLogout(res);
       return;
     }
-    // ログイン画面が参照する公開ブランドアセット(ロゴ・favicon)は未認証でも配信する
-    //   — でないとゲートが 302 /login に飛ばし、ログイン画面のロゴ/favicon が壊れる。
+    // Serve the public brand assets referenced by the login page (logo, favicon) even when unauthenticated
+    //   — otherwise the gate 302s to /login and the login page's logo/favicon break.
     if (req.method === "GET" && opts.webRoot && (url === "/verdict-title.png" || url === "/favicon.png")) {
       serveStatic(res, opts.webRoot, url);
       return;
@@ -391,13 +397,13 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptio
       return;
     }
     role = r;
-    // viewer は read-only: mutating(全 POST は handleControl 経由)は operator 限定。
+    // viewer is read-only: mutating (all POST goes through handleControl) is operator-only.
     if (role === "viewer" && req.method === "POST") {
       sendJson(res, 403, { error: "forbidden: viewer is read-only" });
       return;
     }
   }
-  // 自分のロール(WebUI が operator 専用ボタンを出し分けるため)。無認証なら authEnabled:false。
+  // Own role (so the WebUI can conditionally show operator-only buttons). If no auth, authEnabled:false.
   if (req.method === "GET" && (url === "/api/me" || url.startsWith("/api/me?"))) {
     sendJson(res, 200, { role, authEnabled: !!cfg });
     return;
@@ -411,13 +417,13 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptio
     sendJson(res, 200, rows);
     return;
   }
-  // attended×LiveHands: その run に逆接続中の子(agent)が持つ role セッション一覧。
+  // attended×LiveHands: the list of role sessions held by the child (agent) reverse-connected to this run.
   const sess = url.match(/^\/api\/assessments\/([^/?]+)\/sessions$/);
   if (sess) {
     sendJson(res, 200, relay?.rolesFor(decodeURIComponent(sess[1] ?? "")) ?? []);
     return;
   }
-  // 画面スクショ: runs/<id>/artifacts/screens/<screenId>.png を配信(WebUI 表示用)。
+  // Screen screenshot: serve runs/<id>/artifacts/screens/<screenId>.png (for WebUI display).
   const shot = url.match(/^\/api\/assessments\/([^/]+)\/screens\/([^/?]+)\/screenshot/);
   if (shot) {
     const sid = decodeURIComponent(shot[1] ?? "");
@@ -437,7 +443,7 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptio
     }
     return;
   }
-  // 証拠アーティファクト: finding が引用する evId の req/resp を返す(headers はマスク済)。evId は一意なので screen 横断で探す。
+  // Evidence artifact: return the req/resp for the evId a finding cites (headers already masked). evId is unique, so search across screens.
   const evm = url.match(/^\/api\/assessments\/([^/]+)\/evidence\/([^/?]+)/);
   if (evm) {
     const aid = decodeURIComponent(evm[1] ?? "");
@@ -488,12 +494,12 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptio
       response: readJson("response.json"),
       meta: readJson("meta.json"),
       body: body.slice(0, 20000),
-      requestRaw: readText("request.http.txt"), // リクエスト全体(生 HTTP)
+      requestRaw: readText("request.http.txt"), // full request (raw HTTP)
       responseRaw: readText("response.http.txt")?.slice(0, 24000) ?? null,
     });
     return;
   }
-  // レポート / 画面一覧のダウンロード(その場で最新を生成)。md/html/pdf/csv。
+  // Download report / screen inventory (generate the latest on the fly). md/html/pdf/csv.
   const rep = url.match(/^\/api\/assessments\/([^/?]+)\/(report|inventory)(?:\?|$)/);
   if (rep) {
     const fmt = new URL(url, "http://localhost").searchParams.get("format");
@@ -531,7 +537,7 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptio
 
 const CHAT_SYSTEM = `You are a security-assessment assistant embedded in VERDICT's web UI. Answer the operator's questions about THIS assessment using ONLY the assessment data provided below (findings, screens, scope, stats). Cite finding ids (e.g. f-003) and screen ids when relevant. Be concise and concrete. If something is not in the data, say so plainly — do NOT invent vulnerabilities, severities, or facts. For risk/impact or remediation you may reason generally, but ground claims in the recorded evidence.`;
 
-/** assessment state を Claude への文脈テキストに整形(findings 本体 + 画面一覧 + scope)。 */
+/** Format assessment state into context text for Claude (finding bodies + screen list + scope). */
 function buildChatContext(state: AssessmentState): string {
   const target = state.target.kind === "single_url" ? state.target.url : `scope_manifest ${state.target.path}`;
   const scanByScreen = new Map(state.screenScans.map((s) => [s.screenId, s.status]));
@@ -555,7 +561,7 @@ function buildChatContext(state: AssessmentState): string {
   return out.join("\n");
 }
 
-/** 💬 Ask の本体: state を文脈に会話履歴を渡して Claude に答えさせる(claude CLI サブスク)。 */
+/** 💬 Ask body: pass the conversation history with state as context and let Claude answer (claude CLI subscription). */
 async function serveChat(res: ServerResponse, runsDir: string, id: string, messages: Array<{ role: string; content: string }>): Promise<void> {
   if (!/^[a-z0-9_-]+$/i.test(id)) {
     sendJson(res, 400, { error: "bad id" });
@@ -592,7 +598,7 @@ const REPORT_ALLOWED: Record<"report" | "inventory", string[]> = {
   inventory: ["csv", "html"],
 };
 
-/** artifacts/<screen>/<evId>/ から生 HTTP req/resp を読む(レポート埋め込み用)。evId は一意なので全 screen を探索。 */
+/** Read raw HTTP req/resp from artifacts/<screen>/<evId>/ (for report embedding). evId is unique, so search all screens. */
 function loadEvidenceArtifact(artifactsDir: string, evId: string, maxResponseBytes = 16384): { request: string | null; response: string | null; truncated: boolean } | null {
   if (!existsSync(artifactsDir)) return null;
   let dir: string | null = null;
@@ -622,7 +628,7 @@ function loadEvidenceArtifact(artifactsDir: string, evId: string, maxResponseByt
   return { request, response, truncated };
 }
 
-/** レポート/画面一覧を要求フォーマットで生成して配信(その場で最新を描画)。pdf は Chromium 印刷。 */
+/** Generate and serve the report/screen inventory in the requested format (render the latest on the fly). pdf uses Chromium print. */
 async function serveReport(res: ServerResponse, runsDir: string, id: string, kind: "report" | "inventory", formatRaw: string | null): Promise<void> {
   if (!/^[a-z0-9_-]+$/i.test(id)) {
     sendJson(res, 400, { error: "bad id" });
@@ -648,7 +654,7 @@ async function serveReport(res: ServerResponse, runsDir: string, id: string, kin
   const artifactsDir = join(runsDir, id, "artifacts");
   const model = buildReportModel(state, new Date(), { loadEvidence: (evId) => loadEvidenceArtifact(artifactsDir, evId) });
 
-  // {body, type, filename, inline}. inline = ブラウザ内プレビュー(html/pdf)、それ以外は添付 DL。
+  // {body, type, filename, inline}. inline = in-browser preview (html/pdf), otherwise attachment download.
   let body: string | Buffer;
   let type: string;
   let filename: string;
@@ -725,7 +731,7 @@ function handleWsConnection(ws: WebSocket, req: IncomingMessage, opts: ServerOpt
     }
     if (!state) return;
     const view = buildStateView(state);
-    if (lastSeq !== 0 && view.lastSeq === lastSeq) return; // 変化なし
+    if (lastSeq !== 0 && view.lastSeq === lastSeq) return; // no change
     if (lastSeq === 0) {
       send({ type: "snapshot", view });
     } else {
@@ -736,7 +742,7 @@ function handleWsConnection(ws: WebSocket, req: IncomingMessage, opts: ServerOpt
     lastSeq = view.lastSeq;
   };
 
-  tick(); // 初回スナップショット
+  tick(); // initial snapshot
   const timer = setInterval(tick, opts.pollMs ?? 1000);
   const stop = (): void => {
     clearInterval(timer);
@@ -761,9 +767,9 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
   const supervisor = opts.runLauncher ? new Supervisor(opts.runLauncher, relay) : undefined;
   const httpServer = createServer((req, res) => handleHttp(req, res, opts, supervisor, relay));
 
-  // 複数 WS パスを同一サーバに載せるため noServer + 手動 upgrade ルーティング。
-  //   /ws         状態投影(Cookie 認証)   /ws/session  操作者の attended ログイン(Cookie 認証)
-  //   /ws/agent   子(pilot)の逆接続(token 認証 = relay 内)
+  // noServer + manual upgrade routing to host multiple WS paths on the same server.
+  //   /ws         state projection (Cookie auth)   /ws/session  operator's attended login (Cookie auth)
+  //   /ws/agent   child (pilot) reverse-connection (token auth = inside relay)
   const wss = new WebSocketServer({ noServer: true });
   const agentWss = relay ? new WebSocketServer({ noServer: true }) : null;
   const sessionWss = relay ? new WebSocketServer({ noServer: true }) : null;
@@ -783,15 +789,15 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
   httpServer.on("upgrade", (req, socket, head) => {
     const pathname = (req.url ?? "").split("?")[0] ?? "";
     const cfg = opts.authPasswords;
-    const role = cfg ? roleForReq(req, cfg, Date.now()) : "operator"; // 無認証は operator 扱い
+    const role = cfg ? roleForReq(req, cfg, Date.now()) : "operator"; // no-auth is treated as operator
     if (pathname === "/ws") {
-      if (!role) return void socket.destroy(); // 読み取り投影は認証済みなら operator/viewer どちらでも可
+      if (!role) return void socket.destroy(); // read projection is fine for either operator/viewer once authenticated
       wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
     } else if (sessionWss && pathname === "/ws/session") {
-      if (role !== "operator") return void socket.destroy(); // attended 乗っ取りは operator 限定(viewer 不可)
+      if (role !== "operator") return void socket.destroy(); // attended takeover is operator-only (viewer not allowed)
       sessionWss.handleUpgrade(req, socket, head, (ws) => sessionWss.emit("connection", ws, req));
     } else if (agentWss && pathname === "/ws/agent") {
-      agentWss.handleUpgrade(req, socket, head, (ws) => agentWss.emit("connection", ws, req)); // token は relay 内で検証
+      agentWss.handleUpgrade(req, socket, head, (ws) => agentWss.emit("connection", ws, req)); // token is verified inside relay
     } else {
       socket.destroy();
     }
@@ -800,7 +806,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
   await new Promise<void>((resolve) => httpServer.listen(opts.port ?? 0, host, resolve));
   const addr = httpServer.address();
   const port = typeof addr === "object" && addr ? addr.port : (opts.port ?? 0);
-  supervisor?.setControlBase(`ws://127.0.0.1:${port}`); // 子はローカルに逆接続する
+  supervisor?.setControlBase(`ws://127.0.0.1:${port}`); // the child reverse-connects locally
 
   let closing = false;
   return {
@@ -810,8 +816,8 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
       if (closing) return;
       closing = true;
       relay?.closeAll();
-      await supervisor?.closeAll(); // 子の run を停止
-      // 開いている WS / keep-alive 接続を強制クローズ(そうしないと httpServer.close が完走しない)。
+      await supervisor?.closeAll(); // stop child runs
+      // Force-close open WS / keep-alive connections (otherwise httpServer.close won't complete).
       for (const ws of sockets) {
         try {
           ws.terminate();

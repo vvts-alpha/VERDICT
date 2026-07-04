@@ -1,4 +1,4 @@
-// DESIGN §6.6 / §10 — screen_inventory.json(Phase1→Phase2/WebUI の唯一の契約)の入出力。
+// DESIGN §6.6 / §10 — I/O for screen_inventory.json (the sole contract from Phase1 → Phase2/WebUI).
 
 import { readFileSync, writeFileSync } from "node:fs";
 import type { Screen } from "@veritas/core";

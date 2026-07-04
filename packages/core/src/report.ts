@@ -1,5 +1,5 @@
-// DESIGN §7.6 — 診断レポート(report.md)。対象情報 + スコープ + findings(重大度順・再現手順・
-// リクエスト/レスポンス全文の証拠)。構造化モデル(report-model.ts)から markdown を描画。純粋。
+// DESIGN §7.6 — assessment report (report.md). Target info + scope + findings (by severity, with repro steps
+// and full-request/response evidence). Renders markdown from the structured model (report-model.ts). Pure.
 
 import type { AssessmentState, Severity } from "./types/index.js";
 import type { BuildReportOptions, ReportEvidence, ReportModel } from "./report-model.js";
@@ -12,21 +12,21 @@ function evidenceMd(e: ReportEvidence): string[] {
   return out;
 }
 
-/** ReportModel → Markdown(report.md の本文)。 */
+/** ReportModel → Markdown (the body of report.md). */
 export function renderMarkdown(m: ReportModel): string {
   const out: string[] = [];
   out.push(`# ${m.brand} Security Assessment Report`, "");
 
-  // confirmed(control+2replay)と suspected(異常1件のリード)を分離。headline は confirmed のみ。
+  // Separate confirmed (control+2replay) from suspected (single-anomaly leads). Only confirmed are headlined.
   const confirmed = m.findings.filter((f) => f.verdict === "confirmed");
   const suspected = m.findings.filter((f) => f.verdict === "suspected");
   const tocRow = (f: ReportModel["findings"][number]): string =>
-    // Markdown のリンク文字列に [] があると構文が壊れるので、severity の括弧は付けず title の [] も除去。
+    // A [] in a Markdown link text breaks the syntax, so omit the parens around severity and strip [] from the title.
     `    - [${f.index}. ${f.severity.toUpperCase()} — ${f.title.replace(/[[\]]/g, "")}](#finding-${f.index})`;
 
-  // ── 目次(レンダラ上でクリックすると各節へジャンプ) ──
-  //    固定節は GFM 自動アンカー(#assessment-information 等)、finding は見出しに [SEV]・連番が入り
-  //    スラッグが renderer 依存になるため明示アンカー <a id="finding-N"> に飛ばす。
+  // ── Contents (clicking in the renderer jumps to each section) ──
+  //    Fixed sections use GFM auto-anchors (#assessment-information etc.); findings carry [SEV] + a sequence number
+  //    in the heading so the slug is renderer-dependent — jump to an explicit anchor <a id="finding-N"> instead.
   out.push("## Contents", "");
   out.push("- [Assessment Information](#assessment-information)");
   out.push("- [Scope](#scope)");
@@ -41,7 +41,7 @@ export function renderMarkdown(m: ReportModel): string {
   }
   out.push("");
 
-  // ── 対象情報 ──
+  // ── Target info ──
   out.push("## Assessment Information", "");
   out.push(`| | |`, `|---|---|`);
   out.push(`| Assessment ID | \`${m.id}\` |`);
@@ -54,7 +54,7 @@ export function renderMarkdown(m: ReportModel): string {
   out.push(`| Findings | ${m.stats.findings.total} |`);
   out.push(`| Tooling | ${m.brand} |`, "");
 
-  // ── スコープ(整形) ──
+  // ── Scope (formatted) ──
   const s = m.scope;
   out.push("## Scope", "");
   out.push(`- **In-scope hosts**: ${s.inScopeHosts.length ? s.inScopeHosts.map((h) => `\`${h}\``).join(", ") : "—"}`);
@@ -63,7 +63,7 @@ export function renderMarkdown(m: ReportModel): string {
   out.push(`- **Out-of-scope paths**: ${s.outOfScopePathPrefixes.length ? s.outOfScopePathPrefixes.map((p) => `\`${p}\``).join(", ") : "—"}`);
   out.push(`- **Rate**: ${s.rate.requestsPerMinute} req/min, max ${s.rate.maxConcurrent} concurrent`, "");
 
-  // ── サマリ ──
+  // ── Summary ──
   const summary = (Object.entries(m.stats.findings.bySeverity) as [Severity, number][])
     .filter(([, n]) => n > 0)
     .map(([sev, n]) => `${n} ${sev}`)
@@ -72,9 +72,9 @@ export function renderMarkdown(m: ReportModel): string {
   if (suspected.length > 0)
     out.push(`_Plus ${suspected.length} suspected lead(s) needing manual verification — listed separately below, NOT counted above._`, "");
 
-  // 1 件分を描画(confirmed / suspected 共通。suspected は見出しに [SUSPECTED] + anomaly を添える)。
+  // Render one finding (shared by confirmed / suspected; suspected adds [SUSPECTED] + anomaly to the heading).
   const renderFinding = (f: ReportModel["findings"][number]): void => {
-    out.push(`<a id="finding-${f.index}"></a>`, ""); // 目次からの明示ジャンプ先(renderer 非依存)
+    out.push(`<a id="finding-${f.index}"></a>`, ""); // explicit jump target from the contents (renderer-independent)
     const mark = f.verdict === "suspected" ? "[SUSPECTED] " : "";
     out.push(`### ${f.index}. ${mark}[${f.severity.toUpperCase()}] ${f.title}`, "");
     out.push(`- Screen: \`${f.screenId ?? "(cross-screen)"}\``);
@@ -88,13 +88,13 @@ export function renderMarkdown(m: ReportModel): string {
     else for (const e of f.evidence) out.push(...evidenceMd(e), "");
   };
 
-  // ── confirmed findings(証拠は req/resp 全文) ──
+  // ── confirmed findings (evidence is full req/resp) ──
   if (confirmed.length > 0) {
     out.push("## Findings", "");
     for (const f of confirmed) renderFinding(f);
   }
 
-  // ── suspected(要手動確認。confirmed 集計には含めない) ──
+  // ── suspected (needs manual verification; not included in the confirmed total) ──
   if (suspected.length > 0) {
     out.push("## Suspected (needs manual verification)", "");
     out.push("_Leads with one concrete observed anomaly but without control+2-replay confirmation. NOT counted in the confirmed total above — verify before relying on them._", "");
@@ -104,7 +104,7 @@ export function renderMarkdown(m: ReportModel): string {
   return out.join("\n");
 }
 
-/** AssessmentState → report.md。opts.loadEvidence で証拠本文(req/resp)を取り込める。 */
+/** AssessmentState → report.md. opts.loadEvidence can pull in evidence bodies (req/resp). */
 export function buildReport(state: AssessmentState, now: Date = new Date(), opts: BuildReportOptions = {}): string {
   return renderMarkdown(buildReportModel(state, now, opts));
 }

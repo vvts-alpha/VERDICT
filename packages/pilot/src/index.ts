@@ -1,4 +1,4 @@
-// @veritas/pilot — Claude 主導の自律アセスメント(Agent SDK の tool-use ループ)。
+// @veritas/pilot — Claude-led autonomous assessment (the Agent SDK tool-use loop).
 export { runPilot } from "./run.js";
 export type { RunPilotOptions, PilotResult } from "./run.js";
 export { buildTools, STAGE_TOOLS } from "./tools.js";

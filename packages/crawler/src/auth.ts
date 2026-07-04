@@ -1,6 +1,6 @@
-// DESIGN §6.3 — 認証ハンドオフの「詰まり検出」ヒューリスティクス(純粋)。
-// CAPTCHA(Arkose/hCaptcha/reCAPTCHA/Turnstile)/ challenge リダイレクト / MFA / 429 を検出。
-// Cookie 注入はしない。検出したら HumanHandoff を起票し、人間が生ブラウザでログインする想定。
+// DESIGN §6.3 — "stuck detection" heuristics for auth handoff (pure).
+// Detects CAPTCHA (Arkose/hCaptcha/reCAPTCHA/Turnstile) / challenge redirect / MFA / 429.
+// No cookie injection. On detection, raise a HumanHandoff so a human logs in via a real browser.
 
 import type { HandoffReason } from "@veritas/core";
 import type { Observation } from "./types.js";

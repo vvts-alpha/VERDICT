@@ -1,4 +1,4 @@
-// @veritas/agent — Phase2 ビジネスロジック: 仮説生成(LLM)→ 証拠規律で検証。
+// @veritas/agent — Phase2 business logic: hypothesis generation (LLM) → verification via evidence discipline.
 
 export {
   generateHypotheses,

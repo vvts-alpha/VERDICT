@@ -1,6 +1,6 @@
-// レポートの構造化モデル(純粋)。"何を載せるか" を1つの型に集約し、各フォーマットの
-// レンダラ(markdown / html / csv / inventory)が "どう出すか" を担う。PDF は html を
-// Chromium で印刷する(crawler 側)。screens[] は survey 結果の画面一覧(単体エクスポート用)。
+// The structured report model (pure). Concentrates "what to include" into one type, and each format's
+// renderer (markdown / html / csv / inventory) handles "how to present it". PDF prints the html with
+// Chromium (crawler-side). screens[] is the survey-result screen inventory (for standalone export).
 
 import type { AssessmentState, AuthState, Finding, FindingVerdict, Phase, ScopePolicy, ScreenScanStatus, ScreenType, Severity } from "./types/index.js";
 import { coverage } from "./coverage.js";
@@ -8,15 +8,15 @@ import { coverage } from "./coverage.js";
 export const SEVERITY_ORDER: Record<Severity, number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
 const VERDICT_ORDER: Record<FindingVerdict, number> = { confirmed: 0, suspected: 1 };
 
-/** finding の確度。欠落 ⇒ confirmed(後方互換: 既存 finding は全て confirmed)。 */
+/** finding confidence. Absent ⇒ confirmed (backward compat: all existing findings are confirmed). */
 export const findingVerdict = (f: Pick<Finding, "verdict">): FindingVerdict => f.verdict ?? "confirmed";
 
-/** finding が引用する証拠 1 件。本文(req/resp)は loadEvidence が供給した時のみ入る。 */
+/** One piece of evidence a finding cites. The body (req/resp) is present only when loadEvidence supplies it. */
 export interface ReportEvidence {
   evidenceId: string;
   path: string; // artifacts/<screenId|_>/<evidenceId>/
-  request: string | null; // 生 HTTP リクエスト(redacted 済)
-  response: string | null; // 生 HTTP レスポンス(redacted 済・切り詰めあり)
+  request: string | null; // raw HTTP request (redacted)
+  response: string | null; // raw HTTP response (redacted, possibly truncated)
   truncated: boolean;
 }
 
@@ -25,25 +25,25 @@ export interface ReportFindingRow {
   title: string;
   severity: Severity;
   verdict: FindingVerdict;
-  /** suspected のとき: 観測異常 + 根拠。 */
+  /** When suspected: the observed anomaly + rationale. */
   anomaly?: string;
   screenId: string | null;
   sourceKind: "validator" | "hypothesis";
-  sourceName: string; // validatorName または hypothesisId
+  sourceName: string; // validatorName or hypothesisId
   scopeBasis: string;
   description: string;
   reproSteps: string;
-  evidence: ReportEvidence[]; // 本文込み(loadEvidence 指定時)。未指定なら path のみ
+  evidence: ReportEvidence[]; // with bodies (when loadEvidence is passed); otherwise path only
 }
 
-/** evidenceId → 生 req/resp を返すローダ(impure な fs 読みは呼び出し側=cli/server が注入)。core は純粋を保つ。 */
+/** Loader returning raw req/resp for an evidenceId (the impure fs read is injected by the caller = cli/server). core stays pure. */
 export type EvidenceLoader = (evidenceId: string) => { request: string | null; response: string | null; truncated?: boolean } | null;
 
 export interface BuildReportOptions {
   loadEvidence?: EvidenceLoader;
 }
 
-/** survey が検出した1画面(画面一覧の1行)。 */
+/** One screen the survey discovered (a row in the screen inventory). */
 export interface ReportScreenRow {
   screenId: string;
   url: string; // urlTemplate
@@ -53,7 +53,7 @@ export interface ReportScreenRow {
   paramCount: number;
   apiCount: number;
   scanStatus: ScreenScanStatus | "unknown";
-  screenshot: string; // artifacts ディレクトリ相対(例 "screens/s-0001.png")。未取得なら ""
+  screenshot: string; // relative to the artifacts directory (e.g. "screens/s-0001.png"); "" if not captured
 }
 
 export interface ReportModel {
@@ -61,7 +61,7 @@ export interface ReportModel {
   brand: string;
   target: string;
   phase: Phase;
-  startedAt: string; // ISO(budget.startedAt = run 開始)
+  startedAt: string; // ISO (budget.startedAt = run start)
   generatedAt: string; // ISO
   scope: ScopePolicy;
   stats: {
@@ -69,22 +69,22 @@ export interface ReportModel {
     hypotheses: { total: number; confirmed: number };
     findings: { total: number; bySeverity: Record<Severity, number>; suspected: number };
   };
-  findings: ReportFindingRow[]; // severity 昇順(critical→info)
-  screens: ReportScreenRow[]; // screenId 昇順
+  findings: ReportFindingRow[]; // ascending severity (critical→info)
+  screens: ReportScreenRow[]; // ascending screenId
 }
 
-/** AssessmentState → ReportModel(純粋)。全レンダラの単一の入力。
- *  opts.loadEvidence を渡すと各証拠の req/resp 本文を取り込む(fs 読みは呼び出し側が注入)。 */
+/** AssessmentState → ReportModel (pure). The single input to every renderer.
+ *  Passing opts.loadEvidence pulls in each evidence's req/resp body (the fs read is injected by the caller). */
 export function buildReportModel(state: AssessmentState, now: Date = new Date(), opts: BuildReportOptions = {}): ReportModel {
   const cov = coverage(state);
-  // confirmed を先に、その中で severity 昇順。suspected は後段の別セクションへ。
+  // confirmed first, ordered by ascending severity within; suspected go to a separate later section.
   const sorted = [...state.findings].sort(
     (a, b) => VERDICT_ORDER[findingVerdict(a)] - VERDICT_ORDER[findingVerdict(b)] || SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity],
   );
   const target = state.target.kind === "single_url" ? state.target.url : `scope_manifest ${state.target.path}`;
   const confirmedHypotheses = state.hypotheses.filter((h) => h.status === "confirmed").length;
 
-  // headline(bySeverity / total)は confirmed のみ。suspected は別カウント。
+  // The headline (bySeverity / total) is confirmed only; suspected are counted separately.
   const bySeverity: Record<Severity, number> = { critical: 0, high: 0, medium: 0, low: 0, info: 0 };
   let confirmedCount = 0;
   for (const f of sorted) if (findingVerdict(f) === "confirmed") { bySeverity[f.severity] += 1; confirmedCount += 1; }

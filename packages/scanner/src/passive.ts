@@ -1,6 +1,6 @@
-// パッシブ検査フレームワーク(deterministic, LLM 不使用)。Burp の受動スキャン相当を「チェックの
-// カスタムリスト」として持つ。各チェックは PassiveContext(レスポンス)→ PassiveIssue[] を返す純関数。
-// 既定チェック: security-headers / version-disclosure / vulnerable-js。ここに追加すれば増やせる。
+// Passive-inspection framework (deterministic, no LLM). Holds the Burp-passive-scan equivalent as a
+// "custom list of checks". Each check is a pure function PassiveContext (response) → PassiveIssue[].
+// Default checks: security-headers / version-disclosure / vulnerable-js. Add here to grow the list.
 
 import type { Severity } from "@veritas/core";
 import { SECURITY_HEADERS, auditHeaders, type HeaderRule } from "./headers.js";
@@ -13,7 +13,7 @@ export interface PassiveContext {
 }
 
 export interface PassiveIssue {
-  /** dedup 用の安定キー(finding id の元) */
+  /** stable key for dedup (source of the finding id) */
   key: string;
   severity: Severity;
   title: string;
@@ -66,14 +66,14 @@ export const versionCheck: PassiveCheck = {
 // ───────────────────────── vulnerable JavaScript libraries (Retire.js-lite) ─────────────────────────
 interface JsLib {
   name: string;
-  /** ファイル名/参照から name と version を拾う。group 1 = version */
+  /** pick up name and version from the filename/reference. group 1 = version */
   re: RegExp;
-  /** この版以下を脆弱とみなす(最後の既知脆弱版) */
+  /** treat this version and below as vulnerable (last known-vulnerable version) */
   maxVuln: string;
   note: string;
 }
 
-/** 既知脆弱ライブラリ表(編集してカスタムリストにできる)。 */
+/** Table of known-vulnerable libraries (edit to make a custom list). */
 export const VULN_JS_LIBS: JsLib[] = [
   { name: "jQuery", re: /jquery[-.]?(\d+\.\d+(?:\.\d+)?)(?:\.min)?\.js/i, maxVuln: "3.4.1", note: "jQuery <3.5.0: XSS via htmlPrefilter (CVE-2020-11022/11023)." },
   { name: "jQuery UI", re: /jquery-ui[-.]?(\d+\.\d+(?:\.\d+)?)/i, maxVuln: "1.12.1", note: "jQuery UI <1.13.0: XSS (CVE-2021-41182/41183/41184)." },
@@ -85,7 +85,7 @@ export const VULN_JS_LIBS: JsLib[] = [
   { name: "DOMPurify", re: /(?:purify|dompurify)[-.]?(\d+\.\d+(?:\.\d+)?)(?:\.min)?\.js/i, maxVuln: "2.0.16", note: "DOMPurify <2.0.17: mXSS bypass." },
 ];
 
-/** a <= b ? (数値タプル比較) */
+/** a <= b ? (numeric-tuple comparison) */
 export function versionLeq(a: string, b: string): boolean {
   const pa = a.split(".").map((x) => Number.parseInt(x, 10));
   const pb = b.split(".").map((x) => Number.parseInt(x, 10));
@@ -128,7 +128,7 @@ export const vulnJsCheck: PassiveCheck = {
   },
 };
 
-/** id → チェック。--checks で選ぶ(カスタムリスト)。 */
+/** id → check. Selected via --checks (custom list). */
 export function passiveChecks(): PassiveCheck[] {
   return [headersCheck(), versionCheck, vulnJsCheck];
 }

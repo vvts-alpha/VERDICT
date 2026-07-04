@@ -8,8 +8,7 @@
 
 **AI drives · evidence proves · scans _behind_ login.**
 
-A Claude-led agent that maps your target, hunts vulns with strict evidence discipline,
-drives Burp for breadth, and reaches the authenticated surface other tools miss.
+A Claude-led agent that maps your target, hunts vulns, and marks a finding **`confirmed` only when it reproduces** — then reaches the authenticated surface most scanners drop the session at. **Fewer results, each one proven.**
 
 ![Node](https://img.shields.io/badge/Node-%E2%89%A5%2024-339933?logo=nodedotjs&logoColor=white)
 ![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)
@@ -20,7 +19,7 @@ drives Burp for breadth, and reaches the authenticated surface other tools miss.
 [![Juice Shop](https://img.shields.io/badge/OWASP%20Juice%20Shop-38%20findings-c0392b)](benchmarks/juice-shop)
 ![status](https://img.shields.io/badge/status-active-blue)
 
-[Quickstart](#-quickstart) · [Benchmarks](#-benchmarks) · [How it works](#-how-it-works) · [Why VERDICT](#-why-verdict) · [Complex auth](#-complex-auth-sso--mfa) · [Burp](#-burp-integration) · [WebUI](#-webui)
+[Quickstart](#-quickstart) · [Benchmarks](#-benchmarks) · [Evidence](#-what-confirmed-means) · [How it works](#-how-it-works) · [Why VERDICT](#-why-verdict) · [Complex auth](#-complex-auth-sso--mfa) · [Burp](#-burp-integration) · [WebUI](#-webui)
 
 </div>
 
@@ -40,6 +39,24 @@ VERDICT runs a real browser and a scoped HTTP client through tools that **Claude
 - 🧃 **OWASP Juice Shop — [38 confirmed findings](benchmarks/juice-shop)** in a single autonomous run, across **16 vulnerability classes** — from a **critical SQLi auth-bypass to admin** to business-logic fraud (negative-quantity checkout, self-credit wallet) — plus 5 suspected CVE leads. → *full analysis + the evidence report for every finding.*
 - 🌐 **Beyond benchmarks** — VERDICT has also produced **confirmed, evidence-backed findings against live bug-bounty targets**. Specific programs and reports are withheld under coordinated disclosure — the benchmarks above are the reproducible proof.
 
+## 🔬 What `confirmed` means
+
+Not "the model thinks so." A finding is `confirmed` only when a **negative control fails** *and* **≥2 positive replays succeed** — otherwise it is auto-**refuted**. Here is the actual evidence VERDICT recorded for the critical SQLi on the Juice Shop run (finding #1 of 38):
+
+```text
+finding #1 · CRITICAL · SQL injection → auth-bypass to admin · POST /rest/user/login
+
+  ✗  negative control   {"email":"nonexistent@juice-sh.op","password":"wrong"}  → 401  "Invalid email or password"
+  ✓  positive replay 1  {"email":"' OR 1=1--","password":"anything"}            → 200  JWT ⇒ { id:1, role:"admin" }
+  ✓  positive replay 2  {"email":"' OR 1=1--","password":"anything"}            → 200  JWT ⇒ { id:1, role:"admin" }
+
+  control failed + 2 stable positives  ⇒  CONFIRMED   ·   full request/response recorded for every finding
+```
+
+Catch-all 200s, 0-byte bodies, soft-404s and flaky responses never count. The WebUI shows the control, the replays and the raw request/response inline — so you audit the proof, not the model's word:
+
+<p align="center"><img src="assets/webui-evidence.png" alt="VERDICT WebUI — a confirmed finding's evidence: the failing negative control, two passing positive replays, and the raw request/response shown inline" width="900"></p>
+
 ## ✨ Features
 
 <p align="center"><img src="assets/verdict-banner.png" alt="VERDICT — Reconnaissance · Exploitation · Diagnosis · Intrusion Confirmation · Reporting" width="900" /></p>
@@ -47,6 +64,7 @@ VERDICT runs a real browser and a scoped HTTP client through tools that **Claude
 - 🧠 **Claude-led, staged** — survey → methodology → per-screen diagnosis. Bounded queries stop the model from eliding work.
 - 🔬 **Evidence discipline** — `confirmed` requires a negative control that fails **+ ≥2 stable positive replays**. Catch-all 200s / flaky responses are auto-refuted. FP reduced *by construction*.
 - 🔐 **Scans behind login** — Bearer-JWT propagation + a Burp extension that takes the **authenticated request itself**, so the auth surface (the crown jewels) actually gets tested.
+- 🧬 **API-spec assessment** — point it at a `swagger.json` (OpenAPI 3.x / Swagger 2.0) and it tests **every declared endpoint** behind a Bearer — no web UI required — or overlay the spec on a crawl to reach endpoints the UI never calls.
 - 🧩 **A04 multi-step logic** — a dedicated scenario stage chains requests across endpoints (coupon stacking, negative-qty checkout, mass-assignment) with a differential oracle.
 - 🤝 **AI depth × Burp breadth** — the agent owns IDOR / authz / business-logic; Burp owns injection breadth. Imports are de-duped and **AI re-verified**.
 - ✅ **Coverage gate** — `screen_done` must account for every planned attack class — no "find one, move on".
@@ -71,6 +89,10 @@ node packages/cli/dist/main.js pilot --url https://app.example.com/
 
 # … or from a scope + auth manifest (recommended)
 node packages/cli/dist/main.js pilot --manifest scope.json
+
+# … or point it at an API spec — no web UI needed (m.json carries the Bearer)
+node packages/cli/dist/main.js spec-import --spec swagger.json --url https://api.example.com
+node packages/cli/dist/main.js scan --id <id> --manifest m.json && node packages/cli/dist/main.js logic --id <id> --manifest m.json
 ```
 
 Generate a manifest interactively with `node packages/cli/dist/main.js init`. Findings, screenshots, APIs and the diagnostic log fill the WebUI live; `runs/<id>/report.md` is written at the end.
@@ -120,6 +142,7 @@ node packages/cli/dist/main.js <command> [options]      # after pnpm -r build
 | `serve` | Observability WebUI + state API/WS (`127.0.0.1:4317`; `--host 0.0.0.0` + `--password` to expose). |
 | `init` / `manifest` | Interactive scope-manifest generator. |
 | `report` / `inventory` / `openapi` | Export report (md/html/pdf/csv) / screen inventory / OpenAPI of the discovered surface. |
+| `spec-import` | Ingest an OpenAPI 3.x / Swagger 2.0 spec (`--spec` + `--url`) → seed the surface for a pure-API assessment, or overlay it on a crawl (`--id`). |
 | `burp-scan` / `burp-import` | Active Burp scan via REST → merge net-new / import a Burp XML report. |
 | `header-audit` | Info-level security-header checks. |
 

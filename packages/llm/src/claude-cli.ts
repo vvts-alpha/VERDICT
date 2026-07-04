@@ -1,15 +1,15 @@
-// `claude -p --output-format json` をサブプロセス実行(Claude Max サブスク認証、従量 API 不使用)。
-// 確認済みエンベロープ: { subtype:"success", is_error, result:"<text>", ... }。result は ```json フェンス付きのことがある。
+// Runs `claude -p --output-format json` as a subprocess (Claude Max subscription auth, no metered API).
+// Confirmed envelope: { subtype:"success", is_error, result:"<text>", ... }. result may be wrapped in a ```json fence.
 
 import { execFile } from "node:child_process";
 import type { LlmClient, LlmRequest, LlmResponse } from "./types.js";
 
 export interface ClaudeCliOptions {
-  /** 既定 "claude"(PATH 解決) */
+  /** Default "claude" (resolved via PATH) */
   binPath?: string;
-  /** 既定 "claude-sonnet-4-6" */
+  /** Default "claude-sonnet-4-6" */
   defaultModel?: string;
-  /** 既定 120000ms */
+  /** Default 120000ms */
   defaultTimeoutMs?: number;
   cwd?: string;
 }

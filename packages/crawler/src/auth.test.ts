@@ -1,4 +1,4 @@
-// 詰まり検出 + クロール中のハンドオフ起票(non-blocking)+ pause 停止。
+// Stuck detection + raising handoffs during a crawl (non-blocking) + pause stop.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";

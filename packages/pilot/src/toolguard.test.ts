@@ -1,11 +1,11 @@
-// pilot のツール allowlist: veritas MCP ツールだけ許可し、ハーネスの組み込み/エスケープツールは拒否する。
-// (大きな inventory で methodology stage が Monitor/Skill/Agent に逃げて Bash 禁止をすり抜けた回帰の防止)
+// pilot tool allowlist: allow only the veritas MCP tools; deny the harness built-in / escape tools.
+// (prevents the regression where, on a large inventory, the methodology stage escaped to Monitor/Skill/Agent and slipped past the Bash ban)
 
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import { isPilotAllowedTool } from "./run.js";
 
-test("veritas MCP ツールは許可", () => {
+test("veritas MCP tools are allowed", () => {
   for (const n of [
     "mcp__veritas__get_inventory",
     "mcp__veritas__record_methodology",
@@ -16,11 +16,11 @@ test("veritas MCP ツールは許可", () => {
   }
 });
 
-test("ハーネス/組み込みツールは拒否(Bash 禁止すり抜けの防止)", () => {
+test("harness / built-in tools are denied (prevents slipping past the Bash ban)", () => {
   for (const n of [
     "Bash", "Read", "Write", "Monitor", "Skill", "Agent", "Task",
     "ToolSearch", "TaskCreate", "TaskGet", "Workflow", "WebFetch", "Glob",
-    "mcp__other__tool", // 別 MCP も不可
+    "mcp__other__tool", // a different MCP is not allowed either
   ]) {
     assert.equal(isPilotAllowedTool(n), false, n);
   }

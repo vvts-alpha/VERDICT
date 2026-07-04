@@ -1,4 +1,4 @@
-// 事前取得 Cookie ファイルの読み込み(loadCookieFile)— 生ヘッダ / Playwright storageState / 配列。
+// Loading a pre-captured cookie file (loadCookieFile) — raw header / Playwright storageState / array.
 
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
@@ -15,14 +15,14 @@ const w = (name: string, content: string): string => {
 };
 const target = "https://app.example.com/";
 
-test("生 Cookie ヘッダ", () => {
+test("raw Cookie header", () => {
   const { header, browserCookies } = loadCookieFile(w("raw.txt", "sid=abc123; theme=dark"), target);
   assert.equal(header, "sid=abc123; theme=dark");
   assert.equal(browserCookies.length, 2);
   assert.deepEqual(browserCookies[0], { name: "sid", value: "abc123", domain: "app.example.com", path: "/" });
 });
 
-test("'Cookie:' プレフィックス + 余分な行を許容", () => {
+test("tolerates a 'Cookie:' prefix + extra lines", () => {
   assert.equal(loadCookieFile(w("h.txt", "Cookie: sid=xyz\nignored second line"), target).header, "sid=xyz");
 });
 
@@ -34,9 +34,9 @@ test("Playwright storageState JSON({cookies:[...]})", () => {
   const { header, browserCookies } = loadCookieFile(p, target);
   assert.equal(header, "sid=s1; csrf=c1");
   assert.equal(browserCookies.length, 2);
-  assert.equal(browserCookies[1]?.domain, "app.example.com"); // domain 欠落は target host で補完
+  assert.equal(browserCookies[1]?.domain, "app.example.com"); // missing domain is filled in from the target host
 });
 
-test("単純配列 [{name,value}]", () => {
+test("plain array [{name,value}]", () => {
   assert.equal(loadCookieFile(w("arr.json", JSON.stringify([{ name: "a", value: "1" }])), target).header, "a=1");
 });

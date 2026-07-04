@@ -1,13 +1,13 @@
-// VERDICT Audit REST 拡張(別ポート、既定 1338)のクライアント。tools/burp-audit-ext/ の API を叩く。
-// 標準 Burp REST(1337)と違い、認証済みの生 HTTP リクエストをそのまま投入する(セッションはリクエスト内包)。
-// → VERDICT が live Cookie/Bearer を載せた生リクエストを送れば認証下を能動スキャンできる。
+// Client for the VERDICT Audit REST extension (separate port, default 1338). Calls the tools/burp-audit-ext/ API.
+// Unlike standard Burp REST (1337), it submits authenticated raw HTTP requests as-is (the session is embedded in the request).
+// → If VERDICT sends a raw request carrying a live Cookie/Bearer, it can actively scan while authenticated.
 
 import type { BurpIssue } from "./burp.js";
 
 export interface BurpAuditConn {
-  /** 例 http://172.29.176.1:1338 */
+  /** e.g. http://172.29.176.1:1338 */
   base: string;
-  /** X-Scan-Token(拡張側で AUTH_TOKEN 設定時に必須)。 */
+  /** X-Scan-Token (required when AUTH_TOKEN is set on the extension side). */
   token?: string;
 }
 
@@ -17,7 +17,7 @@ export interface AuditSubmit {
   secure: boolean;
   /** "active" | "passive" */
   auditMode: string;
-  /** CRLF 区切りの生 HTTP リクエスト(Cookie/Bearer/body 込み)。 */
+  /** CRLF-delimited raw HTTP request (including Cookie/Bearer/body). */
   request: string;
 }
 
@@ -28,7 +28,7 @@ function headers(conn: BurpAuditConn, extra: Record<string, string> = {}): Recor
   return { ...(conn.token ? { "X-Scan-Token": conn.token } : {}), ...extra };
 }
 
-/** 生リクエストを 1 件 Audit に投入。Audit キー(host:port)を返す。 */
+/** Submit one raw request to Audit. Returns the Audit key (host:port). */
 export async function submitAudit(conn: BurpAuditConn, s: AuditSubmit): Promise<string> {
   const res = await fetch(url(conn, "/scan"), {
     method: "POST",
@@ -47,7 +47,7 @@ export interface AuditHostStatus {
   errors: number;
 }
 
-/** 全ホストの Audit 進捗。 */
+/** Audit progress for all hosts. */
 export async function getAuditStatusAll(conn: BurpAuditConn): Promise<AuditHostStatus[]> {
   const res = await fetch(url(conn, "/status"), { headers: headers(conn) });
   if (!res.ok) throw new Error(`audit /status failed: ${res.status}`);
@@ -55,7 +55,7 @@ export async function getAuditStatusAll(conn: BurpAuditConn): Promise<AuditHostS
   return (j.hosts ?? []).map((h) => ({ host: h.host ?? "", status: h.status ?? "unknown", requestsMade: h.requests_made ?? 0, errors: h.errors ?? 0 }));
 }
 
-/** 捕捉 issue を取得(since=epoch ms で run 差分)。BurpIssue 形にして既存マージ経路に乗せる。 */
+/** Fetch captured issues (since=epoch ms for the run delta). Convert to BurpIssue shape to ride the existing merge path. */
 export async function getAuditIssues(conn: BurpAuditConn, opts: { since?: number; host?: string } = {}): Promise<BurpIssue[]> {
   const qs = new URLSearchParams({ evidence: "true" });
   if (opts.since != null) qs.set("since", String(opts.since));
@@ -66,7 +66,7 @@ export async function getAuditIssues(conn: BurpAuditConn, opts: { since?: number
   return auditIssuesToBurpIssues(j.issues ?? []);
 }
 
-/** 拡張の蓄積をクリア(run 前に過去 issue を混ぜない)。 */
+/** Clear the extension's accumulation (don't mix in past issues before a run). */
 export async function resetAudit(conn: BurpAuditConn): Promise<void> {
   await fetch(url(conn, "/reset"), { method: "POST", headers: headers(conn) }).catch(() => {});
 }
@@ -93,7 +93,7 @@ function redact(raw: string): string {
   return raw.replace(/^(Cookie|Authorization|Set-Cookie):.*$/gim, "$1: <redacted>").slice(0, 8000);
 }
 
-/** /issues の JSON → BurpIssue[]。FALSE_POSITIVE は捨て、証拠の req/resp は Cookie/Authorization を伏字に。 */
+/** /issues JSON → BurpIssue[]. Drop FALSE_POSITIVE, and redact Cookie/Authorization in the evidence req/resp. */
 export function auditIssuesToBurpIssues(issues: ReadonlyArray<AuditRestIssue>): BurpIssue[] {
   const out: BurpIssue[] = [];
   for (const it of issues) {
@@ -123,8 +123,8 @@ export function auditIssuesToBurpIssues(issues: ReadonlyArray<AuditRestIssue>): 
   return out;
 }
 
-/** 生 HTTP リクエスト文字列(CRLF)を組む。Content-Length は body から自動算出。
- *  pathWithQuery=リクエストターゲット, hostHeader=Host 値(host:port), sessionHeaders=Cookie/Authorization 等。 */
+/** Build a raw HTTP request string (CRLF). Content-Length is computed automatically from body.
+ *  pathWithQuery=the request target, hostHeader=the Host value (host:port), sessionHeaders=Cookie/Authorization etc. */
 export function buildRawRequest(o: {
   method: string;
   pathWithQuery: string;

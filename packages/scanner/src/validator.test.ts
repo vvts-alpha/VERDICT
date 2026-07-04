@@ -1,4 +1,4 @@
-// 証拠規律の不変条件: confirmed = 陽性×2 + negative control 陰性。catch-all/不安定は refuted。
+// Evidence-discipline invariant: confirmed = 2 positives + negative control negative. catch-all/unstable → refuted.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";

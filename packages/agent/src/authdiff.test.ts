@@ -27,7 +27,7 @@ function withEvidence<T>(fn: (ev: EvidenceStore) => Promise<T>): Promise<T> {
 
 test("authDiff confirms when low-priv role gets identical data (boundary crossed)", async () => {
   await withEvidence(async (ev) => {
-    // どのロールでも同じ実体を返す = 認可境界なし
+    // Every role returns the same entity = no authorization boundary
     const http = new FakeHttpClient(() => ({ status: 200, body: '{"order":5,"owner":"victim","total":99}' }));
     const outcome = await authDiffScreen(screen(), http, ev, HIGH, LOW);
     assert.equal(outcome.status, "confirmed");

@@ -1,5 +1,5 @@
-// LLM ラベリングの検証: プロンプト生成 / 構造化出力の型バリデート / マージ / 失敗時 fallback /
-// インベントリ一括ラベリング(store 更新 + phase 遷移)。LLM は FakeLlmClient で決定論化。
+// LLM labeling tests: prompt generation / structured-output type validation / merge / fallback on failure /
+// bulk inventory labeling (store update + phase transition). The LLM is made deterministic via FakeLlmClient.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -75,7 +75,7 @@ test("labelScreen applies a valid LLM label", async () => {
   assert.equal(r.usedFallback, false);
   assert.equal(r.screen.screenType, "detail");
   assert.match(r.screen.description, /IDOR/);
-  // system prompt が渡っている
+  // the system prompt was passed
   assert.match(client.calls[0]?.system ?? "", /security recon/i);
 });
 

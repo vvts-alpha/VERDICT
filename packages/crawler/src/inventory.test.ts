@@ -74,6 +74,17 @@ test("different DOM skeleton at same URL is a separate screen (SPA case)", () =>
   assert.equal(inv.screens().length, 2);
 });
 
+test("InventoryBuilder collapses list/detail pages differing only by item count (blog /post?id=N)", () => {
+  const inv = new InventoryBuilder();
+  // Same /post template. The skeleton differs only in the *count* of comments/paragraphs (structure is the same).
+  const p1 = inv.ingest(obs({ finalUrl: "https://blog.test/post?postId=1", domSkeleton: "html>(body>(article>(h1,p,p,section>(div,div,div,div,div))))" }));
+  const p2 = inv.ingest(obs({ finalUrl: "https://blog.test/post?postId=2", domSkeleton: "html>(body>(article>(h1,p,p,p,section>(div))))" }));
+  assert.equal(p1.isNew, true);
+  assert.equal(p2.isNew, false, "only item counts differ → same screen (no /post explosion)");
+  assert.equal(inv.screens().length, 1);
+  assert.deepEqual(p2.screen.observedUrls, ["https://blog.test/post?postId=1", "https://blog.test/post?postId=2"]);
+});
+
 test("2nd pass (seeded) dedups public pages by url-template despite DOM change (P1)", () => {
   // 1st pass (unauth): /catalog with a "login" navbar
   const first = new InventoryBuilder();
@@ -122,7 +133,7 @@ test("a plain HTML form POST becomes a first-class API with reqSchema from its f
             { name: "attempts", type: "number" },
           ],
         },
-        // GET フォームはボディ無し(項目は query)→ reqSchema は付けない
+        // a GET form has no body (fields go in the query) → no reqSchema
         { action: "/search", method: "get", fields: [{ name: "q", type: "text" }] },
       ],
     }),
@@ -135,7 +146,7 @@ test("a plain HTML form POST becomes a first-class API with reqSchema from its f
   assert.equal(fields.password?.type, "string");
   assert.equal(fields.remember?.type, "boolean"); // checkbox → boolean
   assert.equal(fields.attempts?.type, "number"); // number → number
-  // GET フォームはボディスキーマ無し
+  // a GET form has no body schema
   const get = built.screen.apis.find((a) => a.method === "GET" && a.urlTemplate === "/search");
   assert.equal(get!.reqSchema, null);
 });

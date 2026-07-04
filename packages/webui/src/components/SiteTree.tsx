@@ -2,7 +2,7 @@ import { useState } from "react";
 import type { TreeNode } from "@veritas/core";
 import { useRole } from "../api";
 
-// exclude 対象 = まだスキャンしていない(or 途中/エラーの)画面のみ。clean/finding/suspected は保持する。
+// Exclude targets = only screens not yet scanned (or in-progress/errored). Keep clean/finding/suspected.
 const EXCLUDABLE = new Set(["queued", "scanning", "error"]);
 function collectExcludable(node: TreeNode, out: string[] = []): string[] {
   if (node.screenId && (node.scanStatus === null || EXCLUDABLE.has(node.scanStatus))) out.push(node.screenId);
@@ -10,7 +10,7 @@ function collectExcludable(node: TreeNode, out: string[] = []): string[] {
   return out;
 }
 
-// 状態 → アクセシビリティ用ラベル(dot の色は CSS が担当)。
+// Status → accessibility label (the dot's color is handled by CSS).
 const STATUS_LABEL: Record<string, string> = {
   queued: "queued",
   scanning: "scanning",
@@ -22,7 +22,7 @@ const STATUS_LABEL: Record<string, string> = {
   error: "error",
 };
 
-/** この部分木に含まれる finding 画面の数(折りたたみ時のロールアップ表示用)。 */
+/** Number of finding screens contained in this subtree (for the rolled-up display when collapsed). */
 function countFindings(node: TreeNode): number {
   let n = node.scanStatus === "finding" ? 1 : 0;
   for (const c of node.children) n += countFindings(c);
@@ -50,9 +50,9 @@ function Node({
   const status = node.scanStatus ?? "";
   const hasChildren = node.children.length > 0;
   const isCollapsed = collapsed.has(node.path);
-  // 折りたたみ中の枝に finding があれば件数バッジを出す(展開中は各子が自分で出す)。
+  // If a collapsed branch has findings, show a count badge (when expanded, each child shows its own).
   const rolledFindings = hasChildren && isCollapsed ? countFindings(node) : 0;
-  // この部分木で除外可能(未スキャン)な画面。親ノードで丸ごと除外できる。
+  // Excludable (un-scanned) screens in this subtree. Can be excluded wholesale from the parent node.
   const excludable = canWrite ? collectExcludable(node) : [];
 
   return (
@@ -128,7 +128,7 @@ export function SiteTree({
       else next.add(path);
       return next;
     });
-  // 複数(部分木)を除外するときだけ確認する。単一画面は即除外。
+  // Confirm only when excluding multiple (a subtree). A single screen is excluded immediately.
   const handleExclude = (screenIds: string[], label: string): void => {
     if (screenIds.length > 1 && !window.confirm(`Exclude ${screenIds.length} un-scanned screen(s) under "${label}" from scanning?`)) return;
     onExclude(screenIds);

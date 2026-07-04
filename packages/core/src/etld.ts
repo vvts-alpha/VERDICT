@@ -1,11 +1,11 @@
-// 登録可能ドメイン(eTLD+1)の近似算出。"etld" スコープモードで `*.<登録ドメイン>` を作るのに使う。
+// Approximate the registrable domain (eTLD+1). Used by the "etld" scope mode to build `*.<registrable domain>`.
 //
-// ゼロ依存方針のため完全な Public Suffix List は積まず、よく使う複合 ccTLD(co.uk / com.au /
-// co.jp ...)の例外表 +「末尾2ラベル」フォールバックで近似する。
-// 限界: PSL の網羅ではない(新しい複合 TLD や private suffix は外れうる)。厳密一致が要る現場は
-// manifest の scope.inScopeHosts で明示上書きする運用。
+// To stay zero-dependency we don't ship the full Public Suffix List; instead we approximate with an
+// exception table of common compound ccTLDs (co.uk / com.au / co.jp ...) plus a "last two labels" fallback.
+// Limitation: not a complete PSL (newer compound TLDs or private suffixes may be missed). When an exact
+// match is required, override explicitly via the manifest's scope.inScopeHosts.
 
-/** 末尾2ラベルが「実質 TLD」として機能する複合 ccTLD。これらは3ラベル目までを登録ドメインとみなす。 */
+/** Compound ccTLDs whose last two labels act as an "effective TLD"; treat up to the third label as the registrable domain. */
 const MULTI_PART_SUFFIXES = new Set([
   // UK
   "co.uk", "org.uk", "me.uk", "ltd.uk", "plc.uk", "net.uk", "sch.uk", "ac.uk", "gov.uk", "nhs.uk", "police.uk", "mod.uk",
@@ -25,18 +25,18 @@ const MULTI_PART_SUFFIXES = new Set([
   "co.in", "net.in", "org.in", "gen.in", "firm.in", "ind.in", "gov.in", "ac.in", "edu.in", "res.in",
   // ZA
   "co.za", "org.za", "net.za", "gov.za", "ac.za",
-  // その他よく見る com.* 系
+  // Other commonly seen com.* families
   "com.mx", "com.tr", "com.ar", "com.sg", "com.hk", "com.tw", "com.my", "com.ph", "com.vn",
   "com.ua", "com.pl", "com.ru", "com.co", "com.pe", "com.eg", "com.sa", "com.br",
 ]);
 
 /**
- * ホスト名(ポートを含まない hostname)から登録可能ドメイン(eTLD+1)を近似で返す。
- * IPv4 / IPv6 / 単一ラベル(localhost 等)はそのまま返す。
+ * Approximate the registrable domain (eTLD+1) from a hostname (a hostname without a port).
+ * IPv4 / IPv6 / single-label hosts (e.g. localhost) are returned as-is.
  */
 export function registrableDomain(hostname: string): string {
   const h = hostname.toLowerCase().replace(/\.$/, "");
-  // IPv4(数字とドットのみ)/ IPv6(コロン入り)/ 単一ラベルはそのまま
+  // IPv4 (digits and dots only) / IPv6 (contains a colon) / single label: return as-is
   if (h.length === 0 || h.includes(":") || /^[0-9.]+$/.test(h)) return h;
   const labels = h.split(".");
   if (labels.length <= 2) return h;

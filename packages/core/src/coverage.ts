@@ -1,5 +1,5 @@
-// DESIGN §4.4 / §7.1 / §8.2 — カバレッジ台帳の純粋セレクタ(IO なし)。
-// orchestrator(M5)・WebUI(M3)・cli が同じロジックを共有する。
+// DESIGN §4.4 / §7.1 / §8.2 — pure selectors over the coverage ledger (no IO).
+// orchestrator (M5), WebUI (M3), and cli share the same logic.
 
 import type {
   AssessmentState,
@@ -22,12 +22,12 @@ const ALL_STATUSES: readonly ScreenScanStatus[] = [
   "error",
 ];
 
-/** いま着手できる画面か(queued、または再試行枠が残る error)。 */
+/** Whether the screen can be worked on now (queued, or error with retry budget left). */
 export function isScannable(scan: ScreenScan, maxAttempts: number = DEFAULT_MAX_ATTEMPTS): boolean {
   return scan.status === "queued" || (scan.status === "error" && scan.attempts < maxAttempts);
 }
 
-/** 全画面のカバレッジ集計(§4.4① の coverage_complete 判定もここ)。 */
+/** Coverage aggregation across all screens (also the §4.4① coverage_complete check). */
 export function coverage(
   state: Pick<AssessmentState, "screenScans">,
   maxAttempts: number = DEFAULT_MAX_ATTEMPTS,
@@ -61,7 +61,7 @@ const LABEL_SCORE: Record<string, number> = {
   payment: 15,
 };
 
-/** 画面の攻撃妙味スコア(§7.1: auth / payment / object_ref / 機微 labels を優先)。 */
+/** Screen attack-interest score (§7.1: prioritize auth / payment / object_ref / sensitive labels). */
 export function scoreScreen(screen: Screen): number {
   let score = 0;
   switch (screen.screenType) {
@@ -97,8 +97,8 @@ export function scoreScreen(screen: Screen): number {
 }
 
 /**
- * スキャン対象を優先度降順で返す。既定では「いま着手できる」画面のみ(onlyScannable)。
- * orchestrator はこの順でサブエージェントへ dispatch する(§7.1)。
+ * Return scan targets in descending priority order. By default only screens that can be
+ * worked on now (onlyScannable). The orchestrator dispatches to sub-agents in this order (§7.1).
  */
 export function prioritizeScreens(
   state: Pick<AssessmentState, "screens" | "screenScans">,

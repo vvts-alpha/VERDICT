@@ -1,4 +1,4 @@
-// WebUI 認証の署名 Cookie ロジック(role 付き sign/verify・照合・期限・改竄・鍵ローテ)を browser/server なしで検証。
+// Verify the WebUI auth signed-Cookie logic (role-bound sign/verify, matching, expiry, tampering, key rotation) without a browser/server.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
@@ -13,9 +13,9 @@ test("signSession/verifySession round-trips the role and rejects tampering", () 
   assert.match(tok, /^operator\.\d+\.[0-9a-f]{64}$/);
   assert.equal(verifySession(CFG, tok, now), "operator");
   assert.equal(verifySession(CFG, tok, now + 1000), "operator");
-  // HMAC 改竄 → null
+  // HMAC tampering → null
   assert.equal(verifySession(CFG, tok.replace(/.$/, "0"), now), null);
-  // 形式不正 → null
+  // malformed → null
   assert.equal(verifySession(CFG, "garbage", now), null);
   assert.equal(verifySession(CFG, "operator.123", now), null);
 });
@@ -24,7 +24,7 @@ test("a viewer cookie verifies as viewer, and role is bound into the signature (
   const now = 1_700_000_000_000;
   const vtok = signSession(CFG, "viewer", now);
   assert.equal(verifySession(CFG, vtok, now), "viewer");
-  // role 部分を operator に書き換えても HMAC が合わず null(権限昇格不可)。
+  // even rewriting the role part to operator, the HMAC won't match → null (no privilege escalation).
   const forged = vtok.replace(/^viewer\./, "operator.");
   assert.equal(verifySession(CFG, forged, now), null);
 });
@@ -34,7 +34,7 @@ test("authenticate maps each password to its role, unknown → null (operator ta
   assert.equal(authenticate(CFG, "look-only"), "viewer");
   assert.equal(authenticate(CFG, "nope"), null);
   assert.equal(authenticate(CFG, ""), null);
-  // viewer 未設定なら viewer パスワードは通らない。
+  // if viewer is unset, the viewer password won't pass.
   assert.equal(authenticate({ operator: "hunter2" }, "look-only"), null);
   assert.equal(authenticate({ operator: "hunter2" }, "hunter2"), "operator");
 });
@@ -42,14 +42,14 @@ test("authenticate maps each password to its role, unknown → null (operator ta
 test("changing either password rotates the signing key → existing cookies are invalidated", () => {
   const now = 1_700_000_000_000;
   const tok = signSession(CFG, "operator", now);
-  assert.equal(verifySession({ operator: "hunter2", viewer: "changed" }, tok, now), null); // viewer pw 変更で失効
-  assert.equal(verifySession({ operator: "changed", viewer: "look-only" }, tok, now), null); // operator pw 変更で失効
+  assert.equal(verifySession({ operator: "hunter2", viewer: "changed" }, tok, now), null); // invalidated by viewer pw change
+  assert.equal(verifySession({ operator: "changed", viewer: "look-only" }, tok, now), null); // invalidated by operator pw change
 });
 
 test("verifySession enforces the 7-day expiry window", () => {
   const now = 1_700_000_000_000;
   const tok = signSession(CFG, "viewer", now);
   assert.equal(verifySession(CFG, tok, now + 7 * 24 * 3600 * 1000 - 1), "viewer");
-  assert.equal(verifySession(CFG, tok, now + 7 * 24 * 3600 * 1000 + 1), null); // 期限切れ
-  assert.equal(verifySession(CFG, tok, now - 120_000), null); // 未来発行(時計ズレ上限超)
+  assert.equal(verifySession(CFG, tok, now + 7 * 24 * 3600 * 1000 + 1), null); // expired
+  assert.equal(verifySession(CFG, tok, now - 120_000), null); // issued in the future (beyond the clock-skew limit)
 });

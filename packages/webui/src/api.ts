@@ -1,29 +1,29 @@
-// AssessmentState を server から購読する hooks。WS で snapshot / events を受け、StateView を保持。
+// Hooks that subscribe to AssessmentState from the server. Receive snapshot / events over WS and hold the StateView.
 
 import { useEffect, useRef, useState } from "react";
 import type { StateView, WsMessage } from "@veritas/core";
 
 export type ConnState = "connecting" | "open" | "closed";
 
-/** 最小操作(§8.3)を server に POST。結果は WS push で UI に反映される。 */
+/** POST a minimal control action (§8.3) to the server. The result is reflected in the UI via a WS push. */
 export async function postControl(path: string): Promise<void> {
   try {
     await fetch(path, { method: "POST" });
   } catch {
-    /* WS が次の tick で再同期 */
+    /* WS re-syncs on the next tick */
   }
 }
 
-/** JSON body 付きの制御 POST(一括 exclude 等)。結果は WS push で UI に反映される。 */
+/** Control POST with a JSON body (e.g. bulk exclude). The result is reflected in the UI via a WS push. */
 export async function postControlBody(path: string, body: unknown): Promise<void> {
   try {
     await fetch(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
   } catch {
-    /* WS が次の tick で再同期 */
+    /* WS re-syncs on the next tick */
   }
 }
 
-/** ?id= があればそのアセスメントを表示。無ければ null → App は一覧(Index)を表示する。 */
+/** If ?id= is present, show that assessment. If not, null → App shows the list (Index). */
 export function useAssessmentId(): string | null {
   return new URLSearchParams(window.location.search).get("id");
 }
@@ -35,7 +35,7 @@ export interface Me {
 
 let _mePromise: Promise<Me> | null = null;
 
-/** 自分のロール(/api/me)。operator=全権 / viewer=閲覧のみ。無認証や取得失敗は operator 扱い(従来どおり全操作可)。 */
+/** Your own role (/api/me). operator = full access / viewer = read-only. No-auth or a failed fetch is treated as operator (all actions allowed, as before). */
 export function useRole(): Me & { canWrite: boolean } {
   const [me, setMe] = useState<Me>({ role: "operator", authEnabled: false });
   useEffect(() => {

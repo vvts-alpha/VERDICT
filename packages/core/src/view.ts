@@ -1,5 +1,5 @@
-// DESIGN §8.1 — server が WebUI に push する状態投影 + WS メッセージ契約。
-// 「UI のための state」と「作業記憶」を同一物にする(§4.1)ので、AssessmentState から純粋に導出する。
+// DESIGN §8.1 — the state projection the server pushes to the WebUI + the WS message contract.
+// "State for the UI" and "working memory" are the same thing (§4.1), so this is purely derived from AssessmentState.
 
 import type {
   AssessmentState,
@@ -29,11 +29,11 @@ export interface StateView {
   hypotheses: Hypothesis[];
   findings: Finding[];
   handoffs: HumanHandoff[];
-  /** 直近の活動ログ(診断ログタブ用)。多すぎると重いので末尾 300 件に制限。 */
+  /** Recent activity log (for the diagnosis-log tab). Capped to the last 300 since too many is heavy. */
   events: StateEvent[];
-  /** WebUI 操作で pause 中か(control_changed イベントから導出) */
+  /** Whether paused via a WebUI action (derived from control_changed events) */
   paused: boolean;
-  /** 既知の最終イベント seq(WS 差分の基準) */
+  /** Last known event seq (baseline for WS diffs) */
   lastSeq: number;
 }
 

@@ -1,22 +1,22 @@
-// Burp Suite Pro の XML レポート(Save report → XML)を依存無しで解析。
-// finding 取り込み用に issue を抽出し、重複排除(net-new だけ追加)のための粗カテゴリも提供。
+// Parse a Burp Suite Pro XML report (Save report → XML) with no dependencies.
+// Extracts issues for finding import, and also provides a coarse category for dedup (add net-new only).
 
 import type { Severity } from "@veritas/core";
 
 export interface BurpIssue {
   name: string;
-  /** 例 https://example.com */
+  /** e.g. https://example.com */
   host: string;
-  /** 例 /app.js */
+  /** e.g. /app.js */
   path: string;
   /** High | Medium | Low | Information */
   severity: string;
-  /** issueDetail(HTML 除去済) */
+  /** issueDetail (HTML stripped) */
   detail: string;
   background: string;
-  /** プロキシで捕えた生リクエスト(復号済、Cookie/Authorization は伏字) */
+  /** raw request captured by the proxy (decoded, Cookie/Authorization redacted) */
   request: string;
-  /** 生レスポンス(復号済) */
+  /** raw response (decoded) */
   response: string;
 }
 
@@ -48,7 +48,7 @@ function redactCreds(raw: string): string {
   return raw.replace(/^(Cookie|Authorization|Set-Cookie):.*$/gim, "$1: <redacted>");
 }
 
-/** Burp XML レポート文字列 → issue 配列。 */
+/** Burp XML report string → array of issues. */
 export function parseBurpReport(xml: string): BurpIssue[] {
   const issues: BurpIssue[] = [];
   for (const raw of xml.split(/<issue>/i).slice(1)) {
@@ -76,7 +76,7 @@ export function parseBurpReport(xml: string): BurpIssue[] {
   return issues.filter((i) => i.name);
 }
 
-/** Burp severity → 内部 Severity。 */
+/** Burp severity → internal Severity. */
 export function burpSeverity(s: string): Severity {
   switch (s.toLowerCase()) {
     case "high":
@@ -90,7 +90,7 @@ export function burpSeverity(s: string): Severity {
   }
 }
 
-/** ラベル(Burp issue 名 or 内部 finding タイトル)→ 粗カテゴリ。両系統を同じバケットに落として重複排除する。 */
+/** label (Burp issue name or internal finding title) → coarse category. Drops both families into the same bucket for dedup. */
 export function coarseCategory(label: string): string {
   const s = label.toLowerCase();
   if (/xss|cross[\s-]?site script/.test(s)) return "xss";

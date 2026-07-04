@@ -15,14 +15,14 @@ import { Chat } from "./components/Chat";
 
 type Tab = "screen" | "findings" | "scenarios" | "log" | "apis" | "sessions" | "ask";
 
-// DESIGN §8 — 左 SITE TREE(ナビ)+ 進捗バー、右はタブ: Screen / Findings / 診断ログ / APIs。
+// DESIGN §8 — left: SITE TREE (nav) + progress bar; right: tabs: Screen / Findings / Diagnostic log / APIs.
 export function App() {
   const id = useAssessmentId();
   const { view, conn } = useStateView(id);
   const [selected, setSelected] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>("screen");
 
-  // ログイン待ち(awaiting)セッション数をポーリング → Sessions タブを強調する(operator の入力が必要なサイン)。
+  // Poll the number of sessions awaiting login → highlight the Sessions tab (a sign the operator's input is needed).
   const [awaitingSessions, setAwaitingSessions] = useState(0);
   useEffect(() => {
     if (!id) return;

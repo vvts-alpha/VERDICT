@@ -1,6 +1,6 @@
 import type { StateEvent } from "@veritas/core";
 
-// 診断ログ: 何をしているか(Claude の note / probe / plan / finding / phase 遷移 …)を新しい順に。
+// Diagnostic log: what's happening (Claude's note / probe / plan / finding / phase transition …), newest first.
 export function eventLine(e: StateEvent): string {
   switch (e.type) {
     case "note":
@@ -37,7 +37,7 @@ export function Log({ events }: { events: StateEvent[] }) {
   if (events.length === 0) {
     return <p className="muted log-empty">No activity yet.</p>;
   }
-  const rows = [...events].reverse(); // 新しい順(今やってることが上)
+  const rows = [...events].reverse(); // newest first (what's happening now is on top)
   return (
     <div className="log">
       {rows.map((e) => (

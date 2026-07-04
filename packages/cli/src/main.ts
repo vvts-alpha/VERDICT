@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// @veritas/cli — DESIGN §11 / §12 M0。
-// アセスメントを生成し runs/<id>/state.sqlite を書く(+ status / list で観測)。
-// クロール/スキャン本体は後続マイルストン。ここは状態ストアの薄いフロント。
+// @veritas/cli — DESIGN §11 / §12 M0.
+// Creates an assessment and writes runs/<id>/state.sqlite (+ observe via status / list).
+// The crawl/scan bodies are later milestones. This is a thin front over the state store.
 
 import { parseArgs } from "node:util";
 import { createRequire } from "node:module";
@@ -25,12 +25,14 @@ import {
   evaluateStop,
   isInScope,
   newAssessmentId,
+  parseTargetUrl,
   type AssessmentState,
+  type Screen,
   type ScopeMode,
   type ScopePolicy,
   type TargetInput,
 } from "@veritas/core";
-import { PlaywrightDriver, buildInventory, crawl, exploreScreen, htmlToPdf, labelInventory, normalizePath, smartLogin, writeScreenInventory } from "@veritas/crawler";
+import { PlaywrightDriver, buildInventory, crawl, exploreScreen, htmlToPdf, labelInventory, normalizePath, parseOpenApiToScreens, smartLogin, writeScreenInventory } from "@veritas/crawler";
 import type { LoginCreds } from "@veritas/crawler";
 import { ClaudeCliClient } from "@veritas/llm";
 import { EvidenceStore, FetchHttpClient, SECURITY_HEADERS, auditHeaders, parseBurpReport, pickBurpConfigs, readEvidenceArtifact, scanInventory, startBurpScan, getBurpScan, dedupSeedUrls, submitAudit, getAuditStatusAll, getAuditIssues, resetAudit, buildRawRequest, mergeBurpIssues as scannerMergeBurpIssues, triageBurpInfo, formatBurpLeads } from "@veritas/scanner";
@@ -53,7 +55,7 @@ commands:
   pilot   --manifest <file.json> | --url <url> [--model <m>] [--fast-model <m>] [--max-turns <n>] [--max-screens <n>] [--max-survey-screens <n>] [--rate <ms>] [--headed] [--focus "<text>"] [--browser-path <bin>] [--no-sandbox] [--out <dir>]
             --max-screens caps how many screens get diagnosed (default 40); --max-survey-screens caps how many the survey maps (default unlimited — stops exploring once reached)
             ★Claude-led: Claude drives the tools (browser/http/login/record) to autonomously explore, verify, and record
-            --focus "<text>": operator emphasis injected as the TOP priority of the A04 scenario stage (not per-screen diagnosis). e.g. "決済フローと /api/orders の IDOR を重点的に"
+            --focus "<text>": operator emphasis injected as the TOP priority of the A04 scenario stage (not per-screen diagnosis). e.g. "focus on the payment flow and IDOR in /api/orders"
             uses the manifest's auth.roles via the login(role) tool. more flexible than the deterministic pipeline (no metered API / Max subscription)
             --fast-model enables model tiering: survey/methodology/login and low-value screens on fast, only high-value screen diagnosis on --model (e.g. --model opus --fast-model sonnet)
             after per-screen diagnosis, a SCENARIO stage (deep model) hunts multi-step A04 business-logic abuse across endpoints (coupon/price/qty tampering, step-skip, mass-assignment) — auto-skipped if no transactional surface. [--no-scenario] disables it. the stage also always runs built-in default scenarios (e.g. credential/secret hunting); [--no-default-scenarios] keeps A04 but drops those. [--focus "<text>"] adds an operator objective on top. after that, a FINGERPRINT stage (A06) collects tech/version banners (server, middleware, frontend libs) and flags components with known CVEs; [--no-fingerprint] skips it. [--cve-lookup] (opt-in, external egress) queries online CVE DBs — OSV.dev by exact version for libraries, NVD by keyword for servers/middleware — for authoritative CVE ids instead of model knowledge.
@@ -93,10 +95,12 @@ commands:
             Phase1: crawl + intercept with Playwright → screen_inventory.json + coverage ledger
   label   --id <id> [--model <model>] [--out <dir>]
             Phase1 labeling: classify each screen with the LLM (claude subscription auth, no metered API)
-  scan    --id <id> [--rate <ms>] [--out <dir>]
-            Phase2: generic validators + evidence discipline (neg+2replay). confirmed → findings
-  logic   --id <id> [--screen <sid>] [--model <model>] [--rate <ms>] [--out <dir>]
-            Phase2 business logic: hypothesis generation (LLM) → verify IDOR etc. with evidence discipline
+  scan    --id <id> [--rate <ms>] [--manifest <m.json>] [--out <dir>]
+            Phase2: generic validators + evidence discipline (neg+2replay). confirmed → findings. --manifest injects auth headers (Bearer/Cookie/Basic) — needed for a spec-seeded API run.
+  logic   --id <id> [--screen <sid>] [--model <model>] [--rate <ms>] [--manifest <m.json>] [--out <dir>]
+            Phase2 business logic: hypothesis generation (LLM) → verify IDOR etc. with evidence discipline. --manifest injects auth headers for a spec-seeded API run.
+  spec-import --spec <openapi.json> --url <base> [--id <existing>] [--manifest <m.json>] [--out <dir>]
+            ingest an OpenAPI 3.x / Swagger 2.0 spec (JSON) → seed the screen inventory so the browser-free scan/logic can assess a pure-API target. --url = where the API lives (base). with --id, overlay the spec on an existing crawl (fills endpoints the UI never called). token-protected APIs: put Authorization: Bearer … in the manifest's http.headers.
   serve   [--port <n>] [--host <h>] [--out <dir>] [--web-root <dir>] [--no-web] [--password <pw>] [--viewer-password <pw>] [--no-auth] [--no-launch]
             start the observability WebUI + state API/WS (default 127.0.0.1:4317. expose to LAN with --host 0.0.0.0)
             two roles gate the WebUI/API/WS (/login + signed cookie): operator = env VERDICT_WEB_PASSWORD / --password (full: New/Resume/Stop/mutate);
@@ -106,7 +110,7 @@ commands:
             generate the diagnosis report from findings (by severity + repro + evidence + scope basis).
             default md,html. pdf = HTML printed via Chromium (reuses the browser; needs a chromium binary). csv = findings.csv
   inventory --id <id> [--format csv,html] [--out <dir>]
-            export the screen inventory (survey result / 画面一覧): screens.csv + inventory.html (with screenshots)
+            export the screen inventory (survey result / screen list): screens.csv + inventory.html (with screenshots)
   openapi --id <id> [--out <dir>]
             emit the discovered API surface (XHR/fetch + HTML form POSTs, with body/query params) as openapi.json — feed it to Burp's API scan
   shots   --id <id> [--headed] [--browser-path <bin>] [--no-sandbox] [--out <dir>]
@@ -214,7 +218,7 @@ function cmdStatus(args: string[]): void {
   console.log(`  stop:     ${stop.stop ? `${stop.reason} (${stop.detail})` : "continue"}`);
 }
 
-/** runs/<id>/artifacts から証拠 req/resp を読むローダ(レポート埋め込み用)。 */
+/** Loader that reads evidence req/resp from runs/<id>/artifacts (for embedding into the report). */
 function evidenceLoaderFor(runsDir: string, id: string): EvidenceLoader {
   const artifactsDir = join(runsDir, id, "artifacts");
   return (evId) => readEvidenceArtifact(artifactsDir, evId);
@@ -223,7 +227,7 @@ function evidenceLoaderFor(runsDir: string, id: string): EvidenceLoader {
 const REPORT_FORMATS = ["md", "html", "pdf", "csv"] as const;
 type ReportFormat = (typeof REPORT_FORMATS)[number];
 
-/** "md,html" のような CSV を妥当な ReportFormat[] に。空/不正は fail。 */
+/** Parses a CSV like "md,html" into a valid ReportFormat[]. Empty/invalid -> fail. */
 function parseFormats(spec: string | undefined, fallback: ReportFormat[], allowed: readonly ReportFormat[]): ReportFormat[] {
   const want = (spec ?? "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
   const fmts = want.length ? want : fallback;
@@ -292,7 +296,7 @@ async function cmdReport(args: string[]): Promise<void> {
 
 const INVENTORY_FORMATS = ["csv", "html"] as const;
 
-/** 画面一覧(survey 結果)を単体エクスポート: screens.csv / inventory.html。 */
+/** Standalone export of the screen inventory (survey result): screens.csv / inventory.html. */
 function cmdInventory(args: string[]): void {
   const { values } = parseArgs({ args, options: { id: { type: "string" }, out: { type: "string" }, format: { type: "string" } } });
   if (!values.id) fail("inventory requires --id <assessment-id>");
@@ -323,7 +327,7 @@ function cmdInventory(args: string[]): void {
   for (const p of written) console.log(`  ${p}`);
 }
 
-// 画面インベントリ(XHR/fetch ∪ HTMLフォームPOST)を OpenAPI 3.0 定義として書き出す(Burp の API scan へ渡す土台)。
+// Writes the screen inventory (XHR/fetch ∪ HTML form POSTs) as an OpenAPI 3.0 definition (a base to feed Burp's API scan).
 function cmdOpenApi(args: string[]): void {
   const { values } = parseArgs({ args, options: { id: { type: "string" }, out: { type: "string" } } });
   if (!values.id) fail("openapi requires --id <assessment-id>");
@@ -335,7 +339,7 @@ function cmdOpenApi(args: string[]): void {
   store.close();
   if (!state) fail(`assessment ${values.id} not found`);
 
-  // servers の基底 = target.url → 画面の観測URL → scope host の順で決める。
+  // Base for servers = decided in the order target.url -> a screen's observed URL -> scope host.
   const deriveBaseUrl = (): string => {
     if ("url" in state.target && state.target.url) {
       try {
@@ -413,7 +417,7 @@ async function cmdCrawl(args: string[]): Promise<void> {
   });
   const runsDir = values.out ?? RUNS_DIR_DEFAULT;
 
-  // 対象アセスメントを解決(--url で新規作成、--id で既存を使用)
+  // Resolve the target assessment (--url creates a new one, --id uses an existing one)
   let id: string;
   if (values.url) {
     id = newAssessmentId();
@@ -540,44 +544,44 @@ async function cmdLabel(args: string[]): Promise<void> {
 }
 
 interface AssessManifest {
-  /** 起点(seed)URL。必須 */
+  /** Seed (start) URL. Required. */
   target: string;
-  /** 追加の診断対象 URL(複数シード)。指定時は target と併せてスコープ算出 + survey の起点に使う。 */
+  /** Additional target URLs to diagnose (multiple seeds). When given, used together with target for scope derivation + as survey start points. */
   targets?: string[];
-  /** URL リストのハードロック: true なら survey は target+targets だけをマップし、横断クロールしない
-   *  (診断はそのリスト + 各画面が叩く API に限定)。「診断対象がガッチガチに URL で決まってる」用。 */
+  /** Hard-lock to the URL list: when true, survey maps only target+targets and does not crawl across the site
+   *  (diagnosis is limited to that list + the APIs each screen calls). For when the targets are strictly fixed by URL. */
   lockToTargets?: boolean;
-  /** スコープ広さ(ホスト許可集合の作り方)。"same-origin"(既定) | "etld" | "unrestricted"。
-   *  URL リスト固定の診断では "etld" 推奨(シード画面が叩く同一プログラムの API サブドメインを含む)。 */
+  /** Scope width (how the allowed-host set is built). "same-origin" (default) | "etld" | "unrestricted".
+   *  For a fixed-URL-list assessment, "etld" is recommended (includes the same-program API subdomains the seed screens call). */
   scopeMode?: ScopeMode;
-  /** 明示スコープ(部分指定可。未指定フィールドは target/scopeMode から導出した既定で補完) */
+  /** Explicit scope (partial allowed; unspecified fields are filled from defaults derived from target/scopeMode). */
   scope?: Partial<ScopePolicy>;
   crawl?: { followLinks?: boolean; maxDepth?: number };
-  /** operator 提供のカスタムヘッダ(WAF 回避・案件指定の必須ヘッダ等)。ブラウザ(同一オリジンのみ)+
-   *  raw http 経路の両方に付与。state.sqlite には書かれない(manifest は gitignore)。 */
+  /** Operator-provided custom headers (WAF evasion, engagement-mandated headers, etc.). Applied to both the
+   *  browser (same-origin only) and the raw http path. Not written to state.sqlite (the manifest is gitignored). */
   http?: { headers?: Record<string, string> };
-  /** 操作者の重点ヒント(自由文)。シナリオ段の最優先目的として注入される(--focus と同義)。 */
+  /** Operator focus hint (free text). Injected as the top-priority objective of the scenario stage (same as --focus). */
   focus?: string;
   model?: string;
-  /** 認証(DESIGN §6.3)。資格情報だけでよい — ログインURL/項目はエージェントが自動発見。
-   *  state.sqlite には書かれない。manifest は gitignore。 */
+  /** Auth (DESIGN §6.3). Credentials alone suffice — the agent auto-discovers the login URL/fields.
+   *  Not written to state.sqlite. The manifest is gitignored. */
   auth?: {
     note?: string;
-    /** サイト全体を覆う HTTP Basic/Digest 認証(operator 提供)。アプリのログインフォーム以前の壁向け。
-     *  ブラウザは httpCredentials で 401 を自動応答(Basic/Digest)、raw http には Authorization: Basic を注入。 */
+    /** Site-wide HTTP Basic/Digest auth (operator-provided). For a wall in front of the app's login form.
+     *  The browser answers 401 automatically via httpCredentials (Basic/Digest); raw http injects Authorization: Basic. */
     httpBasic?: { user: string; pass: string };
-    /** 主ログインの資格情報(任意。roles[0] でも可) */
+    /** Primary-login credentials (optional; roles[0] works too). */
     login?: { username?: string; password: string };
-    /** ロール(name=ユーザー名, pass/password=パスワード)。[0]=主ログイン, 全部=auth-diff */
+    /** Roles (name = username, pass/password = password). [0] = primary login, all = auth-diff. */
     roles?: Array<{
       name: string;
-      /** 権限レベルの自由記述(例: "全権管理者" / "一般ユーザ(読取のみ)")。auth-diff の高/低権限判断に使う。 */
+      /** Free-text privilege level (e.g. "full admin" / "regular user (read-only)"). Used for auth-diff high/low-privilege judgement. */
       description?: string;
       desc?: string;
       username?: string;
       pass?: string;
       password?: string;
-      /** 事前取得した Cookie ファイルのパス(pass の代わり。自動ログイン不能な壁向け)。 */
+      /** Path to a pre-captured cookie file (instead of pass; for walls that can't be auto-logged-in). */
       cookieFile?: string;
       cookie_file?: string;
       cookie_file_path?: string;
@@ -586,18 +590,18 @@ interface AssessManifest {
   };
 }
 
-/** 資格情報も cookie ファイルも持たない「純手動」ロールが1つでもあるか(= attended が必要)。 */
+/** Whether at least one "manual-only" role has neither credentials nor a cookie file (= attended is required). */
 function manifestHasManualRole(m: AssessManifest | null): boolean {
   return (m?.auth?.roles ?? []).some((r) => !(r.password ?? r.pass) && !(r.cookieFile ?? r.cookie_file ?? r.cookie_file_path));
 }
 
-/** サイト全体の HTTP Basic/Digest 資格情報(あれば)。user/pass 両方そろって初めて有効。 */
+/** Site-wide HTTP Basic/Digest credentials (if any). Only valid once both user and pass are present. */
 function manifestHttpBasic(m: AssessManifest | null): { user: string; pass: string } | null {
   const b = m?.auth?.httpBasic;
   return b && b.user && b.pass ? { user: b.user, pass: b.pass } : null;
 }
 
-/** manifest のカスタムヘッダ(WAF 回避等)。name が空のものは捨てる。空なら null。 */
+/** The manifest's custom headers (WAF evasion, etc.). Drops entries with an empty name. null if empty. */
 function manifestCustomHeaders(m: AssessManifest | null): Record<string, string> | null {
   const h = m?.http?.headers;
   if (!h) return null;
@@ -606,9 +610,15 @@ function manifestCustomHeaders(m: AssessManifest | null): Record<string, string>
   return Object.keys(out).length ? out : null;
 }
 
-/** raw http(FetchHttpClient)用の Authorization: Basic ヘッダ(null なら空オブジェクト)。 */
+/** Authorization: Basic header for raw http (FetchHttpClient). Empty object if null. */
 function basicHeader(b: { user: string; pass: string } | null): Record<string, string> {
   return b ? { authorization: `Basic ${Buffer.from(`${b.user}:${b.pass}`, "utf8").toString("base64")}` } : {};
+}
+
+/** Auth headers for the headless raw-http path (scan / logic on a spec-seeded run): manifest Basic + custom headers
+ *  (this is how an operator supplies `Authorization: Bearer …` / `Cookie: …` for a token-protected API with no login form). */
+function manifestAuthHeaders(m: AssessManifest | null): Record<string, string> {
+  return { ...basicHeader(manifestHttpBasic(m)), ...(manifestCustomHeaders(m) ?? {}) };
 }
 
 function manifestPrimaryCreds(m: AssessManifest | null): LoginCreds | null {
@@ -629,7 +639,7 @@ function manifestRoleCreds(m: AssessManifest | null): Array<{ name: string; cred
   return out;
 }
 
-/** ロール名 → 権限説明(任意)。auth-diff で高/低権限を見分ける材料としてエージェントに渡す。 */
+/** Role name -> privilege description (optional). Passed to the agent as a cue for distinguishing high/low privilege in auth-diff. */
 function manifestRoleDescriptions(m: AssessManifest | null): Array<{ name: string; description: string }> {
   const out: Array<{ name: string; description: string }> = [];
   for (const role of m?.auth?.roles ?? []) {
@@ -639,7 +649,7 @@ function manifestRoleDescriptions(m: AssessManifest | null): Array<{ name: strin
   return out;
 }
 
-/** ロール名 → 事前取得 Cookie ファイル(pass の代わりに指定可能)。 */
+/** Role name -> pre-captured cookie file (can be given instead of pass). */
 function manifestRoleCookies(m: AssessManifest | null): Array<{ name: string; file: string }> {
   const out: Array<{ name: string; file: string }> = [];
   for (const role of m?.auth?.roles ?? []) {
@@ -661,7 +671,7 @@ function loadManifest(path: string): AssessManifest {
   return m;
 }
 
-// 一括起動: ① crawl → ②(label)→ ③ scan → ④(logic)→ ⑤ report。manifest か --url で起動。
+// One-shot pipeline: ① crawl → ② (label) → ③ scan → ④ (logic) → ⑤ report. Started via manifest or --url.
 async function cmdAssess(args: string[]): Promise<void> {
   const { values } = parseArgs({
     args,
@@ -708,19 +718,19 @@ async function cmdAssess(args: string[]): Promise<void> {
   }
 
   const screensNow = () => store.loadAssessment(id)?.screens ?? [];
-  const httpBasic = manifestHttpBasic(manifest); // サイト全体の Basic/Digest(あれば)
+  const httpBasic = manifestHttpBasic(manifest); // site-wide Basic/Digest (if any)
   const claude = new ClaudeCliClient({ defaultModel: model });
   const http = new FetchHttpClient({ allow: (u) => isInScope(u, scope), minDelayMs: rate, ...(httpBasic ? { headers: basicHeader(httpBasic) } : {}) });
   const evidence = new EvidenceStore(join(runsDir, id, "artifacts"));
 
-  // ① unauth crawl → ② login(資格情報 or 人手)→ ③ post-login crawl →(⑤ role セッション取得)
+  // ① unauth crawl → ② login (credentials or human) → ③ post-login crawl → (⑤ capture role sessions)
   const profileDir = join(runsDir, id, "browser-profile");
   mkdirSync(profileDir, { recursive: true });
   const primaryCreds = manifestPrimaryCreds(manifest);
   const roleCredsList = manifestRoleCreds(manifest);
   const interactiveUrl = values["login-url"];
-  // 既定 headless(自動ログインはヘッドレスで動く)。--headed / --login-url 明示時のみ headed。
-  // creds だけでは headed を強制しない(ヘッドレス VM/CI でも creds 自動ログインが回る)。
+  // Headless by default (auto-login works headless). Headed only when --headed / --login-url is given explicitly.
+  // Credentials alone don't force headed (creds auto-login runs even on a headless VM/CI).
   const headed = !values.headless && (values.headed || !!interactiveUrl);
   const waitSec = values["login-wait"] ? Number.parseInt(values["login-wait"], 10) : 60;
   const roleSessions: RoleContext[] = [];
@@ -734,7 +744,7 @@ async function cmdAssess(args: string[]): Promise<void> {
     ...(httpBasic ? { httpCredentials: { username: httpBasic.user, password: httpBasic.pass } } : {}),
   });
 
-  // 能動探索フック(完全自動): 各新規画面でブラウザを操作し、発火 API/新 URL を引き出す(§7.2)
+  // Active-exploration hook (fully automatic): drives the browser on each new screen to draw out fired APIs / new URLs (§7.2)
   const exploreHook = values["no-explore"]
     ? undefined
     : async (): Promise<{ apis: Awaited<ReturnType<typeof exploreScreen>>["firedApis"]; urls: string[] }> => {
@@ -782,7 +792,7 @@ async function cmdAssess(args: string[]): Promise<void> {
         loggedIn = true;
       }
       if (loggedIn) {
-        // ログイン後の着地点(例 /dashboard)を起点に再クロール(seed からは届かない認証後画面を辿る)
+        // Re-crawl from the post-login landing page (e.g. /dashboard) as the start (to reach authed screens unreachable from the seed)
         const postLoginUrl = driver.currentUrl();
         const authStart = isInScope(postLoginUrl, scope) ? postLoginUrl : seedUrl;
         console.log(`③ crawl post-login (from ${authStart}) …`);
@@ -796,12 +806,12 @@ async function cmdAssess(args: string[]): Promise<void> {
         if (authOnly.length > 0) {
           store.appendEvent(id, { type: "note", payload: { message: `auth-only screens: ${authOnly.map((s) => s.screenId).join(",")}` } });
         }
-        primaryCookie = await driver.sessionCookieHeader(); // 認証後検証(IDOR 等)に使う
+        primaryCookie = await driver.sessionCookieHeader(); // used for post-auth verification (IDOR, etc.)
       }
     }
     writeScreenInventory(join(runsDir, id, "screen_inventory.json"), buildInventory(seedUrl, screensNow()));
 
-    // ⑤(前半)各 role でログインしてセッション cookie を取得
+    // ⑤ (first half) log in as each role to capture its session cookie
     if (roleCredsList.length >= 2) {
       console.log("⑤ auth-diff: log in as each role to capture sessions …");
       for (const rc of roleCredsList) {
@@ -832,7 +842,7 @@ async function cmdAssess(args: string[]): Promise<void> {
   const sr = await scanInventory(screensNow(), http, evidence, { store, assessmentId: id });
   console.log(`   ${sr.confirmed} confirmed`);
 
-  // ④ logic(認証後の画面/API は主ロールのセッションで検証 = IDOR を認証下で叩く)
+  // ④ logic (authed screens/APIs are verified with the primary role's session = hit IDOR under auth)
   if (!values["no-logic"]) {
     console.log("④ logic (business logic) …");
     const logicHttp = primaryCookie
@@ -842,7 +852,7 @@ async function cmdAssess(args: string[]): Promise<void> {
     console.log(`   ${lr.hypotheses} hypotheses, ${lr.confirmed} confirmed`);
   }
 
-  // ⑤(後半)auth-diff: role 間で同一 API を比較(HTTP 層、ブラウザ不要)
+  // ⑤ (second half) auth-diff: compare the same API across roles (HTTP layer, no browser needed)
   if (roleSessions.length >= 2) {
     const high = roleSessions[0];
     const low = roleSessions[1];
@@ -879,9 +889,9 @@ async function cmdAssess(args: string[]): Promise<void> {
   console.log(`\n✓ done. observe: if serve is running, http://127.0.0.1:4317/?id=${id}`);
 }
 
-/** `--attended admin,userA,userB` のインライン CSV を切り出す前処理。
- *  `--attended` の直後がフラグでない(=ロール CSV)ときだけ値として拾い、`--attended` 自体は boolean のまま残す。
- *  `--attended=admin,userA` 形 / 単体 `--attended`(manifest 由来) も両立。 */
+/** Pre-pass that extracts the inline CSV of `--attended admin,userA,userB`.
+ *  Only picks it up as a value when the token right after `--attended` is not a flag (= the role CSV); `--attended` itself stays boolean.
+ *  Also supports the `--attended=admin,userA` form and a bare `--attended` (from the manifest). */
 export function extractAttendedRoles(args: string[]): { args: string[]; roles?: string[] } {
   const out: string[] = [];
   let roles: string[] | undefined;
@@ -893,7 +903,7 @@ export function extractAttendedRoles(args: string[]): { args: string[]; roles?: 
       const next = args[i + 1];
       if (next !== undefined && !next.startsWith("-")) {
         roles = csv(next);
-        i++; // CSV 値を消費(positional として残さない)
+        i++; // consume the CSV value (don't leave it as a positional)
       }
     } else if (a.startsWith("--attended=")) {
       out.push("--attended");
@@ -905,8 +915,8 @@ export function extractAttendedRoles(args: string[]): { args: string[]; roles?: 
   return roles ? { args: out, roles } : { args: out };
 }
 
-/** `--flag [value]` の任意値フラグを argv から切り出す。`--flag` の次がフラグでなければ値、フラグ/末尾なら bare。
- *  `--flag=value` 形も可。bare(present かつ value 無し)は env 既定にフォールバックさせる用途。 */
+/** Extracts a `--flag [value]` optional-value flag from argv. The token after `--flag` is the value unless it's a flag/end-of-args (then bare).
+ *  The `--flag=value` form is also allowed. bare (present but no value) is for falling back to an env default. */
 export function extractOptValueFlag(args: string[], flag: string): { args: string[]; present: boolean; value?: string } {
   const out: string[] = [];
   let present = false;
@@ -930,11 +940,11 @@ export function extractOptValueFlag(args: string[], flag: string): { args: strin
   return value !== undefined ? { args: out, present, value } : { args: out, present };
 }
 
-// Claude 主導アセスメント: Claude がツールを操縦して自律的に探索・検証・記録(@veritas/pilot)。
+// Claude-led assessment: Claude drives the tools to autonomously explore, verify, and record (@veritas/pilot).
 async function cmdPilot(rawArgs: string[]): Promise<void> {
   const a1 = extractAttendedRoles(rawArgs);
   const inlineAttendedRoles = a1.roles;
-  // --burp-proxy は任意値フラグ: bare なら env BURP_PROXY、値ありならそれを使う(基本 env、引数で上書き)。
+  // --burp-proxy is an optional-value flag: bare uses env BURP_PROXY, with a value uses that (env by default, overridden by the arg).
   const bp = extractOptValueFlag(a1.args, "--burp-proxy");
   const { values } = parseArgs({
     args: bp.args,
@@ -958,38 +968,38 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       "max-turns": { type: "string" },
       "max-screens": { type: "string" },
       "max-survey-screens": { type: "string" },
-      focus: { type: "string" }, // 操作者の重点ヒント(自由文)。シナリオ段の最優先目的として注入(per-screen には混ぜない)
-      "no-input-sweep": { type: "boolean" }, // 各画面で入力欄を benign 値で送信して新ルート/API を発見(既定 on)。立てると無効
-      "safe-forms": { type: "boolean" }, // 入力スイープで POST フォームを送信しない(GET/検索のみ=標的にデータを書かない)
-      "no-scenario": { type: "boolean" }, // 既定で診断後に A04 シナリオ(横断ロジック)を実行。立てるとスキップ
-      "no-default-scenarios": { type: "boolean" }, // 既定で常駐シナリオ(資格情報ハント等)を注入。立てるとそれだけ無効(A04 は残る)
-      "no-fingerprint": { type: "boolean" }, // 既定で A06 フィンガープリント(版収集→既知 CVE 評価)を実行。立てるとスキップ
-      "cve-lookup": { type: "boolean" }, // A06 で検出版をオンライン CVE DB(OSV/NVD)へ照会(opt-in: 第三者 egress)。既定 off
+      focus: { type: "string" }, // operator focus hint (free text). Injected as the scenario stage's top-priority objective (not mixed into per-screen)
+      "no-input-sweep": { type: "boolean" }, // submit each screen's input fields with benign values to discover new routes/APIs (default on). Set to disable
+      "safe-forms": { type: "boolean" }, // in the input sweep, don't submit POST forms (GET/search only = don't write data to the target)
+      "no-scenario": { type: "boolean" }, // by default runs the A04 scenario (cross-endpoint logic) after diagnosis. Set to skip
+      "no-default-scenarios": { type: "boolean" }, // by default injects built-in scenarios (credential hunting, etc.). Set to disable just those (A04 stays)
+      "no-fingerprint": { type: "boolean" }, // by default runs A06 fingerprinting (collect versions -> known-CVE assessment). Set to skip
+      "cve-lookup": { type: "boolean" }, // in A06, query online CVE DBs (OSV/NVD) for detected versions (opt-in: third-party egress). Default off
       "burp-scan": { type: "boolean" },
       "burp-api": { type: "string" },
-      "no-burp-verify": { type: "boolean" }, // 既定で Burp High+ を AI 再検証。立てると検証フェーズをスキップ
+      "no-burp-verify": { type: "boolean" }, // by default AI re-verifies Burp High+. Set to skip the verify phase
       "keepalive-min": { type: "string" },
-      "control-url": { type: "string" }, // attended×LiveHands: serve への逆接続先(supervisor が付与)
+      "control-url": { type: "string" }, // attended×LiveHands: reverse-connection target for serve (supplied by the supervisor)
     },
   });
-  // --burp-proxy: 指定時のみ有効。アドレスは引数値 → env BURP_PROXY。
+  // --burp-proxy: active only when given. Address = the arg value -> env BURP_PROXY.
   const burpProxy = bp.present ? (bp.value ?? process.env.BURP_PROXY) : undefined;
   if (bp.present && !burpProxy) console.log("⚠ --burp-proxy was given but neither a value nor BURP_PROXY env is set (continuing without a proxy)");
   const runsDir = values.out ?? RUNS_DIR_DEFAULT;
   const resume = !!values.resume;
-  // resume は survey/methodology をスキップして診断だけ再開する。--manifest 未指定でも、開始時に
-  // 永続化した runs/<id>/manifest.json を読み戻して認証材料(roleCreds/cookie/httpBasic/attended)を復元する。
-  // ※これが無いと resume 後は全部 unauth になり、認証壁の裏が一律 401 で診断不能になる。
+  // resume skips survey/methodology and resumes only diagnosis. Even without --manifest, it reads back the
+  // runs/<id>/manifest.json persisted at start to restore the auth material (roleCreds/cookie/httpBasic/attended).
+  // Note: without this, everything after resume becomes unauth and everything behind the auth wall returns 401, making diagnosis impossible.
   const manifest = values.manifest
     ? loadManifest(values.manifest)
     : resume && values.id && existsSync(join(runsDir, values.id, "manifest.json"))
       ? loadManifest(join(runsDir, values.id, "manifest.json"))
       : null;
-  const model = values.model ?? manifest?.model ?? "claude-opus-4-8"; // deep モデル既定 = Opus(高価値画面/シナリオ/CVE)
+  const model = values.model ?? manifest?.model ?? "claude-opus-4-8"; // deep model default = Opus (high-value screens / scenario / CVE)
   const rate = values.rate ? Number.parseInt(values.rate, 10) : 250;
   const maxTurns = values["max-turns"] ? Number.parseInt(values["max-turns"], 10) : 80;
-  // resume では attended を manifest の手動ロール(creds も cookie も無い)から再導出する。
-  const attended = !!values.attended || (resume && manifestHasManualRole(manifest)); // 手動マルチセッション認証(必ず headed)
+  // On resume, re-derive attended from the manifest's manual roles (neither creds nor cookie).
+  const attended = !!values.attended || (resume && manifestHasManualRole(manifest)); // manual multi-session auth (always headed)
   const headed = attended || (!values.headless && !!values.headed);
   if (attended && values.headless) console.log("⚠ --attended needs a headed browser for manual login (--headless ignored)");
   const browserPath = values["browser-path"] ?? (process.env.VERDICT_BROWSER_PATH ?? process.env.VERITAS_BROWSER_PATH);
@@ -999,8 +1009,8 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
   let store: AssessmentStore;
   let scope: ScopePolicy;
   let seedUrl: string;
-  let seedUrls: string[] = []; // 複数シード(target + manifest.targets)。survey の起点。
-  const lockToTargets = manifest?.lockToTargets === true; // URL リスト固定(横断クロールしない)
+  let seedUrls: string[] = []; // multiple seeds (target + manifest.targets). Survey start points.
+  const lockToTargets = manifest?.lockToTargets === true; // fixed URL list (no cross-site crawl)
 
   if (resume) {
     if (!values.id) fail("pilot --resume requires --id <assessment-id>");
@@ -1026,8 +1036,8 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
     store = AssessmentStore.open(dbPathFor(runsDir, id));
     store.createAssessment({
       id,
-      // ハードロック時はリンク追従しない(survey はシードだけマップ)。
-      target: { kind: "single_url", url: seedUrl, followLinks: !lockToTargets, maxDepth: manifest?.crawl?.maxDepth ?? 10 }, // crawl 既定深さ = 10
+      // When hard-locked, don't follow links (survey maps only the seeds).
+      target: { kind: "single_url", url: seedUrl, followLinks: !lockToTargets, maxDepth: manifest?.crawl?.maxDepth ?? 10 }, // crawl default depth = 10
       scope,
     });
   }
@@ -1040,8 +1050,8 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
   for (const rc of manifestRoleCookies(manifest)) roleCookieFiles.set(rc.name, rc.file);
   const roleDescriptions = new Map<string, string>();
   for (const rc of manifestRoleDescriptions(manifest)) roleDescriptions.set(rc.name, rc.description);
-  const httpBasic = manifestHttpBasic(manifest); // サイト全体の Basic/Digest(あれば)
-  const customHeaders = manifestCustomHeaders(manifest); // カスタムヘッダ(WAF 回避等。あれば)
+  const httpBasic = manifestHttpBasic(manifest); // site-wide Basic/Digest (if any)
+  const customHeaders = manifestCustomHeaders(manifest); // custom headers (WAF evasion, etc.; if any)
   if (resume)
     console.log(
       `  ↻ resume: restored config from manifest — httpBasic ${httpBasic ? "✓" : "—"}, creds ${roleCreds.size}, cookies ${roleCookieFiles.size}, attended ${attended ? "✓" : "—"}`,
@@ -1050,8 +1060,8 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
   const mode = `${surveyOnly ? " · survey-only" : resume ? " · resume" : ""}${attended ? " · attended (manual multi-session)" : ""}`;
   console.log(`▶ pilot ${id}  (Claude-led${mode})`);
   console.log(`  target ${seedUrl} | scope hosts=[${scope.inScopeHosts.join(",")}] | model ${model}${values["fast-model"] ? ` (deep) / ${values["fast-model"]} (fast)` : ""} | rate ${rate}ms`);
-  // attended で窓を開くロール: インライン CSV(--attended a,b,c)が最優先、無ければ manifest の全ロール名
-  // (creds/cookie が無い純手動ロールも含む)。一覧表示にも使う。
+  // Roles to open windows for in attended: the inline CSV (--attended a,b,c) takes priority; otherwise all role names from the manifest
+  // (including manual-only roles with no creds/cookie). Also used for the listing display.
   const attendedRoles = attended ? (inlineAttendedRoles ?? (manifest?.auth?.roles ?? []).map((r) => r.name)) : [];
   const allRoles = [...new Set([...attendedRoles, ...roleCreds.keys(), ...roleCookieFiles.keys()])];
   const roleLabel = (r: string): string => {
@@ -1061,7 +1071,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
   };
   console.log(`  roles: ${allRoles.map(roleLabel).join(", ") || "none"} | max-turns ${maxTurns}${surveyOnly ? " | survey only (no diagnosis)" : resume ? " | resuming undiagnosed screens only" : ""}\n`);
 
-  // attended の人手操作待ち: メッセージを出して Enter で解決する(手動ログイン/再ログインの同期点)。
+  // attended human-operation wait: print a message and resolve on Enter (a sync point for manual login/re-login).
   const { createInterface } = await import("node:readline");
   const rl = attended ? createInterface({ input: process.stdin, output: process.stdout }) : null;
   const promptOperator = (message: string): Promise<void> =>
@@ -1071,7 +1081,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
     });
 
   try {
-    // OOB(Burp Collaborator)接続を診断中に使えるよう解決(BURP_AUDIT_API があれば probe_oob が有効化)。
+    // Resolve the OOB (Burp Collaborator) connection so it's usable during diagnosis (probe_oob is enabled if BURP_AUDIT_API is set).
     const oobConn = resolveBurpAudit();
     if (oobConn) console.log(`  🛰 OOB ready via Collaborator (${oobConn.base}) — probe_oob enabled for blind SSRF/XXE/SQLi`);
     const res = await runPilot({
@@ -1102,7 +1112,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
             attended: true,
             attendedProfilesDir: join(runsDir, id, "profiles"),
             promptOperator,
-            // インライン CSV か manifest 由来のロール名で窓を開く(pass/cookieFile が無い純手動ロールも含む)。
+            // Open windows by role name from the inline CSV or the manifest (including manual-only roles with no pass/cookieFile).
             ...(attendedRoles.length ? { attendedRoles } : {}),
           }
         : {}),
@@ -1112,25 +1122,25 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       ...(values["max-survey-screens"] ? { maxSurveyScreens: Number.parseInt(values["max-survey-screens"], 10) } : {}),
       ...(roleCookieFiles.size ? { roleCookieFiles } : {}),
       ...(roleDescriptions.size ? { roleDescriptions } : {}),
-      fastModel: values["fast-model"] ?? "claude-sonnet-4-6", // fast モデル既定 = Sonnet(survey/methodology/低価値画面 → model tiering を既定 ON)
-      ...(values["no-scenario"] ? { scenarioPass: false } : {}), // 既定 ON。立てると A04 シナリオを省く
-      ...(values["no-default-scenarios"] ? { defaultScenarios: false } : {}), // 既定 ON。立てると常駐シナリオだけ省く
-      ...(values["no-fingerprint"] ? { fingerprintPass: false } : {}), // 既定 ON。立てると A06 フィンガープリントを省く
-      ...(values["cve-lookup"] ? { cveLookup: true } : {}), // 既定 OFF。立てるとオンライン CVE DB 照会を有効化
+      fastModel: values["fast-model"] ?? "claude-sonnet-4-6", // fast model default = Sonnet (survey/methodology/low-value screens -> model tiering ON by default)
+      ...(values["no-scenario"] ? { scenarioPass: false } : {}), // ON by default. Set to drop the A04 scenario
+      ...(values["no-default-scenarios"] ? { defaultScenarios: false } : {}), // ON by default. Set to drop only the built-in scenarios
+      ...(values["no-fingerprint"] ? { fingerprintPass: false } : {}), // ON by default. Set to drop A06 fingerprinting
+      ...(values["cve-lookup"] ? { cveLookup: true } : {}), // OFF by default. Set to enable online CVE DB lookups
       ...(burpProxy ? { burpProxy } : {}),
       ...(values["keepalive-min"] ? { keepAliveMinutes: Number.parseInt(values["keepalive-min"], 10) } : {}),
       ...(browserPath ? { browserPath } : {}),
       ...(values["no-sandbox"] ? { noSandbox: true } : {}),
       onText: (t) => console.log(`\n${t}`),
       onTool: (n, i) => console.log(`  ⚙ ${n.replace("mcp__veritas__", "")} ${JSON.stringify(i).slice(0, 160)}`),
-      // --burp-scan: 診断/シナリオの後、**セッション生存中の phase2_burpscan フェーズ**として Burp 能動スキャン
-      // → 取り込み → High+ 再検証を実施。keepWarm を poll 間に呼んでトークン/Cookie を維持する。失敗しても run は落とさない。
+      // --burp-scan: after diagnosis/scenario, runs a Burp active scan -> import -> High+ re-verify as a **phase2_burpscan phase while the session is alive**.
+      // Calls keepWarm between polls to keep the token/cookie alive. Doesn't crash the run on failure.
       ...(values["burp-scan"] && !surveyOnly
         ? {
             onBurpScanPhase: async ({ keepWarm, cookie, bearer }: { keepWarm: () => Promise<void>; cookie: string; bearer: string }): Promise<void> => {
               const burpState = store.loadAssessment(id);
               if (!burpState) return;
-              // BURP_AUDIT_API が設定されてれば VERDICT Audit REST(1338, セッション内包)を使う。無ければ標準 REST(1337)。
+              // If BURP_AUDIT_API is set, use the VERDICT Audit REST (1338, session-embedded). Otherwise the standard REST (1337).
               const auditConn = resolveBurpAudit();
               if (auditConn) {
                 await runBurpAuditOnRun(store, id, burpState, runsDir, {
@@ -1147,8 +1157,8 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
                 return;
               }
               const burpLogins = manifestRoleCreds(manifest).map((rc) => ({ username: rc.creds.username, password: rc.creds.password }));
-              const auto = pickBurpConfigs(burpState); // surface に応じて最適な named config を自動選択(crawl 戦略等)
-              const customConfigs = buildBurpCustomConfigs(cookie, bearer); // 君の scan policy + session 注入(env)
+              const auto = pickBurpConfigs(burpState); // auto-select the best named config for the surface (crawl strategy, etc.)
+              const customConfigs = buildBurpCustomConfigs(cookie, bearer); // your scan policy + session injection (env)
               await runBurpScanOnRun(store, id, burpState, runsDir, {
                 conn: resolveBurpRest({ ...(values["burp-api"] ? { "burp-api": values["burp-api"] } : {}) }),
                 configs: auto.configs,
@@ -1156,11 +1166,11 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
                 logins: burpLogins,
                 pollSec: 10,
                 maxMin: 30,
-                verify: !values["no-burp-verify"], // 既定: 取り込んだ High+ を AI 再検証
-                verifyModel: model, // 検証は深掘り(adversarial)なので deep model
+                verify: !values["no-burp-verify"], // default: AI re-verifies the imported High+
+                verifyModel: model, // verification is deep (adversarial), so use the deep model
                 httpBasic,
                 ...(customConfigs.length ? { customConfigs } : {}),
-                onPoll: keepWarm, // セッション維持
+                onPoll: keepWarm, // keep the session alive
               });
             },
           }
@@ -1191,7 +1201,7 @@ function resolveWebRoot(): string | undefined {
 async function cmdScan(args: string[]): Promise<void> {
   const { values } = parseArgs({
     args,
-    options: { id: { type: "string" }, out: { type: "string" }, rate: { type: "string" } },
+    options: { id: { type: "string" }, out: { type: "string" }, rate: { type: "string" }, manifest: { type: "string" } },
   });
   if (!values.id) fail("scan requires --id <assessment-id>");
   const runsDir = values.out ?? RUNS_DIR_DEFAULT;
@@ -1210,7 +1220,8 @@ async function cmdScan(args: string[]): Promise<void> {
   }
 
   const minDelayMs = values.rate ? Number.parseInt(values.rate, 10) : 250;
-  const http = new FetchHttpClient({ allow: (url) => isInScope(url, state.scope), minDelayMs });
+  const authHeaders = manifestAuthHeaders(values.manifest ? loadManifest(values.manifest) : null);
+  const http = new FetchHttpClient({ allow: (url) => isInScope(url, state.scope), minDelayMs, ...(Object.keys(authHeaders).length ? { headers: authHeaders } : {}) });
   const evidence = new EvidenceStore(join(runsDir, values.id, "artifacts"));
   console.log(`scanning ${state.screens.length} screens (scope-gated, rate ${minDelayMs}ms) ...`);
   try {
@@ -1242,6 +1253,7 @@ async function cmdLogic(args: string[]): Promise<void> {
       model: { type: "string" },
       screen: { type: "string" },
       rate: { type: "string" },
+      manifest: { type: "string" },
     },
   });
   if (!values.id) fail("logic requires --id <assessment-id>");
@@ -1262,7 +1274,8 @@ async function cmdLogic(args: string[]): Promise<void> {
 
   const minDelayMs = values.rate ? Number.parseInt(values.rate, 10) : 250;
   const llm = new ClaudeCliClient(values.model ? { defaultModel: values.model } : {});
-  const http = new FetchHttpClient({ allow: (url) => isInScope(url, state.scope), minDelayMs });
+  const authHeaders = manifestAuthHeaders(values.manifest ? loadManifest(values.manifest) : null);
+  const http = new FetchHttpClient({ allow: (url) => isInScope(url, state.scope), minDelayMs, ...(Object.keys(authHeaders).length ? { headers: authHeaders } : {}) });
   const evidence = new EvidenceStore(join(runsDir, values.id, "artifacts"));
   const hypoOpts = values.model ? { model: values.model } : {};
   const onHypothesis = (h: { screenId: string; class: string; statement: string }, o: { status: string }): void => {
@@ -1313,9 +1326,9 @@ async function cmdServe(args: string[]): Promise<void> {
   if (!values["no-web"] && !webRoot) {
     console.error("warning: webui dist not found (build @veritas/webui first); serving API/WS only");
   }
-  // WebUI 認証(2ロール): operator=全権 / viewer=閲覧のみ。ENV 主・引数はフォールバック。--no-auth で無効化。
+  // WebUI auth (2 roles): operator = full access / viewer = read-only. ENV is primary, args are the fallback. --no-auth disables it.
   //   operator: --password / env VERDICT_WEB_PASSWORD   viewer: --viewer-password / env VERDICT_WEB_PASSWORD_VIEWER
-  //   旧名 AMRAAM_WEB_PASSWORD[_VIEWER] も fallback として受け付ける(既存 .env を壊さない)。
+  //   The old names AMRAAM_WEB_PASSWORD[_VIEWER] are also accepted as fallbacks (so existing .env files don't break).
   const operatorPw = values["no-auth"] ? undefined : (process.env.VERDICT_WEB_PASSWORD ?? process.env.AMRAAM_WEB_PASSWORD ?? values.password);
   const viewerPw = values["no-auth"] ? undefined : (process.env.VERDICT_WEB_PASSWORD_VIEWER ?? process.env.AMRAAM_WEB_PASSWORD_VIEWER ?? values["viewer-password"]);
   if (!operatorPw && viewerPw) {
@@ -1323,8 +1336,8 @@ async function cmdServe(args: string[]): Promise<void> {
     process.exit(1);
   }
   const authPasswords = operatorPw ? { operator: operatorPw, ...(viewerPw ? { viewer: viewerPw } : {}) } : undefined;
-  // WebUI からの run 起動/停止/再開(server が CLI を子プロセスで spawn)。--no-launch で無効化。
-  // ビルド済み CLI(dist/main.js)からの起動が前提(tsx dev では spawn 不可)。
+  // Launch/stop/resume runs from the WebUI (the server spawns the CLI as a child process). --no-launch disables it.
+  // Requires launching from the built CLI (dist/main.js); spawning isn't possible under tsx dev.
   const cliPath = process.argv[1] ?? "";
   const canLaunch = !values["no-launch"] && cliPath.endsWith(".js");
   const runLauncher = canLaunch
@@ -1351,10 +1364,10 @@ async function cmdServe(args: string[]): Promise<void> {
   console.log("Ctrl-C to stop");
   let stopping = false;
   const shutdown = (): void => {
-    if (stopping) return; // 連打しても二重 close しない(MaxListeners 警告を防ぐ)
+    if (stopping) return; // don't double-close on repeated presses (avoids the MaxListeners warning)
     stopping = true;
     console.log("\nshutting down …");
-    const force = setTimeout(() => process.exit(0), 2000); // 接続が残っても確実に抜ける
+    const force = setTimeout(() => process.exit(0), 2000); // exit for sure even if connections remain
     void srv.close().then(() => {
       clearTimeout(force);
       process.exit(0);
@@ -1364,8 +1377,8 @@ async function cmdServe(args: string[]): Promise<void> {
   process.on("SIGTERM", shutdown);
 }
 
-// 既存 run の各画面スクショを backfill(WebUI 表示用)。assessment は回し直さず、screen.observedUrls を
-// 1 つだけ開いて撮る。run の browser-profile を再利用するので認証済み画面も(セッションが生きていれば)撮れる。
+// Backfill a screenshot for each screen of an existing run (for WebUI display). Doesn't re-run the assessment; opens just
+// one of screen.observedUrls and captures it. Reuses the run's browser-profile, so authed screens can be captured too (if the session is alive).
 async function cmdShots(args: string[]): Promise<void> {
   const { values } = parseArgs({
     args,
@@ -1423,9 +1436,9 @@ async function cmdShots(args: string[]): Promise<void> {
   console.log(`\n${n}/${state.screens.length} screenshots captured → reload the WebUI (serve)`);
 }
 
-// Info レベルのセキュリティヘッダ監査(deterministic, LLM 不使用)。既存 run の各画面の
-// レスポンスヘッダを当て、欠落ヘッダ毎に 1 finding(集約)を記録。トグル = 走らせる/走らせない。
-// --headers csp,hsts,… で対象を絞れる(カスタムリスト)。
+// Info-level security-header audit (deterministic, no LLM). Checks each screen's response headers in an existing run
+// and records one (aggregated) finding per missing header. Toggle = run it or not.
+// --headers csp,hsts,… narrows the set (custom list).
 async function cmdHeaderAudit(args: string[]): Promise<void> {
   const { values } = parseArgs({
     args,
@@ -1450,7 +1463,7 @@ async function cmdHeaderAudit(args: string[]): Promise<void> {
   const evidence = new EvidenceStore(join(runsDir, id, "artifacts"));
   console.log(`▶ header-audit ${id}: ${state.screens.length} screens × [${rules.map((r) => r.key).join(",")}]`);
 
-  // ルール毎に「欠落していた画面/URL」を集約。最初の例で証拠を1つ記録。
+  // Aggregate the screens/URLs where each rule was missing. Record one piece of evidence from the first example.
   const missing = new Map<string, { rule: (typeof rules)[number]; urls: string[]; evId: string | null }>();
   for (const screen of state.screens) {
     const url = screen.observedUrls.find((u) => isInScope(u, state.scope));
@@ -1481,13 +1494,13 @@ async function cmdHeaderAudit(args: string[]): Promise<void> {
 
   for (const [, e] of missing) {
     store.upsertFinding(id, {
-      id: `h-${e.rule.key}`, // 安定 id → 再実行は上書き(冪等)
+      id: `h-${e.rule.key}`, // stable id -> a re-run overwrites (idempotent)
       screenId: null,
       title: `[headers] ${e.rule.title}`,
       severity: e.rule.severity,
       source: { kind: "validator", validatorName: "header-audit" },
-      description: `${e.rule.note} ${e.urls.length} ページで欠落。例: ${e.urls.slice(0, 5).join(", ")}`,
-      reproSteps: `GET 対象 URL → レスポンスに '${e.rule.header}' ヘッダが無いことを確認。`,
+      description: `${e.rule.note} Missing on ${e.urls.length} page(s). e.g.: ${e.urls.slice(0, 5).join(", ")}`,
+      reproSteps: `GET the target URL -> confirm the response has no '${e.rule.header}' header.`,
       evidenceIds: e.evId ? [e.evId] : [],
       scopeBasis: "authorized in-scope screens",
     });
@@ -1497,10 +1510,10 @@ async function cmdHeaderAudit(args: string[]): Promise<void> {
   console.log(`\n${missing.size} header finding(s) recorded → reload the WebUI (toggle info via the severity filter)`);
 }
 
-// Burp issue(XML or REST 由来)を run にマージ。既存 finding と (粗カテゴリ × 正規化エンドポイント) で
-// 重複排除し、スコープ外は捨てる。burp-import / burp-scan の両方が使う共通ロジック。
-// scanner の共通マージへ委譲(エンドポイント正規化だけ crawler の normalizePath を注入)。
-// 取り込んだ件数のログだけ CLI 側で出す(server は WS 経由で WebUI が反映)。
+// Merge Burp issues (from XML or REST) into a run. Deduplicates against existing findings by (coarse category × normalized endpoint)
+// and drops out-of-scope ones. Shared logic used by both burp-import and burp-scan.
+// Delegates to scanner's shared merge (only injecting crawler's normalizePath for endpoint normalization).
+// The CLI only logs the number imported (the server reflects it to the WebUI over WS).
 function mergeBurpIssues(
   store: AssessmentStore,
   id: string,
@@ -1516,11 +1529,11 @@ function mergeBurpIssues(
   });
   if (res.added) console.log(`  + ${res.added} net-new finding(s) merged (from ${before} existing)`);
 
-  // ── info triage ── verifyImportedBurp は High+ しか再検証しない。その下(Information/Low/Medium)は
-  //    素通りするが、反射点→XSS・外部通信→SSRF・緩い CORS→データ窃取…と「実脆弱性の入口」が紛れている。
-  //    全部 verify はせず(operator の方針)、名前ベースで triage して **有望リードだけ** を提示する。
+  // ── info triage ── verifyImportedBurp only re-verifies High+. Everything below (Information/Low/Medium)
+  //    passes straight through, but "entry points to real vulns" hide in there — reflection->XSS, external interaction->SSRF, loose CORS->data theft…
+  //    Rather than verify all of them (operator's policy), triage by name and surface **only the promising leads**.
   const subHigh = issues.filter((i) => {
-    if (/high|critical/i.test(i.severity)) return false; // High+ は verify 側の担当
+    if (/high|critical/i.test(i.severity)) return false; // High+ is the verify phase's job
     let url: string;
     try {
       url = new URL(i.path || "/", i.host).toString();
@@ -1549,9 +1562,9 @@ function mergeBurpIssues(
   return res;
 }
 
-// Burp Pro の XML レポートを取り込み、既存 finding と重複しない net-new だけを追加する。
-// 連携の流れ: pilot --burp-proxy <burp> で全トラフィックを Burp 経由 → Burp でスキャン → レポート XML
-// を export → このコマンドで取り込み。重複排除は (粗カテゴリ × 正規化エンドポイント) で行う。
+// Import a Burp Pro XML report, adding only net-new issues that don't duplicate existing findings.
+// Flow: pilot --burp-proxy <burp> routes all traffic through Burp -> scan in Burp -> export the report XML
+// -> import it with this command. Deduplication is by (coarse category × normalized endpoint).
 async function cmdBurpImport(args: string[]): Promise<void> {
   const { values } = parseArgs({
     args,
@@ -1559,9 +1572,9 @@ async function cmdBurpImport(args: string[]): Promise<void> {
       id: { type: "string" },
       report: { type: "string" },
       out: { type: "string" },
-      manifest: { type: "string" }, // 認証下 finding の再検証に Basic 資格を渡す(任意)
+      manifest: { type: "string" }, // pass Basic credentials for re-verifying authed findings (optional)
       "no-burp-verify": { type: "boolean" },
-      "no-burp-triage": { type: "boolean" }, // High+ 検証は残しつつ、sub-High リードの深堀フェーズだけ無効化
+      "no-burp-triage": { type: "boolean" }, // keep High+ verification but disable only the sub-High lead deep-dive phase
       model: { type: "string" },
     },
   });
@@ -1582,7 +1595,7 @@ async function cmdBurpImport(args: string[]): Promise<void> {
   const issues = parseBurpReport(readFileSync(values.report, "utf8"));
   const { added, skipped, oos } = mergeBurpIssues(store, id, state, runsDir, issues);
   console.log(`\nburp-import ${id}: ${issues.length} issue(s) → +${added} net-new(dup ${skipped} / out-of-scope ${oos})`);
-  // 取り込んだ Burp 由来 High+ を AI が能動再検証(REST 経路と同じフェーズ)。--no-burp-verify で無効。
+  // AI actively re-verifies the imported Burp High+ (same phase as the REST path). --no-burp-verify disables it.
   if (added > 0 && !values["no-burp-verify"]) {
     const httpBasic = manifestHttpBasic(values.manifest ? loadManifest(values.manifest) : null);
     await verifyImportedBurp(store, id, runsDir, { ...(values.model ? { model: values.model } : {}), httpBasic, triage: !values["no-burp-triage"] });
@@ -1592,11 +1605,96 @@ async function cmdBurpImport(args: string[]): Promise<void> {
   store.close();
 }
 
-// Burp REST 接続情報を「引数 → env → 既定」で解決する。env: BURP_API / BURP_API_KEY / BURP_RESOURCE_POOL。
+/** Fall back to the spec's own declared base when --url is omitted: servers[0].url (3.x) or schemes+host+basePath (2.0). */
+function deriveSpecBase(rawDoc: unknown): string | null {
+  const doc = rawDoc && typeof rawDoc === "object" ? (rawDoc as Record<string, unknown>) : null;
+  if (!doc) return null;
+  const servers = doc["servers"];
+  if (Array.isArray(servers) && servers[0] && typeof servers[0] === "object") {
+    const u = (servers[0] as Record<string, unknown>)["url"];
+    if (typeof u === "string" && /^https?:\/\//i.test(u)) return u;
+  }
+  const host = typeof doc["host"] === "string" ? (doc["host"] as string) : null; // Swagger 2.0
+  if (host) {
+    const schemes = Array.isArray(doc["schemes"]) ? (doc["schemes"] as unknown[]) : [];
+    const scheme = schemes.includes("https") ? "https" : typeof schemes[0] === "string" ? (schemes[0] as string) : "https";
+    const basePath = typeof doc["basePath"] === "string" ? (doc["basePath"] as string) : "";
+    return `${scheme}://${host}${basePath}`;
+  }
+  return null;
+}
+
+// Ingest a provided OpenAPI 3.x / Swagger 2.0 spec → seed the screen inventory, so the browser-free `scan`/`logic`
+// steps can assess a pure-API target (or overlay a spec on a crawl with --id). Mirrors the burp-import shape.
+async function cmdSpecImport(args: string[]): Promise<void> {
+  const { values } = parseArgs({
+    args,
+    options: {
+      spec: { type: "string" },
+      url: { type: "string" },
+      id: { type: "string" },
+      manifest: { type: "string" },
+      out: { type: "string" },
+    },
+  });
+  if (!values.spec) fail("spec-import requires --spec <openapi.json>");
+  if (!existsSync(values.spec)) fail(`no spec at ${values.spec}`);
+  let doc: unknown;
+  try {
+    doc = JSON.parse(readFileSync(values.spec, "utf8"));
+  } catch (e) {
+    fail(`spec is not valid JSON (${String(e).slice(0, 100)}). YAML specs aren't supported yet — convert to JSON first.`);
+  }
+  const runsDir = values.out ?? RUNS_DIR_DEFAULT;
+  const manifest = values.manifest ? loadManifest(values.manifest) : null;
+
+  const base = values.url ?? deriveSpecBase(doc);
+  if (!base) fail("spec-import requires --url <base-url> (the spec declares no absolute server URL)");
+  try {
+    parseTargetUrl(base); // require an http(s) scheme (same gate as scope derivation)
+  } catch (e) {
+    fail(e instanceof Error ? e.message : String(e));
+  }
+
+  let id: string;
+  let store: AssessmentStore;
+  let existing: Screen[] = [];
+  if (values.id) {
+    id = values.id;
+    const dbPath = dbPathFor(runsDir, id);
+    if (!existsSync(dbPath)) fail(`no state.sqlite at ${dbPath}`);
+    store = AssessmentStore.open(dbPath);
+    const state = store.loadAssessment(id);
+    if (!state) {
+      store.close();
+      fail(`assessment ${id} not found`);
+    }
+    existing = state.screens;
+  } else {
+    id = newAssessmentId();
+    mkdirSync(join(runsDir, id), { recursive: true });
+    const mode: ScopeMode = manifest?.scopeMode ?? "same-origin";
+    const scope: ScopePolicy = { ...deriveScopeFromUrls([base], mode), ...(manifest?.scope ?? {}) };
+    store = AssessmentStore.open(dbPathFor(runsDir, id));
+    store.createAssessment({ id, target: { kind: "single_url", url: base, followLinks: false, maxDepth: 0 }, scope });
+  }
+
+  const screens = parseOpenApiToScreens(doc, base, existing);
+  for (const sc of screens) store.upsertScreen(id, sc);
+  writeScreenInventory(join(runsDir, id, "screen_inventory.json"), buildInventory(base, screens));
+  store.close();
+
+  const ops = screens.reduce((n, s) => n + s.apis.length, 0);
+  const suffix = values.id ? ` (+${screens.length - existing.length} net-new over the crawl)` : " (fresh run)";
+  console.log(`\nspec-import ${id}: ${screens.length} screen(s), ${ops} operation(s)${suffix} → ${join(runsDir, id, "screen_inventory.json")}`);
+  console.log(`  next: scan --id ${id}${values.manifest ? ` --manifest ${values.manifest}` : ""}  then  logic --id ${id}${values.manifest ? ` --manifest ${values.manifest}` : ""}  then  report --id ${id}`);
+}
+
+// Resolve Burp REST connection info in the order "arg -> env -> default". env: BURP_API / BURP_API_KEY / BURP_RESOURCE_POOL.
 interface BurpRestConn {
   base: string;
   apiKey?: string;
-  resourcePool: string; // "" = Burp 既定プール
+  resourcePool: string; // "" = Burp's default pool
 }
 function resolveBurpRest(v: { "burp-api"?: string; "api-key"?: string; "resource-pool"?: string }): BurpRestConn {
   const base = v["burp-api"] ?? process.env.BURP_API ?? "http://127.0.0.1:1337";
@@ -2227,6 +2325,9 @@ async function main(): Promise<void> {
       return;
     case "burp-import":
       await cmdBurpImport(rest);
+      return;
+    case "spec-import":
+      await cmdSpecImport(rest);
       return;
     case "status":
       cmdStatus(rest);

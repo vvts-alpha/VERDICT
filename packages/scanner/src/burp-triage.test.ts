@@ -1,5 +1,5 @@
-// triageBurpInfo: Burp の High 未満 issue を「実脆弱性の入口」リードへ分類する純関数の検証。
-// 実レポート(juice-shop)に出た issue 名を使い、有望リードの抽出・集約・並びと hygiene 除外を確認する。
+// triageBurpInfo: test of the pure function that classifies Burp's below-High issues into "entry-point to real vuln" leads.
+// Uses issue names that appeared in a real report (juice-shop) to check lead extraction, aggregation, ordering, and hygiene exclusion.
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import { triageBurpInfo, formatBurpLeads } from "./burp-triage.js";

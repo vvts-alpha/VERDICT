@@ -1,14 +1,14 @@
-// DESIGN §6.4 — URL 正規化(path テンプレ化)。スコープ判定は core に集約。
+// DESIGN §6.4 — URL normalization (path templating). Scope checks live in core.
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const LONGHEX_RE = /^[0-9a-f]{16,}$/i; // mongo ObjectId / 長い hex
+const LONGHEX_RE = /^[0-9a-f]{16,}$/i; // mongo ObjectId / long hex
 const NUM_RE = /^\d+$/;
 const SLUGNUM_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*-\d+$/i; // foo-bar-123
-const PREFIXNUM_RE = /^[a-z]{1,3}\d{2,}$/i; // p101, ord12, u99(短い接頭辞 + 2桁以上)
+const PREFIXNUM_RE = /^[a-z]{1,3}\d{2,}$/i; // p101, ord12, u99 (short prefix + 2+ digits)
 
 export type SegmentKind = "static" | "id";
 
-/** path セグメントが「値(id)」か「静的」か。数値/UUID/長hex/末尾数字slug/接頭辞+数字 を id とみなす。 */
+/** Whether a path segment is a "value (id)" or "static". Numbers/UUID/long hex/trailing-number slug/prefix+number count as id. */
 export function classifyPathSegment(seg: string): SegmentKind {
   if (seg === "") return "static";
   if (NUM_RE.test(seg)) return "id";
@@ -24,7 +24,7 @@ export interface PathParam {
   example: string;
 }
 
-/** `/orders/123` → `{ template: "/orders/{id}", params:[{name:"id",example:"123"}] }`。複数は id, id2... */
+/** `/orders/123` → `{ template: "/orders/{id}", params:[{name:"id",example:"123"}] }`. Multiple: id, id2... */
 export function normalizePath(pathname: string): { template: string; params: PathParam[] } {
   const segs = pathname.split("/");
   const params: PathParam[] = [];
@@ -54,7 +54,7 @@ export function extractQueryParams(search: string): QueryParam[] {
   return out;
 }
 
-/** href を base に対して絶対 URL 化。http(s) 以外と解析不能は null。フラグメントは除去。 */
+/** Resolve href to an absolute URL against base. Non-http(s) and unparseable → null. Fragment stripped. */
 export function resolveLink(base: string, href: string): string | null {
   try {
     const u = new URL(href, base);
@@ -66,5 +66,5 @@ export function resolveLink(base: string, href: string): string | null {
   }
 }
 
-// スコープ判定は core に集約(crawler / scanner 共有)。後方互換で re-export。
+// Scope checks live in core (shared by crawler / scanner). Re-exported for backwards compatibility.
 export { hostMatches, isInScope } from "@veritas/core";

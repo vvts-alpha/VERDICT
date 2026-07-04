@@ -297,6 +297,8 @@ button:hover { background: #353d4a; }
 /* 証拠ビューア */
 .evlist { margin-top: 8px; }
 .evlabel { font-size: 10px; letter-spacing: 1px; text-transform: uppercase; margin-bottom: 4px; }
+.evtoggleall { margin-left: 8px; font-size: 10px; letter-spacing: 0; text-transform: none; background: transparent; border: 1px solid var(--line); color: var(--muted); padding: 1px 6px; border-radius: 4px; cursor: pointer; }
+.evtoggleall:hover { color: #fff; border-color: var(--accent); }
 .evitem { margin: 2px 0; }
 .evbtn { width: 100%; text-align: left; font-size: 11px; background: #181b21; border: 1px solid var(--line); color: var(--muted); padding: 3px 8px; border-radius: 4px; }
 .evbtn.open { color: #fff; border-color: var(--accent); }

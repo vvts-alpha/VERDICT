@@ -1,6 +1,6 @@
-// DESIGN §7.2 / §9 — 能動探索。受動 BFS では発火しない API/状態を、エージェントが
-// ブラウザを操作して引き出す(検索/フィルタ/作成/更新フォーム送信 等)。完全自動(承認ゲート無し)。
-// 認可済みアセスメント前提。スコープ/レート/マーカーは driver/crawl 側で担保。
+// DESIGN §7.2 / §9 — active exploration. The agent drives the browser to surface APIs/state that passive BFS
+// never fires (search/filter/create/update form submissions, etc.). Fully automatic (no approval gate).
+// Assumes an authorized assessment. Scope/rate/marker are enforced on the driver/crawl side.
 
 import { z } from "zod";
 import type { LlmClient } from "@veritas/llm";
@@ -8,7 +8,7 @@ import { extractJson } from "@veritas/llm";
 import type { CapturedExchange } from "./types.js";
 import type { PageSnapshot } from "./drivers/playwright.js";
 
-/** exploreScreen が必要とするブラウザ操作(PlaywrightDriver が構造的に満たす。テストは Fake)。 */
+/** Browser operations exploreScreen needs (structurally satisfied by PlaywrightDriver; Fake in tests). */
 export interface ExploreDriver {
   gotoUrl(url: string): Promise<void>;
   snapshot(): Promise<PageSnapshot>;
@@ -41,7 +41,7 @@ function testValue(field: { name: string; type: string }): string {
   return "veritas-test";
 }
 
-/** LLM にどのフォームをどんな値で送信するか選ばせる。失敗時は全フォームをテスト値で送信。 */
+/** Let the LLM choose which forms to submit and with what values. On failure, submit every form with test values. */
 export async function planExplore(llm: LlmClient, snap: PageSnapshot, model?: string): Promise<ExplorePlan> {
   if (snap.forms.length === 0) return [];
   const prompt = [
@@ -62,7 +62,7 @@ export async function planExplore(llm: LlmClient, snap: PageSnapshot, model?: st
   return snap.forms.map((_, index) => ({ formIndex: index }));
 }
 
-/** 画面を能動操作(完全自動): 計画フォームを全送信し、発火した API と新 URL を回収。 */
+/** Actively drive a screen (fully automatic): submit all planned forms and collect the fired APIs and new URLs. */
 export async function exploreScreen(
   driver: ExploreDriver,
   llm: LlmClient,
@@ -73,7 +73,7 @@ export async function exploreScreen(
   const actions: string[] = [];
   const startUrl = driver.currentUrl();
   const snap = await driver.snapshot();
-  driver.drainApiCalls(); // 探索開始時点のバッファをクリア
+  driver.drainApiCalls(); // clear the buffer at the start of exploration
 
   for (const action of (await planExplore(llm, snap, opts.model)).slice(0, 8)) {
     const form = snap.forms[action.formIndex];
@@ -89,7 +89,7 @@ export async function exploreScreen(
     const after = driver.currentUrl();
     if (after !== startUrl) newUrls.push(after);
     actions.push(`submit form#${action.formIndex} ${form.method} ${form.action ?? ""}`);
-    if (after !== startUrl) await driver.gotoUrl(startUrl); // 次のフォームのため元ページへ
+    if (after !== startUrl) await driver.gotoUrl(startUrl); // back to the original page for the next form
   }
   return { firedApis, newUrls, actions };
 }

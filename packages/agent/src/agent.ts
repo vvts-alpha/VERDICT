@@ -1,5 +1,5 @@
-// DESIGN §7.2 — 画面別ビジネスロジック評価(フレッシュコンテキスト)。
-// 1 画面: 仮説生成(LLM) → 各仮説を検証(証拠規律) → store に Hypothesis/Finding を集約。
+// DESIGN §7.2 — Per-screen business-logic assessment (fresh context).
+// One screen: generate hypotheses (LLM) → verify each hypothesis (evidence discipline) → collect Hypothesis/Finding into the store.
 
 import type { AssessmentStore, Finding, Hypothesis, Screen } from "@veritas/core";
 import { prioritizeScreens } from "@veritas/core";
@@ -35,7 +35,7 @@ function buildHypothesisFinding(screen: Screen, h: Hypothesis, outcome: VerifyOu
   };
 }
 
-/** 1 画面のビジネスロジック評価。store 連携時は仮説の status 遷移と confirmed の Finding を記録。 */
+/** Business-logic assessment of one screen. When wired to a store, records hypothesis status transitions and confirmed Findings. */
 export async function assessScreenLogic(
   screen: Screen,
   llm: LlmClient | null,
@@ -66,7 +66,7 @@ export async function assessScreenLogic(
 
   if (store && assessmentId && (findings.length > 0 || hypotheses.length > 0)) {
     const current = store.loadAssessment(assessmentId)?.screenScans.find((s) => s.screenId === screen.screenId);
-    // findings があれば finding、無ければ既存 status を尊重(generic scan の結果を上書きしない)
+    // If there are findings, mark finding; otherwise respect the existing status (don't overwrite the generic scan's result)
     if (findings.length > 0) {
       store.setScreenScanStatus(assessmentId, screen.screenId, "finding", {
         findingIds: findings.map((f) => f.id),
@@ -88,7 +88,7 @@ export interface LogicInventoryResult {
   confirmed: number;
 }
 
-/** object_ref/id param か idor-candidate ラベルを持つ画面にビジネスロジック評価を回す。 */
+/** Run business-logic assessment over screens that have an object_ref/id param or an idor-candidate label. */
 export async function assessLogicInventory(
   screens: Screen[],
   llm: LlmClient | null,
@@ -103,7 +103,7 @@ export async function assessLogicInventory(
       s.labels.includes("idor-candidate") ||
       s.params.some((p) => p.guessedType === "object_ref" || p.guessedType === "id"),
   );
-  // コスト抑制: 優先度上位 N 画面に限定して LLM 仮説生成を回す(§7.1)
+  // Cost control: limit LLM hypothesis generation to the top-N priority screens (§7.1)
   const maxScreens = opts.maxScreens ?? 25;
   const targets =
     applicable.length <= maxScreens

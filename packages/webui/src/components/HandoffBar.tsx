@@ -1,7 +1,7 @@
 import type { HumanHandoff } from "@veritas/core";
 import { useRole } from "../api";
 
-// DESIGN §6.3 / §8.3 — 人間ハンドオフ通知。人間が生ブラウザでログイン完了後「続行」を押す。
+// DESIGN §6.3 / §8.3 — human handoff notice. After the human finishes logging in via the live browser, they press "continue".
 export function HandoffBar({ handoffs, onResolve }: { handoffs: HumanHandoff[]; onResolve: (id: string) => void }) {
   const { canWrite } = useRole();
   const pending = handoffs.filter((h) => h.status === "pending");

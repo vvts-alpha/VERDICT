@@ -1,20 +1,21 @@
-// 初期状態を組み立てる純粋ヘルパ。PolicyEngine/BudgetGuard 本体は後続マイルストン。
+// Pure helpers that build the initial state. The real PolicyEngine/BudgetGuard are later milestones.
 
 import type { BudgetState } from "./types/budget.js";
 import type { ScopeMode, ScopePolicy } from "./types/scope.js";
 import { registrableDomain } from "./etld.js";
+import { parseTargetUrl } from "./scope-check.js";
 
-/** "unrestricted" モードが inScopeHosts に置くワイルドカード(hostMatches が全一致扱い)。 */
+/** The wildcard "unrestricted" mode puts in inScopeHosts (hostMatches treats it as matching all). */
 const UNRESTRICTED_HOST = "*";
 
-/** runs/<assessment_id>/ に使える、ソート可能で人に優しい id */
+/** A sortable, human-friendly id usable for runs/<assessment_id>/ */
 export function newAssessmentId(now: Date = new Date()): string {
   const t = now.getTime().toString(36);
   const r = Math.random().toString(36).slice(2, 8);
   return `a-${t}-${r}`;
 }
 
-/** 保守的な既定予算。実時間/リクエスト数を主軸に(DESIGN §13: コストは Max サブスクで定額)。 */
+/** Conservative default budget, keyed on wall-clock/request count (DESIGN §13: cost is flat under the Max subscription). */
 export function defaultBudget(now: Date = new Date()): BudgetState {
   return {
     limits: {
@@ -31,20 +32,20 @@ export function defaultBudget(now: Date = new Date()): BudgetState {
 }
 
 /**
- * シード URL 群 + モードから既定スコープを導出(DESIGN §4.2/§5)。
- * - "same-origin": 各シードと同一ホスト(exact, ポート込み)
- * - "etld":        各シードの登録可能ドメイン配下(`*.example.com`)。同一プログラムの API サブドメインを含む
- * - "unrestricted": ホスト制限なし(`*`)
- * パス接頭辞は常に "/"(ホスト粒度のゲート)。URL の path で絞らないのは従来挙動どおり。
+ * Derive the default scope from a set of seed URLs + a mode (DESIGN §4.2/§5).
+ * - "same-origin": same host as each seed (exact, port included)
+ * - "etld":        under each seed's registrable domain (`*.example.com`); includes the program's API subdomains
+ * - "unrestricted": no host restriction (`*`)
+ * Path prefix is always "/" (host-granularity gate). Not narrowing by the URL's path is the existing behavior.
  */
 export function deriveScopeFromUrls(rawUrls: string[], mode: ScopeMode = "same-origin"): ScopePolicy {
   const hosts = new Set<string>();
   for (const raw of rawUrls) {
-    const u = new URL(raw);
+    const u = parseTargetUrl(raw); // reject schemeless/non-http(s) with a clear error (vs an opaque throw or a silently empty scope)
     if (mode === "unrestricted") hosts.add(UNRESTRICTED_HOST);
     else if (mode === "etld") {
       const reg = registrableDomain(u.hostname);
-      // IP / localhost 等(サブドメインの概念が無い)は `*.` を付けず exact host(ポート込み)にフォールバック。
+      // IP / localhost etc. (no notion of subdomains): don't add `*.`; fall back to the exact host (port included).
       hosts.add(reg.includes(".") && !/^[0-9.]+$/.test(reg) ? `*.${reg}` : u.host);
     } else hosts.add(u.host);
   }
@@ -54,14 +55,14 @@ export function deriveScopeFromUrls(rawUrls: string[], mode: ScopeMode = "same-o
     inScopePathPrefixes: ["/"],
     outOfScopePathPrefixes: [],
     approvalPathPrefixes: [],
-    approvalMethods: ["DELETE", "PUT", "PATCH"], // 破壊的 → REQUIRES_APPROVAL(DESIGN §4.5)
-    rate: { requestsPerMinute: 30, maxConcurrent: 2 }, // WAF 教訓: 保守的(DESIGN §2.2)
+    approvalMethods: ["DELETE", "PUT", "PATCH"], // destructive → REQUIRES_APPROVAL (DESIGN §4.5)
+    rate: { requestsPerMinute: 30, maxConcurrent: 2 }, // WAF lesson: stay conservative (DESIGN §2.2)
   };
 }
 
 /**
- * 単一 URL から同一オリジン + 起点配下を既定スコープとして導出(DESIGN §4.2/§5)。
- * 後方互換の薄いラッパ(= deriveScopeFromUrls([url], "same-origin"))。
+ * Derive the default scope from a single URL: same origin + under the entry point (DESIGN §4.2/§5).
+ * A thin backward-compatible wrapper (= deriveScopeFromUrls([url], "same-origin")).
  */
 export function deriveScopeFromSingleUrl(rawUrl: string): ScopePolicy {
   return deriveScopeFromUrls([rawUrl], "same-origin");

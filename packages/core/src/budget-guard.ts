@@ -1,4 +1,4 @@
-// DESIGN §4.4 — BudgetGuard(予算・停止条件)。純粋関数で BudgetState を更新し停止判定する。
+// DESIGN §4.4 — BudgetGuard (budget / stop conditions). Pure functions update BudgetState and decide when to stop.
 
 import type { AssessmentState, BudgetState, StopReason } from "./types/index.js";
 import { coverage } from "./coverage.js";
@@ -27,16 +27,16 @@ export interface StopDecision {
 }
 
 export interface StopOptions {
-  /** no-progress: 直近 N ステップで findings も新画面もゼロ(呼び出し側が計測) */
+  /** no-progress: zero findings and zero new screens over the last N steps (measured by the caller) */
   stepsWithoutProgress?: number;
   noProgressThreshold?: number;
-  /** unreachable: 連続到達不能(WAF)カウント */
+  /** unreachable: consecutive-unreachable (WAF) count */
   consecutiveUnreachable?: number;
   unreachableThreshold?: number;
   now?: number;
 }
 
-/** 停止すべきかを評価(DESIGN §4.4 の 5 条件)。優先: halt > budget > unreachable > coverage > no_progress。 */
+/** Evaluate whether to stop (the 5 conditions of DESIGN §4.4). Priority: halt > budget > unreachable > coverage > no_progress. */
 export function evaluateStop(state: AssessmentState, opts: StopOptions = {}): StopDecision {
   if (state.phase === "halted") return { stop: true, reason: "human_halt", detail: "already halted" };
 

@@ -1,4 +1,4 @@
-// M5 完了条件: 1 画面で IDOR 仮説の生成 → 検証が回る(証拠規律 + store 連携)。LLM/HTTP は Fake。
+// M5 completion criterion: on one screen, IDOR hypothesis generation → verification runs (evidence discipline + store integration). LLM/HTTP are Fakes.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -29,7 +29,7 @@ function idorScreen(): Screen {
   };
 }
 
-// 隣接 id(/api/orders/6)は実体、無効 id(/api/orders/10000024)は 404 → IDOR
+// A neighbouring id (/api/orders/6) returns an entity, an invalid id (/api/orders/10000024) 404s → IDOR
 const idorResponder: FakeResponder = (req) => {
   const p = new URL(req.url).pathname;
   if (p === "/api/orders/6") return { status: 200, body: '{"order":6,"total":42,"owner":"victim"}' };

@@ -1,4 +1,4 @@
-// DESIGN §4.4 — BudgetGuard(予算・停止条件)
+// DESIGN §4.4 — BudgetGuard (budget / stop conditions)
 
 export interface BudgetLimits {
   maxTokens: number;
@@ -9,15 +9,15 @@ export interface BudgetLimits {
 
 export interface BudgetState {
   limits: BudgetLimits;
-  /** ISO-8601。実時間予算の起点 */
+  /** ISO-8601. Origin of the wall-clock budget */
   startedAt: string;
   tokensUsed: number;
   totalRequests: number;
-  /** host -> このターゲットへ送ったリクエスト数 */
+  /** host -> number of requests sent to this target */
   requestsPerTarget: Record<string, number>;
 }
 
-/** 停止条件(DESIGN §4.4) */
+/** Stop conditions (DESIGN §4.4) */
 export type StopReason =
   | "coverage_complete"
   | "budget_exceeded"

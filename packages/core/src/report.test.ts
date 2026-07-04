@@ -1,4 +1,4 @@
-// M7: レポート生成 と 停止条件の評価。
+// M7: report generation and stop-condition evaluation.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -47,12 +47,12 @@ test("buildReport renders findings, repro, evidence, scope", () => {
     assert.match(md, /GET \/\.git\/config/);
     assert.match(md, /artifacts\/s-0001\/ev-1\//);
     assert.match(md, /## Scope/);
-    // 目次: Contents 節 + 各節リンク + finding への明示アンカー/リンク。
+    // Contents: the Contents section + per-section links + explicit anchor/link to the finding.
     assert.match(md, /## Contents/);
     assert.match(md, /- \[Assessment Information\]\(#assessment-information\)/);
     assert.match(md, /- \[Findings\]\(#findings\)/);
-    assert.match(md, /\[1\. HIGH — Exposed sensitive file[^\]]*\]\(#finding-1\)/); // TOC は [] を含まない
-    assert.match(md, /<a id="finding-1"><\/a>/); // 見出し直前の明示アンカー
+    assert.match(md, /\[1\. HIGH — Exposed sensitive file[^\]]*\]\(#finding-1\)/); // the TOC contains no []
+    assert.match(md, /<a id="finding-1"><\/a>/); // explicit anchor right before the heading
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -62,11 +62,11 @@ test("evaluateStop trips on budget, coverage, and halt", () => {
   const dir = mkdtempSync(join(tmpdir(), "veritas-stop-"));
   try {
     const store = seedWithFinding(dir);
-    // 未完了(s-0001 は finding=terminal だが total=1 remaining=0 → coverage complete)
+    // Not incomplete (s-0001 is finding=terminal, total=1 remaining=0 → coverage complete)
     let state = store.loadAssessment("a-1")!;
     assert.equal(evaluateStop(state).reason, "coverage_complete");
 
-    // budget 超過(requests 上限を 1 に絞って 2 件記録)
+    // budget exceeded (cap requests at 1 and record 2)
     const tight = { ...state.budget, limits: { ...state.budget.limits, maxTotalRequests: 1 } };
     store.updateBudget("a-1", recordRequests(tight, "shop.test", 2));
     state = store.loadAssessment("a-1")!;

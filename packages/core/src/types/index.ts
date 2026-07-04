@@ -1,4 +1,4 @@
-// 契約スキーマのバレル。全レイヤー(crawler/scanner/agent/server/webui)が core から型を共有する。
+// Barrel of contract schemas. Every layer (crawler/scanner/agent/server/webui) shares types from core.
 
 export type { TargetInput } from "./input.js";
 export type { Phase } from "./phase.js";

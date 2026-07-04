@@ -41,7 +41,7 @@ test("buildSiteTree folds urlTemplates into a hierarchy with scan badges", () =>
   ];
   const tree = buildSiteTree(screens, scans);
 
-  // top-level: "/", "login", "products"(セグメント名でソート)
+  // top-level: "/", "login", "products" (sorted by segment name)
   assert.deepEqual(tree.map((n) => n.segment), ["/", "login", "products"]);
 
   const products = tree.find((n) => n.segment === "products");
@@ -61,22 +61,22 @@ test("buildSiteTree groups by domain when screens span ≥2 hosts", () => {
     screen("s-0001", "/", "dashboard", ["https://app.example.com/"]),
     screen("s-0002", "/login", "auth", ["https://app.example.com/login"]),
     screen("s-0003", "/v1/users/{id}", "detail", ["https://api.example.com/v1/users/42"]),
-    screen("s-0004", "/login", "auth", ["https://api.example.com/login"]), // 別ドメインの同名パスは混ざらない
+    screen("s-0004", "/login", "auth", ["https://api.example.com/login"]), // same-named path on a different domain doesn't merge
   ];
   const tree = buildSiteTree(screens, []);
 
-  // トップ = ドメイン(ソート順)
+  // Top = domain (sorted)
   assert.deepEqual(
     tree.map((n) => n.segment),
     ["api.example.com", "app.example.com"],
   );
 
   const app = tree.find((n) => n.segment === "app.example.com");
-  assert.equal(app?.screenId, "s-0001", "ルート(/)画面はドメインノードに直付け");
+  assert.equal(app?.screenId, "s-0001", "the root (/) screen attaches directly to the domain node");
   assert.deepEqual(app?.children.map((c) => c.segment), ["login"]);
 
   const api = tree.find((n) => n.segment === "api.example.com");
-  // 同名 /login が別ドメイン配下に独立して存在(path はホストで一意化)
+  // The same-named /login exists independently under each domain (path uniqued by host)
   assert.equal(api?.children.find((c) => c.segment === "login")?.path, "api.example.com/login");
   assert.equal(app?.children.find((c) => c.segment === "login")?.path, "app.example.com/login");
 });
@@ -87,11 +87,11 @@ test("buildSiteTree stays a flat path forest for a single host", () => {
     screen("s-0002", "/products", "listing", ["https://app.example.com/products"]),
   ];
   const tree = buildSiteTree(screens, []);
-  assert.deepEqual(tree.map((n) => n.segment), ["/", "products"], "単一ドメインはドメイン段を足さない");
+  assert.deepEqual(tree.map((n) => n.segment), ["/", "products"], "a single domain doesn't add a domain level");
 });
 
 test("buildSiteTree branches SPA hash routes recovered from observedUrls", () => {
-  // 同一 pathname `/app` だが hash route が違う → URL では分離できないが枝分かれさせたい
+  // Same pathname `/app` but different hash routes → URL can't separate them, but we want them branched
   const screens = [
     screen("s-0001", "/app", "dashboard", ["https://app.example.com/app#/"]),
     screen("s-0002", "/app", "listing", ["https://app.example.com/app#/admin/users"]),
@@ -99,29 +99,29 @@ test("buildSiteTree branches SPA hash routes recovered from observedUrls", () =>
   ];
   const tree = buildSiteTree(screens, []);
   const app = tree.find((n) => n.segment === "app");
-  assert.ok(app, "/app ノードが存在");
+  assert.ok(app, "the /app node exists");
   const admin = app!.children.find((n) => n.segment === "#admin");
-  assert.ok(admin, "hash route #admin が枝になる");
+  assert.ok(admin, "the hash route #admin becomes a branch");
   const users = admin!.children.find((n) => n.segment === "users");
   assert.ok(users, "#admin/users");
   assert.equal(users!.screenId, "s-0002");
-  // id っぽい hash セグメントは {id} に畳む
+  // Id-like hash segments collapse to {id}
   assert.ok(users!.children.some((n) => n.segment === "{id}" && n.screenId === "s-0003"), "#admin/users/{id}");
 });
 
 test("buildSiteTree branches URL-stable (pure-state) SPA screens via skeleton tag", () => {
-  // hash も無く pathname も同一(URL が一切変わらない state 駆動 SPA)。DOM 骨格 hash で枝分かれ。
+  // No hash and identical pathname (a state-driven SPA whose URL never changes). Branch by DOM-skeleton hash.
   const screens = [
     screen("s-0001", "/console", "dashboard", ["https://app.example.com/console"]),
     screen("s-0002", "/console", "listing", ["https://app.example.com/console"]),
   ];
   const tree = buildSiteTree(screens, []);
   const console_ = tree.find((n) => n.segment === "console");
-  assert.ok(console_, "/console ノードが存在");
-  assert.equal(console_!.screenId, null, "衝突した親には screen を載せない");
-  assert.equal(console_!.children.length, 2, "2 つの state ビューが ~tag で枝分かれ");
+  assert.ok(console_, "the /console node exists");
+  assert.equal(console_!.screenId, null, "a collided parent carries no screen");
+  assert.equal(console_!.children.length, 2, "the two state views branch by ~tag");
   const tags = console_!.children.map((n) => n.segment).sort();
-  assert.deepEqual(tags, ["~s-0001", "~s-0002"], "domSkeletonHash 由来の短縮子で一意化");
+  assert.deepEqual(tags, ["~s-0001", "~s-0002"], "uniqued by a short id derived from domSkeletonHash");
   assert.deepEqual(
     console_!.children.map((n) => n.screenId).sort(),
     ["s-0001", "s-0002"],

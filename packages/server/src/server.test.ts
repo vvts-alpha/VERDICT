@@ -1,4 +1,4 @@
-// server の HTTP API と WebSocket push を browser なしで検証(Node 24 グローバル fetch/WebSocket 使用)。
+// Verify the server's HTTP API and WebSocket push without a browser (uses Node 24 global fetch/WebSocket).
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -69,19 +69,19 @@ test("auth gate: password-protects WebUI/API with login form + signed cookie", a
   const srv = await startServer({ runsDir, pollMs: 50, authPasswords: { operator: "s3cret", viewer: "look" } });
   const form = { "content-type": "application/x-www-form-urlencoded" };
   try {
-    // 未認証 API → 401、未認証 HTML → 302 /login、/login フォーム → 200
+    // unauthenticated API → 401, unauthenticated HTML → 302 /login, /login form → 200
     assert.equal((await fetch(`${srv.url}/api/assessments`, { redirect: "manual" })).status, 401);
     const root = await fetch(`${srv.url}/`, { redirect: "manual" });
     assert.equal(root.status, 302);
     assert.equal(root.headers.get("location"), "/login");
     assert.equal((await fetch(`${srv.url}/login`)).status, 200);
 
-    // 誤PW → 302 /login?e=1・Cookie なし
+    // wrong PW → 302 /login?e=1, no Cookie
     const bad = await fetch(`${srv.url}/auth`, { method: "POST", headers: form, body: "password=nope", redirect: "manual" });
     assert.equal(bad.headers.get("location"), "/login?e=1");
     assert.equal(bad.headers.getSetCookie().length, 0);
 
-    // 正PW(operator) → 302 /・Set-Cookie
+    // correct PW (operator) → 302 /, Set-Cookie
     const ok = await fetch(`${srv.url}/auth`, { method: "POST", headers: form, body: "password=s3cret", redirect: "manual" });
     assert.equal(ok.headers.get("location"), "/");
     const setc = ok.headers.getSetCookie();
@@ -89,7 +89,7 @@ test("auth gate: password-protects WebUI/API with login form + signed cookie", a
     const cookie = setc[0]?.split(";")[0] ?? "";
     assert.match(cookie, /^verdict_session=operator\./);
 
-    // Cookie 付き API → 200、改竄 Cookie → 401、/api/me → operator(全権)
+    // API with Cookie → 200, tampered Cookie → 401, /api/me → operator (full rights)
     assert.equal((await fetch(`${srv.url}/api/assessments`, { headers: { cookie } })).status, 200);
     assert.equal((await fetch(`${srv.url}/api/assessments`, { headers: { cookie: "verdict_session=1.deadbeef" }, redirect: "manual" })).status, 401);
     assert.deepEqual(await (await fetch(`${srv.url}/api/me`, { headers: { cookie } })).json(), { role: "operator", authEnabled: true });
@@ -109,10 +109,10 @@ test("role split: viewer can read but every mutating POST is 403 (read-only)", a
     const login = await fetch(`${srv.url}/auth`, { method: "POST", headers: form, body: "password=vw", redirect: "manual" });
     const cookie = login.headers.getSetCookie()[0]?.split(";")[0] ?? "";
     assert.match(cookie, /^verdict_session=viewer\./);
-    // 閲覧 GET は OK
+    // read GET is OK
     assert.equal((await fetch(`${srv.url}/api/assessments`, { headers: { cookie } })).status, 200);
     assert.deepEqual(await (await fetch(`${srv.url}/api/me`, { headers: { cookie } })).json(), { role: "viewer", authEnabled: true });
-    // mutating POST は 403(read-only)
+    // mutating POST is 403 (read-only)
     for (const path of ["/api/run", "/api/assessments/a-view/pause", "/api/assessments/a-view/screens/s-1/exclude"]) {
       const r = await fetch(`${srv.url}${path}`, { method: "POST", headers: { cookie, "content-type": "application/json" }, body: "{}", redirect: "manual" });
       assert.equal(r.status, 403, `${path} should be forbidden for viewer`);
@@ -181,7 +181,7 @@ test("WebSocket sends a snapshot then pushes events on state change", async () =
     assert.ok(snap && snap.type === "snapshot");
     assert.equal(snap.view.screens.length, 1);
 
-    // 別プロセス相当: 同じ state.sqlite に画面追加 → server がポーリングで検知し push
+    // equivalent to a separate process: add a screen to the same state.sqlite → the server detects it via polling and pushes
     const writer = AssessmentStore.open(join(runsDir, "a-2", "state.sqlite"));
     writer.upsertScreen("a-2", screen("s-0002", "/login"));
     writer.close();

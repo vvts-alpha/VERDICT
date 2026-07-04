@@ -1,5 +1,5 @@
-// DESIGN §7.3 / §7.5 / §4.3 — validator 抽象 と 証拠規律ランナー。
-// confirmed には negative control(正常応答)+ 2 positive replays を必須(ValidatorBase 相当の不変条件)。
+// DESIGN §7.3 / §7.5 / §4.3 — the validator abstraction and the evidence-discipline runner.
+// confirmed requires a negative control (normal response) + 2 positive replays (the ValidatorBase-equivalent invariant).
 
 import type { Screen, Severity } from "@veritas/core";
 import type { HttpClient, HttpRequest, HttpResponse } from "./http.js";
@@ -7,13 +7,13 @@ import type { EvidenceStore } from "./evidence.js";
 
 export interface ScanTarget {
   screen: Screen;
-  /** 具体的な観測 URL(プローブの基点) */
+  /** the concrete observed URL (probe base point) */
   baseUrl: string;
   /** scheme://host */
   origin: string;
 }
 
-/** observedUrls[0] から具体ターゲットを作る。観測 URL が無ければ null(プローブ不能)。 */
+/** Build a concrete target from observedUrls[0]. Returns null if there's no observed URL (nothing to probe). */
 export function makeTarget(screen: Screen): ScanTarget | null {
   const base = screen.observedUrls[0];
   if (!base) return null;
@@ -24,7 +24,7 @@ export function makeTarget(screen: Screen): ScanTarget | null {
   }
 }
 
-/** api urlTemplate の {name} を screen.params の example で埋めて具体 URL に。埋まらなければ null。 */
+/** Fill {name} in the api urlTemplate with screen.params' example to form a concrete URL. Returns null if any can't be filled. */
 export function concretizeApiUrl(origin: string, urlTemplate: string, screen: Screen): string | null {
   let path = urlTemplate;
   for (const placeholder of urlTemplate.match(/\{[^}]+\}/g) ?? []) {
@@ -54,9 +54,9 @@ export interface Validator {
   name: string;
   severity: Severity;
   applicable(target: ScanTarget): boolean;
-  /** 1 つ以上の陽性プローブ */
+  /** one or more positive probes */
   probes(target: ScanTarget): Probe[];
-  /** 共有の negative control(catch-all / 0-byte 200 ガード) */
+  /** shared negative control (catch-all / 0-byte-200 guard) */
   negativeControl(target: ScanTarget): HttpRequest;
   evaluate(res: HttpResponse, target: ScanTarget, probe: Probe): ProbeEval;
   title(target: ScanTarget, probe: Probe): string;
@@ -77,17 +77,17 @@ export interface ProbeOutcome {
 }
 
 export interface RunOptions {
-  /** 陽性を要求する回数(既定 2 = 「2 positive replays」) */
+  /** how many positives are required (default 2 = "2 positive replays") */
   positiveReplays?: number;
 }
 
 /**
- * 1 validator の全プローブを証拠規律で評価する。
- *  1. 陽性プローブ → 陰性なら no signal
- *  2. negative control も陽性 → catch-all とみなし refuted(0-byte/catch-all ガード)
- *  3. 陽性を計 N 回(既定 2)再現 → いずれか崩れたら refuted
- *  4. すべて満たせば confirmed。negative control + N 陽性を EvidenceStore に記録
- * seen は同一プローブ URL の重複実行をアセスメント内で防ぐ。
+ * Evaluate all probes of one validator under evidence discipline.
+ *  1. positive probe → if negative, no signal
+ *  2. negative control also positive → treated as catch-all, refuted (0-byte/catch-all guard)
+ *  3. reproduce the positive N times total (default 2) → if any breaks down, refuted
+ *  4. if all hold, confirmed. Record the negative control + N positives in the EvidenceStore
+ * seen prevents re-running the same probe URL within an assessment.
  */
 export async function runValidator(
   v: Validator,

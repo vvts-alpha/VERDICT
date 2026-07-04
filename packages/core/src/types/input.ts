@@ -1,7 +1,7 @@
-// DESIGN §5 — 入力モデル
+// DESIGN §5 — input model
 //
-// 2 系統: 起点 URL から同一オリジン + 配下を辿る single_url と、
-// 構造化スコープ(YAML/JSON)を読む scope_manifest。
+// Two forms: single_url, which follows same-origin + descendants from an entry URL, and
+// scope_manifest, which reads a structured scope (YAML/JSON).
 
 export type TargetInput =
   | {
@@ -12,6 +12,6 @@ export type TargetInput =
     }
   | {
       kind: "scope_manifest";
-      /** 構造化スコープ(YAML/JSON)へのパス */
+      /** Path to the structured scope (YAML/JSON) */
       path: string;
     };
