@@ -5,6 +5,12 @@ import type { ScopeMode, ScopePolicy } from "./types/scope.js";
 import { registrableDomain } from "./etld.js";
 import { parseTargetUrl } from "./scope-check.js";
 
+/** A realistic desktop-Chrome User-Agent shared by the browser driver AND the raw-HTTP client, so a target/WAF sees a
+ *  consistent, non-"HeadlessChrome" / non-"scanner" UA across the whole assessment (the x-verdict header identifies our
+ *  traffic separately). Single source of truth — avoids drift between the browser and raw-HTTP paths. Override per-request. */
+export const DEFAULT_BROWSER_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
+
 /** The wildcard "unrestricted" mode puts in inScopeHosts (hostMatches treats it as matching all). */
 const UNRESTRICTED_HOST = "*";
 

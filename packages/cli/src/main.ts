@@ -719,8 +719,9 @@ async function cmdAssess(args: string[]): Promise<void> {
 
   const screensNow = () => store.loadAssessment(id)?.screens ?? [];
   const httpBasic = manifestHttpBasic(manifest); // site-wide Basic/Digest (if any)
+  const assessCustomHeaders = manifestCustomHeaders(manifest); // WAF-bypass / mandated headers (if any)
   const claude = new ClaudeCliClient({ defaultModel: model });
-  const http = new FetchHttpClient({ allow: (u) => isInScope(u, scope), minDelayMs: rate, ...(httpBasic ? { headers: basicHeader(httpBasic) } : {}) });
+  const http = new FetchHttpClient({ allow: (u) => isInScope(u, scope), minDelayMs: rate, headers: manifestAuthHeaders(manifest) }); // basic + custom headers (was httpBasic only)
   const evidence = new EvidenceStore(join(runsDir, id, "artifacts"));
 
   // ① unauth crawl → ② login (credentials or human) → ③ post-login crawl → (⑤ capture role sessions)
@@ -742,6 +743,7 @@ async function cmdAssess(args: string[]): Promise<void> {
     executablePath: values["browser-path"] ?? (process.env.VERDICT_BROWSER_PATH ?? process.env.VERITAS_BROWSER_PATH),
     args: values["no-sandbox"] ? ["--no-sandbox"] : undefined,
     ...(httpBasic ? { httpCredentials: { username: httpBasic.user, password: httpBasic.pass } } : {}),
+    ...(assessCustomHeaders ? { extraHeaders: assessCustomHeaders } : {}), // WAF-bypass / mandated headers on the browser too (same-origin-only, CORS-safe)
   });
 
   // Active-exploration hook (fully automatic): drives the browser on each new screen to draw out fired APIs / new URLs (§7.2)
@@ -1148,6 +1150,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
                   cookie,
                   bearer,
                   httpBasic,
+                  ...(customHeaders ? { customHeaders } : {}), // carry operator custom headers (WAF-bypass / mandated) into the Burp-audited requests
                   verify: !values["no-burp-verify"],
                   ...(model ? { verifyModel: model } : {}),
                   pollSec: 10,
@@ -1169,6 +1172,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
                 verify: !values["no-burp-verify"], // default: AI re-verifies the imported High+
                 verifyModel: model, // verification is deep (adversarial), so use the deep model
                 httpBasic,
+                ...(customHeaders ? { customHeaders } : {}), // carry operator custom headers into the REST-scan re-verify
                 ...(customConfigs.length ? { customConfigs } : {}),
                 onPoll: keepWarm, // keep the session alive
               });
@@ -1201,7 +1205,7 @@ function resolveWebRoot(): string | undefined {
 async function cmdScan(args: string[]): Promise<void> {
   const { values } = parseArgs({
     args,
-    options: { id: { type: "string" }, out: { type: "string" }, rate: { type: "string" }, manifest: { type: "string" } },
+    options: { id: { type: "string" }, out: { type: "string" }, rate: { type: "string" }, manifest: { type: "string" }, "burp-proxy": { type: "string" } },
   });
   if (!values.id) fail("scan requires --id <assessment-id>");
   const runsDir = values.out ?? RUNS_DIR_DEFAULT;
@@ -1221,7 +1225,8 @@ async function cmdScan(args: string[]): Promise<void> {
 
   const minDelayMs = values.rate ? Number.parseInt(values.rate, 10) : 250;
   const authHeaders = manifestAuthHeaders(values.manifest ? loadManifest(values.manifest) : null);
-  const http = new FetchHttpClient({ allow: (url) => isInScope(url, state.scope), minDelayMs, ...(Object.keys(authHeaders).length ? { headers: authHeaders } : {}) });
+  const scanProxy = values["burp-proxy"] ?? process.env.BURP_PROXY;
+  const http = new FetchHttpClient({ allow: (url) => isInScope(url, state.scope), minDelayMs, ...(Object.keys(authHeaders).length ? { headers: authHeaders } : {}), ...(scanProxy ? { proxy: scanProxy } : {}) });
   const evidence = new EvidenceStore(join(runsDir, values.id, "artifacts"));
   console.log(`scanning ${state.screens.length} screens (scope-gated, rate ${minDelayMs}ms) ...`);
   try {
@@ -1254,6 +1259,7 @@ async function cmdLogic(args: string[]): Promise<void> {
       screen: { type: "string" },
       rate: { type: "string" },
       manifest: { type: "string" },
+      "burp-proxy": { type: "string" },
     },
   });
   if (!values.id) fail("logic requires --id <assessment-id>");
@@ -1275,7 +1281,8 @@ async function cmdLogic(args: string[]): Promise<void> {
   const minDelayMs = values.rate ? Number.parseInt(values.rate, 10) : 250;
   const llm = new ClaudeCliClient(values.model ? { defaultModel: values.model } : {});
   const authHeaders = manifestAuthHeaders(values.manifest ? loadManifest(values.manifest) : null);
-  const http = new FetchHttpClient({ allow: (url) => isInScope(url, state.scope), minDelayMs, ...(Object.keys(authHeaders).length ? { headers: authHeaders } : {}) });
+  const logicProxy = values["burp-proxy"] ?? process.env.BURP_PROXY;
+  const http = new FetchHttpClient({ allow: (url) => isInScope(url, state.scope), minDelayMs, ...(Object.keys(authHeaders).length ? { headers: authHeaders } : {}), ...(logicProxy ? { proxy: logicProxy } : {}) });
   const evidence = new EvidenceStore(join(runsDir, values.id, "artifacts"));
   const hypoOpts = values.model ? { model: values.model } : {};
   const onHypothesis = (h: { screenId: string; class: string; statement: string }, o: { status: string }): void => {
@@ -1442,7 +1449,7 @@ async function cmdShots(args: string[]): Promise<void> {
 async function cmdHeaderAudit(args: string[]): Promise<void> {
   const { values } = parseArgs({
     args,
-    options: { id: { type: "string" }, out: { type: "string" }, headers: { type: "string" }, rate: { type: "string" } },
+    options: { id: { type: "string" }, out: { type: "string" }, headers: { type: "string" }, rate: { type: "string" }, manifest: { type: "string" } },
   });
   if (!values.id) fail("header-audit requires --id <assessment-id>");
   const id = values.id;
@@ -1459,7 +1466,8 @@ async function cmdHeaderAudit(args: string[]): Promise<void> {
   const wanted = values.headers ? new Set(values.headers.split(",").map((s) => s.trim().toLowerCase())) : null;
   const rules = wanted ? SECURITY_HEADERS.filter((r) => wanted.has(r.key)) : SECURITY_HEADERS;
   const minDelay = values.rate ? Number.parseInt(values.rate, 10) : 250;
-  const http = new FetchHttpClient({ allow: (u) => isInScope(u, state.scope), minDelayMs: minDelay });
+  const haHeaders = manifestAuthHeaders(values.manifest ? loadManifest(values.manifest) : null); // auth + custom headers → measure behind-login header posture, not the login/WAF page
+  const http = new FetchHttpClient({ allow: (u) => isInScope(u, state.scope), minDelayMs: minDelay, headers: haHeaders });
   const evidence = new EvidenceStore(join(runsDir, id, "artifacts"));
   console.log(`▶ header-audit ${id}: ${state.screens.length} screens × [${rules.map((r) => r.key).join(",")}]`);
 
@@ -1597,8 +1605,10 @@ async function cmdBurpImport(args: string[]): Promise<void> {
   console.log(`\nburp-import ${id}: ${issues.length} issue(s) → +${added} net-new(dup ${skipped} / out-of-scope ${oos})`);
   // AI actively re-verifies the imported Burp High+ (same phase as the REST path). --no-burp-verify disables it.
   if (added > 0 && !values["no-burp-verify"]) {
-    const httpBasic = manifestHttpBasic(values.manifest ? loadManifest(values.manifest) : null);
-    await verifyImportedBurp(store, id, runsDir, { ...(values.model ? { model: values.model } : {}), httpBasic, triage: !values["no-burp-triage"] });
+    const bmani = values.manifest ? loadManifest(values.manifest) : null;
+    const httpBasic = manifestHttpBasic(bmani);
+    const importCustomHeaders = manifestCustomHeaders(bmani);
+    await verifyImportedBurp(store, id, runsDir, { ...(values.model ? { model: values.model } : {}), httpBasic, ...(importCustomHeaders ? { customHeaders: importCustomHeaders } : {}), triage: !values["no-burp-triage"] });
     const fs2 = store.loadAssessment(id);
     if (fs2) writeFileSync(join(runsDir, id, "report.md"), buildReport(fs2, new Date(), { loadEvidence: evidenceLoaderFor(runsDir, id) }));
   }
@@ -1750,7 +1760,7 @@ async function runBurpScanOnRun(
   id: string,
   state: AssessmentState,
   runsDir: string,
-  o: { conn: BurpRestConn; configs: string[]; configReason?: string; logins: Array<{ username: string; password: string }>; pollSec: number; maxMin: number; verify?: boolean; verifyModel?: string; httpBasic?: { user: string; pass: string } | null; onPoll?: () => Promise<void>; customConfigs?: string[] },
+  o: { conn: BurpRestConn; configs: string[]; configReason?: string; logins: Array<{ username: string; password: string }>; pollSec: number; maxMin: number; verify?: boolean; verifyModel?: string; httpBasic?: { user: string; pass: string } | null; customHeaders?: Record<string, string>; onPoll?: () => Promise<void>; customConfigs?: string[] },
 ): Promise<number> {
   const { base, apiKey, resourcePool } = o.conn;
   const usePool = resourcePool !== "";
@@ -1837,7 +1847,7 @@ async function runBurpScanOnRun(
   const { added, skipped, oos } = mergeBurpIssues(store, id, state, runsDir, last.issues, "bs");
   console.log(`\nburp-scan ${id}: ${last.issues.length} issue(s) → +${added} net-new(dup ${skipped} / out-of-scope ${oos})`);
   if (added > 0) {
-    if (o.verify !== false) await verifyImportedBurp(store, id, runsDir, { ...(o.verifyModel ? { model: o.verifyModel } : {}), httpBasic: o.httpBasic ?? null });
+    if (o.verify !== false) await verifyImportedBurp(store, id, runsDir, { ...(o.verifyModel ? { model: o.verifyModel } : {}), httpBasic: o.httpBasic ?? null, ...(o.customHeaders ? { customHeaders: o.customHeaders } : {}) });
     const fs2 = store.loadAssessment(id);
     if (fs2) writeFileSync(join(runsDir, id, "report.md"), buildReport(fs2, new Date(), { loadEvidence: evidenceLoaderFor(runsDir, id) }));
   }
@@ -1850,7 +1860,7 @@ async function verifyImportedBurp(
   store: AssessmentStore,
   id: string,
   runsDir: string,
-  o: { model?: string; httpBasic?: { user: string; pass: string } | null; cookie?: string; bearer?: string; triage?: boolean },
+  o: { model?: string; httpBasic?: { user: string; pass: string } | null; cookie?: string; bearer?: string; customHeaders?: Record<string, string>; triage?: boolean },
 ): Promise<void> {
   const st = store.loadAssessment(id);
   if (!st) return;
@@ -1860,6 +1870,7 @@ async function verifyImportedBurp(
   const artifactsDir = join(runsDir, id, "artifacts");
   // 認証下 finding(Bearer 必須の /profile など)を再現できるよう、http クライアントに session を載せる。
   const sessionHeaders: Record<string, string> = {
+    ...(o.customHeaders ?? {}), // operator custom headers (WAF-bypass / mandated) — carry them so a real finding isn't block-paged on re-verify and silently refuted
     ...(o.cookie ? { cookie: o.cookie } : {}),
     ...(o.bearer ? { authorization: `Bearer ${o.bearer}` } : basicHeader(o.httpBasic ?? null)),
   };
@@ -1968,9 +1979,9 @@ async function runBurpAuditOnRun(
   id: string,
   state: AssessmentState,
   runsDir: string,
-  o: { conn: BurpAuditConn; cookie: string; bearer: string; httpBasic?: { user: string; pass: string } | null; verify?: boolean; verifyModel?: string; pollSec: number; maxMin: number; onPoll?: () => Promise<void> },
+  o: { conn: BurpAuditConn; cookie: string; bearer: string; httpBasic?: { user: string; pass: string } | null; customHeaders?: Record<string, string>; verify?: boolean; verifyModel?: string; pollSec: number; maxMin: number; onPoll?: () => Promise<void> },
 ): Promise<number> {
-  const sessionHeaders: Record<string, string> = {};
+  const sessionHeaders: Record<string, string> = { ...(o.customHeaders ?? {}) }; // operator custom headers (WAF-bypass / mandated) carry into every Burp-audited raw request
   if (o.cookie) sessionHeaders.Cookie = o.cookie;
   if (o.bearer) sessionHeaders.Authorization = `Bearer ${o.bearer}`;
   else if (o.httpBasic) sessionHeaders.Authorization = `Basic ${Buffer.from(`${o.httpBasic.user}:${o.httpBasic.pass}`, "utf8").toString("base64")}`;
@@ -2048,6 +2059,7 @@ async function runBurpAuditOnRun(
         httpBasic: o.httpBasic ?? null,
         ...(o.cookie ? { cookie: o.cookie } : {}),
         ...(o.bearer ? { bearer: o.bearer } : {}),
+        ...(o.customHeaders ? { customHeaders: o.customHeaders } : {}),
       });
     const fs2 = store.loadAssessment(id);
     if (fs2) writeFileSync(join(runsDir, id, "report.md"), buildReport(fs2, new Date(), { loadEvidence: evidenceLoaderFor(runsDir, id) }));
@@ -2106,6 +2118,7 @@ async function cmdBurpScan(args: string[]): Promise<void> {
   const manifest = values.manifest ? loadManifest(values.manifest) : null;
   const logins = manifestRoleCreds(manifest).map((rc) => ({ username: rc.creds.username, password: rc.creds.password }));
   const httpBasic = manifestHttpBasic(manifest);
+  const scanCustomHeaders = manifestCustomHeaders(manifest);
 
   try {
     await runBurpScanOnRun(store, id, state, runsDir, {
@@ -2118,6 +2131,7 @@ async function cmdBurpScan(args: string[]): Promise<void> {
       verify: !values["no-burp-verify"],
       ...(values.model ? { verifyModel: values.model } : {}),
       httpBasic,
+      ...(scanCustomHeaders ? { customHeaders: scanCustomHeaders } : {}),
     });
   } finally {
     store.close();

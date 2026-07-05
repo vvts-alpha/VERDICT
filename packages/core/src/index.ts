@@ -44,7 +44,7 @@ export { AssessmentStore } from "./store.js";
 export type { CreateAssessmentParams } from "./store.js";
 
 // Initial-state factories
-export { newAssessmentId, defaultBudget, deriveScopeFromSingleUrl, deriveScopeFromUrls } from "./factories.js";
+export { newAssessmentId, defaultBudget, deriveScopeFromSingleUrl, deriveScopeFromUrls, DEFAULT_BROWSER_UA } from "./factories.js";
 
 // Registrable-domain (eTLD+1) computation (for scope mode="etld")
 export { registrableDomain } from "./etld.js";

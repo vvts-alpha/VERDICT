@@ -47,8 +47,8 @@ export function classifyScreenType(o: {
     (f) => f.type === "search" || /^(q|query|search|keyword|s)$/i.test(f.name),
   );
 
-  if (hasPassword || /\b(login|signin|sign-in|signup|sign-up|register|auth|sso|oauth|logon)\b/.test(url)) {
-    return "auth";
+  if (hasPassword || /\b(login|signin|sign-in|signup|sign-up|register|auth|sso|oauth|logon|forgot|reset|recover|password|passwd|otp|2fa|mfa|magic-?link|passwordless|email-verif|verify-email)\b/.test(url)) {
+    return "auth"; // incl. password-reset / account-recovery / email-verify — these are auth-critical, not generic forms
   }
   if (/\b(admin|administrator|manage|backoffice|wp-admin)\b/.test(url)) return "admin";
   if (/\b(checkout|payment|billing|cart|pay|purchase|subscribe|invoice)\b/.test(url)) return "payment";

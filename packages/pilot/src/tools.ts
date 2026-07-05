@@ -121,7 +121,7 @@ export const STAGE_TOOLS = {
   methodology: ["get_inventory", "record_methodology", "methodology_done"],
   diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_dom_xss", "probe_stored_xss", "probe_ssti", "probe_sqli", "probe_cmdi", "probe_traversal", "probe_redirect", "probe_jwt", "probe_csrf", "probe_oob", "probe_logic", "analyze_session", "verify_access", "probe_idor", "browser_navigate", "browser_fill", "browser_click", "browser_upload", "record_finding", "screen_done"],
   // scenario (A04 cross-cutting logic): overview the inventory + fire multi-step request chains via probe_scenario. Once, after per-screen diagnosis.
-  scenario: ["get_inventory", "login", "http_request", "probe_scenario", "record_finding", "scenario_done"],
+  scenario: ["get_inventory", "login", "http_request", "browser_navigate", "browser_fill", "browser_click", "probe_scenario", "record_finding", "scenario_done"],
   // fingerprint (A06 known-vulnerable components): fingerprint_scan to collect versions, evaluate known CVEs (cve_lookup opt-in) and record.
   fingerprint: ["fingerprint_scan", "cve_lookup", "http_request", "record_finding", "fingerprint_done"],
 } as const;
@@ -248,6 +248,8 @@ export const CATEGORIES = [
   "xxe",
   "rce",
   "auth-bypass",
+  "account-takeover", // password-reset / account-recovery abuse: reset poisoning, token predictability/leakage/reuse, broken reset logic, magic-link/2FA bypass
+  "user-enumeration", // valid vs invalid username → different response body/status/timing
   "session",
   "csrf",
   "info-disclosure",

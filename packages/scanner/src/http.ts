@@ -1,5 +1,7 @@
 // DESIGN §9 — policy-gated raw HTTP (for validation). The real impl is FetchHttpClient; tests use FakeHttpClient.
 
+import { DEFAULT_BROWSER_UA } from "@veritas/core";
+
 /** multipart/form-data upload spec. undici's FormData generates boundary + CRLF + Content-Type **correctly**
  *  (fixes the problem where an LLM hand-writing the raw wire drops CRLF/boundary and gets rejected by python-multipart etc.). Takes priority over body. */
 export interface MultipartSpec {
@@ -68,7 +70,7 @@ export class FetchHttpClient implements HttpClient {
   /** The headers actually sent (default user-agent + opts.headers + per-call). Used to record the "whole request" in evidence. */
   effectiveHeaders(reqHeaders?: Record<string, string>): Record<string, string> {
     return {
-      "user-agent": this.opts.userAgent ?? "verdict-scanner/0.1",
+      "user-agent": this.opts.userAgent ?? DEFAULT_BROWSER_UA,
       ...(this.opts.headers ?? {}),
       ...(reqHeaders ?? {}),
     };
@@ -90,7 +92,7 @@ export class FetchHttpClient implements HttpClient {
     try {
       const dispatcher = await this.getDispatcher();
       const reqHeaders: Record<string, string> = {
-        "user-agent": this.opts.userAgent ?? "verdict-scanner/0.1",
+        "user-agent": this.opts.userAgent ?? DEFAULT_BROWSER_UA,
         ...(this.opts.headers ?? {}),
         ...(req.headers ?? {}),
       };

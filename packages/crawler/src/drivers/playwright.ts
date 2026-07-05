@@ -7,6 +7,7 @@
 import type { BrowserContext, CDPSession, Dialog, Page } from "playwright-core";
 import type { CapturedExchange, Driver, FormObservation, Observation } from "../types.js";
 import { detectStuck } from "../auth.js";
+import { DEFAULT_BROWSER_UA } from "@veritas/core";
 
 export interface AutoLoginOptions {
   loginUrl: string;
@@ -43,6 +44,8 @@ export interface PlaywrightDriverOptions {
   /** Persistent profile that holds auth state (DESIGN §6.3 / §10) */
   userDataDir: string;
   headless?: boolean;
+  /** Browser User-Agent. Defaults to a realistic desktop Chrome UA (drops Playwright's "HeadlessChrome" tell that some WAFs / bot filters block). */
+  userAgent?: string;
   /** Explicit browser binary (unnecessary if playwright install has been run) */
   executablePath?: string;
   channel?: string;
@@ -174,6 +177,7 @@ export class PlaywrightDriver implements Driver {
     const { chromium } = await import("playwright-core");
     const context = await chromium.launchPersistentContext(options.userDataDir, {
       headless: options.headless ?? true,
+      userAgent: options.userAgent ?? DEFAULT_BROWSER_UA, // avoid the default "HeadlessChrome" UA that bot/WAF filters reject
       // Note: adding everything via extraHTTPHeaders would make custom headers turn cross-origin requests into CORS preflights
       // and break third-party CDN/analytics/other-subdomain APIs. The marker is added "same-origin only" via the routing below.
       ...(options.executablePath ? { executablePath: options.executablePath } : {}),

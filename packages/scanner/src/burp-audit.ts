@@ -3,6 +3,7 @@
 // → If VERDICT sends a raw request carrying a live Cookie/Bearer, it can actively scan while authenticated.
 
 import type { BurpIssue } from "./burp.js";
+import { DEFAULT_BROWSER_UA } from "@veritas/core";
 
 export interface BurpAuditConn {
   /** e.g. http://172.29.176.1:1338 */
@@ -136,6 +137,7 @@ export function buildRawRequest(o: {
   const lines: string[] = [`${o.method.toUpperCase()} ${o.pathWithQuery} HTTP/1.1`, `Host: ${o.hostHeader}`];
   const hdrs = { ...(o.headers ?? {}) };
   for (const [k, v] of Object.entries(hdrs)) lines.push(`${k}: ${v}`);
+  if (!Object.keys(hdrs).some((k) => k.toLowerCase() === "user-agent")) lines.push(`User-Agent: ${DEFAULT_BROWSER_UA}`); // consistent UA (matches browser + raw-http)
   const hasBody = o.body != null && o.body.length > 0;
   if (hasBody) {
     lines.push(`Content-Type: ${o.contentType ?? "application/json"}`);
