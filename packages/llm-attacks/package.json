@@ -1,0 +1,29 @@
+{
+  "name": "@veritas/llm-attacks",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "LLM / AI-assistant red-team mode: canary/OOB oracle + adaptive conversation loop (docs/llm-redteam-design.md)",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --import tsx --disable-warning=ExperimentalWarning --test 'src/**/*.test.ts'",
+    "clean": "rm -rf dist *.tsbuildinfo"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.6",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  }
+}

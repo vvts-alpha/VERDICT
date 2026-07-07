@@ -119,6 +119,18 @@ importers:
         specifier: ^5.7.3
         version: 5.9.3
 
+  packages/llm-attacks:
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.6
+        version: 22.19.20
+      tsx:
+        specifier: ^4.19.2
+        version: 4.22.4
+      typescript:
+        specifier: ^5.7.3
+        version: 5.9.3
+
   packages/pilot:
     dependencies:
       '@anthropic-ai/claude-agent-sdk':
