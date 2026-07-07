@@ -6,3 +6,6 @@ export * from "./taxonomy.js";
 export * from "./adapter.js";
 export * from "./fake.js";
 export * from "./oracle.js";
+export * from "./driver.js";
+export * from "./browser-adapter.js";
+export * from "./fake-driver.js";
