@@ -2392,12 +2392,14 @@ async function cmdRedteam(rawArgs: string[]): Promise<void> {
       ...(transcript ? { transcriptSelector: transcript } : {}),
     });
 
+    const evidence = new EvidenceStore(join(runsDir, id, "artifacts"));
     const probes = defaultInjectedContextProbes(canary).map((p) => ({ ...p, replays: maxReplays }));
     const res = await runLlmRedteam({
       store,
       assessmentId: id,
       chatUrl,
       adapter,
+      evidence,
       probes,
       onProbe: (p, v) => {
         const mark = v.status === "confirmed" ? "✓" : v.status === "suspected" ? "?" : "·";

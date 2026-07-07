@@ -127,6 +127,9 @@ importers:
       '@veritas/core':
         specifier: workspace:*
         version: link:../core
+      '@veritas/scanner':
+        specifier: workspace:*
+        version: link:../scanner
     devDependencies:
       '@types/node':
         specifier: ^22.10.6

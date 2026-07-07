@@ -22,7 +22,8 @@
     "clean": "rm -rf dist *.tsbuildinfo"
   },
   "dependencies": {
-    "@veritas/core": "workspace:*"
+    "@veritas/core": "workspace:*",
+    "@veritas/scanner": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^22.10.6",

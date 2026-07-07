@@ -1,7 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { AssessmentStore, deriveScopeFromSingleUrl, newAssessmentId } from "@veritas/core";
+import { EvidenceStore } from "@veritas/scanner";
 
 import {
   BrowserChatAdapter,
@@ -118,5 +122,33 @@ test("runLlmRedteam upgrades a suspected finding when a later same-category prob
   const res = await runLlmRedteam({ store, assessmentId: id, chatUrl: CHAT, adapter, probes });
   assert.equal(res.findings.length, 1, "one finding for the shared category");
   assert.equal(res.findings[0]?.verdict, "confirmed", "the confirmed probe upgraded the suspected one");
+  store.close();
+});
+
+test("runLlmRedteam records chat turns as CHAT evidence and cites them on the finding", async () => {
+  const { store, id } = setup();
+  const canary = generateCanary();
+  const dir = mkdtempSync(join(tmpdir(), "llm-ev-"));
+  try {
+    const evidence = new EvidenceStore(dir);
+    const driver = new FakeChatDriver({
+      responder: (p) => (/system|config|instructions|confidential|reveal/i.test(p) ? `leak ${canary}` : "hi"),
+    });
+    const adapter = new BrowserChatAdapter(driver, FAST);
+    const res = await runLlmRedteam({
+      store,
+      assessmentId: id,
+      chatUrl: CHAT,
+      adapter,
+      evidence,
+      probes: defaultInjectedContextProbes(canary),
+    });
+    assert.ok(res.findings.length >= 1);
+    assert.ok((res.findings[0]?.evidenceIds.length ?? 0) >= 3, "control + >=2 positive replays recorded + cited");
+    assert.ok(evidence.records.some((r) => r.kind === "negative_control"));
+    assert.ok(evidence.records.filter((r) => r.kind === "positive_replay").length >= 2);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
   store.close();
 });
