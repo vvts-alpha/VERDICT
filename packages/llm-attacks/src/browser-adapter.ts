@@ -45,6 +45,8 @@ export interface BrowserChatAdapterOptions {
   sendSelectors?: string[];
   newChatSelectors?: string[];
   fileInputSelector?: string;
+  /** Pins the transcript/reply container for settle + delta (override when the driver's default misfires). */
+  transcriptSelector?: string;
   /** Settle polling. */
   pollMs?: number;
   maxPolls?: number;
@@ -66,6 +68,7 @@ export class BrowserChatAdapter implements AttachingChatAdapter {
   private readonly sendSelectors: string[];
   private readonly newChatSelectors: string[];
   private readonly fileInputSelector: string;
+  private readonly transcriptSelector?: string;
   private readonly pollMs: number;
   private readonly maxPolls: number;
   private readonly stableChecks: number;
@@ -80,6 +83,7 @@ export class BrowserChatAdapter implements AttachingChatAdapter {
     this.sendSelectors = opts.sendSelectors ?? DEFAULT_SEND;
     this.newChatSelectors = opts.newChatSelectors ?? DEFAULT_NEWCHAT;
     this.fileInputSelector = opts.fileInputSelector ?? "input[type='file']";
+    this.transcriptSelector = opts.transcriptSelector;
     this.pollMs = opts.pollMs ?? 250;
     this.maxPolls = opts.maxPolls ?? 40;
     this.stableChecks = opts.stableChecks ?? 3;
@@ -100,7 +104,7 @@ export class BrowserChatAdapter implements AttachingChatAdapter {
   }
 
   async send(prompt: string): Promise<ChatReply> {
-    const before = await this.driver.transcriptText();
+    const before = await this.driver.transcriptText(this.transcriptSelector);
     this.driver.drainApiCalls(); // clear the buffer so we capture only this turn's calls
     const composer = await this.fillComposer(prompt);
     if (!composer) {
@@ -136,7 +140,7 @@ export class BrowserChatAdapter implements AttachingChatAdapter {
     let current = before;
     for (let i = 0; i < this.maxPolls; i++) {
       await this.sleep(this.pollMs);
-      current = await this.driver.transcriptText();
+      current = await this.driver.transcriptText(this.transcriptSelector);
       if (current !== before && current === prev) {
         if (++stable >= this.stableChecks) return current;
       } else {

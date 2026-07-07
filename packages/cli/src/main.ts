@@ -41,6 +41,7 @@ import type { BurpIssue } from "@veritas/scanner";
 import { assessLogicInventory, assessScreenLogic, authDiffScreen } from "@veritas/agent";
 import type { RoleContext } from "@veritas/agent";
 import { runPilot, verifyBurpFindings, triageAndDeepDiveBurp } from "@veritas/pilot";
+import { BrowserChatAdapter, runLlmRedteam, defaultInjectedContextProbes, generateCanary } from "@veritas/llm-attacks";
 import { startServer } from "@veritas/server";
 import { loadDotEnv } from "./dotenv.js";
 
@@ -101,6 +102,8 @@ commands:
             Phase2 business logic: hypothesis generation (LLM) → verify IDOR etc. with evidence discipline. --manifest injects auth headers for a spec-seeded API run.
   spec-import --spec <openapi.json> --url <base> [--id <existing>] [--manifest <m.json>] [--out <dir>]
             ingest an OpenAPI 3.x / Swagger 2.0 spec (JSON) → seed the screen inventory so the browser-free scan/logic can assess a pure-API target. --url = where the API lives (base). with --id, overlay the spec on an existing crawl (fills endpoints the UI never called). token-protected APIs: put Authorization: Bearer … in the manifest's http.headers.
+  redteam --url <chat-ui-url> | --manifest <file.json>  --canary <token> [--headed] [--max-replays <n>] [--composer <sel>] [--send <sel>] [--new-chat <sel>] [--file-input <sel>] [--transcript <sel>] [--browser-path <bin>] [--no-sandbox] [--out <dir>]
+            (alias: assistant) LLM/AI-assistant red-team: drive a deployed chatbot and confirm canary leaks. the canary is planted out-of-band by the operator in the system prompt / custom instructions and passed via --canary or manifest assistant.canary
   serve   [--port <n>] [--host <h>] [--out <dir>] [--web-root <dir>] [--no-web] [--password <pw>] [--viewer-password <pw>] [--no-auth] [--no-launch]
             start the observability WebUI + state API/WS (default 127.0.0.1:4317. expose to LAN with --host 0.0.0.0)
             two roles gate the WebUI/API/WS (/login + signed cookie): operator = env VERDICT_WEB_PASSWORD / --password (full: New/Resume/Stop/mutate);
@@ -520,7 +523,7 @@ async function cmdLabel(args: string[]): Promise<void> {
     fail("no screens to label — run `crawl` first");
   }
 
-  const model = values.model ?? "claude-sonnet-4-6";
+  const model = values.model ?? "claude-sonnet-5";
   const client = new ClaudeCliClient({ defaultModel: model });
   console.log(`labeling ${state.screens.length} screens with ${model} ...`);
   try {
@@ -563,6 +566,19 @@ interface AssessManifest {
   /** Operator focus hint (free text). Injected as the top-priority objective of the scenario stage (same as --focus). */
   focus?: string;
   model?: string;
+  /** Redteam / assistant-mode config (the redteam command). The canary must be planted out-of-band by the
+   *  operator (system prompt / custom instructions); the file-upload seedMode that plants it lands in a later slice. */
+  assistant?: {
+    chatUrl?: string;
+    composerSelector?: string;
+    sendSelector?: string;
+    newChatSelector?: string;
+    fileInputSelector?: string;
+    /** Pins the transcript/reply container when the driver's default selector list misfires. */
+    transcriptSelector?: string;
+    canary?: string;
+    seededIn?: "system-prompt" | "custom-instructions" | "rag" | "profile";
+  };
   /** Auth (DESIGN §6.3). Credentials alone suffice — the agent auto-discovers the login URL/fields.
    *  Not written to state.sqlite. The manifest is gitignored. */
   auth?: {
@@ -703,7 +719,7 @@ async function cmdAssess(args: string[]): Promise<void> {
   const scope: ScopePolicy = { ...deriveScopeFromUrls(seeds, manifest?.scopeMode ?? "same-origin"), ...(manifest?.scope ?? {}) };
   const followLinks = manifest?.crawl?.followLinks ?? true;
   const maxDepth = manifest?.crawl?.maxDepth ?? (values["max-depth"] ? Number.parseInt(values["max-depth"], 10) : 3);
-  const model = values.model ?? manifest?.model ?? "claude-sonnet-4-6";
+  const model = values.model ?? manifest?.model ?? "claude-sonnet-5";
   const rate = values.rate ? Number.parseInt(values.rate, 10) : 250;
 
   const id = values.id ?? newAssessmentId(); // server-spawned runs supply --id; otherwise generate
@@ -1124,7 +1140,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       ...(values["max-survey-screens"] ? { maxSurveyScreens: Number.parseInt(values["max-survey-screens"], 10) } : {}),
       ...(roleCookieFiles.size ? { roleCookieFiles } : {}),
       ...(roleDescriptions.size ? { roleDescriptions } : {}),
-      fastModel: values["fast-model"] ?? "claude-sonnet-4-6", // fast model default = Sonnet (survey/methodology/low-value screens -> model tiering ON by default)
+      fastModel: values["fast-model"] ?? "claude-sonnet-5", // fast model default = Sonnet (survey/methodology/low-value screens -> model tiering ON by default)
       ...(values["no-scenario"] ? { scenarioPass: false } : {}), // ON by default. Set to drop the A04 scenario
       ...(values["no-default-scenarios"] ? { defaultScenarios: false } : {}), // ON by default. Set to drop only the built-in scenarios
       ...(values["no-fingerprint"] ? { fingerprintPass: false } : {}), // ON by default. Set to drop A06 fingerprinting
@@ -2227,7 +2243,7 @@ async function cmdManifest(args: string[]): Promise<void> {
     const followLinks = await askBool("follow links?", true);
     const maxDepth = await askInt("max depth", 10);
 
-    const model = await ask("\nModel", "claude-sonnet-4-6");
+    const model = await ask("\nModel", "claude-sonnet-5");
 
     console.log("\n--- auth roles (empty name + Enter to finish) ---");
     console.log("  either credentials or a pre-captured cookie file. [0]=primary login, multiple = auth-diff.");
@@ -2285,6 +2301,127 @@ async function cmdManifest(args: string[]): Promise<void> {
   }
 }
 
+// LLM / AI-assistant red-team: drive a deployed chatbot's chat UI and confirm canary leaks (@veritas/llm-attacks).
+async function cmdRedteam(rawArgs: string[]): Promise<void> {
+  const { values } = parseArgs({
+    args: rawArgs,
+    options: {
+      manifest: { type: "string" },
+      url: { type: "string" },
+      id: { type: "string" },
+      out: { type: "string" },
+      canary: { type: "string" },
+      "max-replays": { type: "string" },
+      "browser-path": { type: "string" },
+      "no-sandbox": { type: "boolean" },
+      headed: { type: "boolean" },
+      headless: { type: "boolean" },
+      composer: { type: "string" },
+      send: { type: "string" },
+      "new-chat": { type: "string" },
+      "file-input": { type: "string" },
+      transcript: { type: "string" },
+    },
+  });
+
+  const runsDir = values.out ?? RUNS_DIR_DEFAULT;
+  const manifest = values.manifest ? loadManifest(values.manifest) : null;
+  const assistant = manifest?.assistant;
+  const chatUrl = assistant?.chatUrl ?? manifest?.target ?? values.url ?? "";
+  if (!chatUrl) fail("redteam requires --url <chat-ui-url> or --manifest <file.json> (assistant.chatUrl / target)");
+
+  const canary = values.canary ?? assistant?.canary;
+  if (!canary) {
+    fail(
+      "redteam needs a canary planted out-of-band in the assistant's protected context (system prompt / custom " +
+        "instructions), supplied via --canary <token> or manifest assistant.canary. Generate one: " +
+        generateCanary() +
+        "  (the file-upload seedMode that plants the canary for you lands in a later slice.)",
+    );
+  }
+
+  const scope = { ...deriveScopeFromUrls([chatUrl], manifest?.scopeMode ?? "same-origin"), ...(manifest?.scope ?? {}) };
+  if (!isInScope(chatUrl, scope)) {
+    fail(
+      `redteam: chat URL ${chatUrl} is out of scope — check manifest.scope / scopeMode. The scope gate applies to ` +
+        "the assistant's chat URL too; a seat is not authorization to red-team a vendor's product.",
+    );
+  }
+  if (values["max-replays"] !== undefined) {
+    const n = Number(values["max-replays"]);
+    if (!Number.isInteger(n) || n < 1) fail(`--max-replays must be a positive integer (got ${values["max-replays"]})`);
+  }
+  const id = values.id ?? newAssessmentId();
+  mkdirSync(join(runsDir, id), { recursive: true });
+  const store = AssessmentStore.open(dbPathFor(runsDir, id));
+  store.createAssessment({
+    id,
+    target: { kind: "single_url", url: chatUrl, followLinks: false, maxDepth: 0 },
+    scope,
+  });
+
+  const browserPath = values["browser-path"] ?? (process.env.VERDICT_BROWSER_PATH ?? process.env.VERITAS_BROWSER_PATH);
+  const headed = !values.headless && !!values.headed;
+  const maxReplays = values["max-replays"] ? Number.parseInt(values["max-replays"], 10) : 2;
+  const httpBasic = manifestHttpBasic(manifest);
+  const customHeaders = manifestCustomHeaders(manifest);
+
+  const driver = await PlaywrightDriver.launch({
+    userDataDir: join(runsDir, id, "browser-profile"),
+    headless: !headed,
+    ...(browserPath ? { executablePath: browserPath } : {}),
+    ...(values["no-sandbox"] ? { args: ["--no-sandbox"] } : {}),
+    ...(httpBasic ? { httpCredentials: { username: httpBasic.user, password: httpBasic.pass } } : {}),
+    ...(customHeaders ? { extraHeaders: customHeaders } : {}),
+  });
+
+  console.log(`▶ redteam ${id}  (assistant @ ${chatUrl})`);
+  try {
+    await driver.visit(chatUrl);
+    const composer = values.composer ?? assistant?.composerSelector;
+    const send = values.send ?? assistant?.sendSelector;
+    const newChat = values["new-chat"] ?? assistant?.newChatSelector;
+    const fileInput = values["file-input"] ?? assistant?.fileInputSelector;
+    const transcript = values.transcript ?? assistant?.transcriptSelector;
+    const adapter = new BrowserChatAdapter(driver, {
+      chatUrl,
+      ...(composer ? { composerSelectors: [composer] } : {}),
+      ...(send ? { sendSelectors: [send] } : {}),
+      ...(newChat ? { newChatSelectors: [newChat] } : {}),
+      ...(fileInput ? { fileInputSelector: fileInput } : {}),
+      ...(transcript ? { transcriptSelector: transcript } : {}),
+    });
+
+    const probes = defaultInjectedContextProbes(canary).map((p) => ({ ...p, replays: maxReplays }));
+    const res = await runLlmRedteam({
+      store,
+      assessmentId: id,
+      chatUrl,
+      adapter,
+      probes,
+      onProbe: (p, v) => {
+        const mark = v.status === "confirmed" ? "✓" : v.status === "suspected" ? "?" : "·";
+        console.log(`  ${mark} ${p.id} [${p.category}] → ${v.status}`);
+      },
+    });
+
+    const finalState = store.loadAssessment(id);
+    if (finalState) {
+      writeFileSync(
+        join(runsDir, id, "report.md"),
+        buildReport(finalState, new Date(), { loadEvidence: evidenceLoaderFor(runsDir, id) }),
+      );
+    }
+    console.log(`\n=== ${res.findings.length} finding(s) across ${res.verdicts.length} probes ===`);
+    for (const f of res.findings) console.log(`  - [${f.severity}] ${f.title}`);
+    console.log(`\nreport → ${join(runsDir, id, "report.md")}`);
+    console.log(`observe: if serve is running, http://127.0.0.1:4317/?id=${id}`);
+  } finally {
+    await driver.close();
+    store.close();
+  }
+}
+
 async function main(): Promise<void> {
   // cwd の .env を自動ロード(shell の export が優先・未設定キーだけ反映)。BURP_* / VERITAS_BROWSER_PATH 等。
   const loadedEnv = loadDotEnv();
@@ -2300,6 +2437,10 @@ async function main(): Promise<void> {
       return;
     case "pilot":
       await cmdPilot(rest);
+      return;
+    case "redteam":
+    case "assistant":
+      await cmdRedteam(rest);
       return;
     case "run":
       cmdRun(rest);

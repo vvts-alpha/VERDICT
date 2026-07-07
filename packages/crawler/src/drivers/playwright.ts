@@ -534,6 +534,55 @@ export class PlaywrightDriver implements Driver {
     return { ok: true, note: `uploaded ${filename} via ${selector}${submitted ? " + submitted" : " (no submit button clicked — pass submitSelector if needed)"}` };
   }
 
+  /** Stage a file into an <input type=file> via setInputFiles WITHOUT submitting (chat file-upload seedMode). */
+  async stageFile(
+    selector: string,
+    filename: string,
+    base64: string,
+    contentType?: string,
+  ): Promise<{ ok: boolean; note: string }> {
+    try {
+      await this.page.setInputFiles(selector, {
+        name: filename,
+        mimeType: contentType || "application/octet-stream",
+        buffer: Buffer.from(base64, "base64"),
+      });
+    } catch (e) {
+      return { ok: false, note: `setInputFiles failed on ${selector}: ${String(e).slice(0, 120)}` };
+    }
+    await this.page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
+    await this.waitForDomStable();
+    return { ok: true, note: `staged ${filename} via ${selector}` };
+  }
+
+  /** UNCAPPED innerText of the chat transcript / reply container (bypasses snapshot()'s 4000-char cap).
+   *  With no selector it walks a priority list of common chat-log containers, falling back to full body text. */
+  async transcriptText(selector?: string): Promise<string> {
+    await this.waitForDomStable().catch(() => {});
+    const sels = selector
+      ? [selector]
+      : [
+          '[role="log"]',
+          '[data-testid*="transcript" i], [data-testid*="messages" i], [data-testid*="conversation" i]',
+          "main",
+          '[class*="transcript" i], [class*="messages" i], [class*="conversation" i], [class*="chat-log" i], [class*="chat" i]',
+          "[aria-live]",
+        ];
+    return this.page
+      .evaluate((list: string[]) => {
+        const g = globalThis as any;
+        const doc = g.document;
+        if (!doc) return "";
+        for (const sel of list) {
+          const el = doc.querySelector(sel);
+          if (el && el.innerText && String(el.innerText).trim().length > 0) return String(el.innerText);
+        }
+        const b = doc.body;
+        return b && b.innerText ? String(b.innerText) : "";
+      }, sels)
+      .catch(() => "");
+  }
+
   async pressEnter(selector: string): Promise<void> {
     await this.page.press(selector, "Enter").catch(() => {});
     await new Promise<void>((resolve) => setTimeout(resolve, this.opts.settleMs));

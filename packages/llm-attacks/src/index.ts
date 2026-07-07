@@ -9,3 +9,5 @@ export * from "./oracle.js";
 export * from "./driver.js";
 export * from "./browser-adapter.js";
 export * from "./fake-driver.js";
+export * from "./redteam.js";
+export * from "./corpus.js";

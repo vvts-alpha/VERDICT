@@ -23,6 +23,7 @@
     "@veritas/core": "workspace:*",
     "@veritas/crawler": "workspace:*",
     "@veritas/llm": "workspace:*",
+    "@veritas/llm-attacks": "workspace:*",
     "@veritas/pilot": "workspace:*",
     "@veritas/scanner": "workspace:*",
     "@veritas/server": "workspace:*",

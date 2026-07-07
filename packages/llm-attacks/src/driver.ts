@@ -25,8 +25,9 @@ export interface ChatDriver {
   clickFirst(selectors: string[]): Promise<boolean>;
   /** Press Enter on the element matched by `selector`. */
   pressEnter(selector: string): Promise<void>;
-  /** UNCAPPED text of the conversation transcript / assistant-reply container (NOT whole-page visibleText). */
-  transcriptText(): Promise<string>;
+  /** UNCAPPED text of the conversation transcript / assistant-reply container (NOT whole-page visibleText).
+   *  An optional selector pins the container (operator override) when the default priority list misfires. */
+  transcriptText(selector?: string): Promise<string>;
   /** Take + clear the intercepted API-call buffer since the last drain. */
   drainApiCalls(): ApiCall[];
   /** Stage a file into a file input WITHOUT submitting (setInputFiles only — the composer submits later). */

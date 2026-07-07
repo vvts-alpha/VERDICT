@@ -47,6 +47,9 @@ importers:
       '@veritas/llm':
         specifier: workspace:*
         version: link:../llm
+      '@veritas/llm-attacks':
+        specifier: workspace:*
+        version: link:../llm-attacks
       '@veritas/pilot':
         specifier: workspace:*
         version: link:../pilot
@@ -120,6 +123,10 @@ importers:
         version: 5.9.3
 
   packages/llm-attacks:
+    dependencies:
+      '@veritas/core':
+        specifier: workspace:*
+        version: link:../core
     devDependencies:
       '@types/node':
         specifier: ^22.10.6
