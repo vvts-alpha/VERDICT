@@ -18,7 +18,7 @@ export interface RunLauncherConfig {
 }
 
 export interface StartRunInput {
-  command: "pilot" | "assess";
+  command: "pilot" | "assess" | "redteam";
   /** JSON in AssessManifest format (saved verbatim to runs/<id>/manifest.json). */
   manifest: unknown;
   options?: {
@@ -42,6 +42,8 @@ export interface StartRunInput {
     burpScan?: boolean;
     /** pilot only: route all traffic through the Burp proxy (connection via env BURP_PROXY). */
     burpProxy?: boolean;
+    /** redteam only: positive replays required to confirm a canary leak (default 2). */
+    maxReplays?: number;
   };
 }
 
@@ -80,20 +82,26 @@ export class Supervisor {
 
     const args = [this.cfg.cliPath, input.command, "--manifest", manifestPath, "--id", id, "--out", this.cfg.runsDir];
     const o = input.options ?? {};
-    if (o.model) args.push("--model", o.model);
-    if (o.fastModel) args.push("--fast-model", o.fastModel);
-    if (o.rate != null) args.push("--rate", String(o.rate));
-    if (o.maxTurns != null) args.push("--max-turns", String(o.maxTurns));
-    if (o.headed) args.push("--headed");
-    if (o.surveyOnly) args.push("--survey-only");
-    if (o.exhaustive) args.push("--exhaustive");
-    if (o.attended) args.push("--attended");
-    if (o.loginUrl) args.push("--login-url", o.loginUrl);
-    if (o.maxScreens != null) args.push("--max-screens", String(o.maxScreens));
-    if (o.maxSurveyScreens != null) args.push("--max-survey-screens", String(o.maxSurveyScreens));
-    if (o.focus) args.push("--focus", o.focus);
-    if (input.command === "pilot" && o.burpScan) args.push("--burp-scan");
-    if (input.command === "pilot" && o.burpProxy) args.push("--burp-proxy");
+    if (o.headed) args.push("--headed"); // shared: pilot / assess / redteam all accept --headed
+    if (input.command === "redteam") {
+      // redteam has a strict, small flag set — do NOT pass pilot/assess-only flags (its parseArgs would reject them).
+      // canary + selectors travel in the manifest's `assistant` block, read by cmdRedteam.
+      if (o.maxReplays != null) args.push("--max-replays", String(o.maxReplays));
+    } else {
+      if (o.model) args.push("--model", o.model);
+      if (o.fastModel) args.push("--fast-model", o.fastModel);
+      if (o.rate != null) args.push("--rate", String(o.rate));
+      if (o.maxTurns != null) args.push("--max-turns", String(o.maxTurns));
+      if (o.surveyOnly) args.push("--survey-only");
+      if (o.exhaustive) args.push("--exhaustive");
+      if (o.attended) args.push("--attended");
+      if (o.loginUrl) args.push("--login-url", o.loginUrl);
+      if (o.maxScreens != null) args.push("--max-screens", String(o.maxScreens));
+      if (o.maxSurveyScreens != null) args.push("--max-survey-screens", String(o.maxSurveyScreens));
+      if (o.focus) args.push("--focus", o.focus);
+      if (input.command === "pilot" && o.burpScan) args.push("--burp-scan");
+      if (input.command === "pilot" && o.burpProxy) args.push("--burp-proxy");
+    }
     // attended×LiveHands: the child reverse-connects to serve and screencasts role sessions (token auth).
     if (input.command === "pilot" && o.attended && this.relay && this.controlBase) {
       const token = randomBytes(16).toString("hex");

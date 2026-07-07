@@ -155,8 +155,8 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
       } catch {
         return sendJson(res, 400, { error: "invalid JSON body" });
       }
-      if (input.command !== "pilot" && input.command !== "assess") {
-        return sendJson(res, 400, { error: "command must be 'pilot' or 'assess'" });
+      if (input.command !== "pilot" && input.command !== "assess" && input.command !== "redteam") {
+        return sendJson(res, 400, { error: "command must be 'pilot', 'assess', or 'redteam'" });
       }
       const manifestTarget = (input.manifest as { target?: unknown } | null)?.target;
       if (!input.manifest || typeof input.manifest !== "object" || !manifestTarget) {
@@ -581,7 +581,7 @@ async function serveChat(res: ServerResponse, runsDir: string, id: string, messa
   }
   const transcript = messages.map((m) => `${m.role === "assistant" ? "Assistant" : "User"}: ${m.content}`).join("\n\n");
   try {
-    const llm = new ClaudeCliClient({ defaultModel: "claude-sonnet-4-6" });
+    const llm = new ClaudeCliClient({ defaultModel: "claude-sonnet-5" });
     const r = await llm.complete({
       system: `${CHAT_SYSTEM}\n\n# Assessment data\n${buildChatContext(state)}`,
       prompt: `${transcript}\n\nAssistant:`,

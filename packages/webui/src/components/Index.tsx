@@ -2,7 +2,7 @@
 // "+ New" launches a run; each row has Stop/Resume (the control plane where the server spawns the CLI).
 import { useEffect, useState, type MouseEvent } from "react";
 import type { TargetInput } from "@veritas/core";
-import { NewAssessment } from "./NewAssessment";
+import { NewLauncher } from "./NewLauncher";
 import { useRole } from "../api";
 
 interface Row {
@@ -77,7 +77,7 @@ export function Index() {
   if (creating) {
     return (
       <div className="idx">
-        <NewAssessment onCancel={() => setCreating(false)} />
+        <NewLauncher onCancel={() => setCreating(false)} />
       </div>
     );
   }
