@@ -18,8 +18,10 @@ export interface ChatReply {
  * §Two make-or-break risks: conversation isolation.
  */
 export interface ChatAdapter {
-  /** Reset to a fresh, isolated conversation (memory-off). Called before the control and before each replay. */
-  newConversation(): Promise<void>;
+  /** Reset to a fresh, isolated conversation (memory-off). Called before the control and before each replay.
+   *  Returns false when isolation could NOT be achieved (e.g. an attended widget with no reset control that
+   *  we won't reload); the oracle then caps the verdict at 'suspected' since the turns aren't independent. */
+  newConversation(): Promise<boolean>;
   /** Send one user turn; resolves once the reply has settled. */
   send(prompt: string): Promise<ChatReply>;
 }

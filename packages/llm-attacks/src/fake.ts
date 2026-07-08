@@ -17,9 +17,10 @@ export class FakeChatAdapter implements ChatAdapter {
 
   constructor(private readonly responder: FakeResponder) {}
 
-  async newConversation(): Promise<void> {
+  async newConversation(): Promise<boolean> {
     this.conversation += 1;
     this.turn = 0;
+    return true;
   }
 
   async send(prompt: string): Promise<ChatReply> {

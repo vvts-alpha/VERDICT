@@ -116,22 +116,21 @@ export class BrowserChatAdapter implements AttachingChatAdapter {
     return hit.frame;
   }
 
-  async newConversation(): Promise<void> {
+  async newConversation(): Promise<boolean> {
     if (this.newChatSelectors.length > 0 && (await this.driver.clickFrame(this.frameSelector, this.newChatSelectors))) {
-      return;
+      return true; // reset via the widget's own new-chat control (isolated, no reload)
     }
     if (this.chatUrl && !this.noReload) {
       await this.driver.visit(this.chatUrl);
-      return;
+      return true; // reset via page reload
     }
-    // Fail loud rather than reload a manually-opened widget (destroys it) or share one conversation (breaks
-    // the oracle's per-replay isolation — a canary lingering in history would fake stable positives).
+    if (this.noReload) {
+      // Attended widget with no reset control: reloading would destroy the manually-opened widget, so degrade
+      // to a single continuous conversation. The oracle caps such results at 'suspected' (turns aren't independent).
+      return false;
+    }
     throw new Error(
-      "chat-adapter: cannot start a fresh conversation — no new-chat control matched" +
-        (this.noReload
-          ? " and page reload is disabled (attended widget). Provide a new-chat selector."
-          : " and no chatUrl configured") +
-        "; conversation isolation cannot be guaranteed.",
+      "chat-adapter: cannot start a fresh conversation — no new-chat control matched and no chatUrl configured; conversation isolation cannot be guaranteed.",
     );
   }
 

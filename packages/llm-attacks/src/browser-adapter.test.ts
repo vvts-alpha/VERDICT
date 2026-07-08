@@ -154,9 +154,19 @@ test("calibrate returns null when the marker was not found", async () => {
   assert.equal(await adapter.calibrate("VERDICT-CAL-nope"), null);
 });
 
-test("noReload: newConversation throws instead of reloading a manually-opened widget", async () => {
+test("noReload: newConversation degrades (returns false, no reload, no throw) with no reset control", async () => {
   const driver = new FakeChatDriver({ responder: () => "x" }); // no new-chat control
   const adapter = new BrowserChatAdapter(driver, { ...FAST, noReload: true }); // chatUrl set but reloads disabled
-  await assert.rejects(() => adapter.newConversation(), /reload is disabled/);
+  const isolated = await adapter.newConversation();
+  assert.equal(isolated, false, "could not isolate → degraded (single conversation)");
   assert.equal(driver.visits.length, 0, "did not reload the page");
+});
+
+test("degraded isolation (noReload, no reset control) caps a canary leak at suspected", async () => {
+  const canary = generateCanary();
+  const driver = new FakeChatDriver({ responder: (p) => (p === ATTACK ? `leak ${canary}` : "hi") });
+  const adapter = new BrowserChatAdapter(driver, { ...FAST, noReload: true }); // no new-chat → can't isolate
+  const v = await confirmCanaryLeak(adapter, { canary, controlPrompt: CONTROL, attackPrompt: ATTACK });
+  assert.equal(v.status, "suspected", "correlated turns (no isolation) → lead, not confirmed");
+  assert.match(v.reason, /isolation/);
 });
