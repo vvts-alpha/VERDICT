@@ -1,5 +1,6 @@
 // @veritas/pilot — Claude-led autonomous assessment (the Agent SDK tool-use loop).
 export { runPilot } from "./run.js";
+export { LiveControl } from "./live-control.js";
 export type { RunPilotOptions, PilotResult } from "./run.js";
 export { buildTools, STAGE_TOOLS } from "./tools.js";
 export type { PilotSession } from "./tools.js";

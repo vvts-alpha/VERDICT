@@ -5,7 +5,8 @@ import { useState } from "react";
 export function RedteamForm({ onCancel }: { onCancel: () => void }) {
   const [chatUrl, setChatUrl] = useState("");
   const [canary, setCanary] = useState("");
-  const [headed, setHeaded] = useState(true); // headed by default: the operator may need to log in / watch the chat
+  const [attended, setAttended] = useState(false); // open the chat in the WebUI Sessions tab (manual login / watch)
+  const [headed, setHeaded] = useState(false);
   const [maxReplays, setMaxReplays] = useState("");
   const [composer, setComposer] = useState("");
   const [send, setSend] = useState("");
@@ -51,7 +52,8 @@ export function RedteamForm({ onCancel }: { onCancel: () => void }) {
 
     const manifest: Record<string, unknown> = { target: chatUrl.trim(), assistant };
     const options: Record<string, unknown> = {};
-    if (headed) options.headed = true;
+    if (attended) options.attended = true; // screencast into the Sessions tab (manual login gate before probes)
+    else if (headed) options.headed = true;
     if (maxReplays.trim()) options.maxReplays = Number.parseInt(maxReplays, 10);
 
     try {
@@ -98,8 +100,11 @@ export function RedteamForm({ onCancel }: { onCancel: () => void }) {
       </label>
 
       <div className="nf-checks">
-        <label>
-          <input type="checkbox" checked={headed} onChange={(e) => setHeaded(e.target.checked)} /> headed (watch the chat / log in manually)
+        <label title="screencast the chat into the Sessions tab: log into the chatbot manually, then click Done to start the probes">
+          <input type="checkbox" checked={attended} onChange={(e) => setAttended(e.target.checked)} /> open in browser (log in / watch in the Sessions tab)
+        </label>
+        <label title="open a real browser window on the runner — only useful when running locally with a display">
+          <input type="checkbox" checked={headed} onChange={(e) => setHeaded(e.target.checked)} /> headed window
         </label>
         <label className="nf-field nf-inline">
           <span>max replays</span>

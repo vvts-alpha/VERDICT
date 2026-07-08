@@ -40,7 +40,7 @@ import type { BurpAuditConn } from "@veritas/scanner";
 import type { BurpIssue } from "@veritas/scanner";
 import { assessLogicInventory, assessScreenLogic, authDiffScreen } from "@veritas/agent";
 import type { RoleContext } from "@veritas/agent";
-import { runPilot, verifyBurpFindings, triageAndDeepDiveBurp } from "@veritas/pilot";
+import { runPilot, verifyBurpFindings, triageAndDeepDiveBurp, LiveControl } from "@veritas/pilot";
 import { BrowserChatAdapter, runLlmRedteam, defaultInjectedContextProbes, generateCanary } from "@veritas/llm-attacks";
 import { startServer } from "@veritas/server";
 import { loadDotEnv } from "./dotenv.js";
@@ -2321,6 +2321,7 @@ async function cmdRedteam(rawArgs: string[]): Promise<void> {
       "new-chat": { type: "string" },
       "file-input": { type: "string" },
       transcript: { type: "string" },
+      "control-url": { type: "string" },
     },
   });
 
@@ -2363,12 +2364,13 @@ async function cmdRedteam(rawArgs: string[]): Promise<void> {
   const browserPath = values["browser-path"] ?? (process.env.VERDICT_BROWSER_PATH ?? process.env.VERITAS_BROWSER_PATH);
   const headed = !values.headless && !!values.headed;
   const maxReplays = values["max-replays"] ? Number.parseInt(values["max-replays"], 10) : 2;
+  const controlUrl = values["control-url"]; // attended: screencast the chat into the WebUI Sessions tab for manual login
   const httpBasic = manifestHttpBasic(manifest);
   const customHeaders = manifestCustomHeaders(manifest);
 
   const driver = await PlaywrightDriver.launch({
     userDataDir: join(runsDir, id, "browser-profile"),
-    headless: !headed,
+    headless: controlUrl ? true : !headed, // web-attended screencasts headless into the WebUI; else --headed opens a window
     ...(browserPath ? { executablePath: browserPath } : {}),
     ...(values["no-sandbox"] ? { args: ["--no-sandbox"] } : {}),
     ...(httpBasic ? { httpCredentials: { username: httpBasic.user, password: httpBasic.pass } } : {}),
@@ -2376,8 +2378,18 @@ async function cmdRedteam(rawArgs: string[]): Promise<void> {
   });
 
   console.log(`▶ redteam ${id}  (assistant @ ${chatUrl})`);
+  let live: LiveControl | undefined;
   try {
     await driver.visit(chatUrl);
+    if (controlUrl) {
+      // Attended: screencast the chat page into the WebUI Sessions tab so the operator logs in / interacts,
+      // then clicks Done to release the gate. Blocking BEFORE the probes avoids the operator and the adapter
+      // typing on the same page at once (the screencast stays read-only once the automated probes run).
+      live = new LiveControl(controlUrl, (m) => console.log(m));
+      await live.register("chat", driver);
+      console.log("  ⏸ open the Sessions tab in the WebUI, log into the chat, then click Done to start the probes.");
+      await live.waitForDone("chat");
+    }
     const composer = values.composer ?? assistant?.composerSelector;
     const send = values.send ?? assistant?.sendSelector;
     const newChat = values["new-chat"] ?? assistant?.newChatSelector;
@@ -2419,6 +2431,7 @@ async function cmdRedteam(rawArgs: string[]): Promise<void> {
     console.log(`\nreport → ${join(runsDir, id, "report.md")}`);
     console.log(`observe: if serve is running, http://127.0.0.1:4317/?id=${id}`);
   } finally {
+    live?.close();
     await driver.close();
     store.close();
   }

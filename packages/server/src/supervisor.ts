@@ -103,7 +103,7 @@ export class Supervisor {
       if (input.command === "pilot" && o.burpProxy) args.push("--burp-proxy");
     }
     // attended×LiveHands: the child reverse-connects to serve and screencasts role sessions (token auth).
-    if (input.command === "pilot" && o.attended && this.relay && this.controlBase) {
+    if ((input.command === "pilot" || input.command === "redteam") && o.attended && this.relay && this.controlBase) {
       const token = randomBytes(16).toString("hex");
       this.relay.issueToken(id, token);
       args.push("--control-url", `${this.controlBase}/ws/agent?id=${id}&token=${token}`);
