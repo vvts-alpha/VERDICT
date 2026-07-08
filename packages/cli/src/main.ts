@@ -2387,6 +2387,7 @@ async function cmdRedteam(rawArgs: string[]): Promise<void> {
       // typing on the same page at once (the screencast stays read-only once the automated probes run).
       live = new LiveControl(controlUrl, (m) => console.log(m));
       await live.register("chat", driver);
+      store.appendEvent(id, { type: "note", payload: { message: "attended — open the Sessions tab, log into the chat, then click Done to start the probes" } });
       console.log("  ⏸ open the Sessions tab in the WebUI, log into the chat, then click Done to start the probes.");
       await live.waitForDone("chat");
     }
@@ -2406,6 +2407,8 @@ async function cmdRedteam(rawArgs: string[]): Promise<void> {
 
     const evidence = new EvidenceStore(join(runsDir, id, "artifacts"));
     const probes = defaultInjectedContextProbes(canary).map((p) => ({ ...p, replays: maxReplays }));
+    store.setPhase(id, "phase2_scan");
+    store.appendEvent(id, { type: "note", payload: { message: `running ${probes.length} probes against ${chatUrl}` } });
     const res = await runLlmRedteam({
       store,
       assessmentId: id,
@@ -2415,6 +2418,7 @@ async function cmdRedteam(rawArgs: string[]): Promise<void> {
       probes,
       onProbe: (p, v) => {
         const mark = v.status === "confirmed" ? "✓" : v.status === "suspected" ? "?" : "·";
+        store.appendEvent(id, { type: "note", payload: { message: `${mark} ${p.id} [${p.category}] → ${v.status}` } });
         console.log(`  ${mark} ${p.id} [${p.category}] → ${v.status}`);
       },
     });
@@ -2426,6 +2430,8 @@ async function cmdRedteam(rawArgs: string[]): Promise<void> {
         buildReport(finalState, new Date(), { loadEvidence: evidenceLoaderFor(runsDir, id) }),
       );
     }
+    store.appendEvent(id, { type: "note", payload: { message: `done — ${res.findings.length} finding(s) across ${res.verdicts.length} probes` } });
+    store.setPhase(id, "done");
     console.log(`\n=== ${res.findings.length} finding(s) across ${res.verdicts.length} probes ===`);
     for (const f of res.findings) console.log(`  - [${f.severity}] ${f.title}`);
     console.log(`\nreport → ${join(runsDir, id, "report.md")}`);
