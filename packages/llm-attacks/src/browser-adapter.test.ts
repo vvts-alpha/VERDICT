@@ -118,7 +118,7 @@ test("attach stages the file as base64 WITHOUT submitting a turn", async () => {
   assert.equal(driver.uploads.length, 1);
   assert.equal(driver.uploads[0]?.filename, "poison.txt");
   assert.equal(Buffer.from(driver.uploads[0]?.base64 ?? "", "base64").toString("utf8"), "hello");
-  assert.equal(await driver.transcriptText(), "", "attach did not advance the transcript");
+  assert.equal(await driver.transcriptTextFrame(""), "", "attach did not advance the transcript");
 });
 
 test("end-to-end: BrowserChatAdapter + oracle confirms a canary leak", async () => {
@@ -137,4 +137,26 @@ test("end-to-end: oracle refutes when the assistant never leaks the canary", asy
   const adapter = new BrowserChatAdapter(driver, FAST);
   const v = await confirmCanaryLeak(adapter, { canary, controlPrompt: CONTROL, attackPrompt: ATTACK });
   assert.equal(v.status, "refuted");
+});
+
+test("calibrate pins the frame the marker landed in; sends still work afterward", async () => {
+  const driver = new FakeChatDriver({ responder: (p) => `you said: ${p}`, markerFrame: "https://widget.test/" });
+  const adapter = new BrowserChatAdapter(driver, FAST);
+  const frame = await adapter.calibrate("VERDICT-CAL-xyz");
+  assert.equal(frame, "https://widget.test/", "calibrated to the iframe the marker landed in");
+  const r = await adapter.send("hi");
+  assert.match(r.text, /assistant: you said: hi/);
+});
+
+test("calibrate returns null when the marker was not found", async () => {
+  const driver = new FakeChatDriver({ responder: () => "x" }); // no markerFrame configured
+  const adapter = new BrowserChatAdapter(driver, FAST);
+  assert.equal(await adapter.calibrate("VERDICT-CAL-nope"), null);
+});
+
+test("noReload: newConversation throws instead of reloading a manually-opened widget", async () => {
+  const driver = new FakeChatDriver({ responder: () => "x" }); // no new-chat control
+  const adapter = new BrowserChatAdapter(driver, { ...FAST, noReload: true }); // chatUrl set but reloads disabled
+  await assert.rejects(() => adapter.newConversation(), /reload is disabled/);
+  assert.equal(driver.visits.length, 0, "did not reload the page");
 });

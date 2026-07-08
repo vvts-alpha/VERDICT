@@ -583,6 +583,90 @@ export class PlaywrightDriver implements Driver {
       .catch(() => "");
   }
 
+  /** Resolve a live frame by URL ("" = top document). */
+  private frameByUrl(frameUrl: string) {
+    return this.page.frames().find((f) => f.url() === frameUrl) ?? null;
+  }
+
+  /** fill() scoped to a frame ("" = top document → the existing top-level fill, unchanged). */
+  async fillFrame(frameUrl: string, selector: string, value: string): Promise<boolean> {
+    if (!frameUrl) return this.fill(selector, value);
+    const fr = this.frameByUrl(frameUrl);
+    if (!fr) return false;
+    return fr
+      .fill(selector, value, { timeout: 4000 })
+      .then(() => true)
+      .catch(() => false);
+  }
+
+  /** clickFirst() scoped to a frame ("" = top document). */
+  async clickFrame(frameUrl: string, selectors: string[]): Promise<boolean> {
+    if (!frameUrl) return this.clickFirst(selectors);
+    const fr = this.frameByUrl(frameUrl);
+    if (!fr) return false;
+    for (const selector of selectors) {
+      const ok = await fr
+        .click(selector, { timeout: 2500 })
+        .then(() => true)
+        .catch(() => false);
+      if (ok) return true;
+    }
+    return false;
+  }
+
+  /** pressEnter() scoped to a frame ("" = top document). */
+  async pressEnterFrame(frameUrl: string, selector: string): Promise<void> {
+    if (!frameUrl) return this.pressEnter(selector);
+    const fr = this.frameByUrl(frameUrl);
+    await fr?.press(selector, "Enter").catch(() => {});
+    await new Promise<void>((resolve) => setTimeout(resolve, this.opts.settleMs));
+  }
+
+  /** UNCAPPED transcript/reply-container text scoped to a frame ("" = top document → transcriptText). */
+  async transcriptTextFrame(frameUrl: string, selector?: string): Promise<string> {
+    if (!frameUrl) return this.transcriptText(selector);
+    const fr = this.frameByUrl(frameUrl);
+    if (!fr) return "";
+    const sels = selector
+      ? [selector]
+      : [
+          '[role="log"]',
+          '[data-testid*="transcript" i], [data-testid*="messages" i], [data-testid*="conversation" i]',
+          "main",
+          '[class*="transcript" i], [class*="messages" i], [class*="conversation" i], [class*="chat-log" i], [class*="chat" i]',
+          "[aria-live]",
+        ];
+    return fr
+      .evaluate((list: string[]) => {
+        const g = globalThis as any;
+        const doc = g.document;
+        if (!doc) return "";
+        for (const sel of list) {
+          const el = doc.querySelector(sel);
+          if (el && el.innerText && String(el.innerText).trim().length > 0) return String(el.innerText);
+        }
+        const b = doc.body;
+        return b && b.innerText ? String(b.innerText) : "";
+      }, sels)
+      .catch(() => "");
+  }
+
+  /** Scan every frame for a calibration marker the operator sent into the target composer. Returns the URL of
+   *  the frame whose transcript now shows it ("" = top document), or null — this is how attended calibration
+   *  locates the right frame + composer even when the assistant is an embedded (iframe) widget. */
+  async findMarker(marker: string): Promise<{ frame: string } | null> {
+    for (const fr of this.page.frames()) {
+      const has = await fr
+        .evaluate((m: string) => {
+          const b = (globalThis as any).document?.body;
+          return b && b.innerText ? String(b.innerText).includes(m) : false;
+        }, marker)
+        .catch(() => false);
+      if (has) return { frame: fr === this.page.mainFrame() ? "" : fr.url() };
+    }
+    return null;
+  }
+
   async pressEnter(selector: string): Promise<void> {
     await this.page.press(selector, "Enter").catch(() => {});
     await new Promise<void>((resolve) => setTimeout(resolve, this.opts.settleMs));

@@ -4,24 +4,26 @@ export interface FakeChatDriverOptions {
   /** Produce the assistant reply for a sent prompt in a given (0-based) conversation. */
   responder: (prompt: string, conversation: number) => string;
   composerSelector?: string;
-  /** If set, clickFirst() submits when this selector is among the candidates (else Enter submits). */
+  /** If set, clickFrame() submits when this selector is among the candidates (else Enter submits). */
   sendSelector?: string;
-  /** If set, clickFirst() starts a fresh conversation when this selector is among the candidates. */
+  /** If set, clickFrame() starts a fresh conversation when this selector is among the candidates. */
   newChatSelector?: string;
   fileInputSelector?: string;
   /**
-   * Fractions of the new turn segment revealed on successive transcriptText() calls after submit (models
+   * Fractions of the new turn segment revealed on successive transcriptTextFrame() calls after submit (models
    * streaming). Monotonic growth never lets settle() settle early; a REPEATED value models a mid-stream STALL
    * that a too-small stableChecks would settle on prematurely (truncating the reply). Default: [0.34,0.67,1].
    */
   revealSchedule?: number[];
   apisFor?: (prompt: string, conversation: number) => ApiCall[];
+  /** findMarker() returns this frame ("" = top doc) as the calibration hit; undefined = marker not found. */
+  markerFrame?: string;
 }
 
 /**
  * Scriptable in-memory ChatDriver for offline tests — models composer-fill, submit, streaming settle (incl.
- * mid-stream stalls), delta, an APPENDING API buffer, no-submit file staging, and conversation reset, all
- * without a browser or the network.
+ * mid-stream stalls), delta, an APPENDING API buffer, no-submit file staging, calibration (findMarker), and
+ * conversation reset, all without a browser or the network. The frame argument is ignored (single-page model).
  */
 export class FakeChatDriver implements ChatDriver {
   private base = ""; // transcript committed before the current turn
@@ -43,14 +45,14 @@ export class FakeChatDriver implements ChatDriver {
     return this.opts.revealSchedule ?? [0.34, 0.67, 1];
   }
 
-  async fill(selector: string, value: string): Promise<boolean> {
+  async fillFrame(_frame: string, selector: string, value: string): Promise<boolean> {
     if (selector !== this.composerSel) return false;
     this.pendingPrompt = value;
     this.filled.push(value);
     return true;
   }
 
-  async clickFirst(selectors: string[]): Promise<boolean> {
+  async clickFrame(_frame: string, selectors: string[]): Promise<boolean> {
     if (this.opts.sendSelector && selectors.includes(this.opts.sendSelector)) {
       this.submit();
       return true;
@@ -62,11 +64,11 @@ export class FakeChatDriver implements ChatDriver {
     return false;
   }
 
-  async pressEnter(_selector: string): Promise<void> {
+  async pressEnterFrame(_frame: string, _selector: string): Promise<void> {
     this.submit();
   }
 
-  async transcriptText(): Promise<string> {
+  async transcriptTextFrame(_frame: string, _selector?: string): Promise<string> {
     if (this.segment === null) return this.base;
     const sched = this.schedule;
     const frac = sched[Math.min(this.revealIdx, sched.length - 1)] ?? 1;
@@ -78,6 +80,10 @@ export class FakeChatDriver implements ChatDriver {
     }
     const cut = Math.floor(this.segment.length * frac);
     return this.base + this.segment.slice(0, cut);
+  }
+
+  async findMarker(_marker: string): Promise<{ frame: string } | null> {
+    return this.opts.markerFrame === undefined ? null : { frame: this.opts.markerFrame };
   }
 
   drainApiCalls(): ApiCall[] {

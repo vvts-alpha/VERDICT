@@ -2381,16 +2381,6 @@ async function cmdRedteam(rawArgs: string[]): Promise<void> {
   let live: LiveControl | undefined;
   try {
     await driver.visit(chatUrl);
-    if (controlUrl) {
-      // Attended: screencast the chat page into the WebUI Sessions tab so the operator logs in / interacts,
-      // then clicks Done to release the gate. Blocking BEFORE the probes avoids the operator and the adapter
-      // typing on the same page at once (the screencast stays read-only once the automated probes run).
-      live = new LiveControl(controlUrl, (m) => console.log(m));
-      await live.register("chat", driver);
-      store.appendEvent(id, { type: "note", payload: { message: "attended — open the Sessions tab, log into the chat, then click Done to start the probes" } });
-      console.log("  ⏸ open the Sessions tab in the WebUI, log into the chat, then click Done to start the probes.");
-      await live.waitForDone("chat");
-    }
     const composer = values.composer ?? assistant?.composerSelector;
     const send = values.send ?? assistant?.sendSelector;
     const newChat = values["new-chat"] ?? assistant?.newChatSelector;
@@ -2398,12 +2388,34 @@ async function cmdRedteam(rawArgs: string[]): Promise<void> {
     const transcript = values.transcript ?? assistant?.transcriptSelector;
     const adapter = new BrowserChatAdapter(driver, {
       chatUrl,
+      ...(controlUrl ? { noReload: true } : {}), // attended widget: never reload the page (destroys the manual session)
       ...(composer ? { composerSelectors: [composer] } : {}),
       ...(send ? { sendSelectors: [send] } : {}),
       ...(newChat ? { newChatSelectors: [newChat] } : {}),
       ...(fileInput ? { fileInputSelector: fileInput } : {}),
       ...(transcript ? { transcriptSelector: transcript } : {}),
     });
+
+    if (controlUrl) {
+      // Attended: screencast the chat page into the WebUI Sessions tab. The operator navigates to the RIGHT
+      // assistant, pastes + sends a calibration marker, then clicks Done — findMarker locates that frame + input
+      // (works even for an iframe widget). Blocking before the probes avoids operator + adapter typing at once.
+      live = new LiveControl(controlUrl, (m) => console.log(m));
+      await live.register("chat", driver);
+      const calMarker = generateCanary();
+      store.appendEvent(id, { type: "note", payload: { message: `attended — in the Sessions tab, paste this marker into the assistant's message box and SEND it, then click Done: ${calMarker}` } });
+      console.log(`  ⏸ Sessions tab: paste & send this marker into the assistant box, then click Done:\n     ${calMarker}`);
+      await live.waitForDone("chat");
+      const frame = await adapter.calibrate(calMarker);
+      const where =
+        frame === null
+          ? "not found — probes target the top document (may be the wrong input)"
+          : frame === ""
+            ? "top document"
+            : `frame ${frame}`;
+      store.appendEvent(id, { type: "note", payload: { message: `calibration: ${where}` } });
+      console.log(`  calibration → ${where}`);
+    }
 
     const evidence = new EvidenceStore(join(runsDir, id, "artifacts"));
     const probes = defaultInjectedContextProbes(canary).map((p) => ({ ...p, replays: maxReplays }));

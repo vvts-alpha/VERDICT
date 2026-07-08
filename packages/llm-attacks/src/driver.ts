@@ -7,27 +7,22 @@ export interface ApiCall {
 }
 
 /**
- * The browser primitives the chat-adapter composes over. Most map directly onto crawler's PlaywrightDriver
- * (fill / clickFirst / pressEnter / drainApiCalls / visit), but two require small **additive** primitives on
- * the real driver (added when it is wired in, slice 3) because the existing methods have the wrong semantics
- * for a chat UI:
- *   - `transcriptText()` — the crawler's `snapshot().visibleText` is whole-page AND capped (~4000 chars), which
- *     truncates long replies (they append at the bottom) and would make settle/delta silently return empty.
- *     Chat needs the UNCAPPED transcript / assistant-reply container text.
- *   - `stageFile()` — the crawler's `uploadFile()` always clicks a button after setInputFiles, which on a chat
- *     UI submits the file as a turn; the file-upload seedMode needs to STAGE the file without submitting.
- * FakeChatDriver implements all of these for offline tests.
+ * The browser primitives the chat-adapter composes over. All page ops are FRAME-SCOPED: the first argument is
+ * the target frame's URL, or "" for the top document. This lets the adapter drive an assistant embedded in an
+ * iframe widget (located by attended calibration via findMarker) without touching the crawler's existing
+ * top-level driver methods — PlaywrightDriver's *Frame methods delegate to the unchanged fill/clickFirst/
+ * pressEnter/transcriptText when the frame is "". transcriptText is UNCAPPED (not whole-page visibleText);
+ * stageFile stages a file WITHOUT the submit-click uploadFile performs.
  */
 export interface ChatDriver {
-  /** Fill `value` into the element matched by `selector` (pierces open shadow DOM). Returns success. */
-  fill(selector: string, value: string): Promise<boolean>;
-  /** Click the first `selectors` entry that resolves. Returns success (never throws on no-match). */
-  clickFirst(selectors: string[]): Promise<boolean>;
-  /** Press Enter on the element matched by `selector`. */
-  pressEnter(selector: string): Promise<void>;
-  /** UNCAPPED text of the conversation transcript / assistant-reply container (NOT whole-page visibleText).
-   *  An optional selector pins the container (operator override) when the default priority list misfires. */
-  transcriptText(selector?: string): Promise<string>;
+  /** Fill `value` into `selector` within `frame` ("" = top document). Returns success. */
+  fillFrame(frame: string, selector: string, value: string): Promise<boolean>;
+  /** Click the first `selectors` entry that resolves within `frame`. Returns success. */
+  clickFrame(frame: string, selectors: string[]): Promise<boolean>;
+  /** Press Enter on `selector` within `frame`. */
+  pressEnterFrame(frame: string, selector: string): Promise<void>;
+  /** UNCAPPED transcript / reply-container text within `frame` ("" = top document). */
+  transcriptTextFrame(frame: string, selector?: string): Promise<string>;
   /** Take + clear the intercepted API-call buffer since the last drain. */
   drainApiCalls(): ApiCall[];
   /** Stage a file into a file input WITHOUT submitting (setInputFiles only — the composer submits later). */
@@ -37,6 +32,8 @@ export interface ChatDriver {
     base64: string,
     contentType?: string,
   ): Promise<{ ok: boolean; note: string }>;
-  /** Navigate to a URL (newConversation fallback). */
+  /** Navigate to a URL (newConversation fallback when reloads are allowed). */
   visit(url: string): Promise<unknown>;
+  /** Locate which frame a calibration marker landed in ("" = top document), or null if not found. */
+  findMarker(marker: string): Promise<{ frame: string } | null>;
 }
