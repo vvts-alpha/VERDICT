@@ -1,9 +1,11 @@
-// "+ New" → choose an assessment mode (Web / LLM / API), then render the mode-specific form.
+// "+ New" → choose an assessment mode (Web / API), then render the mode-specific form.
+// (The autonomous LLM/AI-assistant red-team lives in the CLI — `veritas redteam` — and is intentionally not
+//  surfaced here; VERDICT's WebUI is the autonomous web/API pentest surface. The operator-assisted LLM tool is
+//  a separate project.)
 import { useState, type ReactNode } from "react";
 import { NewAssessment } from "./NewAssessment";
-import { RedteamForm } from "./RedteamForm";
 
-type Mode = "web" | "llm" | "api";
+type Mode = "web" | "api";
 
 // Lucide-style single-color outline icons — stroke = currentColor, sized/colored via CSS (.mode-ic).
 const svg = {
@@ -21,18 +23,6 @@ function GlobeIcon() {
       <circle cx="12" cy="12" r="10" />
       <path d="M12 2a15 15 0 0 1 0 20 15 15 0 0 1 0-20" />
       <path d="M2 12h20" />
-    </svg>
-  );
-}
-function BotIcon() {
-  return (
-    <svg {...svg}>
-      <path d="M12 8V4H8" />
-      <rect width="16" height="12" x="4" y="8" rx="2" />
-      <path d="M2 14h2" />
-      <path d="M20 14h2" />
-      <path d="M15 13v2" />
-      <path d="M9 13v2" />
     </svg>
   );
 }
@@ -60,7 +50,6 @@ export function NewLauncher({ onCancel }: { onCancel: () => void }) {
   const back = (): void => setMode(null);
 
   if (mode === "web") return <NewAssessment onCancel={back} />;
-  if (mode === "llm") return <RedteamForm onCancel={back} />;
   if (mode === "api") {
     return (
       <div className="newform">
@@ -94,12 +83,6 @@ export function NewLauncher({ onCancel }: { onCancel: () => void }) {
           title="Web / API app"
           desc="Autonomous recon → diagnosis of a web app from one URL."
           onClick={() => setMode("web")}
-        />
-        <Card
-          icon={<BotIcon />}
-          title="AI assistant"
-          desc="Red-team a deployed chatbot: confirm canary leaks with evidence."
-          onClick={() => setMode("llm")}
         />
         <Card
           icon={<BracesIcon />}
