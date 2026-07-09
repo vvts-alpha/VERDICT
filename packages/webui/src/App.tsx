@@ -12,6 +12,7 @@ import { Scenarios } from "./components/Scenarios";
 import { Index } from "./components/Index";
 import { Sessions } from "./components/Sessions";
 import { Chat } from "./components/Chat";
+import { AssetTree } from "./components/AssetTree";
 
 type Tab = "screen" | "findings" | "scenarios" | "log" | "apis" | "sessions" | "ask";
 
@@ -43,8 +44,42 @@ export function App() {
     };
   }, [id]);
 
+  // An ASR (Attack Surface Recon) run has its OWN asset view — not the web-assessment tabbed layout. Detect it
+  // (its asset_inventory has assets) and render a standalone page; the web-assessment viewer below stays untouched.
+  const [isAsr, setIsAsr] = useState<boolean | null>(null);
+  useEffect(() => {
+    if (!id) return;
+    let alive = true;
+    fetch(`/api/assessments/${encodeURIComponent(id)}/assets`)
+      .then((r) => {
+        if (alive) setIsAsr(r.ok); // 200 = an asset_inventory exists = an ASR run (even mid-scan); 404 = web/API run
+      })
+      .catch(() => {
+        if (alive) setIsAsr(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [id]);
+
   if (!id) {
     return <Index />;
+  }
+  if (isAsr) {
+    // ASR has its OWN full-height viewer (not the web-viewer's .body grid / .scroll / .tabbody, which would cram
+    // the asset tree into the 300px SiteTree column). .page is a flex column at 100vh; AssetTree fills the rest.
+    return (
+      <div className="page">
+        <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "9px 14px", borderBottom: "1px solid var(--line)", flex: "0 0 auto" }}>
+          <a href="/" style={{ color: "var(--muted)", textDecoration: "none", fontSize: 13 }}>← projects</a>
+          <span style={{ fontWeight: 700, color: "#fff" }}>Attack Surface Recon</span>
+          <span style={{ color: "var(--muted)", fontSize: 12, fontFamily: "ui-monospace, monospace" }}>{id}</span>
+        </div>
+        <div style={{ flex: 1, minHeight: 0 }}>
+          <AssetTree id={id} />
+        </div>
+      </div>
+    );
   }
   if (!view) {
     return <div className="empty">Connecting to {id} … ({conn})</div>;

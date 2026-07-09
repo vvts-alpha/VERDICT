@@ -18,7 +18,7 @@ export interface RunLauncherConfig {
 }
 
 export interface StartRunInput {
-  command: "pilot" | "assess" | "redteam";
+  command: "pilot" | "assess" | "redteam" | "asr";
   /** JSON in AssessManifest format (saved verbatim to runs/<id>/manifest.json). */
   manifest: unknown;
   options?: {
@@ -44,6 +44,18 @@ export interface StartRunInput {
     burpProxy?: boolean;
     /** redteam only: positive replays required to confirm a canary leak (default 2). */
     maxReplays?: number;
+    /** asr only: the wildcard/apex to recon (e.g. "*.example.com"). */
+    domain?: string;
+    /** asr only: hosts to exclude (comma-separated carve-outs). */
+    outOfScope?: string;
+    /** asr only: screenshot each live host. */
+    screenshot?: boolean;
+    /** asr only: probe curated high-signal paths on live hosts. */
+    paths?: boolean;
+    /** asr only: AI-triage the top-scoring hosts. */
+    triage?: boolean;
+    /** asr only: cap the number of discovered hosts probed. */
+    maxHosts?: number;
   };
 }
 
@@ -87,6 +99,17 @@ export class Supervisor {
       // redteam has a strict, small flag set — do NOT pass pilot/assess-only flags (its parseArgs would reject them).
       // canary + selectors travel in the manifest's `assistant` block, read by cmdRedteam.
       if (o.maxReplays != null) args.push("--max-replays", String(o.maxReplays));
+    } else if (input.command === "asr") {
+      // asr has its own flag set — do NOT pass pilot/assess flags (its parseArgs would reject them).
+      // The domain travels in options; the base args already carry --manifest/--id/--out (cmdAsr accepts them).
+      if (o.domain) args.push("--domain", o.domain);
+      if (o.outOfScope) args.push("--out-of-scope", String(o.outOfScope));
+      if (o.screenshot) args.push("--screenshot");
+      if (o.paths) args.push("--paths");
+      if (o.triage) args.push("--triage");
+      if (o.maxHosts != null) args.push("--max-hosts", String(o.maxHosts));
+      if (o.model) args.push("--model", o.model);
+      if (o.rate != null) args.push("--rate", String(o.rate));
     } else {
       if (o.model) args.push("--model", o.model);
       if (o.fastModel) args.push("--fast-model", o.fastModel);

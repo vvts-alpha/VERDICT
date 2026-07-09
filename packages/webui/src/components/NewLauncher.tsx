@@ -4,8 +4,9 @@
 //  a separate project.)
 import { useState, type ReactNode } from "react";
 import { NewAssessment } from "./NewAssessment";
+import { NewAsr } from "./NewAsr";
 
-type Mode = "web" | "api";
+type Mode = "web" | "api" | "asr";
 
 // Lucide-style single-color outline icons — stroke = currentColor, sized/colored via CSS (.mode-ic).
 const svg = {
@@ -34,6 +35,16 @@ function BracesIcon() {
     </svg>
   );
 }
+function RadarIcon() {
+  return (
+    <svg {...svg}>
+      <path d="M19.07 4.93A10 10 0 1 0 22 12" />
+      <path d="M12 12l5-3" />
+      <circle cx="12" cy="12" r="6" />
+      <circle cx="12" cy="12" r="2" />
+    </svg>
+  );
+}
 
 function Card({ icon, title, desc, onClick }: { icon: ReactNode; title: string; desc: string; onClick: () => void }) {
   return (
@@ -50,6 +61,7 @@ export function NewLauncher({ onCancel }: { onCancel: () => void }) {
   const back = (): void => setMode(null);
 
   if (mode === "web") return <NewAssessment onCancel={back} />;
+  if (mode === "asr") return <NewAsr onCancel={back} />;
   if (mode === "api") {
     return (
       <div className="newform">
@@ -89,6 +101,12 @@ export function NewLauncher({ onCancel }: { onCancel: () => void }) {
           title="API spec"
           desc="Import an OpenAPI / Swagger spec to drive an API assessment."
           onClick={() => setMode("api")}
+        />
+        <Card
+          icon={<RadarIcon />}
+          title="Attack Surface Recon"
+          desc="Map a domain's hosts from a wildcard, then score & triage attack targets."
+          onClick={() => setMode("asr")}
         />
       </div>
     </div>

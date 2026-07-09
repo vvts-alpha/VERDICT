@@ -59,6 +59,7 @@ const MIME: Record<string, string> = {
 interface AssessmentSummaryRow {
   id: string;
   phase: string;
+  type: "web" | "api" | "asr";
   screens: number;
   findings: number;
   target: TargetInput;
@@ -79,9 +80,17 @@ function listAssessments(runsDir: string): AssessmentSummaryRow[] {
       const summary = store.listAssessments().find((s) => s.id === ent.name);
       store.close();
       if (state) {
+        const dir = join(runsDir, ent.name);
+        // asr = has an asset inventory · api = spec-seeded (no browser profile + API-only screens) · web = everything else
+        const type: "web" | "api" | "asr" = existsSync(join(dir, "asset_inventory.json"))
+          ? "asr"
+          : !existsSync(join(dir, "browser-profile")) && state.screens.length > 0 && state.screens.every((s) => s.apis.length > 0 && !s.screenshot)
+            ? "api"
+            : "web";
         rows.push({
           id: state.id,
           phase: state.phase,
+          type,
           screens: state.screens.length,
           findings: state.findings.length,
           target: state.target,
@@ -155,8 +164,8 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
       } catch {
         return sendJson(res, 400, { error: "invalid JSON body" });
       }
-      if (input.command !== "pilot" && input.command !== "assess" && input.command !== "redteam") {
-        return sendJson(res, 400, { error: "command must be 'pilot', 'assess', or 'redteam'" });
+      if (input.command !== "pilot" && input.command !== "assess" && input.command !== "redteam" && input.command !== "asr") {
+        return sendJson(res, 400, { error: "command must be 'pilot', 'assess', 'redteam', or 'asr'" });
       }
       const manifestTarget = (input.manifest as { target?: unknown } | null)?.target;
       if (!input.manifest || typeof input.manifest !== "object" || !manifestTarget) {
@@ -504,6 +513,48 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptio
   if (rep) {
     const fmt = new URL(url, "http://localhost").searchParams.get("format");
     void serveReport(res, opts.runsDir, decodeURIComponent(rep[1] ?? ""), rep[2] as "report" | "inventory", fmt);
+    return;
+  }
+  // ASR asset inventory (runs/<id>/asset_inventory.json) — read by the WebUI Assets tab. Missing → empty inventory.
+  const assetsM = url.match(/^\/api\/assessments\/([^/?]+)\/assets(?:\?|$)/);
+  if (assetsM) {
+    const aid = decodeURIComponent(assetsM[1] ?? "");
+    if (!/^[a-z0-9_-]+$/i.test(aid)) {
+      res.writeHead(400);
+      res.end("bad id");
+      return;
+    }
+    const invFile = join(opts.runsDir, aid, "asset_inventory.json");
+    if (!existsSync(invFile) || !statSync(invFile).isFile()) {
+      sendJson(res, 404, { error: "not an ASR run" }); // no inventory → the WebUI treats this as a web/API run
+      return;
+    }
+    try {
+      sendJson(res, 200, JSON.parse(readFileSync(invFile, "utf8")));
+    } catch {
+      sendJson(res, 200, { version: 1, generatedAt: "", apex: "", assets: [] }); // exists but mid-write
+    }
+    return;
+  }
+  // ASR host screenshot: runs/<id>/artifacts/hosts/<host>.png. Hostnames contain dots, so the id check allows
+  // [a-z0-9.-] (and rejects "..") rather than the screen route's stricter alnum set — traversal is impossible (no slash).
+  const hostShot = url.match(/^\/api\/assessments\/([^/]+)\/hosts\/([^/?]+)\/screenshot/);
+  if (hostShot) {
+    const aid = decodeURIComponent(hostShot[1] ?? "");
+    const host = decodeURIComponent(hostShot[2] ?? "");
+    if (!/^[a-z0-9_-]+$/i.test(aid) || !/^[a-z0-9.-]+$/i.test(host) || host.includes("..")) {
+      res.writeHead(400);
+      res.end("bad id");
+      return;
+    }
+    const file = join(opts.runsDir, aid, "artifacts", "hosts", `${host}.png`);
+    if (existsSync(file) && statSync(file).isFile()) {
+      res.writeHead(200, { "content-type": "image/png", "cache-control": "no-cache", "access-control-allow-origin": "*" });
+      res.end(readFileSync(file));
+    } else {
+      res.writeHead(404);
+      res.end("no screenshot");
+    }
     return;
   }
   const m = url.match(/^\/api\/assessments\/([^/?]+)/);

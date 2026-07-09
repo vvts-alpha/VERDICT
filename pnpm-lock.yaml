@@ -33,11 +33,33 @@ importers:
         specifier: ^5.7.3
         version: 5.9.3
 
+  packages/asr:
+    dependencies:
+      '@veritas/core':
+        specifier: workspace:*
+        version: link:../core
+      '@veritas/llm':
+        specifier: workspace:*
+        version: link:../llm
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.6
+        version: 22.19.20
+      tsx:
+        specifier: ^4.19.2
+        version: 4.22.4
+      typescript:
+        specifier: ^5.7.3
+        version: 5.9.3
+
   packages/cli:
     dependencies:
       '@veritas/agent':
         specifier: workspace:*
         version: link:../agent
+      '@veritas/asr':
+        specifier: workspace:*
+        version: link:../asr
       '@veritas/core':
         specifier: workspace:*
         version: link:../core

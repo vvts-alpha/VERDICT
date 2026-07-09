@@ -37,6 +37,17 @@ export type {
   StateEventInput,
   AssessmentState,
   AssessmentSummary,
+  AssetSource,
+  AssetBand,
+  AssetScore,
+  AssetTriage,
+  AssetPathHit,
+  FindingSeverity,
+  AssetFinding,
+  AssetTakeover,
+  ListingEntry,
+  Asset,
+  AssetInventory,
 } from "./types/index.js";
 
 // SQLite state store

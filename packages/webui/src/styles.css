@@ -37,6 +37,10 @@ body { background: var(--bg); color: var(--fg); font-size: 13px; }
 .statusbar .brand-logo { height: 30px; top: 0; }
 .idxtitle { color: var(--fg); }
 .idxcount { margin-left: auto; color: var(--muted); }
+.typepill { font-size: 10px; font-weight: 700; letter-spacing: 0.4px; text-transform: uppercase; padding: 1px 7px; border-radius: 999px; border: 1px solid; white-space: nowrap; }
+.typepill.web { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, transparent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.typepill.api { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); background: color-mix(in srgb, var(--ok) 12%, transparent); }
+.typepill.asr { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); background: color-mix(in srgb, var(--warn) 12%, transparent); }
 .idxempty { padding: 2rem 4px; color: var(--muted); }
 .idxempty code { background: #11141a; padding: 1px 6px; border-radius: 4px; }
 .idxtable { width: 100%; border-collapse: collapse; margin-top: 10px; }

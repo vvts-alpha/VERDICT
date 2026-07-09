@@ -1,0 +1,74 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+
+import { crtShUrl, parseCrtSh, discoverCrtSh } from "./index.js";
+
+const ROWS = [
+    { name_value: "*.example.com\nexample.com", common_name: "example.com" },
+    { name_value: "www.example.com\napi.example.com" },
+    { name_value: "admin.staging.example.com", common_name: "admin.staging.example.com" },
+    { name_value: "blog.example.com" }, // a carve-out in the test below
+    { name_value: "evil.com\nnot-example.com.attacker.net" }, // foreign domains
+    { common_name: "*.dev.example.com" }, // wildcard -> dev.example.com
+];
+
+test("parseCrtSh: keeps in-scope hosts, strips wildcards, dedups, drops foreign domains + carve-outs", () => {
+    const hosts = parseCrtSh(ROWS, { domain: "*.example.com", outOfScope: ["blog.example.com"] });
+    assert.deepEqual(hosts, [
+        "admin.staging.example.com",
+        "api.example.com",
+        "dev.example.com",
+        "example.com",
+        "www.example.com",
+    ]);
+    assert.ok(!hosts.includes("blog.example.com"), "carve-out excluded");
+    assert.ok(!hosts.some((h) => h.includes("attacker") || h === "evil.com"), "foreign domains excluded");
+});
+
+test("parseCrtSh: a carve-out also excludes its subdomains", () => {
+    const hosts = parseCrtSh([{ name_value: "x.blog.example.com\nblog.example.com\nkeep.example.com" }], {
+        domain: "example.com",
+        outOfScope: ["blog.example.com"],
+    });
+    assert.deepEqual(hosts, ["keep.example.com"]);
+});
+
+test("crtShUrl: url-encodes the CT wildcard search and normalizes a wildcard apex", () => {
+    assert.equal(crtShUrl("*.example.com"), "https://crt.sh/?q=%25.example.com&output=json");
+});
+
+test("discoverCrtSh: parses an injected crt.sh JSON body (offline)", async () => {
+    const fakeGet = async (url: string): Promise<string> => {
+        assert.match(url, /crt\.sh/);
+        assert.match(url, /%25\.example\.com/); // url-encoded "%.example.com"
+        return JSON.stringify([{ name_value: "a.example.com\nb.example.com" }]);
+    };
+    const hosts = await discoverCrtSh({ domain: "example.com" }, fakeGet);
+    assert.deepEqual(hosts, ["a.example.com", "b.example.com"]);
+});
+
+test("discoverCrtSh: returns [] on a non-JSON body (crt.sh rate-limit HTML)", async () => {
+    const hosts = await discoverCrtSh({ domain: "example.com" }, async () => "<html>rate limited</html>");
+    assert.deepEqual(hosts, []);
+});
+
+test("discoverCrtSh: retries a transient crt.sh failure (502) then succeeds", async () => {
+    let calls = 0;
+    const flaky = async (): Promise<string> => {
+        calls += 1;
+        if (calls < 3) throw new Error("crt.sh returned HTTP 502");
+        return JSON.stringify([{ name_value: "a.example.com" }]);
+    };
+    const hosts = await discoverCrtSh({ domain: "example.com" }, flaky, { attempts: 3, backoffMs: 0 });
+    assert.equal(calls, 3);
+    assert.deepEqual(hosts, ["a.example.com"]);
+});
+
+test("discoverCrtSh: throws the last error when every attempt fails", async () => {
+    await assert.rejects(
+        discoverCrtSh({ domain: "example.com" }, async () => {
+            throw new Error("crt.sh 503");
+        }, { attempts: 2, backoffMs: 0 }),
+        /503/,
+    );
+});

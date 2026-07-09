@@ -20,6 +20,7 @@
   },
   "dependencies": {
     "@veritas/agent": "workspace:*",
+    "@veritas/asr": "workspace:*",
     "@veritas/core": "workspace:*",
     "@veritas/crawler": "workspace:*",
     "@veritas/llm": "workspace:*",

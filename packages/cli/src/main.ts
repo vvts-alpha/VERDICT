@@ -7,6 +7,7 @@ import { parseArgs } from "node:util";
 import { createRequire } from "node:module";
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { lookup, resolveCname } from "node:dns/promises";
 
 import {
   AssessmentStore,
@@ -27,6 +28,7 @@ import {
   newAssessmentId,
   parseTargetUrl,
   type AssessmentState,
+  type Asset,
   type Screen,
   type ScopeMode,
   type ScopePolicy,
@@ -42,6 +44,7 @@ import { assessLogicInventory, assessScreenLogic, authDiffScreen } from "@verita
 import type { RoleContext } from "@veritas/agent";
 import { runPilot, verifyBurpFindings, triageAndDeepDiveBurp, LiveControl } from "@veritas/pilot";
 import { BrowserChatAdapter, runLlmRedteam, defaultInjectedContextProbes, generateCanary } from "@veritas/llm-attacks";
+import { discoverCrtSh, fetchHttpGet, probeHost, probeSurface, enumerateListing, detectTakeover, reconFindings, scoreAsset, triageAsset, buildAssetInventory, writeAssetInventory } from "@veritas/asr";
 import { startServer } from "@veritas/server";
 import { loadDotEnv } from "./dotenv.js";
 
@@ -102,6 +105,11 @@ commands:
             Phase2 business logic: hypothesis generation (LLM) → verify IDOR etc. with evidence discipline. --manifest injects auth headers for a spec-seeded API run.
   spec-import --spec <openapi.json> --url <base> [--id <existing>] [--manifest <m.json>] [--out <dir>]
             ingest an OpenAPI 3.x / Swagger 2.0 spec (JSON) → seed the screen inventory so the browser-free scan/logic can assess a pure-API target. --url = where the API lives (base). with --id, overlay the spec on an existing crawl (fills endpoints the UI never called). token-protected APIs: put Authorization: Bearer … in the manifest's http.headers.
+  asr     --domain <apex|*.wildcard> [--out-of-scope a.ex.com,b.ex.com] [--screenshot] [--paths] [--triage [--triage-top <n>] [--model <m>]] [--max-hosts <n>] [--rate <ms>] [--browser-path <bin>] [--no-sandbox] [--headed] [--out <dir>]
+            Attack Surface Recon: passive discovery (crt.sh CT logs) → dns resolve + HTTP liveness → deterministic attack-target score (ranked) → runs/<id>/asset_inventory.json
+            [--screenshot] per-host screenshot · [--paths] probe curated high-signal paths on live hosts (/.git/, /.env, /actuator, swagger, server-status…) → real exposure + auto-escalate
+            [--triage] Claude classifies the top-N by score (default 15, --triage-top) → category / band / attack-angle (a lead, not a finding; claude CLI subscription, no metered API)
+            wide-shallow triage feeding pilot; observe-only (no attacks). view in the WebUI (serve) 🌐 ASR tab (sorted by score, band badges)
   redteam --url <chat-ui-url> | --manifest <file.json>  --canary <token> [--headed] [--max-replays <n>] [--composer <sel>] [--send <sel>] [--new-chat <sel>] [--file-input <sel>] [--transcript <sel>] [--browser-path <bin>] [--no-sandbox] [--out <dir>]
             (alias: assistant) LLM/AI-assistant red-team: drive a deployed chatbot and confirm canary leaks. the canary is planted out-of-band by the operator in the system prompt / custom instructions and passed via --canary or manifest assistant.canary
   serve   [--port <n>] [--host <h>] [--out <dir>] [--web-root <dir>] [--no-web] [--password <pw>] [--viewer-password <pw>] [--no-auth] [--no-launch]
@@ -1459,6 +1467,198 @@ async function cmdShots(args: string[]): Promise<void> {
   console.log(`\n${n}/${state.screens.length} screenshots captured → reload the WebUI (serve)`);
 }
 
+// ASR — Attack Surface Recon (Phase-0, docs/ASR.md). A wildcard/apex → crt.sh passive discovery → dns resolve +
+// HTTP liveness → (optional) per-host screenshot → runs/<id>/asset_inventory.json. Wide-shallow triage feeding pilot.
+// P0: passive discovery + liveness + screenshots + inventory. Active DNS brute, scoring and AI triage are later slices.
+async function cmdAsr(args: string[]): Promise<void> {
+  const { values } = parseArgs({
+    args,
+    options: {
+      domain: { type: "string" },
+      id: { type: "string" },
+      manifest: { type: "string" },
+      "out-of-scope": { type: "string" },
+      screenshot: { type: "boolean" },
+      paths: { type: "boolean" },
+      triage: { type: "boolean" },
+      "triage-top": { type: "string" },
+      model: { type: "string" },
+      "max-hosts": { type: "string" },
+      rate: { type: "string" },
+      out: { type: "string" },
+      "browser-path": { type: "string" },
+      "no-sandbox": { type: "boolean" },
+      headed: { type: "boolean" },
+    },
+  });
+  if (!values.domain) fail("asr requires --domain <apex|*.wildcard> (e.g. --domain '*.example.com')");
+  const apex = values.domain.trim().toLowerCase().replace(/^\*\./, "").replace(/\.$/, "");
+  const base = `https://${apex}`;
+  try {
+    parseTargetUrl(base); // the apex must form a valid http(s) origin
+  } catch (e) {
+    fail(e instanceof Error ? e.message : String(e));
+  }
+  const outOfScope = (values["out-of-scope"] ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  const maxHosts = values["max-hosts"] ? Math.max(1, Number.parseInt(values["max-hosts"], 10)) : 200;
+  const minDelayMs = values.rate ? Math.max(0, Number.parseInt(values.rate, 10)) : 250;
+  const runsDir = values.out ?? RUNS_DIR_DEFAULT;
+
+  const scope: ScopePolicy = deriveScopeFromUrls([base], "etld"); // *.apex — subdomains in scope
+  const id = values.id ?? newAssessmentId(); // the WebUI launch passes a pre-generated id via the supervisor
+  mkdirSync(join(runsDir, id), { recursive: true });
+  const store = AssessmentStore.open(dbPathFor(runsDir, id));
+  store.createAssessment({ id, target: { kind: "single_url", url: base, followLinks: false, maxDepth: 0 }, scope });
+  store.close(); // assets persist to asset_inventory.json, not the store (a store table is a later slice)
+  const invPath = join(runsDir, id, "asset_inventory.json");
+  writeAssetInventory(invPath, buildAssetInventory(apex, [])); // write empty now so the WebUI detects an ASR run while it scans
+
+  // ① DISCOVER — passive, crt.sh CT logs (an OSINT lookup about the apex; no target host is touched here)
+  console.log(`▶ asr ${id}: discovering *.${apex} via crt.sh…`);
+  let hosts: string[] = [];
+  try {
+    hosts = await discoverCrtSh({ domain: apex, outOfScope }, fetchHttpGet);
+  } catch (e) {
+    console.error(`  crt.sh discovery failed: ${String(e).slice(0, 120)}`);
+  }
+  if (hosts.length > maxHosts) {
+    console.log(`  ${hosts.length} hosts found; capping to --max-hosts ${maxHosts} (${hosts.length - maxHosts} dropped)`);
+    hosts = hosts.slice(0, maxHosts);
+  }
+  console.log(`  ${hosts.length} candidate host(s)`);
+
+  // ② PROBE — dns resolve + HTTP liveness (scope-gated + rate-limited via FetchHttpClient)
+  const http = new FetchHttpClient({ allow: (u) => isInScope(u, scope), minDelayMs, timeoutMs: 10_000 });
+  const assets: Asset[] = [];
+  for (const host of hosts) {
+    const p = await probeHost(
+      host,
+      async (h) => {
+        try {
+          return (await lookup(h, { all: true })).map((a) => a.address);
+        } catch {
+          return [];
+        }
+      },
+      (url) => http.send({ method: "GET", url }),
+      (h) => resolveCname(h).catch(() => []),
+    );
+    const asset: Asset = {
+      host,
+      source: "crt.sh",
+      resolved: p.addresses,
+      alive: p.alive,
+      scheme: p.scheme,
+      status: p.status,
+      title: p.title,
+      tech: p.server ? [p.server] : [],
+      screenshot: null,
+      inScope: isInScope(`https://${host}/`, scope),
+    };
+    const tko = detectTakeover({ cnames: p.cnames, status: p.status, body: p.bodySample });
+    if (tko) {
+      asset.takeover = tko;
+      console.log(`  ! ${host}: possible subdomain takeover — ${tko.service} (${tko.confidence})`);
+    }
+    assets.push(asset);
+    console.log(p.alive ? `  ✓ ${host}  ${p.status ?? ""} ${p.title ?? ""}`.trimEnd() : `  · ${host}`);
+  }
+  const live = assets.filter((a) => a.alive);
+
+  // ③ SCREENSHOT (optional) — one nav per live host, scope-gated
+  if (values.screenshot && live.length > 0) {
+    const browserPath = values["browser-path"] ?? (process.env.VERDICT_BROWSER_PATH ?? process.env.VERITAS_BROWSER_PATH);
+    const artifactsDir = join(runsDir, id, "artifacts");
+    console.log(`▶ screenshotting ${live.length} live host(s)…`);
+    const driver = await PlaywrightDriver.launch({
+      userDataDir: join(runsDir, id, "browser-profile"),
+      headless: !values.headed,
+      ...(browserPath ? { executablePath: browserPath } : {}),
+      ...(values["no-sandbox"] ? { args: ["--no-sandbox"] } : {}),
+    });
+    try {
+      for (const a of live) {
+        const url = `${a.scheme}://${a.host}/`;
+        if (!isInScope(url, scope)) continue;
+        try {
+          await driver.visit(url);
+          const rel = `hosts/${a.host}.png`;
+          if (await driver.saveScreenshot(join(artifactsDir, rel))) {
+            a.screenshot = rel;
+            console.log(`  ✓ ${a.host}`);
+          }
+        } catch (e) {
+          console.log(`  ✗ ${a.host} — ${String(e).slice(0, 60)}`);
+        }
+      }
+    } finally {
+      await driver.close();
+    }
+  }
+
+  // ③b SURFACE (P1, opt-in) — curated path probing on live in-scope hosts → real exposure + auto-escalate
+  if (values.paths && live.length > 0) {
+    console.log(`▶ probing curated paths on ${live.length} live host(s)…`);
+    for (const a of live) {
+      if (!a.scheme || !isInScope(`${a.scheme}://${a.host}/`, scope)) continue;
+      a.notablePaths = await probeSurface(a.host, a.scheme, (u) => http.send({ method: "GET", url: u }));
+      if (a.notablePaths.length > 0) {
+        console.log(`  ${a.host}: ${a.notablePaths.map((h) => (h.escalate ? `⚠${h.path}` : h.path)).join(", ")}`);
+      }
+      // open directory listing → enumerate it into a tree (depth/entry-bounded)
+      if ((a.title ?? "").toLowerCase().includes("index of")) {
+        a.listing = await enumerateListing(`${a.scheme}://${a.host}`, "/", (u) => http.send({ method: "GET", url: u }));
+        if (a.listing.length > 0) console.log(`  ${a.host}: open directory listing (${a.listing.length} top-level entries)`);
+      }
+    }
+  }
+
+  // ④ SCORE — recon findings + deterministic attack-target rubric, then rank by band (auto-escalate first), then score
+  for (const a of assets) a.findings = reconFindings(a);
+  for (const a of assets) a.score = scoreAsset(a);
+  const bandRank = (b: string | undefined): number => (b === "critical" ? 3 : b === "high" ? 2 : b === "medium" ? 1 : 0);
+  assets.sort(
+    (x, y) =>
+      bandRank(y.score?.band) - bandRank(x.score?.band) ||
+      (y.score?.total ?? 0) - (x.score?.total ?? 0) ||
+      Number(y.alive) - Number(x.alive) ||
+      x.host.localeCompare(y.host),
+  );
+
+  // ④b AI TRIAGE (P1, opt-in) — Claude classifies the top-scoring live hosts (category/band/angle). A lead, not a finding.
+  if (values.triage) {
+    const topN = values["triage-top"] ? Math.max(1, Number.parseInt(values["triage-top"], 10)) : 15;
+    const targets = assets.filter((a) => a.alive).slice(0, topN);
+    if (targets.length > 0) {
+      const llm = new ClaudeCliClient({});
+      console.log(`▶ AI triage on the top ${targets.length} live host(s)…`);
+      for (const a of targets) {
+        try {
+          a.ai = (await triageAsset(a, llm, values.model)) ?? undefined;
+          if (a.ai) console.log(`  [${a.ai.band}] ${a.host} — ${a.ai.category}${a.ai.angle ? `: ${a.ai.angle}` : ""}`);
+        } catch (e) {
+          console.log(`  ✗ ${a.host}: ${String(e).slice(0, 70)}`);
+        }
+      }
+    }
+  }
+
+  // ⑤ persist the asset inventory (overwrite the early empty file with the scored, ranked set)
+  writeAssetInventory(invPath, buildAssetInventory(apex, assets));
+  console.log(`\nasr ${id}: ${assets.length} asset(s), ${live.length} live → ${invPath}`);
+  const top = assets.filter((a) => a.alive).slice(0, 10);
+  if (top.length > 0) {
+    console.log(`  top targets by score:`);
+    for (const a of top) {
+      console.log(`    [${(a.score?.band ?? "low").padEnd(8)} ${String(a.score?.total ?? 0).padStart(3)}]  ${a.host}  ${a.status ?? ""}`);
+    }
+  }
+  console.log(`  view in the WebUI: serve → open ${id} → Assets tab`);
+}
+
 // Info-level security-header audit (deterministic, no LLM). Checks each screen's response headers in an existing run
 // and records one (aggregated) finding per missing header. Toggle = run it or not.
 // --headers csp,hsts,… narrows the set (custom list).
@@ -2516,6 +2716,9 @@ async function main(): Promise<void> {
       return;
     case "spec-import":
       await cmdSpecImport(rest);
+      return;
+    case "asr":
+      await cmdAsr(rest);
       return;
     case "status":
       cmdStatus(rest);

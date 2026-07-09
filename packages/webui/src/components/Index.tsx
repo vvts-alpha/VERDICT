@@ -8,6 +8,7 @@ import { useRole } from "../api";
 interface Row {
   id: string;
   phase: string;
+  type: "web" | "api" | "asr";
   screens: number;
   findings: number;
   target: TargetInput;
@@ -115,6 +116,7 @@ export function Index() {
           <thead>
             <tr>
               <th>Target</th>
+              <th>Type</th>
               <th>Phase</th>
               <th className="num">Screens</th>
               <th className="num">Findings</th>
@@ -138,6 +140,9 @@ export function Index() {
                     {targetName(r.target)}
                   </div>
                   <div className="tsub">{targetSub(r.target)}</div>
+                </td>
+                <td>
+                  <span className={`typepill ${r.type}`}>{r.type}</span>
                 </td>
                 <td>
                   <span className={`phasepill ${r.phase}`}>{r.phase}</span>
