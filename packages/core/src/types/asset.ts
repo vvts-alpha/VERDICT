@@ -110,5 +110,7 @@ export interface AssetInventory {
     generatedAt: string;
     /** The apex the run was scoped to, e.g. "example.com". */
     apex: string;
+    /** Total candidate hosts discovered (for scan-progress); undefined until discovery completes. */
+    discovered?: number;
     assets: Asset[];
 }

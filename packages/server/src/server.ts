@@ -557,6 +557,21 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptio
     }
     return;
   }
+  // Run log (the spawned child's stdout/stderr) — for the ASR Log tab. Empty 200 while nothing's been written yet.
+  const runLog = url.match(/^\/api\/assessments\/([^/?]+)\/run-log(?:\?|$)/);
+  if (runLog) {
+    const aid = decodeURIComponent(runLog[1] ?? "");
+    if (!/^[a-z0-9_-]+$/i.test(aid)) {
+      res.writeHead(400);
+      res.end("bad id");
+      return;
+    }
+    const file = join(opts.runsDir, aid, "run.log");
+    const body = existsSync(file) && statSync(file).isFile() ? readFileSync(file) : "";
+    res.writeHead(200, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-cache" });
+    res.end(body);
+    return;
+  }
   const m = url.match(/^\/api\/assessments\/([^/?]+)/);
   const id = m?.[1];
   if (id) {

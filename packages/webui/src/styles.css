@@ -278,6 +278,28 @@ button:hover { background: #353d4a; }
 .logline.lt-halted .log-msg { color: var(--err); }
 .log-empty { padding: 14px; }
 
+/* ASR viewer — Host detail + Findings (uses the design-system variables so it matches the web/API viewer). */
+.pane-subtitle { font-size: 11px; letter-spacing: 0.6px; text-transform: uppercase; color: var(--muted); margin: 4px 0 8px; }
+.asr-host-h { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
+.asr-host-h a { color: #fff; font-weight: 700; font-size: 15px; text-decoration: none; }
+.asr-host-h a:hover { text-decoration: underline; }
+.asr-shot { width: 100%; max-height: 220px; object-fit: cover; object-position: top; border: 1px solid var(--line); border-radius: 8px; margin-bottom: 14px; display: block; }
+.asr-metabox { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin: 8px 0 12px; }
+.asr-meta { display: flex; gap: 10px; font-size: 12.5px; padding: 3px 0; }
+.asr-meta-k { color: var(--muted); min-width: 84px; }
+.asr-meta-v { color: var(--fg); word-break: break-all; font-family: ui-monospace, monospace; }
+.asr-finding { background: var(--panel); border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; margin-bottom: 6px; }
+.asr-finding-h { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 3px; }
+.asr-finding-t { font-size: 13px; font-weight: 600; color: var(--fg); }
+.asr-finding-host { font-size: 12px; color: var(--accent); }
+.asr-finding-d { font-size: 12px; color: var(--muted); font-family: ui-monospace, monospace; word-break: break-word; }
+.sev { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.3px; border: 1px solid; border-radius: 999px; padding: 0 6px; }
+.asr-ai { background: #171326; border: 1px solid #2e2350; border-radius: 8px; padding: 10px 12px; }
+.asr-ai-h { font-size: 12px; color: #a78bfa; font-weight: 700; margin-bottom: 5px; }
+.asr-ai-r { font-size: 12.5px; color: var(--muted); margin-bottom: 5px; }
+.asr-ai-a { font-size: 12.5px; color: var(--fg); }
+.asr-ai-a b { color: #a78bfa; }
+
 /* 進捗バー(global, run の現在地) */
 .progress { padding: 6px 14px; border-bottom: 1px solid var(--line); background: var(--panel); }
 .pbar { display: flex; height: 8px; border-radius: 4px; overflow: hidden; background: #0d0f13; }

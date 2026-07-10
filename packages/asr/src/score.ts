@@ -84,7 +84,10 @@ export function scoreAsset(asset: Asset): AssetScore {
 
     // exposure (0–30) — what's actually reachable/served, incl. P1 curated-path hits
     let exp = 0;
-    if (title.includes("index of /")) {
+    if (asset.listing?.length) {
+        exp += 24;
+        autoEscalate.push("open directory listing"); // authoritative signal (matches findings.ts), not just the root title
+    } else if (title.includes("index of /")) {
         exp += 24;
         autoEscalate.push("directory listing (Index of /)");
     }

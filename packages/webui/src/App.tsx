@@ -12,7 +12,7 @@ import { Scenarios } from "./components/Scenarios";
 import { Index } from "./components/Index";
 import { Sessions } from "./components/Sessions";
 import { Chat } from "./components/Chat";
-import { AssetTree } from "./components/AssetTree";
+import { AsrView } from "./components/AsrView";
 
 type Tab = "screen" | "findings" | "scenarios" | "log" | "apis" | "sessions" | "ask";
 
@@ -66,20 +66,8 @@ export function App() {
     return <Index />;
   }
   if (isAsr) {
-    // ASR has its OWN full-height viewer (not the web-viewer's .body grid / .scroll / .tabbody, which would cram
-    // the asset tree into the 300px SiteTree column). .page is a flex column at 100vh; AssetTree fills the rest.
-    return (
-      <div className="page">
-        <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "9px 14px", borderBottom: "1px solid var(--line)", flex: "0 0 auto" }}>
-          <a href="/" style={{ color: "var(--muted)", textDecoration: "none", fontSize: 13 }}>← projects</a>
-          <span style={{ fontWeight: 700, color: "#fff" }}>Attack Surface Recon</span>
-          <span style={{ color: "var(--muted)", fontSize: 12, fontFamily: "ui-monospace, monospace" }}>{id}</span>
-        </div>
-        <div style={{ flex: 1, minHeight: 0 }}>
-          <AssetTree id={id} />
-        </div>
-      </div>
-    );
+    // ASR is its own assessment type → its own viewer (Assets tree + a Log tab), never the web-viewer tab layout.
+    return <AsrView id={id} />;
   }
   if (!view) {
     return <div className="empty">Connecting to {id} … ({conn})</div>;

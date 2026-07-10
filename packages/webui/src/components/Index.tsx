@@ -139,7 +139,7 @@ export function Index() {
                     {r.running ? <span className="rundot" title="running" /> : null}
                     {targetName(r.target)}
                   </div>
-                  <div className="tsub">{targetSub(r.target)}</div>
+                  <div className="tsub">{r.type === "asr" ? `*.${targetName(r.target)}` : targetSub(r.target)}</div>
                 </td>
                 <td>
                   <span className={`typepill ${r.type}`}>{r.type}</span>
@@ -160,7 +160,7 @@ export function Index() {
                     </button>
                   ) : (
                     <button type="button" className="resumebtn" onClick={runCtl(r.id, "resume")}>
-                      ▶ Resume
+                      {r.type === "asr" ? "↻ Re-scan" : "▶ Resume"}
                     </button>
                   )}
                 </td>
