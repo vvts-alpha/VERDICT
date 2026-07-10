@@ -36,6 +36,7 @@ export interface PageSnapshot {
   domSkeleton: string;
   visibleText: string;
   links: string[];
+  clickables?: { text: string; selector: string }[];
   forms: FormObservation[];
   virtualRoutes: string[];
 }
@@ -114,6 +115,7 @@ const PAGE_EXTRACT_FN = (): {
   skeleton: string;
   visibleText: string;
   links: string[];
+  clickables: { text: string; selector: string }[];
   forms: { action: string | null; method: string; fields: { name: string; type: string }[] }[];
   virtualRoutes: string[];
   scripts: string[];
@@ -125,6 +127,7 @@ const PAGE_EXTRACT_FN = (): {
     skeleton: "empty",
     visibleText: "",
     links: [] as string[],
+    clickables: [] as { text: string; selector: string }[],
     forms: [] as { action: string | null; method: string; fields: { name: string; type: string }[] }[],
     virtualRoutes: (g.__veritasRoutes || []) as string[],
     scripts: [] as string[],
@@ -136,6 +139,25 @@ const PAGE_EXTRACT_FN = (): {
   result.links = Array.from(doc.querySelectorAll("a[href]"))
     .map((a: any) => a.getAttribute("href"))
     .filter((h: any): h is string => typeof h === "string" && h.length > 0);
+  // Non-anchor clickable controls (button-based navigation the a[href] crawl misses). Give each a label + a selector
+  // usable with browser_click. Cap to keep responses small; dedup by selector.
+  const cssEsc = (v: string): string => (g.CSS && g.CSS.escape ? g.CSS.escape(v) : v.replace(/[^\w-]/g, "\\$&"));
+  const seenSel = new Set<string>();
+  for (const el of Array.from(doc.querySelectorAll("button, input[type=submit], input[type=button], [role=button], [onclick]")) as any[]) {
+    if (result.clickables.length >= 30) break;
+    const tag = String(el.tagName || "").toLowerCase();
+    const text = String(el.innerText || el.value || el.getAttribute("aria-label") || el.getAttribute("title") || "").replace(/\s+/g, " ").trim().slice(0, 60);
+    const id = el.getAttribute("id");
+    const name = el.getAttribute("name");
+    let selector: string;
+    if (id) selector = "#" + cssEsc(id);
+    else if (name) selector = tag + '[name="' + name.replace(/"/g, '\\"') + '"]';
+    else if (text && text.length <= 40) selector = tag + ':has-text("' + text.replace(/"/g, '\\"') + '")';
+    else selector = tag;
+    if (seenSel.has(selector)) continue;
+    seenSel.add(selector);
+    result.clickables.push({ text, selector });
+  }
   result.forms = Array.from(doc.querySelectorAll("form")).map((f: any) => ({
     action: f.getAttribute("action"),
     method: String(f.getAttribute("method") || "get").toLowerCase(),
@@ -330,6 +352,7 @@ export class PlaywrightDriver implements Driver {
       skeleton: "empty",
       visibleText: "",
       links: [],
+      clickables: [],
       forms: [],
       virtualRoutes: [],
       scripts: [],
@@ -349,6 +372,7 @@ export class PlaywrightDriver implements Driver {
       visibleText: data.visibleText,
       forms: data.forms,
       links: data.links,
+      clickables: data.clickables,
       virtualRoutes: data.virtualRoutes,
       apiCalls: this.buffer.slice(),
       scripts: data.scripts,
@@ -485,6 +509,7 @@ export class PlaywrightDriver implements Driver {
       domSkeleton: data?.skeleton ?? "",
       visibleText: data?.visibleText ?? "",
       links: data?.links ?? [],
+      clickables: data?.clickables ?? [],
       forms: data?.forms ?? [],
       virtualRoutes: data?.virtualRoutes ?? [],
     };

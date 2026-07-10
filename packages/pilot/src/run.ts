@@ -16,7 +16,7 @@ import { EvidenceStore, FetchHttpClient, fingerprintTech, stackAttackHints } fro
 import type { TechSample } from "@veritas/scanner";
 import type { BurpAuditConn } from "@veritas/scanner";
 import { join } from "node:path";
-import { buildTools, STAGE_TOOLS, dedupKey, isAuthWalled, loadCookieFile, sessionLooksDead, stripHash } from "./tools.js";
+import { buildTools, STAGE_TOOLS, dedupKey, isAuthWalled, loadCookieFile, mergeSetCookie, touchIsDead, stripHash } from "./tools.js";
 import type { PilotSession, RoleSession } from "./tools.js";
 import { LiveControl } from "./live-control.js";
 import { DEFAULT_SCENARIOS, DIAGNOSE_PROMPT, FINGERPRINT_PROMPT, METHODOLOGY_PROMPT, SCENARIO_PROMPT, SURVEY_PROMPT } from "./system.js";
@@ -42,12 +42,15 @@ export interface RunPilotOptions {
   roleCreds: Map<string, LoginCreds>;
   /** Role name -> path of a pre-captured cookie file (in place of credentials; for walls that can't be auto-logged-in). */
   roleCookieFiles?: Map<string, string>;
+  /** Role name -> that role's own login entry URL (for apps whose roles log in at different pages, e.g. a user login vs an
+   *  admin login). Attended opens that role's window there; the login() tool starts smartLogin there. Falls back to loginUrl/target. */
+  roleLoginUrls?: Map<string, string>;
   /** Role name -> free-text privilege description (e.g. "full admin" / "regular user (read-only)").
    *  Context for the agent to tell high/low privilege apart in auth-diff. Not secret, but not persisted in state. */
   roleDescriptions?: Map<string, string>;
   /** The "deep" model for diagnosis (high-value screens that need emergent reasoning). e.g. claude-opus-4-8. If unset, SDK default. */
   model?: string;
-  /** The "fast" model for survey/methodology/login and low-value screens (e.g. claude-sonnet-4-6).
+  /** The "fast" model for survey/methodology/login and low-value screens (e.g. claude-sonnet-5).
    *  If unset, same as model (= no model tiering, behaviour unchanged). Setting it tiers Opus/Sonnet. */
   fastModel?: string;
   /** Whether to run the post-diagnosis A04 scenario (cross-screen multi-step logic abuse) stage. Default true.
@@ -78,9 +81,18 @@ export interface RunPilotOptions {
   surveyOnly?: boolean;
   /** Upstream proxy such as Burp (e.g. http://127.0.0.1:8080). Routes HTTP + browser through it only when set. Unset = as-is. */
   burpProxy?: string;
-  /** Keep the auth session alive: during diagnosis, if the gap between screens exceeds this many minutes, navigate to
-   *  the top page and re-sync cookies (0 disables). Guards against sliding/short-lived tokens going stale. Default 4 min. */
+  /** Keep the auth session alive: during diagnosis, if the gap between screens exceeds this many minutes, do a raw-HTTP
+   *  GET of a safe authed URL (NOT the top page — some sites reset the session on a cold hit to `/` or a full reload,
+   *  and an SPA holding auth in memory is rebooted by any page load) and re-sync the rotated cookie. No browser
+   *  navigation. 0 disables. Guards against sliding/short-lived tokens going stale. Default 4 min. */
   keepAliveMinutes?: number;
+  /** Explicit URL for the keepalive touch (power-user override). If unset, keepalive uses the authed page currently
+   *  being diagnosed (falling back to the last one), and skips entirely rather than ever touch `/`. */
+  keepAliveUrl?: string;
+  /** Goto-safe authenticated hub (the app menu). For sites where deep routes die on a cold/direct navigation: a route
+   *  that bounces to an error page is reached by clicking its link from here instead, and it becomes the keepalive
+   *  target. Unset = unchanged (no anchor recovery). */
+  anchorUrl?: string;
   /** attended (manual multi-session auth): launch one headed persistent context per role and have a human log in
    *  (clearing CAPTCHA/MFA/Arkose too) before running survey/diagnosis. Diagnosis uses each role's live
    *  cookie. For walls that auto-login / cookie files can't cross (CAPTCHA/MFA, absolute-TTL expiry, etc.). */
@@ -314,7 +326,9 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     // Launch each role and resolve auth. cookie -> inject / creds -> smartLogin (manual on failure) / no material -> manual.
     // viaWeb manual roles are registered together later and their Done awaited in parallel (N tabs at once). CLI (non-viaWeb) is sequential Enter as before.
     const manual: Array<{ role: string; driver: PlaywrightDriver }> = [];
-    const earlyLlm = viaWeb ? new ClaudeCliClient({ defaultModel: opts.fastModel ?? "claude-sonnet-4-6" }) : undefined;
+    const earlyLlm = viaWeb ? new ClaudeCliClient({ defaultModel: opts.fastModel ?? "claude-sonnet-5" }) : undefined;
+    // Each role's login entry: its own loginUrl (user vs admin log in at different pages) → global loginUrl → target.
+    const roleLoginUrl = (role: string): string => opts.roleLoginUrls?.get(role) ?? opts.loginUrl ?? opts.targetUrl;
     for (const role of roles) {
       const d = await PlaywrightDriver.launch({ ...launchBase, userDataDir: join(baseDir, role), headless: viaWeb });
       const cookieFile = opts.roleCookieFiles?.get(role);
@@ -332,11 +346,11 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         }
       } else if (viaWeb && creds && earlyLlm) {
         // Credentials present -> auto-login. On failure (CAPTCHA/MFA) fall back to a manual tab.
-        await d.gotoUrl(opts.loginUrl ?? opts.targetUrl);
+        await d.gotoUrl(roleLoginUrl(role));
         let ok = false;
         try {
           await d.clearSession();
-          const r = await smartLogin(d, earlyLlm, creds, { targetUrl: opts.targetUrl, ...(opts.model ? { model: opts.model } : {}) });
+          const r = await smartLogin(d, earlyLlm, creds, { targetUrl: opts.targetUrl, ...(opts.roleLoginUrls?.get(role) ? { loginScreenUrl: opts.roleLoginUrls.get(role)! } : {}), ...(opts.model ? { model: opts.model } : {}) });
           ok = r.ok;
           opts.onText?.(
             ok
@@ -351,12 +365,12 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
           deferred = true;
         }
       } else if (viaWeb) {
-        await d.gotoUrl(opts.loginUrl ?? opts.targetUrl);
+        await d.gotoUrl(roleLoginUrl(role));
         manual.push({ role, driver: d });
         deferred = true;
       } else {
         // CLI attended: confirm one role at a time with Enter, as before.
-        await d.gotoUrl(opts.loginUrl ?? opts.targetUrl);
+        await d.gotoUrl(roleLoginUrl(role));
         await opts.promptOperator!(`▶ Please log in manually in the browser window for role ${roleLabel(role, opts.roleDescriptions)} (clear CAPTCHA/MFA too). Press Enter when done…`);
       }
       if (!deferred) {
@@ -401,6 +415,36 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
   const deepModel = opts.model;
   const fastModel = opts.fastModel ?? opts.model;
 
+  // ── keepalive (raw-HTTP touch) ── the warm target is a concrete, in-scope, non-root, non-logout URL. Never `/`:
+  //    some sites reset the session on a cold hit to root or a full reload, and an SPA holding auth in memory is
+  //    rebooted by any page load — so keepalive GETs a real authed page instead (no navigation). Updated as diagnosis
+  //    walks authed screens; shared by the diagnosis loop and the Burp scan phase.
+  const warmSeed = opts.keepAliveUrl ?? opts.anchorUrl; // the anchor hub is a goto-safe authed page = an ideal warm target
+  let lastWarmUrl: string | null = warmSeed && isInScope(warmSeed, opts.scope) ? warmSeed : null;
+  const isRootUrl = (u: string): boolean => {
+    try {
+      const p = new URL(u).pathname;
+      return p === "" || p === "/";
+    } catch {
+      return false;
+    }
+  };
+  const warmTarget = (u: string | undefined): string | null =>
+    u && isInScope(u, opts.scope) && !isRootUrl(u) && !/logout|signout|sign-out|logoff/i.test(u) ? u : null;
+  /** GET a safe authed URL to keep the sliding session alive (no browser navigation). Merges a rotated Set-Cookie back
+   *  into the caller's cookie. Returns dead=true if the touch shows the session expired; null on a network error. */
+  const warmTouch = async (url: string, cookie: string, bearer: string): Promise<{ cookie: string; dead: boolean } | null> => {
+    try {
+      const headers: Record<string, string> = {};
+      if (cookie) headers.cookie = cookie;
+      if (bearer) headers.authorization = `Bearer ${bearer}`;
+      const res = await http.send({ method: "GET", url, headers, body: null });
+      return { cookie: mergeSetCookie(cookie, res.headers["set-cookie"]), dead: touchIsDead(res.status, res.headers.location, res.body) };
+    } catch {
+      return null;
+    }
+  };
+
   const session: PilotSession = {
     driver,
     http,
@@ -410,10 +454,12 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     artifactsDir: opts.artifactsDir,
     scope: opts.scope,
     targetUrl: opts.targetUrl,
+    anchorUrl: opts.anchorUrl,
     roleCreds: opts.roleCreds,
     roleCookieFiles: opts.roleCookieFiles ?? new Map(),
+    roleLoginUrls: opts.roleLoginUrls,
     roleDescriptions: opts.roleDescriptions ?? new Map(),
-    loginLlm: new ClaudeCliClient({ defaultModel: fastModel ?? "claude-sonnet-4-6" }),
+    loginLlm: new ClaudeCliClient({ defaultModel: fastModel ?? "claude-sonnet-5" }),
     currentCookie: primaryCookie, // attended starts with the primary role's live cookie (normally "")
     currentBearer: "", // login() loads each role's localStorage Bearer JWT
     currentRole: primaryRole,
@@ -433,6 +479,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     inv: new InventoryBuilder(),
     visited: new Set(),
     frontier: new Set(),
+    refererGated: new Set(),
     ignorePaths: [],
     exhaustive: !!opts.exhaustiveSurvey,
     ...(opts.maxSurveyScreens != null ? { maxSurveyScreens: opts.maxSurveyScreens } : {}),
@@ -724,27 +771,31 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       // Screens with multiple endpoints need >25 turns to confirm IDOR. At 25 it capped out just before recording.
       const perScreen = Math.min(maxTurns, 40);
 
-      // ── Keep the auth session alive (A) ── if the gap between screens grows, navigate to top and re-sync cookies.
-      //   Prevents sliding/short-lived tokens going stale on the raw HTTP path. Does nothing without currentCookie (unauth).
-      //   attended holds a live context per role, so cycle through all roles to re-sync, and for a role bounced back to
-      //   the login page (expired) ask the operator to re-login (liveness detection -> handoff).
+      // ── Keep the auth session alive (A) ── if the gap between screens grows, do a raw-HTTP GET of a safe authed URL
+      //   (never `/`, no page load) to keep a sliding/short-lived token from going stale, and re-sync the rotated cookie.
+      //   attended holds a live context per role: re-read each role's live cookie jar (no navigation) and touch to detect
+      //   expiry — a role bounced to login (401/login body) prompts the operator to re-login (handoff).
       const keepAliveMs = (opts.keepAliveMinutes ?? (opts.attended ? 1 : 4)) * 60_000;
       let lastTouch = Date.now();
       const keepAttendedWarm = async (): Promise<void> => {
         if (!roleSessions) return;
         for (const [role, rs] of roleSessions) {
           try {
-            await rs.driver.gotoUrl(opts.targetUrl); // each role's live context to top (follow Set-Cookie)
-            const snap = await rs.driver.snapshot();
-            if (sessionLooksDead(snap) && opts.promptOperator) {
+            // The operator's live browser is authoritative — re-read its cookie jar (no navigation) to pick up rotation.
+            const jar = await rs.driver.sessionCookieHeader().catch(() => "");
+            if (jar) rs.cookie = jar;
+            let dead = false;
+            if (lastWarmUrl) {
+              const r = await warmTouch(lastWarmUrl, rs.cookie, role === session.currentRole ? session.currentBearer : "");
+              dead = r?.dead ?? false;
+            }
+            if (dead && opts.promptOperator) {
               opts.onText?.(`🔴 role ${roleLabel(role, opts.roleDescriptions)} session appears to have expired (bounced back to the login page)`);
               await opts.promptOperator(`▶ Please log in again in the browser window for role ${roleLabel(role, opts.roleDescriptions)}. Press Enter when done…`);
+              const fresh = await rs.driver.sessionCookieHeader().catch(() => "");
+              if (fresh) rs.cookie = fresh;
             }
-            const fresh = await rs.driver.sessionCookieHeader();
-            if (fresh) {
-              rs.cookie = fresh;
-              if (role === session.currentRole) session.currentCookie = fresh; // for the active role, update the http path too
-            }
+            if (role === session.currentRole) session.currentCookie = rs.cookie; // for the active role, update the http path too
           } catch (e) {
             opts.onText?.(`⚠ keepalive '${role}' failed: ${String(e).slice(0, 100)}`);
           }
@@ -754,7 +805,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
           payload: { message: `🫀 keepalive (attended): re-synced ${roleSessions.size} role(s) (keep session alive)` },
         });
       };
-      const keepSessionWarm = async (): Promise<void> => {
+      const keepSessionWarm = async (warm: string | null): Promise<void> => {
         if (keepAliveMs <= 0) return;
         if (Date.now() - lastTouch < keepAliveMs) return;
         if (opts.attended) {
@@ -762,24 +813,25 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
           lastTouch = Date.now();
           return;
         }
-        if (!session.currentCookie) return;
-        try {
-          await driver.gotoUrl(opts.targetUrl); // to top via the browser path (follow Set-Cookie rotation)
-          const fresh = await driver.sessionCookieHeader(); // re-sync the raw HTTP path cookie too
-          if (fresh) session.currentCookie = fresh;
+        if (!session.currentCookie && !session.currentBearer) return; // unauth: nothing to keep warm
+        const url = warm ?? lastWarmUrl;
+        if (!url) return; // no safe authed URL yet — skip rather than touch `/`
+        const r = await warmTouch(url, session.currentCookie, session.currentBearer);
+        if (r) {
+          session.currentCookie = r.cookie; // re-sync the raw HTTP path cookie (rotated Set-Cookie)
           opts.store.appendEvent(opts.assessmentId, {
             type: "note",
-            payload: { message: "🫀 keepalive: navigate to top + re-sync cookies (keep session alive)" },
+            payload: { message: `🫀 keepalive: touched ${new URL(url).pathname} (keep session alive, no reload)` },
           });
-        } catch (e) {
-          opts.onText?.(`⚠ keepalive failed: ${String(e).slice(0, 120)}`);
         }
         lastTouch = Date.now();
       };
 
       // Diagnose one screen (shared body called from both the primary path and the drain). "break" stops the outer loop.
       const diagnoseOne = async (sc: Screen): Promise<"continue" | "break"> => {
-        await keepSessionWarm();
+        const scUrl = warmTarget(sc.observedUrls?.[0]); // the authed page we're about to diagnose = a safe warm target
+        await keepSessionWarm(opts.anchorUrl ?? scUrl); // with an anchor set, keep warming the stable hub
+        if (scUrl && !opts.anchorUrl) lastWarmUrl = scUrl; // else remember it for attended/Burp keepalive (no per-screen context)
         session.currentScreenId = sc.screenId;
         session.screenDone = false;
         session.screenVerdict = null;
@@ -925,18 +977,23 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
 
     // ── Burp scan phase ── after diagnosis/scenarios, before dropping to report, run it **while the session is alive**.
     //    (Previously runPilot returned -> driver disposed -> cmdPilot ran Burp, so the authed surface couldn't be reached.)
-    //    keepWarm navigates to top + re-syncs cookies to keep the session alive through a long scan.
+    //    keepWarm does a raw-HTTP touch of a safe authed URL (never `/`, no page load) to keep the session alive.
     if (!opts.surveyOnly && !session.done && opts.onBurpScanPhase) {
       opts.store.setPhase(opts.assessmentId, "phase2_burpscan");
       opts.onText?.("🐝 burp scan phase — active scan with the auth session kept warm");
       const keepWarm = async (): Promise<void> => {
+        if (!lastWarmUrl) return; // no safe authed URL mapped — don't fall back to `/`
         try {
           if (roleSessions) {
-            for (const rs of roleSessions.values()) await rs.driver.gotoUrl(opts.targetUrl).catch(() => {});
-          } else if (session.currentCookie) {
-            await driver.gotoUrl(opts.targetUrl);
-            const fresh = await driver.sessionCookieHeader();
-            if (fresh) session.currentCookie = fresh;
+            for (const [role, rs] of roleSessions) {
+              const jar = await rs.driver.sessionCookieHeader().catch(() => "");
+              if (jar) rs.cookie = jar;
+              const r = await warmTouch(lastWarmUrl, rs.cookie, role === session.currentRole ? session.currentBearer : "");
+              if (r && role === session.currentRole) session.currentCookie = r.cookie;
+            }
+          } else if (session.currentCookie || session.currentBearer) {
+            const r = await warmTouch(lastWarmUrl, session.currentCookie, session.currentBearer);
+            if (r) session.currentCookie = r.cookie;
           }
         } catch {
           /* best-effort keepalive */

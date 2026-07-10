@@ -9,12 +9,13 @@ interface Role {
   password: string;
   description: string;
   cookieFile: string;
+  loginUrl: string;
 }
 
 // Selectable models. Used for tiering: deep (high-value screens) / fast (survey, low-value screens).
 const MODELS = [
   { id: "claude-opus-4-8", label: "Opus 4.8" },
-  { id: "claude-sonnet-4-6", label: "Sonnet 4.6" },
+  { id: "claude-sonnet-5", label: "Sonnet 5" },
   { id: "claude-haiku-4-5-20251001", label: "Haiku 4.5" },
 ];
 
@@ -29,7 +30,7 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
   const [command, setCommand] = useState<"pilot" | "assess">("pilot");
   const [target, setTarget] = useState("");
   const [model, setModel] = useState("claude-opus-4-8"); // deep default = Opus: high-value screens/scenarios/fingerprint
-  const [fastModel, setFastModel] = useState("claude-sonnet-4-6"); // fast default = Sonnet: survey/methodology/low-value screens (= tiering ON by default; "none" = single model)
+  const [fastModel, setFastModel] = useState("claude-sonnet-5"); // fast default = Sonnet: survey/methodology/low-value screens (= tiering ON by default; "none" = single model)
   const [rate, setRate] = useState("250");
   const [maxTurns, setMaxTurns] = useState("");
   const [focus, setFocus] = useState(""); // operator's emphasis hint → top priority of the scenario stage
@@ -61,6 +62,8 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
   const [loginUrl, setLoginUrl] = useState(""); // entry URL for manual login (attended)
   const [maxScreens, setMaxScreens] = useState(""); // cap on the number of screens to diagnose (blank = default 40)
   const [maxSurveyScreens, setMaxSurveyScreens] = useState(""); // cap on the number of screens the survey maps (blank = unlimited)
+  const [keepAliveMin, setKeepAliveMin] = useState(""); // keepalive touch interval in minutes (blank = default 4, "0" = off)
+  const [anchorUrl, setAnchorUrl] = useState(""); // goto-safe authed hub (menu) — reach cold-nav-bouncing routes by clicking from here (blank = off)
 
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -88,7 +91,7 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
 
   const setRole = (i: number, patch: Partial<Role>): void =>
     setRoles((rs) => rs.map((r, j) => (j === i ? { ...r, ...patch } : r)));
-  const addRole = (): void => setRoles((rs) => [...rs, { name: "", method: "manual", password: "", description: "", cookieFile: "" }]);
+  const addRole = (): void => setRoles((rs) => [...rs, { name: "", method: "manual", password: "", description: "", cookieFile: "", loginUrl: "" }]);
   const rmRole = (i: number): void => setRoles((rs) => rs.filter((_, j) => j !== i));
 
   const submit = async (): Promise<void> => {
@@ -116,7 +119,7 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
 
     const named = roles.filter((r) => r.name.trim());
     const authRoles = named.map((r) => {
-      const base = { name: r.name.trim(), ...(r.description ? { description: r.description } : {}) };
+      const base = { name: r.name.trim(), ...(r.description ? { description: r.description } : {}), ...(r.loginUrl.trim() ? { loginUrl: r.loginUrl.trim() } : {}) };
       if (r.method === "credentials") return { ...base, ...(r.password ? { pass: r.password } : {}) };
       if (r.method === "cookie") return { ...base, ...(r.cookieFile ? { cookieFile: r.cookieFile } : {}) };
       return base; // manual: name(+description) only → logged in via the Sessions tab
@@ -157,6 +160,8 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
     if (loginUrl.trim()) options.loginUrl = loginUrl.trim();
     if (command === "pilot" && maxScreens) options.maxScreens = Number.parseInt(maxScreens, 10);
     if (command === "pilot" && maxSurveyScreens) options.maxSurveyScreens = Number.parseInt(maxSurveyScreens, 10);
+    if (command === "pilot" && keepAliveMin.trim() !== "" && Number.isFinite(Number(keepAliveMin))) options.keepAliveMin = Number.parseInt(keepAliveMin, 10);
+    if (command === "pilot" && anchorUrl.trim()) options.anchorUrl = anchorUrl.trim();
     if (command === "pilot" && focus.trim()) options.focus = focus.trim();
 
     try {
@@ -255,7 +260,19 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
             <input value={maxSurveyScreens} onChange={(e) => setMaxSurveyScreens(e.target.value)} placeholder="(unlimited)" inputMode="numeric" />
           </label>
         ) : null}
+        {command === "pilot" ? (
+          <label className="nf-field" title="keepalive interval (minutes). touches a safe authed page (never /) to keep the session warm. set 0 to turn off for sites whose session dies on a cold / hit or a full reload.">
+            <span>Keepalive (min)</span>
+            <input value={keepAliveMin} onChange={(e) => setKeepAliveMin(e.target.value)} placeholder="4 · 0 = off" inputMode="numeric" />
+          </label>
+        ) : null}
       </div>
+      {command === "pilot" ? (
+        <label className="nf-field nf-wide" title="goto-safe authed hub (the app menu). for sites where deep routes die on a direct/cold navigation: a route that bounces to an error page is reached by clicking its link from here instead, and this becomes the keepalive target. blank = off (unchanged).">
+          <span>Anchor URL (menu hub)</span>
+          <input value={anchorUrl} onChange={(e) => setAnchorUrl(e.target.value)} placeholder="e.g. http://host/Account/AccountMenu  (blank = off)" autoComplete="off" />
+        </label>
+      ) : null}
       {command === "pilot" ? (
         <label className="nf-field nf-wide" title="operator focus — injected as the TOP priority of the scenario (A04) stage, not per-screen diagnosis. emphasis, not exclusive (full coverage still runs).">
           <span>Focus (scenario emphasis)</span>
@@ -406,6 +423,7 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
               <input placeholder="cookieFile path" value={r.cookieFile} onChange={(e) => setRole(i, { cookieFile: e.target.value })} />
             ) : null}
             <input placeholder="description (e.g. admin)" value={r.description} onChange={(e) => setRole(i, { description: e.target.value })} />
+            <input placeholder="login URL (optional — this role's own login page)" value={r.loginUrl} onChange={(e) => setRole(i, { loginUrl: e.target.value })} autoComplete="off" />
             <button type="button" onClick={() => rmRole(i)}>
               ✕
             </button>

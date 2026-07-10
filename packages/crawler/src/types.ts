@@ -30,6 +30,15 @@ export interface FormObservation {
   fields: FormFieldObservation[];
 }
 
+/** A clickable UI control that is NOT a plain <a href> (buttons / submit inputs / [role=button] / [onclick]). These drive
+ *  button-based navigation the a[href] link crawl misses; surfaced to the survey so it can click the navigational ones. */
+export interface ClickableObservation {
+  /** Visible label (button text / value / aria-label), for the model to pick + judge destructive vs navigational. */
+  text: string;
+  /** A selector to click it (id / name / :has-text / tag) — usable directly with browser_click. */
+  selector: string;
+}
+
 /** The observation driver.visit() returns for one screen. */
 export interface Observation {
   requestedUrl: string;
@@ -44,6 +53,8 @@ export interface Observation {
   forms: FormObservation[];
   /** In-page links (href strings; the pipeline makes them absolute) */
   links: string[];
+  /** Non-anchor clickable controls (buttons / submit / [onclick]) — button-based navigation the link crawl misses. */
+  clickables?: ClickableObservation[];
   /** SPA virtual routes (pushState/hashchange, already absolute; §6.4) */
   virtualRoutes: string[];
   /** XHR/fetch intercepted during this navigation (§6.2) */

@@ -34,9 +34,15 @@ export interface PilotSession {
   artifactsDir: string;
   scope: ScopePolicy;
   targetUrl: string;
+  /** Goto-safe authenticated hub (the menu). When set (--anchor-url), a route that bounces to an error page on a cold
+   *  navigation is reached by clicking its link from here instead, and it's the preferred keepalive touch target. */
+  anchorUrl?: string;
   roleCreds: Map<string, LoginCreds>;
   /** Role name → path to a pre-captured Cookie file (instead of credentials; for walls that can't be auto-logged-in). */
   roleCookieFiles: Map<string, string>;
+  /** Role name → that role's own login entry URL (user vs admin log in at different pages). The login() tool starts
+   *  smartLogin there. Optional; falls back to targetUrl. */
+  roleLoginUrls?: Map<string, string>;
   /** Role name → free-form privilege description (e.g. "full admin" / "regular user (read-only)"). Used for the high/low-privilege call in auth-diff. */
   roleDescriptions: Map<string, string>;
   loginLlm: LlmClient;
@@ -76,6 +82,9 @@ export interface PilotSession {
   visited: Set<string>;
   /** In-scope, unvisited links (survey's remaining tasks = the frontier that prevents eliding work). */
   frontier: Set<string>;
+  /** Routes that bounce to an error/login catch-all on a cold navigation (referer/click-gated). Kept OUT of the frontier
+   *  so the crawl doesn't loop re-navigating them onto the error page; reached instead by an in-app browser_click. */
+  refererGated: Set<string>;
   /** Low-value path patterns the model dynamically pruned via ignore_paths (CMS content trees etc.). Filtered out when adding to the frontier. */
   ignorePaths: string[];
   /** Exhaustive extraction mode (--exhaustive). When true, ignore_paths is disabled (map every screen). */
@@ -476,6 +485,72 @@ export function sessionLooksDead(snap: { url: string; visibleText: string }): bo
   return looksLikeLogin(snap.visibleText);
 }
 
+/** From a keepalive touch (a raw-HTTP GET of an authed URL), does the session look expired? 401/403, a redirect to a
+ *  login-ish location, or a login/denied body all mean the session died and re-auth is needed. */
+export function touchIsDead(status: number, location: string | undefined, body: string): boolean {
+  if (status === 401 || status === 403) return true;
+  if (status >= 300 && status < 400 && location && /(login|signin|sign-in|auth|sso)/i.test(location)) return true;
+  return looksLikeLogin(body);
+}
+
+/** Merge a response's Set-Cookie into an existing `Cookie:` header (best-effort). Keeps cookies the response didn't
+ *  touch, overwrites the names it rotated. Used by keepalive's raw-HTTP touch to pick up a rotated session cookie
+ *  WITHOUT a page load (so a fragile site's session survives). undici joins multiple Set-Cookie with ", ", so split
+ *  only where a comma is followed by a fresh `token=` (not inside `Expires=Wed, 09-Jun-...`, which has no `=` there). */
+export function mergeSetCookie(current: string, setCookie: string | undefined): string {
+  if (!setCookie) return current;
+  const jar = new Map<string, string>();
+  for (const kv of current.split(";")) {
+    const s = kv.trim();
+    const i = s.indexOf("=");
+    if (i > 0) jar.set(s.slice(0, i).trim(), s.slice(i + 1));
+  }
+  for (const chunk of setCookie.split(/,(?=\s*[A-Za-z0-9!#$%&'*+.^_`|~-]+=)/)) {
+    const first = (chunk.split(";")[0] ?? "").trim();
+    const i = first.indexOf("=");
+    if (i <= 0) continue;
+    const name = first.slice(0, i).trim();
+    const value = first.slice(i + 1).trim();
+    if (value) jar.set(name, value); // ignore empty-value deletions rather than risk dropping a live cookie
+  }
+  return [...jar].map(([k, v]) => `${k}=${v}`).join("; ");
+}
+
+/** Detect an error / login catch-all page — an ASP.NET `aspxerrorpath` redirect, a generic ErrX/error/40x/50x static
+ *  page, or a bounce (requested != final) that lands on a login/denied body. Such a page is NOT real functionality: it
+ *  must not be enrolled as a screen and its links must not seed the frontier (they derail the crawl onto the error page,
+ *  the a-mre85zq4 symptom). The requested route is flagged referer-gated instead — reach it via an in-app click, not a
+ *  cold navigation. */
+export function looksLikeErrorCatchAll(o: Pick<Observation, "requestedUrl" | "finalUrl" | "visibleText">): boolean {
+  const final = o.finalUrl;
+  if (/[?&]aspxerrorpath=/i.test(final)) return true; // ASP.NET unhandled-route / request-validation catch-all
+  let path = final.toLowerCase();
+  try {
+    path = new URL(final).pathname.toLowerCase();
+  } catch {
+    /* relative/malformed: match against the raw string */
+  }
+  if (/\/(err[a-z0-9_-]*|error|errorpage|400|401|403|404|500|accessdenied|denied|forbidden)\.[a-z0-9]+$/.test(path)) return true;
+  // a redirect/bounce that ends on a login/denied page (the route needs in-app referer/click context to reach real content)
+  if (stripHash(o.requestedUrl) !== stripHash(o.finalUrl) && looksLikeLogin(o.visibleText)) return true;
+  return false;
+}
+
+/** Detect a WAF / bot-management block or challenge (Cloudflare "Just a moment..." with cf-mitigated, Akamai / Incapsula /
+ *  Imperva, a 429 / 503, or a 403 challenge interstitial). Such a response is NOT the application — a length/differential
+ *  signal measured on it is block-page variance (a rotating cf-ray / nonce), not a real effect. Used to refuse confirming
+ *  a finding when the probes are actually being blocked (the namejet.com run manufactured 5 "confirmed SQLi" from 403
+ *  "Just a moment" challenge pages because the boolean length delta was just challenge-page variance). */
+export function looksBlocked(res: { status: number; headers?: Record<string, string>; body?: string }): boolean {
+  const h = res.headers ?? {};
+  if (h["cf-mitigated"]) return true; // Cloudflare bot-management (challenge/block) — definitive
+  if (res.status === 429 || res.status === 503) return true;
+  const b = (res.body ?? "").slice(0, 2000);
+  if (/just a moment\.\.\.|challenges\.cloudflare\.com|cf-mitigated|attention required|_incapsula_|imperva|akamai/i.test(b)) return true;
+  if (res.status === 403 && /captcha|challenge|verify you are (?:a )?human|are you a robot|enable javascript/i.test(b)) return true;
+  return false;
+}
+
 export type AccessVerdict = "not_bypass" | "needs_judgment" | "inconclusive";
 
 /** Unauthenticated/authenticated responses → machine verdict for auth-bypass.
@@ -504,7 +579,7 @@ export function classifyAccess(
  *  Excludes out-of-scope / logout-ish / ignore_paths / already-visited. */
 export function frontierLinks(
   o: Pick<Observation, "finalUrl" | "links"> & { virtualRoutes?: string[] },
-  s: Pick<PilotSession, "scope" | "lockToSeeds" | "visited" | "ignorePaths" | "targetUrl">,
+  s: Pick<PilotSession, "scope" | "lockToSeeds" | "visited" | "ignorePaths" | "targetUrl" | "refererGated">,
 ): string[] {
   if (s.lockToSeeds) return [];
   const out = new Set<string>();
@@ -520,6 +595,7 @@ export function frontierLinks(
     if (!isInScope(abs, s.scope)) continue;
     if (isSessionDestroyingPath(abs)) continue; // don't add logout/signout links to the frontier (self-sabotage if walked)
     if (pathIsIgnored(abs, s.ignorePaths, s.targetUrl)) continue; // don't add low-value paths the model pruned
+    if (s.refererGated.has(abs)) continue; // known to bounce to the error page on cold nav — don't re-queue it for goto
     if (!s.visited.has(abs)) out.add(abs);
   }
   return [...out];
@@ -598,6 +674,11 @@ export function checkEvidenceDiscipline(
   if (!stable) return { ok: false, reason: "the positive replays disagree (status or body length differ) — unstable / not reproducible" };
   const differs = neg.status !== p0.status || Math.abs(neg.bodyLen - p0.bodyLen) > 64;
   if (!differs) return { ok: false, reason: "the negative control is indistinguishable from the positives (same status & body length) — catch-all / no real effect" };
+  // A body-length-ONLY differential (positives + control share a status) is only meaningful on a real 2xx APP response.
+  // On a non-2xx status (a 403/429/503 WAF challenge, a 5xx error) the length varies for reasons unrelated to the payload
+  // (a rotating Cloudflare nonce/cf-ray) — that manufactured "confirmed SQLi" from 403 "Just a moment" challenge pages.
+  if (neg.status === p0.status && !(p0.status >= 200 && p0.status < 300))
+    return { ok: false, reason: `both control and positives are status ${p0.status} — not a 2xx app response (WAF challenge / error / block page); a body-length differential there is block-page variance, not a real effect` };
   return { ok: true };
 }
 
@@ -656,6 +737,87 @@ async function captureScreenshot(s: PilotSession, screen: Screen): Promise<void>
   if (okShot) {
     screen.screenshot = rel;
     s.store.upsertScreen(s.assessmentId, screen);
+  }
+}
+
+/** CSS selectors to find the anchor-page link that points at a referer-gated route (exact path, absolute URL, or a
+ *  suffix match for relative hrefs). Pure, so it's unit-tested. */
+export function anchorLinkSelectors(targetUrl: string): string[] {
+  let path = targetUrl;
+  try {
+    path = new URL(targetUrl).pathname;
+  } catch {
+    /* relative/malformed: match against the raw string */
+  }
+  const esc = (v: string): string => v.replace(/"/g, '\\"');
+  return [`a[href="${esc(path)}"]`, `a[href="${esc(targetUrl)}"]`, `a[href$="${esc(path)}"]`];
+}
+
+/** Reach a referer-gated route by clicking its link from the goto-safe anchor hub (the menu), when --anchor-url is set.
+ *  Positions the browser at the anchor (a cold GET the anchor survives), clicks the route's link (in-app nav, session
+ *  preserved), and enrolls the reached view. Returns null if the link isn't on the anchor or the click still bounces —
+ *  the caller then falls back to flagging the route referer-gated (unchanged no-anchor behavior). */
+async function reachViaAnchor(s: PilotSession, targetUrl: string): Promise<{ screen: Screen; isNew: boolean } | null> {
+  if (!s.anchorUrl) return null;
+  try {
+    await s.driver.visit(s.anchorUrl); // goto-safe hub — position the browser there
+    const clicked = await s.driver.clickFirst(anchorLinkSelectors(targetUrl));
+    if (!clicked) return null;
+    const fired = s.driver.drainApiCalls();
+    const snap = await s.driver.snapshot();
+    const o: Observation = {
+      requestedUrl: targetUrl,
+      finalUrl: snap.url,
+      status: 200,
+      title: snap.title,
+      domSkeleton: snap.domSkeleton,
+      visibleText: snap.visibleText,
+      forms: snap.forms,
+      links: snap.links,
+      virtualRoutes: snap.virtualRoutes,
+      apiCalls: fired,
+      scripts: [],
+    };
+    if (looksLikeErrorCatchAll(o)) return null; // the click still bounced to the error page
+    const rec = recordObservation(s, o);
+    await captureScreenshot(s, rec.screen);
+    s.refererGated.delete(stripHash(targetUrl));
+    s.refererGated.delete(stripHash(snap.url));
+    return rec;
+  } catch {
+    return null;
+  }
+}
+
+/** Input sweep — the primary surface-discovery engine: exercise this screen's forms / search boxes with benign values and
+ *  add newly discovered in-scope routes/APIs to the frontier. Run on every NEW screen whether it was reached by
+ *  browser_navigate OR browser_click, so a click-driven survey on a session-fragile site does not lose it (the old code
+ *  only swept inside browser_navigate → click-reached screens got zero discovery). No-op unless enabled + new + not locked. */
+async function runInputSweep(s: PilotSession, screen: Screen, isNew: boolean): Promise<{ exercised: number; added: number }> {
+  if (!s.inputSweep || s.lockToSeeds || !isNew) return { exercised: 0, added: 0 };
+  try {
+    const sweep = await s.driver.exerciseInputs({
+      aggressive: s.aggressiveForms,
+      allow: (u) => isInScope(u, s.scope) && !isSessionDestroyingPath(u),
+    });
+    let added = 0;
+    for (const d of sweep.discovered) {
+      const abs = stripHash(d);
+      if (!isInScope(abs, s.scope) || isSessionDestroyingPath(abs)) continue;
+      if (s.visited.has(abs) || s.frontier.has(abs) || s.refererGated.has(abs)) continue;
+      if (pathIsIgnored(abs, s.ignorePaths, s.targetUrl)) continue;
+      s.frontier.add(abs);
+      added += 1;
+    }
+    if (sweep.exercised > 0)
+      s.store.appendEvent(s.assessmentId, {
+        type: "note",
+        payload: { message: `⌨ input sweep ${screen.screenId}: exercised ${sweep.exercised} form/input(s) → +${added} new route/API to frontier` },
+      });
+    return { exercised: sweep.exercised, added };
+  } catch (e) {
+    s.store.appendEvent(s.assessmentId, { type: "note", payload: { message: `⚠ input sweep ${screen.screenId} failed: ${String(e).slice(0, 100)}` } });
+    return { exercised: 0, added: 0 };
   }
 }
 
@@ -718,36 +880,51 @@ export function buildTools(s: PilotSession) {
           return txt(`SKIPPED: ${url} is a logout/sign-out path. Navigating to it would break the auth session and wipe out all subsequent diagnosis, so it is not visited.`);
         try {
           const o = await s.driver.visit(url);
-          const { screen, isNew } = recordObservation(s, o);
-          await captureScreenshot(s, screen);
-          // ── input sweep ── submit this screen's forms/searches with benign values and add any new routes/APIs that surface to the frontier.
-          //    "touch every input field" = so we don't miss features/endpoints hidden behind an input gate. logout/out-of-scope are filtered out.
-          let swept = 0;
-          let sweptAdded = 0;
-          if (s.inputSweep && !s.lockToSeeds && isNew) {
-            try {
-              const sweep = await s.driver.exerciseInputs({
-                aggressive: s.aggressiveForms,
-                allow: (u) => isInScope(u, s.scope) && !isSessionDestroyingPath(u),
-              });
-              swept = sweep.exercised;
-              for (const d of sweep.discovered) {
-                const abs = stripHash(d);
-                if (!isInScope(abs, s.scope) || isSessionDestroyingPath(abs)) continue;
-                if (s.visited.has(abs) || s.frontier.has(abs)) continue;
-                if (pathIsIgnored(abs, s.ignorePaths, s.targetUrl)) continue;
-                s.frontier.add(abs);
-                sweptAdded += 1;
-              }
-              if (swept > 0)
+          // ── error/login catch-all guard ── if the cold navigation bounced to an ASP.NET aspxerrorpath / ErrX / login
+          //   page, do NOT enroll it as a screen and do NOT seed its links to the frontier (that derails the crawl onto
+          //   the error page). Flag the route referer-gated so it's reached by an in-app browser_click instead.
+          if (looksLikeErrorCatchAll(o)) {
+            // Anchor auto-recovery (opt-in via --anchor-url): the cold GET bounced, but the route may be reachable by
+            // clicking its link from the goto-safe anchor hub. With no anchor set this whole block is skipped = unchanged.
+            if (s.anchorUrl) {
+              const rec = await reachViaAnchor(s, url);
+              if (rec) {
                 s.store.appendEvent(s.assessmentId, {
                   type: "note",
-                  payload: { message: `⌨ input sweep ${screen.screenId}: exercised ${swept} form/input(s) → +${sweptAdded} new route/API to frontier` },
+                  payload: { message: `🧭 ${url} bounced on cold nav → reached via anchor click → ${rec.screen.screenId}` },
                 });
-            } catch (e) {
-              s.store.appendEvent(s.assessmentId, { type: "note", payload: { message: `⚠ input sweep ${screen.screenId} failed: ${String(e).slice(0, 100)}` } });
+                return txt(
+                  JSON.stringify({
+                    recoveredViaAnchor: true,
+                    screenId: rec.screen.screenId,
+                    isNew: rec.isNew,
+                    finalUrl: rec.screen.observedUrls[0] ?? url,
+                    note: "This route bounces on a cold navigation but was reached by clicking its link from the anchor hub, and is now enrolled as a screen.",
+                    frontierRemaining: s.frontier.size,
+                  }),
+                );
+              }
             }
+            s.refererGated.add(stripHash(url));
+            s.frontier.delete(stripHash(url));
+            s.store.appendEvent(s.assessmentId, {
+              type: "note",
+              payload: { message: `🚧 ${url} bounced to an error/login page (${o.finalUrl}) — referer-gated, not enrolled. Reach it via browser_click from a page that links to it.` },
+            });
+            return txt(
+              JSON.stringify({
+                refererGated: true,
+                requested: url,
+                bouncedTo: o.finalUrl,
+                note: "This route bounces to an error/login catch-all on a cold navigation, so it was NOT recorded and its links were NOT added to the frontier. Do NOT browser_navigate it again — reach it with browser_click on its link from a page that lists it (the app needs in-app referer/session context).",
+                frontierRemaining: s.frontier.size,
+              }),
+            );
           }
+          const { screen, isNew } = recordObservation(s, o);
+          await captureScreenshot(s, screen);
+          // ── input sweep ── submit this screen's forms/searches with benign values and add any new routes/APIs to the frontier.
+          const { exercised: swept, added: sweptAdded } = await runInputSweep(s, screen, isNew);
           return txt(
             JSON.stringify({
               screenId: screen.screenId,
@@ -757,6 +934,7 @@ export function buildTools(s: PilotSession) {
               title: o.title,
               text: o.visibleText.slice(0, 500),
               links: o.links.slice(0, 40),
+              clickables: (o.clickables ?? []).slice(0, 30), // non-anchor buttons — click the navigational ones to reach more screens
               forms: o.forms,
               firedApis: o.apiCalls.map((a) => ({ method: a.method, url: a.url, status: a.status })).slice(0, 30),
               inputSweep: s.inputSweep ? { exercised: swept, discovered: sweptAdded } : "disabled",
@@ -777,20 +955,55 @@ export function buildTools(s: PilotSession) {
     ),
     tool(
       "browser_click",
-      "Click an element by CSS selector; returns the resulting page state and any fired APIs.",
+      "Click an element by CSS selector. If the click reaches a new in-app view (SPA navigation — no full reload, so the session is preserved), it is recorded as a screen (auto-enrolled into the coverage ledger, deduped by DOM skeleton). This is how you map a route that dies on a direct/cold navigation: click its link instead of browser_navigate-ing it. Returns the resulting page state, screenId (if enrolled), and any fired APIs.",
       { selector: z.string() },
       async ({ selector }) => {
+        const preUrl = s.driver.currentUrl();
         const clicked = await s.driver.clickFirst([selector]);
         const fired = s.driver.drainApiCalls();
         const snap = await s.driver.snapshot();
+        // Enroll the clicked-to view as a screen. clickFirst() is page.click = an in-app pushState/hashchange nav with no
+        // reload, so an SPA / nav-token session survives — the only way to enroll a referer/click-gated route. Synthesize
+        // an Observation from the snapshot (buildScreenFromObservation ignores status/requestedUrl; dedups on skeleton, so
+        // re-clicks of the same view don't duplicate). Skip error/login pages and logout.
+        let enrolled: { screenId: string; isNew: boolean } | null = null;
+        let swept = { exercised: 0, added: 0 };
+        const o: Observation = {
+          requestedUrl: preUrl || snap.url,
+          finalUrl: snap.url,
+          status: 200,
+          title: snap.title,
+          domSkeleton: snap.domSkeleton,
+          visibleText: snap.visibleText,
+          forms: snap.forms,
+          links: snap.links,
+          clickables: snap.clickables ?? [],
+          virtualRoutes: snap.virtualRoutes,
+          apiCalls: fired,
+          scripts: [],
+        };
+        if (clicked && isInScope(snap.url, s.scope) && !isSessionDestroyingPath(snap.url) && !looksLikeErrorCatchAll(o)) {
+          const wasGated = s.refererGated.has(stripHash(snap.url));
+          const { screen, isNew } = recordObservation(s, o);
+          await captureScreenshot(s, screen);
+          s.refererGated.delete(stripHash(snap.url)); // reachable after all (via in-app click)
+          enrolled = { screenId: screen.screenId, isNew };
+          // Run the discovery engine on click-reached screens too (parity with browser_navigate) — skip only a KNOWN
+          // referer-gated leaf, whose the sweep's cold-goto restore would bounce. Most click-reached screens are goto-safe.
+          if (!wasGated) swept = await runInputSweep(s, screen, isNew);
+        }
         return txt(
           JSON.stringify({
             clicked,
+            ...(enrolled ? { screenId: enrolled.screenId, isNew: enrolled.isNew } : {}),
             url: snap.url,
             title: snap.title,
             forms: snap.forms,
             links: snap.links.slice(0, 40),
+            clickables: (snap.clickables ?? []).slice(0, 30), // non-anchor buttons — click the navigational ones to reach more screens
             firedApis: fired.map((a) => ({ method: a.method, url: a.url, status: a.status })).slice(0, 30),
+            ...(s.inputSweep ? { inputSweep: { exercised: swept.exercised, discovered: swept.added } } : {}),
+            frontierRemaining: s.frontier.size,
           }),
         );
       },
@@ -1096,6 +1309,7 @@ export function buildTools(s: PilotSession) {
           await s.driver.clearSession();
           const r = await smartLogin(s.driver, s.loginLlm, creds, {
             targetUrl: s.targetUrl,
+            ...(s.roleLoginUrls?.get(role) ? { loginScreenUrl: s.roleLoginUrls.get(role)! } : {}),
             ...(s.model ? { model: s.model } : {}),
           });
           if (r.ok) {
@@ -1578,13 +1792,20 @@ export function buildTools(s: PilotSession) {
           const errSig = err ? SQL_ERR.exec(err.body)?.[0] : undefined;
           // ── boolean-based(in-band 差分) ──
           const falseR = await send("' OR '1'='2'-- -", "negative_control", "boolean FALSE");
+          // A boolean length differential only means anything on a real 2xx app response. If the app is behind a WAF /
+          // bot-challenge (403 "Just a moment", 429/503, cf-mitigated), the "response" is a block page and its length
+          // varies with a rotating nonce — NOT injection. Skip boolean confirmation when blocked (that FP'd namejet.com).
+          const usable = (x: { status: number; body: string }): boolean => x.status >= 200 && x.status < 300 && !looksBlocked(x);
+          if (falseR && looksBlocked(falseR)) {
+            return txt(JSON.stringify({ technique: null, blocked: true, verdict: `BLOCKED: the target returned a WAF / bot-challenge page (status ${falseR.status}) instead of the app — probes are not reaching it, so SQLi cannot be confirmed here. Do NOT record a finding from these responses.` }));
+          }
           for (const tp of ["' OR '1'='1'-- -", " OR 1=1-- -", "') OR ('1'='1"]) {
             const t1 = await send(tp, "positive_replay", `boolean TRUE ${tp}`);
-            if (!t1 || !falseR) continue;
+            if (!t1 || !falseR || !usable(t1) || !usable(falseR)) continue;
             const diff = (x: { status: number; len: number }): boolean => x.status !== falseR.status || Math.abs(x.len - falseR.len) > 64;
-            if (t1.status < 500 && diff(t1)) {
+            if (diff(t1)) {
               const t2 = await send(tp, "positive_replay", `boolean TRUE#2 ${tp}`);
-              if (t2 && diff(t2) && Math.abs(t2.len - t1.len) <= 64)
+              if (t2 && usable(t2) && diff(t2) && Math.abs(t2.len - t1.len) <= 64)
                 return txt(JSON.stringify({ technique: "boolean", negativeControl: falseR.evId, positiveReplays: [t1.evId, t2.evId], verdict: `SQLi CONFIRMED (boolean): TRUE(${tp}) len ${t1.len}/${t2.len} vs FALSE len ${falseR.len}. record_finding(category sqli) with these evidenceIds.${errSig ? ` (SQL error also seen: ${errSig})` : ""}` }));
             }
           }

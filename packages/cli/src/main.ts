@@ -609,6 +609,9 @@ interface AssessManifest {
       cookieFile?: string;
       cookie_file?: string;
       cookie_file_path?: string;
+      /** This role's own login entry URL (for apps where roles log in at different pages: a user login vs an admin login). */
+      loginUrl?: string;
+      login_url?: string;
       headers?: Record<string, string>;
     }>;
   };
@@ -679,6 +682,16 @@ function manifestRoleCookies(m: AssessManifest | null): Array<{ name: string; fi
   for (const role of m?.auth?.roles ?? []) {
     const file = role.cookieFile ?? role.cookie_file ?? role.cookie_file_path;
     if (file) out.push({ name: role.name, file });
+  }
+  return out;
+}
+
+/** Role name -> that role's own login entry URL (user vs admin log in at different pages). Optional. */
+function manifestRoleLoginUrls(m: AssessManifest | null): Array<{ name: string; url: string }> {
+  const out: Array<{ name: string; url: string }> = [];
+  for (const role of m?.auth?.roles ?? []) {
+    const url = role.loginUrl ?? role.login_url;
+    if (url) out.push({ name: role.name, url });
   }
   return out;
 }
@@ -1005,6 +1018,8 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       "burp-api": { type: "string" },
       "no-burp-verify": { type: "boolean" }, // by default AI re-verifies Burp High+. Set to skip the verify phase
       "keepalive-min": { type: "string" },
+      "keepalive-url": { type: "string" }, // explicit URL for the keepalive touch (default: the authed page being diagnosed; never `/`)
+      "anchor-url": { type: "string" }, // goto-safe authed hub (menu): reach cold-nav-bouncing routes by clicking their link from here; also the keepalive target
       "control-url": { type: "string" }, // attended×LiveHands: reverse-connection target for serve (supplied by the supervisor)
     },
   });
@@ -1074,6 +1089,8 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
   if (roleCreds.size === 0 && primary) roleCreds.set(primary.username || "user", primary);
   const roleCookieFiles = new Map<string, string>();
   for (const rc of manifestRoleCookies(manifest)) roleCookieFiles.set(rc.name, rc.file);
+  const roleLoginUrls = new Map<string, string>();
+  for (const rc of manifestRoleLoginUrls(manifest)) roleLoginUrls.set(rc.name, rc.url);
   const roleDescriptions = new Map<string, string>();
   for (const rc of manifestRoleDescriptions(manifest)) roleDescriptions.set(rc.name, rc.description);
   const httpBasic = manifestHttpBasic(manifest); // site-wide Basic/Digest (if any)
@@ -1147,6 +1164,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       ...(values["max-screens"] ? { maxScreens: Number.parseInt(values["max-screens"], 10) } : {}),
       ...(values["max-survey-screens"] ? { maxSurveyScreens: Number.parseInt(values["max-survey-screens"], 10) } : {}),
       ...(roleCookieFiles.size ? { roleCookieFiles } : {}),
+      ...(roleLoginUrls.size ? { roleLoginUrls } : {}),
       ...(roleDescriptions.size ? { roleDescriptions } : {}),
       fastModel: values["fast-model"] ?? "claude-sonnet-5", // fast model default = Sonnet (survey/methodology/low-value screens -> model tiering ON by default)
       ...(values["no-scenario"] ? { scenarioPass: false } : {}), // ON by default. Set to drop the A04 scenario
@@ -1155,6 +1173,8 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       ...(values["cve-lookup"] ? { cveLookup: true } : {}), // OFF by default. Set to enable online CVE DB lookups
       ...(burpProxy ? { burpProxy } : {}),
       ...(values["keepalive-min"] ? { keepAliveMinutes: Number.parseInt(values["keepalive-min"], 10) } : {}),
+      ...(values["keepalive-url"] ? { keepAliveUrl: values["keepalive-url"] } : {}),
+      ...(values["anchor-url"] ? { anchorUrl: values["anchor-url"] } : {}),
       ...(browserPath ? { browserPath } : {}),
       ...(values["no-sandbox"] ? { noSandbox: true } : {}),
       onText: (t) => console.log(`\n${t}`),
@@ -1507,11 +1527,18 @@ async function cmdAsr(args: string[]): Promise<void> {
   const minDelayMs = values.rate ? Math.max(0, Number.parseInt(values.rate, 10)) : 250;
   const runsDir = values.out ?? RUNS_DIR_DEFAULT;
 
-  const scope: ScopePolicy = deriveScopeFromUrls([base], "etld"); // *.apex — subdomains in scope
+  const scope: ScopePolicy = {
+    ...deriveScopeFromUrls([base], "etld"),
+    inScopeHosts: [`*.${apex}`], // scope to the operator's --domain, not the registrable domain (a deep apex must not widen)
+    outOfScopeHosts: outOfScope.map((d) => (d.startsWith("*.") ? d : `*.${d}`)), // carve-outs enforced at the probe gate too, not just discovery
+  };
   const id = values.id ?? newAssessmentId(); // the WebUI launch passes a pre-generated id via the supervisor
   mkdirSync(join(runsDir, id), { recursive: true });
   const store = AssessmentStore.open(dbPathFor(runsDir, id));
-  store.createAssessment({ id, target: { kind: "single_url", url: base, followLinks: false, maxDepth: 0 }, scope });
+  if (!store.loadAssessment(id)) {
+    // fresh run; a --id re-scan (resume) reuses the existing assessment row (avoids a UNIQUE conflict)
+    store.createAssessment({ id, target: { kind: "single_url", url: base, followLinks: false, maxDepth: 0 }, scope });
+  }
   store.close(); // assets persist to asset_inventory.json, not the store (a store table is a later slice)
   const invPath = join(runsDir, id, "asset_inventory.json");
   writeAssetInventory(invPath, buildAssetInventory(apex, [])); // write empty now so the WebUI detects an ASR run while it scans
@@ -1565,6 +1592,9 @@ async function cmdAsr(args: string[]): Promise<void> {
     }
     assets.push(asset);
     console.log(p.alive ? `  ✓ ${host}  ${p.status ?? ""} ${p.title ?? ""}`.trimEnd() : `  · ${host}`);
+    // Incremental write → the WebUI (polling /assets) shows hosts appear + a progress bar (probed / discovered).
+    // Write every host for the first 10 (immediate feedback), then every 10 (bounded I/O on large runs).
+    if (assets.length <= 10 || assets.length % 10 === 0) writeAssetInventory(invPath, buildAssetInventory(apex, assets, new Date(), hosts.length));
   }
   const live = assets.filter((a) => a.alive);
 
@@ -1647,7 +1677,7 @@ async function cmdAsr(args: string[]): Promise<void> {
   }
 
   // ⑤ persist the asset inventory (overwrite the early empty file with the scored, ranked set)
-  writeAssetInventory(invPath, buildAssetInventory(apex, assets));
+  writeAssetInventory(invPath, buildAssetInventory(apex, assets, new Date(), hosts.length));
   console.log(`\nasr ${id}: ${assets.length} asset(s), ${live.length} live → ${invPath}`);
   const top = assets.filter((a) => a.alive).slice(0, 10);
   if (top.length > 0) {

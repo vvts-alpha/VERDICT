@@ -3,7 +3,7 @@
 // The child writes runs/<id>/state.sqlite → the existing WS projection live-streams progress as-is. The Phase-1 control plane in docs/LIVE_TAKEOVER.md.
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { newAssessmentId } from "@veritas/core";
 import type { Relay } from "./relay.js";
@@ -38,6 +38,10 @@ export interface StartRunInput {
     maxSurveyScreens?: number;
     /** Operator's focus hint (free text). Injected as the top-priority objective of the scenario stage (--focus). */
     focus?: string;
+    /** pilot only: keepalive interval in minutes (0 = off). For sites whose session dies on a cold `/` hit / full reload. */
+    keepAliveMin?: number;
+    /** pilot only: goto-safe authed hub (menu). Reach cold-nav-bouncing routes by clicking their link from here; also the keepalive target. */
+    anchorUrl?: string;
     /** pilot only: also run a Burp active scan after diagnosis (connection via env BURP_API). */
     burpScan?: boolean;
     /** pilot only: route all traffic through the Burp proxy (connection via env BURP_PROXY). */
@@ -91,6 +95,12 @@ export class Supervisor {
     writeFileSync(manifestPath, `${JSON.stringify(input.manifest, null, 2)}\n`);
     // Persist options too so resume can restore the start-time settings (attended/model/burp etc.).
     writeFileSync(join(dir, "run.json"), `${JSON.stringify({ command: input.command, options: input.options ?? {} }, null, 2)}\n`);
+    // ASR is detected by the WebUI via asset_inventory.json. Write it empty NOW (before the child has started and
+    // written it) so the run opens as an ASR view immediately, not briefly as a web assessment.
+    if (input.command === "asr") {
+      const apex = (input.options?.domain ?? "").replace(/^\*\./, "").replace(/\.$/, "");
+      writeFileSync(join(dir, "asset_inventory.json"), `${JSON.stringify({ version: 1, generatedAt: "", apex, assets: [] }, null, 2)}\n`);
+    }
 
     const args = [this.cfg.cliPath, input.command, "--manifest", manifestPath, "--id", id, "--out", this.cfg.runsDir];
     const o = input.options ?? {};
@@ -122,6 +132,8 @@ export class Supervisor {
       if (o.maxScreens != null) args.push("--max-screens", String(o.maxScreens));
       if (o.maxSurveyScreens != null) args.push("--max-survey-screens", String(o.maxSurveyScreens));
       if (o.focus) args.push("--focus", o.focus);
+      if (o.keepAliveMin != null) args.push("--keepalive-min", String(o.keepAliveMin));
+      if (o.anchorUrl) args.push("--anchor-url", o.anchorUrl);
       if (input.command === "pilot" && o.burpScan) args.push("--burp-scan");
       if (input.command === "pilot" && o.burpProxy) args.push("--burp-proxy");
     }
@@ -139,21 +151,42 @@ export class Supervisor {
    *  recover the auth material (roleCreds/cookie/httpBasic/attended) (without this, resume floods with 401s while unauthenticated). */
   resume(id: string): void {
     const dir = join(this.cfg.runsDir, id);
-    const args = [this.cfg.cliPath, "pilot", "--resume", "--id", id, "--out", this.cfg.runsDir];
     const manifestPath = join(dir, "manifest.json");
-    if (existsSync(manifestPath)) args.push("--manifest", manifestPath);
+    let command = "pilot";
     let o: NonNullable<StartRunInput["options"]> = {};
     try {
-      o = (JSON.parse(readFileSync(join(dir, "run.json"), "utf8")).options ?? {}) as NonNullable<StartRunInput["options"]>;
+      const run = JSON.parse(readFileSync(join(dir, "run.json"), "utf8")) as { command?: string; options?: unknown };
+      command = run.command ?? "pilot";
+      o = (run.options ?? {}) as NonNullable<StartRunInput["options"]>;
     } catch {
-      /* no run.json (old run) → continue with defaults */
+      /* no run.json (old run) → continue as a pilot resume with defaults */
     }
+
+    // ASR is one-shot — "resume" re-runs the scan (asr with the saved options), NOT pilot --resume.
+    if (command === "asr") {
+      const args = [this.cfg.cliPath, "asr", "--id", id, "--out", this.cfg.runsDir];
+      if (o.domain) args.push("--domain", o.domain);
+      if (o.outOfScope) args.push("--out-of-scope", String(o.outOfScope));
+      if (o.screenshot) args.push("--screenshot");
+      if (o.paths) args.push("--paths");
+      if (o.triage) args.push("--triage");
+      if (o.maxHosts != null) args.push("--max-hosts", String(o.maxHosts));
+      if (o.model) args.push("--model", o.model);
+      if (o.rate != null) args.push("--rate", String(o.rate));
+      this.spawnChild(id, "asr (re-scan)", args);
+      return;
+    }
+
+    const args = [this.cfg.cliPath, "pilot", "--resume", "--id", id, "--out", this.cfg.runsDir];
+    if (existsSync(manifestPath)) args.push("--manifest", manifestPath);
     if (o.model) args.push("--model", o.model);
     if (o.fastModel) args.push("--fast-model", o.fastModel);
     if (o.burpProxy) args.push("--burp-proxy"); // valueless flag (reads from BURP_PROXY env)
     if (o.loginUrl) args.push("--login-url", o.loginUrl);
     if (o.maxScreens != null) args.push("--max-screens", String(o.maxScreens));
     if (o.focus) args.push("--focus", o.focus);
+    if (o.keepAliveMin != null) args.push("--keepalive-min", String(o.keepAliveMin));
+    if (o.anchorUrl) args.push("--anchor-url", o.anchorUrl);
     // attended issues a new control channel (token) to reopen the windows in the WebUI.
     if (o.attended && this.relay && this.controlBase) {
       args.push("--attended");
@@ -222,12 +255,36 @@ export class Supervisor {
     const child = spawn(this.cfg.nodePath, args, { cwd: process.cwd(), env: process.env, stdio: ["ignore", "pipe", "pipe"] });
     const rec: RunProc = { id, command, child, startedAt: new Date().toISOString(), status: "running", exitCode: null };
     this.procs.set(id, rec);
+    // Tee the child's stdout/stderr to runs/<id>/run.log, one timestamped line at a time (the WebUI ASR Log tab
+    // renders these with a .log-ts column, like the web diagnostic log).
+    const logStream = createWriteStream(join(this.cfg.runsDir, id, "run.log"), { flags: "a" });
+    let logBuf = "";
+    const stamp = (): string => new Date().toTimeString().slice(0, 8);
+    const writeLog = (chunk: string): void => {
+      logBuf += chunk;
+      let nl = logBuf.indexOf("\n");
+      while (nl >= 0) {
+        logStream.write(`[${stamp()}] ${logBuf.slice(0, nl)}\n`);
+        logBuf = logBuf.slice(nl + 1);
+        nl = logBuf.indexOf("\n");
+      }
+    };
     log(`▶ spawned ${command} ${id} (pid ${child.pid ?? "?"})`);
-    child.stdout?.on("data", (d: Buffer) => log(`[${id}] ${String(d).trimEnd()}`));
-    child.stderr?.on("data", (d: Buffer) => log(`[${id}!] ${String(d).trimEnd()}`));
+    child.stdout?.on("data", (d: Buffer) => {
+      const s = String(d);
+      writeLog(s);
+      log(`[${id}] ${s.trimEnd()}`);
+    });
+    child.stderr?.on("data", (d: Buffer) => {
+      const s = String(d);
+      writeLog(s);
+      log(`[${id}!] ${s.trimEnd()}`);
+    });
     child.on("exit", (code) => {
       rec.status = "exited";
       rec.exitCode = code;
+      if (logBuf.length) logStream.write(`[${stamp()}] ${logBuf}\n`);
+      logStream.end(`[${stamp()}] exited (code ${code ?? "?"})\n`);
       this.relay?.revokeToken(id);
       log(`◼ ${command} ${id} exited (code ${code ?? "?"})`);
     });
