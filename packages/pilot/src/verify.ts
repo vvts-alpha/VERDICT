@@ -1,8 +1,9 @@
 // Post-Burp-import verification phase: the AI actively re-tests Burp active-scan High+ findings to confirm/refute them.
 // Burp's scanner produces false positives (especially SSTI/XSS/desync/reflected classes), so for each imported High+
 // the AI reproduces it with its own http_request (negative control + >=2 stable positives = evidence discipline) and
-// judges by the effect. A refutation does NOT remove it from the report (severity kept + note only). Confirmations are
-// marked [burp✓], refutations [burp?].
+// judges by the effect. A refutation does NOT remove it from the report, but drops it to **info** and labels it a LIKELY
+// FALSE POSITIVE (so a refuted medium/high stops masquerading at its Burp severity). Confirmations are marked [burp✓]
+// (raised upward-only to the confirmed level), refutations [burp?].
 //
 // Self-contained: does not depend on the diagnosis stage's heavy PilotSession (driver/inventory…) — runs on just the
 // http client and evidence store. Callable from runBurpScanOnRun / burp-import (either the REST or XML import path).
@@ -96,7 +97,7 @@ function pick(h: Record<string, string>, keys: string[]): Record<string, string>
 
 /**
  * The AI actively re-tests Burp-derived High+ findings to confirm/refute them. Idempotent (skips already-marked findings).
- * A refutation keeps severity unchanged (note only). Marks confirm=[burp✓] / refute=[burp?] and attaches the AI's re-test evidence.
+ * A refutation drops the finding to info + labels it a likely false positive. Marks confirm=[burp✓] / refute=[burp?] and attaches the AI's re-test evidence.
  */
 export async function verifyBurpFindings(deps: VerifyBurpDeps): Promise<VerifyBurpResult> {
   const all = deps.store.loadAssessment(deps.assessmentId)?.findings ?? [];
@@ -383,7 +384,9 @@ export async function triageAndDeepDiveBurp(
 const SEV_RANK: Record<Severity, number> = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
 
 /** Attach the verification mark and note to a finding. confirmed=[burp✓] / refuted=[burp?].
- *  When newSeverity is given, raise the severity of a confirmed sub-High lead **upward only** (info→high, etc.). */
+ *  Confirmed: raise a sub-High lead upward-only to the hint severity (correct an under-rated import).
+ *  Refuted (AI re-test could not reproduce): drop the finding to **info** and label it a LIKELY FALSE POSITIVE — a
+ *  refuted medium/high must not keep sitting in the report at its Burp severity, which misleads a reader who skips the note. */
 function annotate(
   deps: VerifyBurpDeps,
   f: Finding,
@@ -395,12 +398,16 @@ function annotate(
   const cur = deps.store.loadAssessment(deps.assessmentId)?.findings.find((x) => x.id === f.id) ?? f;
   const mark = outcome === "confirmed" ? "[burp✓]" : "[burp?]";
   const title = cur.title.replace(/^\[burp\]/, mark);
-  // If confirmed and the hint severity is higher than the current one, raise it (correcting an under-rated info import). Never lowers.
-  const bumped = outcome === "confirmed" && newSeverity && SEV_RANK[newSeverity] > SEV_RANK[cur.severity] ? newSeverity : cur.severity;
+  const bumped: Severity =
+    outcome === "confirmed"
+      ? newSeverity && SEV_RANK[newSeverity] > SEV_RANK[cur.severity] // confirmed: raise upward-only to the hint level
+        ? newSeverity
+        : cur.severity
+      : "info"; // refuted: could not reproduce → drop to info (likely false positive), still documented via the [burp?] note
   const head =
     outcome === "confirmed"
       ? `✅ AI-verified by active re-test: ${note}${bumped !== cur.severity ? ` (severity raised ${cur.severity}→${bumped}: confirmed real, not info-only)` : ""}`
-      : `⚠ AI re-test could not reproduce (severity kept, manual confirmation advised): ${note}`;
+      : `⚠ LIKELY FALSE POSITIVE — AI active re-test could not reproduce it${cur.severity !== "info" ? ` (severity ${cur.severity}→info)` : ""}; manual confirmation advised: ${note}`;
   const ev = [...new Set([...cur.evidenceIds, ...evidenceIds])];
   deps.store.upsertFinding(deps.assessmentId, { ...cur, title, severity: bumped, description: `${head}\n\n${cur.description}`, evidenceIds: ev });
   deps.store.appendEvent(deps.assessmentId, {

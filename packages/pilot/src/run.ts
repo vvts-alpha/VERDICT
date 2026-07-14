@@ -16,10 +16,10 @@ import { EvidenceStore, FetchHttpClient, fingerprintTech, stackAttackHints } fro
 import type { TechSample } from "@veritas/scanner";
 import type { BurpAuditConn } from "@veritas/scanner";
 import { join } from "node:path";
-import { buildTools, STAGE_TOOLS, dedupKey, isAuthWalled, loadCookieFile, mergeSetCookie, touchIsDead, stripHash } from "./tools.js";
+import { buildTools, STAGE_TOOLS, dedupKey, isAuthWalled, loadCookieFile, mergeSetCookie, touchIsDead, stripHash, backfillParentPrefixes } from "./tools.js";
 import type { PilotSession, RoleSession } from "./tools.js";
 import { LiveControl } from "./live-control.js";
-import { DEFAULT_SCENARIOS, DIAGNOSE_PROMPT, FINGERPRINT_PROMPT, METHODOLOGY_PROMPT, SCENARIO_PROMPT, SURVEY_PROMPT } from "./system.js";
+import { DEFAULT_SCENARIOS, DIAGNOSE_PROMPT, FINGERPRINT_PROMPT, METHODOLOGY_PROMPT, RECON_GUESS_PROMPT, SCENARIO_PROMPT, SURVEY_PROMPT } from "./system.js";
 
 export interface RunPilotOptions {
   store: AssessmentStore;
@@ -490,7 +490,9 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     plans: new Map(),
     currentScreenId: null,
     screenVerdict: null,
+    screenSkipReason: null,
     surveyDone: false,
+    reconGuessDone: false,
     methodologyDone: false,
     screenDone: false,
     scenarioDone: false,
@@ -700,6 +702,37 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       });
     }
 
+    // ── Parent-prefix backfill (deterministic, no LLM) ── survey only enrolls what it navigated, so a controller/
+    //   directory prefix (/Account implied by /Account/AccountEdit) that is itself a live page but was never linked
+    //   stays unmapped — an un-clickable folder in the site tree. Probe each unmapped static ancestor and enroll the
+    //   real ones (a 404 / error-catch-all is dropped). Runs whenever survey ran (survey-only included) so those parents
+    //   enter the inventory before methodology plans them.
+    if (doSurvey && !session.done) {
+      try {
+        const bf = await backfillParentPrefixes(session);
+        if (bf.enrolled > 0) opts.onText?.(`🧭 parent-prefix backfill: +${bf.enrolled} screen(s) from ${bf.probed} unmapped parent path(s)`);
+      } catch (e) {
+        opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: `⚠ parent-prefix backfill skipped: ${String(e).slice(0, 120)}` } });
+      }
+    }
+
+    // ── Recon extrapolation (LLM URL guessing) ── the deterministic backfill only fills structural PARENTS; here a
+    //   bounded LLM pass reads the mapped surface, infers the app's URL/naming convention, and probe_guesses the endpoints
+    //   it predicts exist but were never linked (missing CRUD actions, sibling controllers, admin variants, API
+    //   resources). Real hits enroll; 404s drop. A fresh, single-job query() guesses far better than tacking this onto the
+    //   survey loop (where the model drifts to survey_done). Skipped under a URL-list lock or once the survey cap is hit.
+    if (doSurvey && !session.done && !opts.lockToSeeds && !session.surveyCapped && session.inv.screens().length > 0) {
+      opts.store.setPhase(opts.assessmentId, "phase1_recon");
+      turns += await runStage({
+        system: RECON_GUESS_PROMPT,
+        goal: `${session.inv.screens().length} screens were mapped. Call get_inventory, infer the app's URL/naming convention, then probe_guesses the endpoints you predict exist but were not linked (missing CRUD actions on known controllers, sibling controllers by analogy, admin/privileged variants, API resources matching the observed style). Real pages are enrolled automatically; wrong guesses are dropped. Iterate AT MOST twice, then guess_done.`,
+        allowed: STAGE_TOOLS.reconGuess,
+        maxTurns: Math.min(maxTurns, 12),
+        model: fastModel, // guessing is mechanical -> fast
+        shouldStop: () => session.reconGuessDone || session.done,
+      });
+    }
+
     // ── Early fingerprint (before methodology) ── detect the stack and produce tech-aware attack-plan hints.
     //    The A06 fingerprint stage runs *after* diagnosis, too late for planning. Here we lightly GET root/login/first screens
     //    (deterministic, no LLM) and inject detected-stack -> target-attack-classes into the methodology goal.
@@ -835,6 +868,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         session.currentScreenId = sc.screenId;
         session.screenDone = false;
         session.screenVerdict = null;
+        session.screenSkipReason = null;
         session.screenProbes = 0; // reset per screen for the coverage-gate cross-check
         opts.store.setScreenScanStatus(opts.assessmentId, sc.screenId, "scanning");
         turns += await runStage({
@@ -853,7 +887,14 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         }
         // The ledger decides terminal by the **confidence of the finding actually recorded** (confirmed->finding / suspected->suspected /
         //   none->clean). screenVerdict is the authoritative value record_finding maintains (upgrade-only; the model's screen_done self-report never overwrites it).
-        const status = session.screenVerdict === "finding" ? "finding" : session.screenVerdict === "suspected" ? "suspected" : "clean";
+        //   skip_screen flags the screen out-of-scope for active testing (high-harm / out-of-ROE) → excluded (terminal), and the run continues.
+        const status = session.screenSkipReason
+          ? "excluded"
+          : session.screenVerdict === "finding"
+            ? "finding"
+            : session.screenVerdict === "suspected"
+              ? "suspected"
+              : "clean";
         opts.store.setScreenScanStatus(opts.assessmentId, sc.screenId, status);
 
         // ── Auth-wall circuit breaker ── if every probe returns 401 and nothing gets through (zero 2xx, zero findings),

@@ -108,8 +108,13 @@ export interface PilotSession {
   currentScreenId: string | null;
   /** Diagnosis result for the most recent screen (set by screen_done). */
   screenVerdict: "finding" | "suspected" | "clean" | null;
+  /** Set by skip_screen: the current screen was flagged out-of-scope for ACTIVE testing (high-harm / out-of-ROE) and
+   *  excluded, NOT diagnosed — the run continues to the next screen instead of halting. Reset per screen. */
+  screenSkipReason: string | null;
   // ── stage completion signals ──
   surveyDone: boolean;
+  /** Completion signal for the post-survey recon extrapolation (LLM URL-guessing) pass. */
+  reconGuessDone: boolean;
   methodologyDone: boolean;
   screenDone: boolean;
   /** Completion signal for the scenario (A04 cross-cutting logic) stage. */
@@ -127,8 +132,10 @@ export interface PilotSession {
 /** Tools shown per stage (base names). run.ts prefixes them with `mcp__veritas__` and passes them to allowedTools. */
 export const STAGE_TOOLS = {
   survey: ["browser_navigate", "browser_fill", "browser_click", "login", "probe_paths", "ignore_paths", "survey_status", "survey_done"],
+  // recon extrapolation: after survey, read the mapped surface and forced-browse LLM-predicted unlinked endpoints.
+  reconGuess: ["get_inventory", "probe_guesses", "browser_navigate", "guess_done"],
   methodology: ["get_inventory", "record_methodology", "methodology_done"],
-  diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_dom_xss", "probe_stored_xss", "probe_ssti", "probe_sqli", "probe_cmdi", "probe_traversal", "probe_redirect", "probe_jwt", "probe_csrf", "probe_oob", "probe_logic", "analyze_session", "verify_access", "probe_idor", "browser_navigate", "browser_fill", "browser_click", "browser_upload", "record_finding", "screen_done"],
+  diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_dom_xss", "probe_stored_xss", "probe_ssti", "probe_sqli", "probe_cmdi", "probe_traversal", "probe_redirect", "probe_jwt", "probe_csrf", "probe_oob", "probe_logic", "analyze_session", "verify_access", "probe_idor", "browser_navigate", "browser_fill", "browser_click", "browser_upload", "record_finding", "screen_done", "skip_screen"],
   // scenario (A04 cross-cutting logic): overview the inventory + fire multi-step request chains via probe_scenario. Once, after per-screen diagnosis.
   scenario: ["get_inventory", "login", "http_request", "browser_navigate", "browser_fill", "browser_click", "probe_scenario", "record_finding", "scenario_done"],
   // fingerprint (A06 known-vulnerable components): fingerprint_scan to collect versions, evaluate known CVEs (cve_lookup opt-in) and record.
@@ -551,6 +558,44 @@ export function looksBlocked(res: { status: number; headers?: Record<string, str
   return false;
 }
 
+/** Strip per-request VOLATILE tokens from a response body before a length/differential comparison, so two responses with
+ *  the SAME content but different tokens (CSP nonce, ASP.NET __VIEWSTATE / __EVENTVALIDATION, a CSRF/XSRF token, a
+ *  timestamp / datetime, a "generated in Nms" note) compare as equal length. Kills the FP+FN both created by token churn.
+ *  Scoped to the length-differential path (SQLi boolean etc.) — NOT the IDOR impact-oracle, which needs the raw ids. */
+export function normalizeVolatile(body: string): string {
+  return body
+    .replace(/(name="__(?:VIEWSTATE|VIEWSTATEGENERATOR|EVENTVALIDATION)"[^>]*?value=")[^"]*/gi, "$1") // ASP.NET hidden state
+    .replace(/(\bnonce=")[^"]*/gi, "$1") // CSP / script nonce
+    .replace(/((?:csrf|xsrf|_token|authenticity_token|requestverificationtoken)["'\s:=>]{1,4})[A-Za-z0-9+/=_-]{8,}/gi, "$1")
+    .replace(/\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?/g, "DT") // datetimes
+    .replace(/\b\d{10,13}\b/g, "TS") // unix timestamps (s / ms)
+    .replace(/\b(?:in|took)\s+\d+(?:\.\d+)?\s*(?:ms|s|seconds?|milliseconds?)\b/gi, "DUR"); // "generated in 12ms"
+}
+
+/** Is `marker` reflected in a LIVE HTML position — at least one occurrence NOT inside a <script>...</script> block? A
+ *  payload echoed into a framework's flight-data / JSON script (Next.js self.__next_f / __NEXT_DATA__, where `<` is
+ *  serialized/escaped to a \\u003c unicode escape) is INERT: it is data, not markup, and cannot execute. Reflected-XSS
+ *  confirmation must ignore those
+ *  occurrences — they FP'd infiniteathlete.ai's Next.js pages (marker matched inside the RSC flight data). */
+export function reflectionIsLive(body: string, marker: string): boolean {
+  if (!marker) return false;
+  let from = 0;
+  for (;;) {
+    const i = body.indexOf(marker, from);
+    if (i < 0) return false;
+    const pre = body.slice(0, i);
+    if (pre.lastIndexOf("<script") <= pre.lastIndexOf("</script>")) return true; // this occurrence is in live HTML
+    from = i + marker.length; // inside a <script> blob → skip, try the next occurrence
+  }
+}
+
+/** The minimum body-length delta that counts as a REAL difference, given the page's own measured jitter (noise). A fixed
+ *  ±64 is fooled by dynamic content (ads / rotating tokens / __VIEWSTATE) — require the delta to clear max(floor, noise*k)
+ *  so a "signal" below the page's natural variance is NOT confirmed (it degrades to a lead instead of a false positive). */
+export function diffThreshold(noise: number, floor = 64, k = 2): number {
+  return Math.max(floor, Math.round(Math.abs(noise) * k));
+}
+
 export type AccessVerdict = "not_bypass" | "needs_judgment" | "inconclusive";
 
 /** Unauthenticated/authenticated responses → machine verdict for auth-bypass.
@@ -819,6 +864,126 @@ async function runInputSweep(s: PilotSession, screen: Screen, isNew: boolean): P
     s.store.appendEvent(s.assessmentId, { type: "note", payload: { message: `⚠ input sweep ${screen.screenId} failed: ${String(e).slice(0, 100)}` } });
     return { exercised: 0, added: 0 };
   }
+}
+
+/** A normalized dynamic path placeholder ({id}, {id2}, {orderId}) — can't be navigated literally, so it's not a probe candidate. */
+function isDynamicSeg(seg: string): boolean {
+  return /^\{.*\}$/.test(seg);
+}
+
+/** Path segments of a urlTemplate (templates are paths, but tolerate an absolute URL defensively). Root ("/") → []. */
+function templateSegs(urlTemplate: string): string[] {
+  let path = urlTemplate;
+  try {
+    path = new URL(urlTemplate).pathname; // absolute → pathname; a bare path throws and stays as-is
+  } catch {
+    /* already a path */
+  }
+  return path.split("/").filter((x) => x.length > 0);
+}
+
+/** Origin to resolve a screen's derived prefixes against: the screen's own observed origin, else the target's. Null if neither parses. */
+function screenOrigin(sc: Pick<Screen, "observedUrls">, targetUrl: string): string | null {
+  for (const u of sc.observedUrls) {
+    try {
+      return new URL(u).origin;
+    } catch {
+      /* not an absolute URL */
+    }
+  }
+  try {
+    return new URL(targetUrl).origin;
+  } catch {
+    return null;
+  }
+}
+
+/** Derive the UNMAPPED parent-path prefixes implied by discovered deep paths, as absolute URLs to probe. MVC and
+ *  directory layouts expose deep routes (/Account/AccountEdit, /Html/qa.html) whose PARENT (/Account, /Html) is often a
+ *  real page that nothing ever linked to — so survey (which only enrolls what it navigated) never maps it, and the site
+ *  tree shows it as an un-clickable folder. This lists every static ancestor that is NOT already a screen so a
+ *  deterministic post-survey pass can probe it. Ancestors containing a dynamic segment ({id}) are skipped (not literally
+ *  navigable); the root (/) has no parent. Origin-aware (a same path on two hosts stays distinct). Pure. */
+export function deriveParentPrefixes(
+  screens: ReadonlyArray<Pick<Screen, "urlTemplate" | "observedUrls">>,
+  opts: { targetUrl: string; ignorePaths?: ReadonlyArray<string> },
+): string[] {
+  const have = new Set<string>(); // absolute (origin+path) of every enrolled screen — don't re-probe one that exists
+  for (const sc of screens) {
+    const origin = screenOrigin(sc, opts.targetUrl);
+    if (origin) have.add(origin + "/" + templateSegs(sc.urlTemplate).join("/"));
+  }
+  const out = new Map<string, true>(); // absolute URL → dedup (insertion order preserved)
+  for (const sc of screens) {
+    const origin = screenOrigin(sc, opts.targetUrl);
+    if (!origin) continue;
+    const segs = templateSegs(sc.urlTemplate);
+    for (let k = segs.length - 1; k >= 1; k--) {
+      const prefixSegs = segs.slice(0, k);
+      if (prefixSegs.some(isDynamicSeg)) continue; // {id} etc — can't navigate literally
+      const abs = origin + "/" + prefixSegs.join("/");
+      if (have.has(abs)) continue; // already an enrolled screen
+      if (isSessionDestroyingPath(abs)) continue; // never GET a logout/signout prefix
+      if (opts.ignorePaths && pathIsIgnored(abs, opts.ignorePaths, opts.targetUrl)) continue;
+      out.set(abs, true);
+    }
+  }
+  return [...out.keys()];
+}
+
+export type EnrolOutcome = "enrolled" | "duplicate" | "not_found" | "bounced" | "out_of_scope";
+
+/** Enroll one URL by a cold browser GET-navigation, applying browser_navigate's guards but WITHOUT anchor recovery,
+ *  referer-gated flagging, or the input sweep — used by the post-survey passes (parent-prefix backfill, LLM endpoint
+ *  guessing) where onward discovery is moot. A 404 / error-or-login catch-all is NOT enrolled; a real page becomes a
+ *  screen (deduped by DOM skeleton, so an echo/empty page collapses onto an existing one → "duplicate"). Best-effort. */
+async function enrolByNavigate(
+  s: PilotSession,
+  url: string,
+): Promise<{ outcome: EnrolOutcome; screenId?: string; status?: number; finalUrl?: string }> {
+  if (!isInScope(url, s.scope) || isSessionDestroyingPath(url)) return { outcome: "out_of_scope" };
+  const key = stripHash(url);
+  if (s.visited.has(key) || s.refererGated.has(key)) return { outcome: "duplicate" };
+  const o = await s.driver.visit(url);
+  s.visited.add(key); // probed — never retry, whatever the result
+  if (o.status >= 400) return { outcome: "not_found", status: o.status, finalUrl: o.finalUrl };
+  if (looksLikeErrorCatchAll(o)) return { outcome: "bounced", status: o.status, finalUrl: o.finalUrl }; // 404 page / login-bounce = not real
+  const { screen, isNew } = recordObservation(s, o);
+  await captureScreenshot(s, screen);
+  return { outcome: isNew ? "enrolled" : "duplicate", screenId: screen.screenId, status: o.status, finalUrl: o.finalUrl };
+}
+
+/** Deterministic post-survey pass: probe each UNMAPPED parent-path prefix (deriveParentPrefixes) with a cold GET and
+ *  enroll the ones that are real pages. Closes the coverage gap where a controller/directory prefix (/Account from
+ *  /Account/AccountEdit) is a live page that nothing linked to, so survey never mapped it (an un-clickable folder in the
+ *  site tree). No-op under a URL-list lock. Bounded (CAP) and logged; respects the survey screen cap. */
+export async function backfillParentPrefixes(s: PilotSession): Promise<{ probed: number; enrolled: number }> {
+  if (s.lockToSeeds) return { probed: 0, enrolled: 0 }; // URL-list lock: map only the seeds, no exploration
+  const CAP = 40;
+  const candidates = deriveParentPrefixes(s.inv.screens(), { targetUrl: s.targetUrl, ignorePaths: s.ignorePaths }).filter(
+    (u) => !s.visited.has(stripHash(u)) && !s.refererGated.has(stripHash(u)),
+  );
+  const list = candidates.slice(0, CAP);
+  let probed = 0;
+  let enrolled = 0;
+  for (const url of list) {
+    if (s.maxSurveyScreens != null && s.inv.screens().length >= s.maxSurveyScreens) break; // honor the exploration cap
+    probed += 1;
+    try {
+      if ((await enrolByNavigate(s, url)).outcome === "enrolled") enrolled += 1;
+    } catch {
+      /* best-effort: a parent-prefix probe must never break the survey */
+    }
+  }
+  if (probed > 0) {
+    s.store.appendEvent(s.assessmentId, {
+      type: "note",
+      payload: {
+        message: `🧭 parent-prefix backfill: probed ${probed} unmapped parent path(s) → +${enrolled} enrolled${candidates.length > CAP ? ` (capped at ${CAP}; ${candidates.length - CAP} more not probed)` : ""}`,
+      },
+    });
+  }
+  return { probed, enrolled };
 }
 
 /** Collect identifiers observed on other screens from the whole inventory (for IDOR). */
@@ -1364,12 +1529,12 @@ export function buildTools(s: PilotSession) {
         const corpus = [
           { name: "img-onerror", payload: `<img src=x onerror=alert('${tok}')>`, marker: `<img src=x onerror=alert('${tok}')>` },
           { name: "attr-break-svg", payload: `"><svg onload=alert('${tok}')>`, marker: `<svg onload=alert('${tok}')>` },
-          { name: "case-mix", payload: `<ImG sRc=x OnErRoR=alert('${tok}')>`, marker: `OnErRoR=alert('${tok}')` },
+          { name: "case-mix", payload: `<ImG sRc=x OnErRoR=alert('${tok}')>`, marker: `<ImG sRc=x OnErRoR=alert('${tok}')>` },
           { name: "svg-slash", payload: `<svg/onload=alert('${tok}')>`, marker: `<svg/onload=alert('${tok}')` },
           { name: "details-toggle", payload: `<details open ontoggle=alert('${tok}')>`, marker: `<details open ontoggle=alert('${tok}')` },
           { name: "body-onload", payload: `<body onload=alert('${tok}')>`, marker: `<body onload=alert('${tok}')` },
           { name: "iframe-js", payload: `<iframe src=javascript:alert('${tok}')>`, marker: `<iframe src=javascript:alert('${tok}')` },
-          { name: "input-autofocus", payload: `"><input autofocus onfocus=alert('${tok}')>`, marker: `onfocus=alert('${tok}')` },
+          { name: "input-autofocus", payload: `"><input autofocus onfocus=alert('${tok}')>`, marker: `<input autofocus onfocus=alert('${tok}')` },
           { name: "img-slash-sep", payload: `<img/src=x/onerror=alert('${tok}')>`, marker: `<img/src=x/onerror=alert('${tok}')` },
           { name: "svg-comment", payload: `<svg onload=alert(1)//${tok}>`, marker: `<svg onload=alert(1)//${tok}` },
         ];
@@ -1395,7 +1560,9 @@ export function buildTools(s: PilotSession) {
           }
           if (!r) continue;
           tried.push(c.name);
-          if (r.status < 500 && r.body.includes(c.marker)) {
+          // Survivor = the payload's tag reflects UNESCAPED in a LIVE HTML position — NOT inside a <script>/flight-data
+          // JSON blob (where `<` is serialized to < and the tag is inert). reflectionIsLive enforces that.
+          if (r.status < 500 && reflectionIsLive(r.body, c.marker)) {
             winner = c;
             htmlCtx = r.html;
             break;
@@ -1416,8 +1583,8 @@ export function buildTools(s: PilotSession) {
         const w1 = await recordSend(winner.payload, "positive_replay", `bypass ${winner.name} #1`);
         const w2 = await recordSend(winner.payload, "positive_replay", `bypass ${winner.name} #2`);
         const verdict = checkLogicEvidence(
-          { status: ctrl.status, hasMarker: ctrl.body.includes(winner.marker) },
-          [w1, w2].map((p) => ({ status: p.status, hasMarker: p.body.includes(winner!.marker) })),
+          { status: ctrl.status, hasMarker: reflectionIsLive(ctrl.body, winner.marker) },
+          [w1, w2].map((p) => ({ status: p.status, hasMarker: reflectionIsLive(p.body, winner!.marker) })),
         );
         return txt(
           JSON.stringify({
@@ -1781,11 +1948,17 @@ export function buildTools(s: PilotSession) {
             response: overrideBody != null ? { ...res, body: overrideBody } : res,
             note: `sqli ${tag}`,
           });
-          return { evId: ev.id, status: res.status, len: res.body.length, ms: res.durationMs, body: res.body };
+          return { evId: ev.id, status: res.status, len: res.body.length, nlen: normalizeVolatile(res.body).length, ms: res.durationMs, body: res.body };
         };
         try {
           const benign = await send("1", "negative_control", "baseline(benign)");
           if (!benign) return txt("ERROR: bad url/param — pass url+param or a body with {{SQLI}}.");
+          // ── noise-floor ── measure the page's own per-request jitter from two benign baselines (normalized to strip
+          //   __VIEWSTATE / nonce / CSRF / timestamps). A boolean length delta is only trusted when it CLEARS this noise —
+          //   a fixed ±64 got fooled by dynamic content into confirming SQLi from nothing.
+          const benign2 = await send("1", "negative_control", "baseline#2(noise)");
+          const noise = benign2 ? Math.abs(benign.nlen - benign2.nlen) : 0;
+          const thr = diffThreshold(noise);
           // ── error-based(ヒント) ──
           const SQL_ERR = /sql syntax|you have an error in your sql|warning:\s*mysql|ORA-\d{3,}|PostgreSQL.*ERROR|SQLite3?::|ODBC[^;]*SQL|unclosed quotation|quoted string not properly terminated|SQLSTATE\[/i;
           const err = await send("'", "positive_replay", "error-probe(quote)");
@@ -1799,18 +1972,25 @@ export function buildTools(s: PilotSession) {
           if (falseR && looksBlocked(falseR)) {
             return txt(JSON.stringify({ technique: null, blocked: true, verdict: `BLOCKED: the target returned a WAF / bot-challenge page (status ${falseR.status}) instead of the app — probes are not reaching it, so SQLi cannot be confirmed here. Do NOT record a finding from these responses.` }));
           }
+          let subNoise = false; // a difference was seen but below the page's noise floor → suspected, not confirmed
           for (const tp of ["' OR '1'='1'-- -", " OR 1=1-- -", "') OR ('1'='1"]) {
             const t1 = await send(tp, "positive_replay", `boolean TRUE ${tp}`);
             if (!t1 || !falseR || !usable(t1) || !usable(falseR)) continue;
-            const diff = (x: { status: number; len: number }): boolean => x.status !== falseR.status || Math.abs(x.len - falseR.len) > 64;
+            // Compare on the NORMALIZED length against the noise-aware threshold (not raw ±64).
+            const delta = (x: { nlen: number }): number => Math.abs(x.nlen - falseR.nlen);
+            const diff = (x: { status: number; nlen: number }): boolean => x.status !== falseR.status || delta(x) > thr;
             if (diff(t1)) {
               const t2 = await send(tp, "positive_replay", `boolean TRUE#2 ${tp}`);
-              if (t2 && usable(t2) && diff(t2) && Math.abs(t2.len - t1.len) <= 64)
-                return txt(JSON.stringify({ technique: "boolean", negativeControl: falseR.evId, positiveReplays: [t1.evId, t2.evId], verdict: `SQLi CONFIRMED (boolean): TRUE(${tp}) len ${t1.len}/${t2.len} vs FALSE len ${falseR.len}. record_finding(category sqli) with these evidenceIds.${errSig ? ` (SQL error also seen: ${errSig})` : ""}` }));
+              if (t2 && usable(t2) && diff(t2) && Math.abs(t2.nlen - t1.nlen) <= thr)
+                return txt(JSON.stringify({ technique: "boolean", negativeControl: falseR.evId, positiveReplays: [t1.evId, t2.evId], verdict: `SQLi CONFIRMED (boolean): TRUE(${tp}) normalized-len ${t1.nlen}/${t2.nlen} vs FALSE ${falseR.nlen} (delta > noise-floor ${thr}). record_finding(category sqli) with these evidenceIds.${errSig ? ` (SQL error also seen: ${errSig})` : ""}` }));
+            } else if (t1.status === falseR.status && delta(t1) > 0) {
+              subNoise = true; // there IS a length change, but within the page's natural variance
             }
           }
-          // ── time-based(blind: 一定の遅延) ──
-          const baselineMs = Math.min(benign.ms, (await send("1", "negative_control", "baseline#2"))?.ms ?? benign.ms);
+          if (subNoise)
+            return txt(JSON.stringify({ technique: "boolean", suspected: true, verdict: `SUSPECTED (not confirmed): a boolean length difference was seen but it is WITHIN the page's natural variance (noise floor ${thr}) — not reliably distinguishable from dynamic content. Record as SUSPECTED (a lead), not confirmed, unless you get a second independent signal (time-based delay or a SQL error). ${errSig ? `SQL error signature also seen: ${errSig}.` : ""}` }));
+          // ── time-based(blind: 一定の遅延) ── reuse the noise baseline (benign2) instead of sending a third baseline.
+          const baselineMs = Math.min(benign.ms, benign2?.ms ?? benign.ms);
           for (const sp of ["' AND SLEEP(5)-- -", " AND SLEEP(5)-- -", "' AND pg_sleep(5)-- -", "'; WAITFOR DELAY '0:0:5'-- -", "' OR SLEEP(5)-- -"]) {
             const a = await send(sp, "positive_replay", `time ${sp}`);
             if (!a || a.ms < baselineMs + 4000) continue;
@@ -2523,8 +2703,12 @@ export function buildTools(s: PilotSession) {
           if (!effectMarker)
             return txt(`REJECTED: ${category} requires effectMarker (the string that appears only when the issue fires — the unescaped payload for xss, the OOB host for open-redirect, the injected total for business-logic). Run probe_xss / probe_redirect / probe_logic / probe_scenario and cite its evidenceIds + the marker.`);
           // マーカーは body だけでなくヘッダも見る(open-redirect の印は Location ヘッダに出る)。
+          // XSS は「live HTML 位置での反射」= 実行可能文脈のみ有効(<script>/flight-data JSON 内の反射は不活性 → refute)。
+          const isXss = category === "xss-reflected" || category === "xss-stored";
           const hasMarker = (r: { body: string; headers: Record<string, string> }): boolean =>
-            r.body.includes(effectMarker) || JSON.stringify(r.headers ?? {}).includes(effectMarker);
+            isXss
+              ? reflectionIsLive(r.body, effectMarker)
+              : r.body.includes(effectMarker) || JSON.stringify(r.headers ?? {}).includes(effectMarker);
           const verdict = checkLogicEvidence(
             { status: negRec.response.status, hasMarker: hasMarker(negRec.response) },
             posRecs.map((r) => ({ status: r!.response.status, hasMarker: hasMarker(r!.response) })),
@@ -2568,6 +2752,20 @@ export function buildTools(s: PilotSession) {
           payload: { message: `✓ ${s.currentScreenId} → ${verdict}${covSummary}${note ? ` — ${note.slice(0, 160)}` : ""}` },
         });
         return txt(`screen ${s.currentScreenId} → ${verdict}${covSummary}`);
+      },
+    ),
+    tool(
+      "skip_screen",
+      "Flag the CURRENT screen as excluded and move on WITHOUT firing its attack — reserve this for a screen whose ONLY meaningful action would actively MOVE REAL MONEY or MUTATE / DESTROY real production state on a live third party (submitting a tampered or real payment / transfer request, a fund movement, a mass-delete). READING / RETRIEVAL IS NOT A REASON TO SKIP — IDOR-READ, cross-user data access, and PII / financial-data DISCLOSURE are IN scope; test those normally and record_finding the exposure. It records the screen as EXCLUDED with your reason (flagged for manual / authorized review) and CONTINUES to the next screen. Use this INSTEAD of `done` (which halts the ENTIRE assessment) and INSTEAD of fabricating a 'clean' verdict. The operator already asserted target authorization by scoping the run — use this only for a genuinely money-moving / state-destroying screen, not to skip ordinary work (incl. read-only data-exposure testing).",
+      { reason: z.string() },
+      async ({ reason }) => {
+        s.screenSkipReason = reason;
+        s.screenDone = true;
+        s.store.appendEvent(s.assessmentId, {
+          type: "note",
+          payload: { message: `🚩 ${s.currentScreenId} SKIPPED (excluded from active testing — flagged for manual/authorized review): ${reason.slice(0, 240)}` },
+        });
+        return txt(`screen ${s.currentScreenId} flagged EXCLUDED (skipped active testing, not attacked) and closed. Continue to the next screen.`);
       },
     ),
     // ───────────────────────── 能動探索(A): paths ─────────────────────────
@@ -2617,6 +2815,52 @@ export function buildTools(s: PilotSession) {
           payload: { message: `🔍 probe_paths: ${hits.length} hit(s)/${list.length}, frontier=${s.frontier.size}${skippedLogout ? `, skipped ${skippedLogout} logout-path(s)` : ""}` },
         });
         return txt(JSON.stringify({ hits, queuedToFrontier: s.frontier.size, ...(skippedLogout ? { skippedLogoutPaths: skippedLogout } : {}) }));
+      },
+    ),
+    tool(
+      "probe_guesses",
+      "Forced-browse a list of URLs/paths YOU predict exist from the app's naming convention — endpoints nothing links to, so link-following and the static probe_paths wordlist both miss them. Each path is GET-navigated in scope: a real page is enrolled as a screen (you get its screenId back); a 404 / error / login-bounce is dropped; an echo/empty page dedupes onto an existing screen (duplicate). GET-ONLY (never submits) and scope-gated. Pass absolute URLs or root-relative paths. Use after get_inventory to extrapolate missing CRUD actions / sibling controllers / admin variants / API resources.",
+      { paths: z.array(z.string()) },
+      async ({ paths }) => {
+        const CAP = 60;
+        const list = paths.slice(0, CAP);
+        const results: Array<Record<string, unknown>> = [];
+        let enrolled = 0;
+        for (const p of list) {
+          if (s.maxSurveyScreens != null && s.inv.screens().length >= s.maxSurveyScreens) {
+            results.push({ path: p, outcome: "cap_reached" });
+            continue;
+          }
+          let url: string;
+          try {
+            url = new URL(p, s.targetUrl).toString();
+          } catch {
+            results.push({ path: p, outcome: "bad_url" });
+            continue;
+          }
+          try {
+            const r = await enrolByNavigate(s, url);
+            if (r.outcome === "enrolled") enrolled += 1;
+            results.push({ path: p, outcome: r.outcome, ...(r.screenId ? { screenId: r.screenId } : {}), ...(r.status ? { status: r.status } : {}) });
+          } catch (e) {
+            results.push({ path: p, outcome: "error", detail: String(e).slice(0, 80) });
+          }
+        }
+        s.store.appendEvent(s.assessmentId, {
+          type: "note",
+          payload: { message: `🔮 probe_guesses: ${list.length} guessed path(s) → +${enrolled} enrolled${paths.length > CAP ? ` (capped at ${CAP})` : ""}` },
+        });
+        return txt(JSON.stringify({ enrolled, screensNow: s.inv.screens().length, results, ...(paths.length > CAP ? { truncated: paths.length - CAP } : {}) }));
+      },
+    ),
+    tool(
+      "guess_done",
+      "Signal the recon-extrapolation pass is complete: you have inferred the URL/naming convention and probed the endpoints you predicted. Pass a one-line note of the convention found and how many new screens it surfaced.",
+      { note: z.string().optional() },
+      async ({ note }) => {
+        s.reconGuessDone = true;
+        if (note) s.store.appendEvent(s.assessmentId, { type: "note", payload: { message: `🔮 recon extrapolation done: ${note.slice(0, 300)}` } });
+        return txt("recon extrapolation complete");
       },
     ),
 
