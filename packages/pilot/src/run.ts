@@ -16,7 +16,7 @@ import { EvidenceStore, FetchHttpClient, fingerprintTech, stackAttackHints } fro
 import type { TechSample } from "@veritas/scanner";
 import type { BurpAuditConn } from "@veritas/scanner";
 import { join } from "node:path";
-import { buildTools, STAGE_TOOLS, dedupKey, isAuthWalled, loadCookieFile, mergeSetCookie, touchIsDead, stripHash, backfillParentPrefixes } from "./tools.js";
+import { buildTools, STAGE_TOOLS, dedupKey, isAuthWalled, loadCookieFile, mergeSetCookie, touchIsDead, stripHash, backfillParentPrefixes, availableRoles } from "./tools.js";
 import type { PilotSession, RoleSession } from "./tools.js";
 import { LiveControl } from "./live-control.js";
 import { DEFAULT_SCENARIOS, DIAGNOSE_PROMPT, FINGERPRINT_PROMPT, METHODOLOGY_PROMPT, RECON_GUESS_PROMPT, SCENARIO_PROMPT, SURVEY_PROMPT } from "./system.js";
@@ -509,12 +509,15 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
   }
 
   const server = createSdkMcpServer({ name: "veritas", version: "1.0.0", tools: buildTools(session) });
+  // rolesLine drives the survey's "log in EACH role before survey_done" gate (authClause below). It MUST list the same
+  // roles login() can actually switch to — availableRoles(session): in attended mode the live-session keys (INCLUDING
+  // pure-manual roles that carry no creds/cookie), otherwise the creds + cookie-file keys. Computing it from
+  // roleCreds/roleCookieFiles alone silently dropped attended/manual roles → rolesLine collapsed to "none" → the
+  // authenticated-surface gate never fired → an attended run (operator logged in by hand) mapped only the PUBLIC
+  // surface (~1/3 coverage). Share one source of truth with the login tool so the two can't diverge again.
   const rolesLine =
-    [...new Set([...opts.roleCreds.keys(), ...(opts.roleCookieFiles?.keys() ?? [])])]
-      .map((r) => {
-        const d = opts.roleDescriptions?.get(r);
-        return d ? `${r} (${d})` : r;
-      })
+    availableRoles(session)
+      .map(({ name, description }) => (description ? `${name} (${description})` : name))
       .join(", ") || "none";
   const maxTurns = opts.maxTurns ?? 80; // matches the CLI default (main.ts is also 80). WebUI blank -> CLI default lands on 80.
 

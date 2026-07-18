@@ -2,8 +2,51 @@
 
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { sessionLooksDead } from "./tools.js";
+import { sessionLooksDead, availableRoles } from "./tools.js";
+import type { PilotSession, RoleSession } from "./tools.js";
 import { roleLabel } from "./run.js";
+
+const sess = (p: Partial<PilotSession>): PilotSession => p as PilotSession;
+
+// Regression: rolesLine (the survey's "log in EACH role before survey_done" gate in run.ts) is built from
+// availableRoles(session). In attended mode the roles are pure-manual (no creds, no cookie file) — they live ONLY in
+// roleSessions. If availableRoles omitted them, rolesLine collapsed to "none", the auth-surface gate never fired, and an
+// attended run (operator logged in by hand) mapped only the PUBLIC surface (~1/3 of the screens). Lock the two branches.
+test("availableRoles: attended live sessions (incl. pure-manual roles with no creds/cookie) are listed", () => {
+  const rs = new Map<string, RoleSession>([
+    ["admin", {} as RoleSession],
+    ["user1", {} as RoleSession],
+    ["user2", {} as RoleSession],
+  ]);
+  const s = sess({
+    roleSessions: rs,
+    roleCreds: new Map(),
+    roleCookieFiles: new Map(),
+    roleDescriptions: new Map([
+      ["admin", "admin"],
+      ["user1", "user"],
+    ]),
+  });
+  const line = availableRoles(s)
+    .map((r) => (r.description ? `${r.name} (${r.description})` : r.name))
+    .join(", ");
+  assert.equal(line, "admin (admin), user1 (user), user2"); // all three present → the auth gate fires
+});
+
+test("availableRoles: without attended, falls back to credentials + cookie-file keys", () => {
+  const s = sess({
+    roleSessions: undefined,
+    roleCreds: new Map([["test", { username: "t", password: "p" }]]),
+    roleCookieFiles: new Map([["viewer", "/tmp/v.cookie"]]),
+    roleDescriptions: new Map(),
+  });
+  assert.deepEqual(
+    availableRoles(s)
+      .map((r) => r.name)
+      .sort(),
+    ["test", "viewer"],
+  );
+});
 
 test("roleLabel: shows the privilege in the manual-login prompt when a description exists", () => {
   const d = new Map([["admin", "full-access admin"]]);

@@ -2122,6 +2122,23 @@ async function verifyImportedBurp(
   };
   const http = new FetchHttpClient({ allow: (u) => isInScope(u, scope), minDelayMs, headers: sessionHeaders });
   const evidence = new EvidenceStore(artifactsDir);
+  // Attach a headless browser so XSS leads get an ACTUAL-EXECUTION DOM re-test (probe_dom_xss) — raw HTTP can't see
+  // client-side / SPA / hash-route sinks, which is why HTTP-only re-verification mislabels DOM-XSS as false positives.
+  // Best-effort: reuses the run's browser-profile (carries auth); if chromium is unavailable the re-verify degrades to
+  // HTTP-only (unchanged behaviour). --no-sandbox because this ephemeral nav runs headless in the same envs the pilot does.
+  const browserPath = process.env.VERDICT_BROWSER_PATH ?? process.env.VERITAS_BROWSER_PATH;
+  let driver: PlaywrightDriver | undefined;
+  try {
+    driver = await PlaywrightDriver.launch({
+      userDataDir: join(runsDir, id, "browser-profile"),
+      headless: true,
+      args: ["--no-sandbox"],
+      ...(browserPath ? { executablePath: browserPath } : {}),
+    });
+  } catch (e) {
+    console.log(`  (DOM-XSS re-verify browser unavailable — HTTP-only: ${String(e).slice(0, 80)})`);
+    driver = undefined;
+  }
   try {
     const res = await verifyBurpFindings({
       store,
@@ -2130,13 +2147,15 @@ async function verifyImportedBurp(
       http,
       evidence,
       artifactsDir,
+      ...(driver ? { driver } : {}),
       ...(o.cookie ? { cookie: o.cookie } : {}),
       ...(o.bearer ? { bearer: o.bearer } : {}),
       ...(o.model ? { model: o.model } : {}),
       onText: (t) => console.log(`  🔎 ${t.slice(0, 200)}`),
       onTool: (n, i) => console.log(`    ⚙ ${n.replace("mcp__veritas__", "")} ${JSON.stringify(i).slice(0, 120)}`),
     });
-    if (res.checked > 0) console.log(`▶ burp-verify ${id}: ${res.checked} High+ re-tested → ${res.confirmed} confirmed ✓ / ${res.refuted} not reproduced ?`);
+    if (res.checked > 0)
+      console.log(`▶ burp-verify ${id}: ${res.checked} High+ re-tested → ${res.confirmed} confirmed ✓ / ${res.inconclusive} inconclusive ~ / ${res.refuted} not reproduced ?`);
 
     // ── 深堀フェーズ ── High+ の後に、sub-High リード(info/low/medium)の **タイトル一覧をモデルに見せて
     //    有望なものを選ばせ、選ばれた分だけ同じ証拠規律で能動再テスト**する。全部はやらない(operator 方針)。
@@ -2148,6 +2167,7 @@ async function verifyImportedBurp(
         http,
         evidence,
         artifactsDir,
+        ...(driver ? { driver } : {}),
         ...(o.cookie ? { cookie: o.cookie } : {}),
         ...(o.bearer ? { bearer: o.bearer } : {}),
         ...(o.model ? { model: o.model } : {}),
@@ -2156,11 +2176,13 @@ async function verifyImportedBurp(
       });
       if (t.listed > 0)
         console.log(
-          `▶ burp-triage ${id}: ${t.listed} sub-High lead(s) listed → model deep-dived ${t.selected} → ${t.confirmed} confirmed ✓ / ${t.refuted} not reproduced ?`,
+          `▶ burp-triage ${id}: ${t.listed} sub-High lead(s) listed → model deep-dived ${t.selected} → ${t.confirmed} confirmed ✓ / ${t.inconclusive} inconclusive ~ / ${t.refuted} not reproduced ?`,
         );
     }
   } catch (e) {
     console.log(`⚠ burp-verify skipped: ${String(e).slice(0, 160)}`);
+  } finally {
+    await driver?.close();
   }
 }
 

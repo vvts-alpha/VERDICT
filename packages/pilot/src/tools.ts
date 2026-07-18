@@ -320,6 +320,45 @@ export function isSessionDestroyingPath(pathOrUrl: string): boolean {
   return SESSION_DESTROYING.test(p);
 }
 
+/** IDOR fuzzing: candidate neighbour ids around a self-owned id, for when the model has NO known victim id (cross-tenant /
+ *  needs-another-user's-object). Walks a pure-numeric id (n±1, ±2, ±3) or a fixed-prefix + trailing-digits id
+ *  (user-1024, ORD00042 — width-preserving), plus a few low/seed ids (1, 2, 1000) that often belong to admin/seed rows.
+ *  Returns [] for an OPAQUE id (uuid / long hex) that can't be walked → the caller falls back to verdict:suspected. */
+export function idNeighbors(selfId: string): string[] {
+  // Opaque ids (uuid / long hex) carry trailing digits but are NOT enumerable — guard before the prefix+digits branch.
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-/i.test(selfId) || /^[0-9a-f]{16,}$/i.test(selfId)) return [];
+  const out: string[] = [];
+  const push = (v: string): void => {
+    if (v !== selfId && !out.includes(v)) out.push(v);
+  };
+  if (/^\d+$/.test(selfId)) {
+    const n = Number(selfId);
+    if (!Number.isSafeInteger(n)) return [];
+    for (const d of [1, -1, 2, -2, 3]) if (n + d >= 0) push(String(n + d));
+    for (const c of [1, 2, 1000]) push(String(c)); // low / round ids often = seed or admin accounts
+    return out.slice(0, 6);
+  }
+  const m = selfId.match(/^([A-Za-z][A-Za-z_.-]{0,15})(\d{1,10})$/); // short alpha(-ish) prefix + trailing digits
+  if (m) {
+    const [, prefix, digits] = m;
+    const width = digits!.length;
+    const n = Number(digits);
+    if (!Number.isSafeInteger(n)) return [];
+    for (const d of [1, -1, 2, -2]) if (n + d >= 0) push(`${prefix}${String(n + d).padStart(width, "0")}`);
+    for (const c of [1, 2]) push(`${prefix}${String(c).padStart(width, "0")}`);
+    return out.slice(0, 6);
+  }
+  return out; // non-enumerable id shape
+}
+
+/** A non-existent id of the SAME shape as `id` — the IDOR negative control (must be deniable so a catch-all 200 shows up). */
+export function nonexistentIdLike(id: string): string {
+  if (/^\d+$/.test(id)) return "2147483646";
+  const m = id.match(/^([A-Za-z][A-Za-z_.-]{0,15})(\d{1,10})$/);
+  if (m) return `${m[1]}${"9".repeat(m[2]!.length)}`; // same prefix, all-nines tail = almost certainly absent
+  return "00000000-0000-0000-0000-000000000000";
+}
+
 /** A safe marker that never attempts external reachability (for open-redirect / reflection detection; a non-resolving domain). */
 const OOB_MARKER = "veritas-oob.example";
 
@@ -427,7 +466,7 @@ export function pathIsIgnored(urlOrPath: string, patterns: ReadonlyArray<string>
 
 /** The roles usable by login() (name + optional privilege description). In attended mode, the live-session keys (including pure-manual roles);
  *  normally, the credentials + Cookie-file keys. description is the material auth-diff uses to tell high/low privilege apart. */
-function availableRoles(s: PilotSession): Array<{ name: string; description?: string }> {
+export function availableRoles(s: PilotSession): Array<{ name: string; description?: string }> {
   const names = s.roleSessions ? [...s.roleSessions.keys()] : [...new Set([...s.roleCreds.keys(), ...s.roleCookieFiles.keys()])];
   return names.map((name) => {
     const description = s.roleDescriptions.get(name);
@@ -3037,8 +3076,8 @@ export function buildTools(s: PilotSession) {
 
     tool(
       "probe_idor",
-      "Confirm IDOR / BOLA mechanically: as YOUR current session, try to reach ANOTHER user's object. Give `selfId` (an object id you legitimately own) and `victimId` (another user's id — from knownObjectIds or a second role). Put the id in the URL/body via a {{ID}} placeholder, or pass `param` (query/body field), or `header` (for header-based BOLA like X-User-Id). It runs three requests: a NON-EXISTENT id (negative control — the endpoint must be able to say 404/deny), then the victim's id TWICE (positive replays). Confirms only if the victim request returns the victim's object (cross-user data present, not your own, not the 404 template) and is stable x2. Returns negativeControl + positiveReplays evidenceIds + the cross-user impact → record_finding(category idor, or idor-write for a mutating method).",
-      { url: z.string(), selfId: z.string(), victimId: z.string(), param: z.string().optional(), header: z.string().optional(), method: z.string().optional(), body: z.string().optional() },
+      "Confirm IDOR / BOLA mechanically. As YOUR current session, try to reach ANOTHER user's object. `selfId` = an object id you legitimately own. `victimId` = another user's id (from knownObjectIds or a second role) — OPTIONAL: OMIT it to FUZZ, and the tool enumerates neighbouring ids (selfId±1, ±2, plus low/seed ids like 1/2/1000) to AUTO-DISCOVER another user's object with no second account. Place the id via a {{ID}} placeholder in url/body, or pass `param` (query/body field) or `header` (header-based BOLA like X-User-Id). It sends a NON-EXISTENT id (negative control — the endpoint must be able to 404/deny), then the victim/neighbour id (with a 2nd stable replay once it looks real). Confirms only if the request returns another user's object (cross-user data present, not your own, not the 404 template) and is stable. An opaque uuid/hash selfId can't be enumerated → get a real victim id or record verdict:suspected. Returns negativeControl + positiveReplays evidenceIds + the cross-user impact → record_finding(category idor, or idor-write for a mutating method).",
+      { url: z.string(), selfId: z.string(), victimId: z.string().optional(), param: z.string().optional(), header: z.string().optional(), method: z.string().optional(), body: z.string().optional() },
       async ({ url, selfId, victimId, param, header, method, body }) => {
         const buildReq = (idVal: string): HttpRequest | null => {
           let u = url;
@@ -3067,35 +3106,86 @@ export function buildTools(s: PilotSession) {
           const ev = s.evidence.record({ screenId: s.currentScreenId ?? "pilot", validator: "claude-pilot-idor", kind, request: { ...req, headers: s.http.effectiveHeaders(req.headers) }, response: res, note: `idor ${tag}` });
           return { evId: ev.id, status: res.status, len: res.body.length, body: res.body };
         };
+        type Sent = NonNullable<Awaited<ReturnType<typeof send>>>;
+        // Evaluate one candidate victim/neighbour id against a shared control: cross-user object present + control (a
+        // non-existent id) denied + stable x2. The 2nd (stability) replay is only paid for once the id already looks real.
+        const evalVictim = async (vid: string, ctrl: Sent, label: string) => {
+          const p1 = await send(vid, "positive_replay", `${label} #1`);
+          if (!p1) return null;
+          const accessible = p1.status < 400;
+          const impact = impactOracle(p1.body, { requestedIdentity: vid, sessionIdentity: selfId, baselineBody: ctrl.body });
+          const crossUser = impact.some((i) => i.kind === "cross-user") || (p1.body.includes(vid) && !p1.body.includes(selfId));
+          const controlDenied = ctrl.status >= 400 || Math.abs(ctrl.len - p1.len) > 64 || !ctrl.body.includes(vid);
+          let p2: Sent | null = null;
+          let stable = false;
+          if (accessible && crossUser && controlDenied) {
+            p2 = await send(vid, "positive_replay", `${label} #2`);
+            stable = !!p2 && Math.abs(p1.len - p2.len) <= 64 && p1.status === p2.status;
+          }
+          return { vid, p1, p2, confirmed: accessible && crossUser && controlDenied && stable, accessible, crossUser, controlDenied, stable, impact };
+        };
+        const cat = (method ?? "GET").toUpperCase() === "GET" ? "idor" : "idor-write";
         try {
-          // 非存在 id を control に(数値なら大きな不在値、それ以外はダミー)。
-          const nonexistent = /^\d+$/.test(victimId) ? "2147483646" : "00000000-0000-0000-0000-000000000000";
-          const ctrl = await send(nonexistent, "negative_control", "non-existent id");
+          // ── Explicit victim id ── (a second account / a known other-user id was supplied)
+          if (victimId) {
+            const ctrl = await send(nonexistentIdLike(victimId), "negative_control", "non-existent id");
+            if (!ctrl) return txt("ERROR: could not place the id — pass a {{ID}} in url/body, or a param, or a header.");
+            const r = await evalVictim(victimId, ctrl, "victim id");
+            if (!r) return txt("ERROR: victim request failed to build.");
+            return txt(
+              JSON.stringify({
+                mode: "victim",
+                negativeControl: ctrl.evId,
+                positiveReplays: [r.p1.evId, ...(r.p2 ? [r.p2.evId] : [])],
+                ...(r.impact.length ? { impact: r.impact.map((i) => ({ kind: i.kind, marker: i.marker })) } : {}),
+                observed: { control: { status: ctrl.status, len: ctrl.len }, victim: { status: r.p1.status, len: r.p1.len }, crossUser: r.crossUser, controlDenied: r.controlDenied, stable: r.stable },
+                verdict: r.confirmed
+                  ? `IDOR/BOLA CONFIRMED — your session read victim ${victimId}'s object (status ${r.p1.status}, cross-user data present) while a non-existent id was denied (control status ${ctrl.status}). record_finding(category ${cat}) with these evidenceIds.`
+                  : !r.accessible
+                    ? `not IDOR: the victim object returned ${r.p1.status} (access control appears to hold).`
+                    : !r.crossUser
+                      ? `not confirmed: got ${r.p1.status} but the body does not carry victim ${victimId}'s data (may be your own object, a template, or a catch-all) — verify the id is really another user's.`
+                      : !r.controlDenied
+                        ? `not confirmed: a NON-EXISTENT id returned the same thing — this endpoint is a catch-all (returns 200 for any id), so a 200 for the victim id proves nothing.`
+                        : `not confirmed: victim replays were unstable.`,
+              }),
+            );
+          }
+          // ── ENUMERATION (fuzzing) mode ── no victim id supplied → walk neighbouring ids to discover another user's object.
+          const candidates = idNeighbors(selfId);
+          if (candidates.length === 0)
+            return txt(
+              `ENUMERATION NOT POSSIBLE: '${selfId}' is opaque (uuid/hash) — neighbouring ids can't be walked. Get a real victim id (a second account / knownObjectIds), or if the endpoint clearly exposes an object by id record verdict:"suspected" with the anomaly.`,
+            );
+          const ctrl = await send(nonexistentIdLike(selfId), "negative_control", "non-existent id");
           if (!ctrl) return txt("ERROR: could not place the id — pass a {{ID}} in url/body, or a param, or a header.");
-          const v1 = await send(victimId, "positive_replay", "victim id #1");
-          const v2 = await send(victimId, "positive_replay", "victim id #2");
-          if (!v1 || !v2) return txt("ERROR: victim request failed to build.");
-          const impact = impactOracle(v1.body, { requestedIdentity: victimId, sessionIdentity: selfId, baselineBody: ctrl.body });
-          const crossUser = impact.some((i) => i.kind === "cross-user") || (v1.body.includes(victimId) && !v1.body.includes(selfId));
-          const accessible = v1.status < 400;
-          const controlDenied = ctrl.status >= 400 || Math.abs(ctrl.len - v1.len) > 64 || !ctrl.body.includes(victimId);
-          const stable = Math.abs(v1.len - v2.len) <= 64 && v1.status === v2.status;
-          const confirmed = accessible && crossUser && controlDenied && stable;
+          const tried: Array<{ id: string; status: number; len: number; crossUser: boolean }> = [];
+          for (const vid of candidates) {
+            const r = await evalVictim(vid, ctrl, `neighbour ${vid}`);
+            if (!r) continue;
+            tried.push({ id: vid, status: r.p1.status, len: r.p1.len, crossUser: r.crossUser });
+            if (r.confirmed)
+              return txt(
+                JSON.stringify({
+                  mode: "enumerate",
+                  discoveredVictimId: vid,
+                  triedIds: candidates,
+                  negativeControl: ctrl.evId,
+                  positiveReplays: [r.p1.evId, ...(r.p2 ? [r.p2.evId] : [])],
+                  ...(r.impact.length ? { impact: r.impact.map((i) => ({ kind: i.kind, marker: i.marker })) } : {}),
+                  verdict: `IDOR/BOLA CONFIRMED via id enumeration — neighbour id ${vid} returned another user's object (status ${r.p1.status}, cross-user data) while a non-existent id was denied (control ${ctrl.status}). No second account needed. record_finding(category ${cat}) with these evidenceIds.`,
+                }),
+              );
+          }
+          const distinct = tried.filter((t) => t.status < 400 && Math.abs(t.len - ctrl.len) > 64);
           return txt(
             JSON.stringify({
-              negativeControl: ctrl.evId,
-              positiveReplays: [v1.evId, v2.evId],
-              ...(impact.length ? { impact: impact.map((i) => ({ kind: i.kind, marker: i.marker })) } : {}),
-              observed: { control: { status: ctrl.status, len: ctrl.len }, victim: { status: v1.status, len: v1.len }, crossUser, controlDenied, stable },
-              verdict: confirmed
-                ? `IDOR/BOLA CONFIRMED — your session read victim ${victimId}'s object (status ${v1.status}, cross-user data present) while a non-existent id was denied (control status ${ctrl.status}). record_finding(category ${(method ?? "GET").toUpperCase() === "GET" ? "idor" : "idor-write"}) with these evidenceIds.`
-                : !accessible
-                  ? `not IDOR: the victim object returned ${v1.status} (access control appears to hold).`
-                  : !crossUser
-                    ? `not confirmed: got 200 but the body does not carry victim ${victimId}'s data (may be your own object, a template, or a catch-all) — verify the id is really another user's.`
-                    : !controlDenied
-                      ? `not confirmed: a NON-EXISTENT id returned the same thing — this endpoint is a catch-all (returns 200 for any id), so a 200 for the victim id proves nothing.`
-                      : `not confirmed: victim replays were unstable.`,
+              mode: "enumerate",
+              triedIds: candidates,
+              observed: tried,
+              verdict: distinct.length
+                ? `not confirmed by fuzzing: ${distinct.length} neighbour id(s) (${distinct.map((t) => t.id).join(", ")}) returned a populated 200 but cross-user OWNERSHIP couldn't be auto-proven (the body didn't clearly carry another user's identity). If these are plausibly other users' objects, record verdict:"suspected" citing one of these evidenceIds, or log in as a second role to get a real victim id and re-run.`
+                : `not confirmed by fuzzing: no neighbour id (${candidates.join(", ")}) returned another user's object — access control appears to hold, or these ids don't map to other users.${ctrl.status < 400 ? " NOTE: the non-existent control also returned 200 → this endpoint may be a catch-all, so id-based tests are inconclusive here." : ""}`,
             }),
           );
         } catch (e) {
