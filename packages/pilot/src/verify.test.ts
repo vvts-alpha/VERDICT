@@ -2,7 +2,7 @@
 // in the "<detail> @ <url>" form, so make sure the trailing URL is reliably picked up.
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { endpointOf, confirmedLeadSeverity, reverifiedSeverity } from "./verify.js";
+import { endpointOf, confirmedLeadSeverity, reverifiedSeverity, reverifiedVerdict } from "./verify.js";
 import type { Finding } from "@veritas/core";
 
 function fnd(description: string): Finding {
@@ -70,4 +70,12 @@ test("reverifiedSeverity: INCONCLUSIVE keeps the severity unchanged — a bare r
 test("reverifiedSeverity: refuted (could not reproduce at all) drops to info", () => {
   assert.equal(reverifiedSeverity("refuted", "high", "high"), "info");
   assert.equal(reverifiedSeverity("refuted", "medium"), "info");
+});
+
+// Burp imports carry no verdict field, and findingVerdict() defaults undefined→"confirmed". So a non-confirmed re-verify
+// MUST set the verdict explicitly, or an inconclusive/refuted finding stays counted in the confirmed total + headlined.
+test("reverifiedVerdict: only a confirmed outcome is 'confirmed'; inconclusive/refuted → 'suspected' (leave the confirmed count)", () => {
+  assert.equal(reverifiedVerdict("confirmed"), "confirmed");
+  assert.equal(reverifiedVerdict("inconclusive"), "suspected");
+  assert.equal(reverifiedVerdict("refuted"), "suspected");
 });

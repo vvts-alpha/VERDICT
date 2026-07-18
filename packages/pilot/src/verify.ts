@@ -12,7 +12,7 @@ import { createSdkMcpServer, query, tool } from "@anthropic-ai/claude-agent-sdk"
 import type { HookCallback } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { isInScope } from "@veritas/core";
-import type { AssessmentStore, Finding, ScopePolicy, Severity } from "@veritas/core";
+import type { AssessmentStore, Finding, FindingVerdict, ScopePolicy, Severity } from "@veritas/core";
 import { readEvidenceArtifact, classifyBurpName } from "@veritas/scanner";
 import type { EvidenceStore, FetchHttpClient, HttpRequest, HttpResponse } from "@veritas/scanner";
 import type { PlaywrightDriver } from "@veritas/crawler";
@@ -510,6 +510,13 @@ export function reverifiedSeverity(outcome: DeepDiveOutcome, current: Severity, 
   return confirmSeverity && SEV_RANK[confirmSeverity] > SEV_RANK[current] ? confirmSeverity : current;
 }
 
+/** The report verdict a Burp finding takes after re-verification. Only a reproduced-exploitable outcome is `confirmed`;
+ *  `inconclusive` (surface real, unproven) and `refuted` (likely FP) become `suspected` so they leave the CONFIRMED total
+ *  and the headlined findings section (findingVerdict() defaults undefined→"confirmed", so this must be set explicitly). */
+export function reverifiedVerdict(outcome: DeepDiveOutcome): FindingVerdict {
+  return outcome === "confirmed" ? "confirmed" : "suspected";
+}
+
 /** Attach the verification mark and note to a finding: confirmed=[burp✓] / inconclusive=[burp~] / refuted=[burp?].
  *  Confirmed: raise a sub-High lead upward-only to its class-band severity (correct an under-rated import — capped, never
  *  above the band). Inconclusive: keep it as a lead at its current severity — the automated re-test reproduced the reported
@@ -535,7 +542,11 @@ function annotate(
         ? `🔎 SURFACE REAL, EXPLOITATION UNCONFIRMED — automated re-test reproduced the reported behaviour but could not prove an exploitable effect (e.g. the input reflects but did not execute — likely a client-side/DOM sink or a context needing manual/browser verification). NOT a false positive; kept at its current severity as a lead: ${note}`
         : `⚠ LIKELY FALSE POSITIVE — AI active re-test could not reproduce it${cur.severity !== "info" ? ` (severity ${cur.severity}→info)` : ""}; manual confirmation advised: ${note}`;
   const ev = [...new Set([...cur.evidenceIds, ...evidenceIds])];
-  deps.store.upsertFinding(deps.assessmentId, { ...cur, title, severity: bumped, description: `${head}\n\n${cur.description}`, evidenceIds: ev });
+  // Set the verdict explicitly. Burp imports carry NO verdict field, and findingVerdict() defaults undefined→"confirmed"
+  // (report-model.ts) — so without this an inconclusive/refuted re-verify would still be COUNTED as confirmed and headlined
+  // in the report. Only a reproduced-exploitable outcome is confirmed; inconclusive (surface real, unproven) and refuted
+  // (likely FP) drop to "suspected" so they leave the confirmed total and land in the leads/needs-review section.
+  deps.store.upsertFinding(deps.assessmentId, { ...cur, title, verdict: reverifiedVerdict(outcome), severity: bumped, description: `${head}\n\n${cur.description}`, evidenceIds: ev });
   deps.store.appendEvent(deps.assessmentId, {
     type: "note",
     payload: { message: `${outcome === "confirmed" ? "✅" : outcome === "inconclusive" ? "🔎" : "⚠"} burp-verify ${f.id}: ${outcome} — ${note.slice(0, 200)}` },
