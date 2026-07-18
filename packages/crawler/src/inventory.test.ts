@@ -85,6 +85,23 @@ test("InventoryBuilder collapses list/detail pages differing only by item count 
   assert.deepEqual(p2.screen.observedUrls, ["https://blog.test/post?postId=1", "https://blog.test/post?postId=2"]);
 });
 
+test("InventoryBuilder caps per-template screens against structural DOM churn (self-injected XSS)", () => {
+  const inv = new InventoryBuilder();
+  // Reflected-XSS lab pathology: the SAME /post URL, but the agent's injected markup adds a structurally new
+  // element each visit, so hashDomSkeleton can't fold it (distinct tags → distinct hash). Without a cap this
+  // inflated one page into 15 screens; the cap must fold it back to a handful.
+  const injected = ["svg", "img", "iframe", "object", "embed", "video", "audio", "canvas", "table", "select", "form", "details"];
+  let created = 0;
+  for (const tag of injected) {
+    const r = inv.ingest(obs({ finalUrl: "https://blog.test/post?postId=1", domSkeleton: `html>(body>(article>(h1,p,${tag})))` }));
+    if (r.isNew) created += 1;
+  }
+  assert.ok(inv.screens().length <= 3, `capped: expected <=3 screens for one template, got ${inv.screens().length}`);
+  assert.equal(created, inv.screens().length, "isNew is true exactly for the screens actually created");
+  const post = inv.screens().find((s) => s.urlTemplate === "/post");
+  assert.ok(post?.observedUrls.includes("https://blog.test/post?postId=1"), "churned variants still merge into the /post representative");
+});
+
 test("2nd pass (seeded) dedups public pages by url-template despite DOM change (P1)", () => {
   // 1st pass (unauth): /catalog with a "login" navbar
   const first = new InventoryBuilder();
@@ -149,4 +166,30 @@ test("a plain HTML form POST becomes a first-class API with reqSchema from its f
   // a GET form has no body schema
   const get = built.screen.apis.find((a) => a.method === "GET" && a.urlTemplate === "/search");
   assert.equal(get!.reqSchema, null);
+});
+
+// Regression: SPA hash routes (#/basket, #/wallet, …) all share pathname "/", so the per-template cap — keyed on the
+// pathname template before the fix — collapsed a whole hash-routed app (Angular / OWASP Juice Shop) into 3 screens
+// (the 4th+ merged into "/"). The cap now keys on a hash-aware capTemplate, so each distinct route is its own screen.
+test("InventoryBuilder does NOT collapse distinct SPA hash routes into pathname-'/'s per-template cap", () => {
+  const inv = new InventoryBuilder(3); // cap = 3 per capTemplate
+  const routes = ["/", "#/about", "#/basket", "#/administration", "#/wallet", "#/order-history", "#/photo-wall"];
+  const results = routes.map((r, i) =>
+    inv.ingest(obs({ finalUrl: `https://shop.test/${r === "/" ? "" : r}`, domSkeleton: `html>(body>(div.${i}))` })),
+  );
+  assert.equal(inv.screens().length, routes.length, "each distinct SPA hash route must be its own screen");
+  assert.ok(
+    results.every((r) => r.isNew),
+    "no hash route should be swallowed by the pathname-'/' cap",
+  );
+});
+
+// The cap's PURPOSE (fold DOM-skeleton churn of ONE page — e.g. self-injected XSS mutating markup — into <=maxPerTemplate
+// screens) is preserved: it now applies PER hash route, not globally to "/".
+test("InventoryBuilder still caps DOM-skeleton churn within a single SPA hash route", () => {
+  const inv = new InventoryBuilder(3);
+  for (let i = 0; i < 5; i++) {
+    inv.ingest(obs({ finalUrl: "https://shop.test/#/search", domSkeleton: `html>(body>(span.${i}))` }));
+  }
+  assert.equal(inv.screens().length, 3, "churn on one hash route is still capped (backstop preserved)");
 });

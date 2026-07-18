@@ -180,6 +180,7 @@ export function parseOpenApiToScreens(rawDoc: unknown, baseUrl: string, existing
       const built: BuiltScreen = {
         dedupKey: `${ep.template} ${domSkeletonHash}`,
         observedUrl: ep.observedUrl,
+        capTemplate: ep.template, // spec endpoints are real API paths (no SPA hash) → cap key = the template
         screen: {
           urlTemplate: ep.template,
           observedUrls: [ep.observedUrl],
