@@ -3,7 +3,7 @@
 
 import type { Hypothesis, Screen } from "@veritas/core";
 import type { EvidenceStore, HttpClient, HttpResponse, Probe, ProbeEval, ScanTarget, Validator } from "@veritas/scanner";
-import { makeTarget, runValidator } from "@veritas/scanner";
+import { makeTarget, runValidator, impactOracle } from "@veritas/scanner";
 
 const MIN_BYTES = 16;
 
@@ -91,11 +91,17 @@ function makeIdorValidator(screen: Screen, origin: string, t: IdorTarget): Valid
     evaluate: (res: HttpResponse): ProbeEval => {
       if (res.status !== 200) return { positive: false, reason: `status ${res.status}` };
       if (res.body.trim().length < MIN_BYTES) return { positive: false, reason: "empty 200 (0-byte guard)" };
-      return { positive: true, reason: `neighbouring ${t.kind} id returned 200 with ${res.body.length}B` };
+      // Require a CROSS-USER signal — the neighbour object distinctly carries the OTHER id's data and not our own — not
+      // merely a 200. "neighbour id returns 200" only proves the id space is enumerable (or the endpoint is public); it
+      // does NOT prove object-level authorization is missing. This is the deterministic analogue of probe_idor's oracle,
+      // and it stops the false HIGH IDOR on public catalogs / self-owned objects.
+      const cross = impactOracle(res.body, { requestedIdentity: other, sessionIdentity: t.exampleId }).some((i) => i.kind === "cross-user");
+      if (!cross) return { positive: false, reason: `neighbour ${t.kind} id ${other} returned 200 but carries no cross-user data (enumerable, not a proven object-level-auth failure)` };
+      return { positive: true, reason: `neighbouring ${t.kind} id ${other} returned its own object (cross-user data present, not ${t.exampleId}'s)` };
     },
-    title: () => `IDOR candidate: ${t.kind} object enumeration on ${t.urlTemplate} (${t.paramName})`,
+    title: () => `IDOR: ${t.kind} cross-user object access on ${t.urlTemplate} (${t.paramName})`,
     describe: () =>
-      `A neighbouring ${t.paramName} on ${t.kind} ${t.urlTemplate} returns substantive data while an invalid id does not — object-level authorization may be missing`,
+      `A neighbouring ${t.paramName} on ${t.kind} ${t.urlTemplate} returns ANOTHER id's object (cross-user data present, not the session's own) while an invalid id is denied — object-level authorization is missing`,
   };
 }
 

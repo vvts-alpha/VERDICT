@@ -35,6 +35,21 @@ test("authDiff confirms when low-priv role gets identical data (boundary crossed
   });
 });
 
+// A self-scoped endpoint (/api/me, /api/orders) returns a 200 to BOTH roles but DIFFERENT data (each caller its own).
+// That is NOT a boundary crossing. Before the body-match requirement this fabricated a HIGH "boundary crossed" finding on
+// every such endpoint (the deterministic over-confirm the audit flagged).
+test("authDiff refutes a self-scoped endpoint (each role its OWN data, not a crossing)", async () => {
+  await withEvidence(async (ev) => {
+    const http = new FakeHttpClient((req) =>
+      (req.headers?.["cookie"] ?? "").includes("admin")
+        ? { status: 200, body: '{"order":5,"owner":"admin","total":500}' }
+        : { status: 200, body: '{"order":9,"owner":"user","total":12}' },
+    );
+    const outcome = await authDiffScreen(screen(), http, ev, HIGH, LOW);
+    assert.equal(outcome.status, "refuted", "different content per role = self-scoped, not a boundary crossing");
+  });
+});
+
 test("authDiff refutes when low-priv role is blocked", async () => {
   await withEvidence(async (ev) => {
     const http = new FakeHttpClient((req) =>

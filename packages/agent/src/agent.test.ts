@@ -74,6 +74,17 @@ test("catch-all (every id returns data) refutes IDOR", async () => {
   });
 });
 
+// A neighbour id that returns 200 but carries NO cross-user data proves only enumerability (or a public endpoint), not a
+// missing object-level auth. Before the cross-user requirement this confirmed a HIGH IDOR on ANY 200 — the deterministic
+// over-confirm the audit flagged (false HIGH on public catalogs / self-owned objects).
+test("IDOR refutes a 200 that carries no cross-user data (enumerable ≠ proven object-level-auth failure)", async () => {
+  await withEvidence(async (ev) => {
+    const http = new FakeHttpClient((req) => (req.url.includes("/api/orders/6") ? { status: 200, body: '{"status":"ok","results":[]}' } : { status: 404, body: "not found" }));
+    const outcome = await verifyHypothesis(ruleHypotheses(idorScreen())[0]!, idorScreen(), http, ev, new Set());
+    assert.equal(outcome.status, "refuted", "no cross-user data → must not confirm HIGH IDOR");
+  });
+});
+
 test("non-idor class is blocked (no automated verifier yet)", async () => {
   await withEvidence(async (ev) => {
     const http = new FakeHttpClient(() => ({ status: 200, body: "x" }));

@@ -71,6 +71,16 @@ const DETECTORS: Detector[] = [
   { kind: "command-output", severity: "medium", re: /Volume Serial Number is [0-9A-F]{4}-[0-9A-F]{4}/i, detail: "Windows dir/command output" },
 ];
 
+/** Does `id` appear as a DISTINCT token in `body` (not an incidental substring of a longer run)? Guards the cross-user
+ *  oracle: a bare id like "1002" must not match inside "3100241" — it needs a non-alphanumeric boundary on both sides.
+ *  This kills the false-cross-user bug where a victim id matched incidentally inside an unrelated number, letting a
+ *  self-owned / public object confirm as IDOR. (No length floor — single-digit object ids are legitimate.) */
+export function identityAppears(body: string, id: string): boolean {
+  if (!id) return false;
+  const esc = id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(^|[^A-Za-z0-9_])${esc}([^A-Za-z0-9_]|$)`).test(body);
+}
+
 /**
  * Scan the response text and return concrete-impact signals (empty if none). Suppresses FP via placeholder / anti-ambient.
  */
@@ -93,12 +103,14 @@ export function impactOracle(responseText: string, ctx: ImpactContext = {}): Imp
     const m = d.re.exec(body);
     if (m) emit(d.kind, d.severity, m[0], d.detail);
   }
-  // cross-user: the requested victim ID is in the response, the attacker's own ID is not, and it's not in the baseline either.
+  // cross-user: the requested victim ID appears as a DISTINCT token in the response, the attacker's own ID does not, and it
+  // is not in the baseline either. identityAppears (word-boundary + min length) stops a bare short id like "42" from
+  // matching incidentally inside unrelated numbers — the false-cross-user bug that let a self-owned/public object confirm.
   if (
     ctx.requestedIdentity &&
-    body.includes(ctx.requestedIdentity) &&
-    (!ctx.sessionIdentity || !body.includes(ctx.sessionIdentity)) &&
-    !base.includes(ctx.requestedIdentity)
+    identityAppears(body, ctx.requestedIdentity) &&
+    (!ctx.sessionIdentity || !identityAppears(body, ctx.sessionIdentity)) &&
+    !identityAppears(base, ctx.requestedIdentity)
   ) {
     out.push({
       kind: "cross-user",

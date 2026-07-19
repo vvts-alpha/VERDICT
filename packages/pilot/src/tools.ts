@@ -10,7 +10,7 @@ import type { LoginCreds, Observation, PlaywrightDriver } from "@veritas/crawler
 import { InventoryBuilder, normalizePath, smartLogin, guessParamType, extractApiRefs, apiCallToBuiltScreen } from "@veritas/crawler";
 import type { LlmClient } from "@veritas/llm";
 import type { BurpAuditConn, EvidenceStore, FetchHttpClient, HttpRequest, HttpResponse, TechComponent, TechSample } from "@veritas/scanner";
-import { oobPayload, oobPoll, fingerprintTech, formatTechInventory, lookupCves, formatCveResults, impactOracle } from "@veritas/scanner";
+import { oobPayload, oobPoll, fingerprintTech, formatTechInventory, lookupCves, formatCveResults, impactOracle, identityAppears } from "@veritas/scanner";
 import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { join } from "node:path";
@@ -3288,7 +3288,7 @@ export function buildTools(s: PilotSession) {
           if (!p1) return null;
           const accessible = p1.status < 400;
           const impact = impactOracle(p1.body, { requestedIdentity: vid, sessionIdentity: selfId, baselineBody: ctrl.body });
-          const crossUser = impact.some((i) => i.kind === "cross-user") || (p1.body.includes(vid) && !p1.body.includes(selfId));
+          const crossUser = impact.some((i) => i.kind === "cross-user") || (identityAppears(p1.body, vid) && !identityAppears(p1.body, selfId));
           const controlDenied = ctrl.status >= 400 || Math.abs(ctrl.len - p1.len) > 64 || !ctrl.body.includes(vid);
           let p2: Sent | null = null;
           let stable = false;

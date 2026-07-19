@@ -1,7 +1,7 @@
 // impactOracle: verifies each impact signal firing + two-stage FP suppression (placeholder / anti-ambient) + cross-user + CTF-default-OFF.
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { impactOracle, formatImpact } from "./impact.js";
+import { impactOracle, formatImpact, identityAppears } from "./impact.js";
 
 const kinds = (body: string, ctx = {}) => impactOracle(body, ctx).map((s) => s.kind);
 
@@ -46,6 +46,17 @@ test("cross-user fires only when the victim id is present and the attacker's own
   assert.ok(!kinds("Receipt for 10052 owner 10032", { requestedIdentity: "10052", sessionIdentity: "10032" }).includes("cross-user"));
   // victim id also in baseline → ambient → no fire
   assert.ok(!kinds("acct 10052", { requestedIdentity: "10052", baselineBody: "acct 10052" }).includes("cross-user"));
+});
+
+test("identityAppears: a DISTINCT token matches; an embedded substring does not (the false-cross-user fix)", () => {
+  assert.ok(identityAppears('{"orderId":1002,"n":1}', "1002")); // standalone token
+  assert.ok(!identityAppears('{"total":31002410}', "1002")); // embedded inside 31002410 → NOT a match
+  assert.ok(identityAppears("order 6 belongs to victim", "6")); // single-digit standalone still works
+});
+
+test("cross-user does NOT fire when the victim id only appears EMBEDDED in an unrelated number", () => {
+  // "1002" is not really referenced — it's a substring of the total 31002 → before word-boundary this false-confirmed IDOR
+  assert.ok(!kinds("your order total is 31002 cents", { requestedIdentity: "1002", sessionIdentity: "77" }).includes("cross-user"));
 });
 
 test("CTF flag detection is OFF by default, ON only with an explicit flagRegex", () => {

@@ -27,6 +27,18 @@ function accessible(res: HttpResponse): boolean {
   return res.status === 200 && res.body.trim().length >= MIN_BYTES && !DENIED_RE.test(res.body.slice(0, 2000));
 }
 
+/** Collapse whitespace + mask volatile tokens (csrf/nonce/viewstate/timestamps) so two responses of the SAME protected
+ *  object compare equal despite per-request churn — used to tell a real boundary crossing (identical object) from a
+ *  self-scoped endpoint (each caller its own data). */
+function normalizeBody(b: string): string {
+  return b
+    .replace(/\s+/g, " ")
+    .replace(/((?:csrf|xsrf|_token|authenticity_token|nonce|requestverificationtoken|viewstate|eventvalidation)["'\s:=>]{1,4})[A-Za-z0-9+/=_-]{8,}/gi, "$1")
+    .replace(/\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?/g, "DT")
+    .replace(/\b\d{10,13}\b/g, "TS")
+    .trim();
+}
+
 /**
  * Hit an authenticated GET API with 2 roles (high/low). If high returns the entity and low stably fetches the **same entity** twice →
  * an authorization-boundary crossing (confirmed). Records high baseline + 2 low replays as evidence (following the spirit of evidence discipline).
@@ -65,6 +77,18 @@ export async function authDiffScreen(
       return { status: "refuted", reason: `low-priv role blocked on ${label} (status ${r.status})`, evidenceIds: [] };
     }
     lowResponses.push(r);
+  }
+
+  // A real authorization-boundary crossing means the low-priv role reads the SAME protected object the high-priv role
+  // sees. If the two roles get DIFFERENT content, it's a self-scoped endpoint (each caller its OWN data — /api/me,
+  // /api/orders, /api/profile) returning a 200 to both — NOT a crossing. Require normalized-body equality so this stops
+  // fabricating a HIGH "boundary crossed" finding on every self-scoped authenticated endpoint (the norm, not the exception).
+  if (normalizeBody(highRes.body) !== normalizeBody(lowResponses[0]?.body ?? "")) {
+    return {
+      status: "refuted",
+      reason: `low-priv '${low.name}' got 200 on ${label} but its content DIFFERS from high-priv '${high.name}' — self-scoped endpoint (each role sees its own data), not a boundary crossing`,
+      evidenceIds: [],
+    };
   }
 
   const evidenceIds = [
