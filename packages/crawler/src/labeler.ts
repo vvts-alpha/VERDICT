@@ -20,15 +20,35 @@ const PII_HINTS = [
 
 const URLISH_RE = /(url|uri|redirect|return|next|callback|dest|destination|target|continue)/i;
 
-export function guessParamType(name: string, loc: ParamLoc): GuessedType {
+/** A value that LOOKS like an object id even when the param NAME doesn't say so — uuid / long-hex (Mongo ObjectId) /
+ *  multi-digit number. Lets `?q=<uuid>` or `?x=10294` be recognised as an id-bearing (IDOR-candidate) param. */
+export function exampleLooksLikeId(example?: string): boolean {
+  if (!example) return false;
+  const v = example.trim();
+  return (
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v) || // uuid
+    /^[0-9a-f]{16,}$/i.test(v) || // long hex / Mongo ObjectId
+    /^\d{2,}$/.test(v) // a bare multi-digit number
+  );
+}
+
+export function guessParamType(name: string, loc: ParamLoc, example?: string): GuessedType {
   const n = name.toLowerCase();
   if (loc === "path") return "object_ref"; // an id segment in the path is an object reference
-  if (/^(id|.*_id)$/i.test(name) || /id$/.test(name)) return "object_ref";
+  // id-bearing names → object reference. Matched on the LOWERCASED name so camelCase (userId → userid) AND snake_case
+  // both hit — the old /id$/ was case-sensitive and MISSED userId/orderId/accountId, the most common API id params.
+  if (
+    /^(id|uid|uuid|guid|gid|sid|oid|pid|pk|ref|slug|account|acct|handle)$/.test(n) ||
+    /(_id|_ref|_uuid|_guid|_key|_pk|_no|_num|_number|_slug)$/.test(n) ||
+    /(id|uuid|guid)$/.test(n)
+  )
+    return "object_ref";
   if (/(price|amount|cost|total|fee|balance)/.test(n)) return "price";
   if (/(qty|quantity|count|num|stock)/.test(n)) return "qty";
   if (/(file|upload|attachment|document|avatar|photo|image)/.test(n)) return "file";
   if (/(sort|order|filter|status|category|lang|locale|type|role)/.test(n)) return "enum";
   if (URLISH_RE.test(n)) return "free_text"; // SSRF/open-redirect candidates are picked up on the labels side
+  if (exampleLooksLikeId(example)) return "object_ref"; // weak fallback: an id-shaped VALUE under an ambiguous name
   return "unknown";
 }
 

@@ -43,6 +43,23 @@ test("guessParamType maps names/locations to types", () => {
   assert.equal(guessParamType("nonce", "query"), "unknown");
 });
 
+// IDOR-candidate recall: the old /id$/ was case-sensitive → it MISSED camelCase userId/orderId (the most common API id
+// params), so those endpoints were never enrolled as IDOR candidates. Lock the strengthened detection.
+test("guessParamType detects camelCase + id-shaped-value ids (IDOR recall)", () => {
+  assert.equal(guessParamType("userId", "query"), "object_ref"); // was "unknown" before the fix
+  assert.equal(guessParamType("orderId", "body"), "object_ref");
+  assert.equal(guessParamType("accountId", "query"), "object_ref");
+  assert.equal(guessParamType("uuid", "query"), "object_ref");
+  assert.equal(guessParamType("customer_ref", "query"), "object_ref");
+  assert.equal(guessParamType("account", "query"), "object_ref");
+  // ambiguous NAME but id-shaped VALUE → object_ref via the example fallback
+  assert.equal(guessParamType("q", "query", "550e8400-e29b-41d4-a716-446655440000"), "object_ref");
+  assert.equal(guessParamType("x", "query", "10294"), "object_ref");
+  // name-based semantics still win over an id-shaped number (no false id-typing)
+  assert.equal(guessParamType("amount", "body", "42"), "price");
+  assert.equal(guessParamType("quantity", "body", "50"), "qty");
+});
+
 test("deriveLabels surfaces attack hints", () => {
   const idParam: Param = { name: "id", in: "path", example: "1", guessedType: "object_ref" };
   assert.ok(deriveLabels("detail", [idParam], [], "").includes("idor-candidate"));

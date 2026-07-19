@@ -7,7 +7,7 @@
 import type { AssessmentStore, Finding, FindingVerdict, Screen, ScopePolicy, Severity } from "@veritas/core";
 import { findingVerdict, isInScope } from "@veritas/core";
 import type { LoginCreds, Observation, PlaywrightDriver } from "@veritas/crawler";
-import { InventoryBuilder, normalizePath, smartLogin } from "@veritas/crawler";
+import { InventoryBuilder, normalizePath, smartLogin, guessParamType } from "@veritas/crawler";
 import type { LlmClient } from "@veritas/llm";
 import type { BurpAuditConn, EvidenceStore, FetchHttpClient, HttpRequest, HttpResponse, TechComponent, TechSample } from "@veritas/scanner";
 import { oobPayload, oobPoll, fingerprintTech, formatTechInventory, lookupCves, formatCveResults, impactOracle } from "@veritas/scanner";
@@ -288,7 +288,7 @@ export const BUSINESS_LOGIC_CATEGORIES = new Set<string>(["price-tampering", "qt
 
 /** Categories of the "confirmed when a specific marker appears in the response" type (judged by marker presence, not length delta).
  *  Business logic (probe_logic/probe_scenario) + reflected XSS (unescaped reflection) + open-redirect (Location is the OOB). */
-export const MARKER_BASED_CATEGORIES = new Set<string>([...BUSINESS_LOGIC_CATEGORIES, "xss-reflected", "xss-stored", "open-redirect", "ssti", "secret-exposure"]);
+export const MARKER_BASED_CATEGORIES = new Set<string>([...BUSINESS_LOGIC_CATEGORIES, "xss-reflected", "xss-stored", "open-redirect", "ssti", "secret-exposure", "user-enumeration"]);
 
 /** Categories that don't allow verdict:"suspected". Deterministically observable, or low-value hygiene classes, make poor leads
  *  and just add noise (rate-limit/version-disclosure were being mass-produced as "suspected"). These are confirmed-or-skip only. */
@@ -1025,12 +1025,42 @@ export async function backfillParentPrefixes(s: PilotSession): Promise<{ probed:
   return { probed, enrolled };
 }
 
-/** Collect identifiers observed on other screens from the whole inventory (for IDOR). */
+/** id-ish JSON key + value, and bare uuids, harvested from a captured response body (for cross-user IDOR). */
+const BODY_ID_KEYVAL = /"(id|_id|uid|user_?id|account_?id|order_?id|customer_?id|owner_?id|object_?id|member_?id|tenant_?id|guid|uuid|email|username|slug)"\s*:\s*"?([A-Za-z0-9._%@+-]{1,64})"?/gi;
+const BODY_BARE_UUID = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
+
+/** Mine object ids the agent has ALREADY seen in captured response bodies this run (list endpoints, JSON id/email
+ *  fields) — the richest source of ANOTHER user's object id for cross-user IDOR, which the inventory scan alone misses. */
+export function harvestBodyIds(records: ReadonlyArray<{ response: { body: string } }>, out: Set<string>): void {
+  const CAP_RECORDS = 40;
+  const CAP_BODY = 20_000;
+  const CAP_TOTAL = 30;
+  let hits = 0;
+  for (const r of records.slice(-CAP_RECORDS)) {
+    const body = r.response?.body;
+    if (!body) continue;
+    const slice = body.slice(0, CAP_BODY);
+    for (const m of slice.matchAll(BODY_ID_KEYVAL)) {
+      if (m[1] && m[2]) out.add(`${m[1]}=${m[2]}`);
+      if (++hits >= CAP_TOTAL) return;
+    }
+    for (const m of slice.matchAll(BODY_BARE_UUID)) {
+      if (m[0]) out.add(m[0]);
+      if (++hits >= CAP_TOTAL) return;
+    }
+  }
+}
+
+/** Collect identifiers observed this run (for cross-user IDOR): id-typed params from the inventory (with a strengthened
+ *  rule so camelCase / id-shaped values are caught, not just the stored guessedType) + ids seen in response bodies. */
 function knownObjectIds(s: PilotSession): string[] {
   const out = new Set<string>();
   for (const sc of s.inv.screens()) {
     for (const p of sc.params) {
-      if ((p.guessedType === "object_ref" || p.guessedType === "id") && p.example) {
+      if (!p.example) continue;
+      // Trust the stored guessedType, but ALSO re-run the rule — a weak/LLM label may have missed userId, or an
+      // ambiguous name (q, ref) whose EXAMPLE is id-shaped (uuid / multi-digit).
+      if (p.guessedType === "object_ref" || p.guessedType === "id" || guessParamType(p.name, p.in, p.example) === "object_ref") {
         out.add(`${p.name}=${p.example}`);
       }
     }
@@ -1039,7 +1069,8 @@ function knownObjectIds(s: PilotSession): string[] {
       if (/[a-z]*\d{2,}|^[0-9a-f-]{6,}$/i.test(seg)) out.add(seg);
     }
   }
-  return [...out].slice(0, 30);
+  harvestBodyIds(s.evidence.records, out);
+  return [...out].slice(0, 40);
 }
 
 function screenDigest(sc: Screen): Record<string, unknown> {

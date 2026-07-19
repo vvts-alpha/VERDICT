@@ -149,7 +149,7 @@ export function parseOpenApiToScreens(rawDoc: unknown, baseUrl: string, existing
       const inLoc = str(p?.["in"]);
       const name = str(p?.["name"]);
       if (p && name && (inLoc === "query" || inLoc === "header")) {
-        add({ name, in: inLoc as ParamLoc, example: exampleStr(p), guessedType: guessParamType(name, inLoc as ParamLoc) });
+        add({ name, in: inLoc as ParamLoc, example: exampleStr(p), guessedType: guessParamType(name, inLoc as ParamLoc, exampleStr(p)) });
       }
     }
     if (reqSchema && reqSchema.type === "object") {

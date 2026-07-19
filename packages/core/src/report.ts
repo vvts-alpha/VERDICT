@@ -19,7 +19,13 @@ export function renderMarkdown(m: ReportModel): string {
 
   // Separate confirmed (control+2replay) from suspected (single-anomaly leads). Only confirmed are headlined.
   const confirmed = m.findings.filter((f) => f.verdict === "confirmed");
-  const suspected = m.findings.filter((f) => f.verdict === "suspected");
+  // Split suspected into MEDIUM+ leads (worth a human's manual verification) and INFO/LOW low-signal notes (inconclusive
+  // re-verifications, inert reflections, weak-CSP). Surfacing every info-level item in "needs verification" buries the
+  // real leads — the low-signal tier is kept for completeness but rendered compactly, out of the way.
+  const SEV_RANK: Record<Severity, number> = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
+  const allSuspected = m.findings.filter((f) => f.verdict === "suspected");
+  const suspected = allSuspected.filter((f) => SEV_RANK[f.severity] >= SEV_RANK.medium);
+  const lowSignal = allSuspected.filter((f) => SEV_RANK[f.severity] < SEV_RANK.medium);
   const tocRow = (f: ReportModel["findings"][number]): string =>
     // A [] in a Markdown link text breaks the syntax, so omit the parens around severity and strip [] from the title.
     `    - [${f.index}. ${f.severity.toUpperCase()} — ${f.title.replace(/[[\]]/g, "")}](#finding-${f.index})`;
@@ -39,6 +45,7 @@ export function renderMarkdown(m: ReportModel): string {
     out.push("- [Suspected (needs manual verification)](#suspected-needs-manual-verification)");
     for (const f of suspected) out.push(tocRow(f));
   }
+  if (lowSignal.length > 0) out.push("- [Low-signal notes](#low-signal-notes)");
   out.push("");
 
   // ── Target info ──
@@ -70,7 +77,9 @@ export function renderMarkdown(m: ReportModel): string {
     .join(", ");
   out.push("## Summary", "", confirmed.length === 0 ? "_No confirmed findings._" : `${confirmed.length} finding(s): ${summary}`, "");
   if (suspected.length > 0)
-    out.push(`_Plus ${suspected.length} suspected lead(s) needing manual verification — listed separately below, NOT counted above._`, "");
+    out.push(`_Plus ${suspected.length} suspected lead(s) (medium+) needing manual verification — listed separately below, NOT counted above._`, "");
+  if (lowSignal.length > 0)
+    out.push(`_And ${lowSignal.length} low-signal note(s) (info/low inconclusive) — see Low-signal notes; NOT counted above._`, "");
 
   // Render one finding (shared by confirmed / suspected; suspected adds [SUSPECTED] + anomaly to the heading).
   const renderFinding = (f: ReportModel["findings"][number]): void => {
@@ -97,8 +106,17 @@ export function renderMarkdown(m: ReportModel): string {
   // ── suspected (needs manual verification; not included in the confirmed total) ──
   if (suspected.length > 0) {
     out.push("## Suspected (needs manual verification)", "");
-    out.push("_Leads with one concrete observed anomaly but without control+2-replay confirmation. NOT counted in the confirmed total above — verify before relying on them._", "");
+    out.push("_Medium+ leads with one concrete observed anomaly but without control+2-replay confirmation. NOT counted in the confirmed total above — verify before relying on them._", "");
     for (const f of suspected) renderFinding(f);
+  }
+
+  // ── low-signal notes (info/low inconclusive; compact — kept for completeness, NOT a verification to-do list) ──
+  if (lowSignal.length > 0) {
+    out.push("## Low-signal notes", "");
+    out.push("_Info/low-severity inconclusive observations (inert input reflections, weak-CSP notes, etc.) — real but not exploitation-worthy leads. Listed compactly; NOT counted in the confirmed total._", "");
+    for (const f of lowSignal)
+      out.push(`- **[${f.severity.toUpperCase()}] ${f.title}**${f.screenId ? ` — screen \`${f.screenId}\`` : ""}${f.anomaly ? ` — ${f.anomaly.slice(0, 160)}` : ""}`);
+    out.push("");
   }
 
   return out.join("\n");

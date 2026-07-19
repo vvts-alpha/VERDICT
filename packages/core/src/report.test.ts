@@ -58,6 +58,45 @@ test("buildReport renders findings, repro, evidence, scope", () => {
   }
 });
 
+// C: the "Suspected (needs manual verification)" list should carry only MEDIUM+ leads; info/low inconclusive items
+// (inert reflections, weak-CSP burp~ notes) are demoted to a compact "Low-signal notes" section so they don't bury the
+// real leads. Neither is counted in the confirmed total.
+test("report splits suspected into medium+ leads vs info/low low-signal notes", () => {
+  const dir = mkdtempSync(join(tmpdir(), "veritas-report-lowsig-"));
+  try {
+    const store = AssessmentStore.open(join(dir, "state.sqlite"));
+    store.createAssessment({
+      id: "a-2",
+      target: { kind: "single_url", url: "https://shop.test/", followLinks: true, maxDepth: 2 },
+      scope: deriveScopeFromSingleUrl("https://shop.test/"),
+    });
+    const lead: Finding = {
+      id: "f-1", screenId: null, title: "[user-enumeration] auth-routing oracle", severity: "medium", verdict: "suspected",
+      anomaly: "valid vs invalid accounts return a stable auth_method flip worth manual sign-off",
+      source: { kind: "validator", validatorName: "claude-pilot" }, description: "d", reproSteps: "r", evidenceIds: ["ev-9"], scopeBasis: "in-scope",
+    };
+    const note: Finding = {
+      id: "f-2", screenId: null, title: "[burp~] Input returned in response (reflected)", severity: "info", verdict: "suspected",
+      source: { kind: "validator", validatorName: "burp" }, description: "inert reflection", reproSteps: "r", evidenceIds: [], scopeBasis: "in-scope",
+    };
+    store.upsertFinding("a-2", lead);
+    store.upsertFinding("a-2", note);
+    const md = buildReport(store.loadAssessment("a-2")!);
+    store.close();
+
+    assert.match(md, /## Suspected \(needs manual verification\)/);
+    assert.match(md, /user-enumeration\] auth-routing oracle/); // the medium lead is here
+    assert.match(md, /## Low-signal notes/);
+    assert.match(md, /\[INFO\] \[burp~\] Input returned in response/); // the info item is demoted here (compact)
+    assert.match(md, /1 suspected lead\(s\) \(medium\+\)/); // summary counts them apart
+    assert.match(md, /1 low-signal note\(s\)/);
+    // the info note must NOT appear as a full "### N. [SUSPECTED]" heading in the Suspected section
+    assert.doesNotMatch(md, /### \d+\. \[SUSPECTED\] \[INFO\]/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("evaluateStop trips on budget, coverage, and halt", () => {
   const dir = mkdtempSync(join(tmpdir(), "veritas-stop-"));
   try {
