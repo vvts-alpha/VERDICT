@@ -1101,6 +1101,121 @@ function screenBrief(sc: Screen): Record<string, unknown> {
   };
 }
 
+export interface AnalyzeJsResult {
+  page: string;
+  analyzed: number;
+  endpointsEnrolled: number;
+  secretsFound: number;
+  bundles: Array<Record<string, unknown>>;
+  note?: string;
+}
+
+/**
+ * Fetch a page's in-scope FIRST-PARTY <script src> bundles and mine each: enroll discovered endpoints as synthetic screens
+ * (so diagnosis probes them), scan for hardcoded secrets, flag exposed source maps, and record a js_analyzed event
+ * (deduped by URL). Driver-free (http/store/inv only) so it works from both the analyze_js tool AND the deterministic
+ * post-survey pass. Returns a summary.
+ */
+export async function analyzePageJs(s: PilotSession, pageUrl: string): Promise<AnalyzeJsResult> {
+  const empty: AnalyzeJsResult = { page: pageUrl, analyzed: 0, endpointsEnrolled: 0, secretsFound: 0, bundles: [] };
+  if (!isInScope(pageUrl, s.scope)) return { ...empty, note: "out of scope" };
+  let html = "";
+  try {
+    const r = await s.http.send({ method: "GET", url: pageUrl, headers: authHeaders(s), body: null });
+    bumpHttp(s, r.status);
+    html = r.body;
+  } catch (e) {
+    return { ...empty, note: `fetch error: ${String(e).slice(0, 120)}` };
+  }
+  // The scope gate naturally keeps this FIRST-party — a third-party CDN jQuery/analytics bundle is out of scope and skipped.
+  const already = s.store.analyzedJsUrls(s.assessmentId);
+  const srcs = new Set<string>();
+  for (const m of html.matchAll(/<script[^>]+src=["']([^"']+)["']/gi)) {
+    const raw = m[1];
+    if (!raw) continue;
+    let abs: string;
+    try {
+      abs = new URL(raw, pageUrl).toString();
+    } catch {
+      continue;
+    }
+    if (!/\.(m?js)(\?|#|$)/i.test(abs)) continue; // only .js/.mjs bundles
+    if (!isInScope(abs, s.scope) || already.has(abs)) continue;
+    srcs.add(abs);
+  }
+  const bundles = [...srcs].slice(0, 15);
+  if (bundles.length === 0) return { ...empty, note: "no new in-scope first-party .js bundles" };
+
+  const mask = (v: string): string => (v.length > 12 ? `${v.slice(0, 6)}…${v.slice(-4)}` : v);
+  const perBundle: Array<Record<string, unknown>> = [];
+  let totalEnrolled = 0;
+  let totalSecrets = 0;
+  for (const burl of bundles) {
+    let body = "";
+    try {
+      const r = await s.http.send({ method: "GET", url: burl, headers: authHeaders(s), body: null });
+      bumpHttp(s, r.status);
+      if (r.status >= 400) {
+        perBundle.push({ url: burl, error: `status ${r.status}` });
+        continue;
+      }
+      body = r.body;
+    } catch (e) {
+      perBundle.push({ url: burl, error: String(e).slice(0, 100) });
+      continue;
+    }
+    // (1) endpoints → enroll each NEW in-scope one as its own synthetic screen (diagnosed by Stage 3)
+    const refs = extractApiRefs([body], s.targetUrl);
+    let enrolled = 0;
+    for (const api of refs) {
+      const built = apiCallToBuiltScreen(api, s.targetUrl);
+      if (!built || !isInScope(built.observedUrl, s.scope) || isSessionDestroyingPath(built.observedUrl)) continue;
+      const { screen, isNew } = s.inv.ingestBuilt(built);
+      s.store.upsertScreen(s.assessmentId, screen);
+      if (isNew) enrolled += 1;
+    }
+    totalEnrolled += enrolled;
+    // (2) hardcoded secrets (values masked in the record; the agent re-verifies + record_finding for real ones)
+    const secretsFound = impactOracle(body)
+      .filter((i) => i.kind === "secret" || i.kind === "source-leak" || i.kind === "file-leak")
+      .map((i) => ({ kind: i.kind, detail: `${i.detail}: ${mask(i.marker)}` }));
+    totalSecrets += secretsFound.length;
+    // (3) source-map exposure — inline sourceMappingURL, or a reachable <bundle>.map
+    let sourceMap = /\/\/[#@]\s*sourceMappingURL=/.test(body);
+    if (!sourceMap) {
+      const b0 = burl.split(/[?#]/)[0] ?? burl;
+      const mapUrl = `${b0}.map`;
+      if (isInScope(mapUrl, s.scope)) {
+        try {
+          const mr = await s.http.send({ method: "GET", url: mapUrl, headers: authHeaders(s), body: null });
+          bumpHttp(s, mr.status);
+          sourceMap = mr.status === 200 && /"version"|"sources"/.test(mr.body.slice(0, 300));
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    s.store.appendEvent(s.assessmentId, {
+      type: "js_analyzed",
+      payload: {
+        url: burl,
+        bytes: body.length,
+        endpointsFound: refs.map((a) => `${a.method} ${a.urlTemplate}`),
+        secretsFound,
+        sourceMap,
+        analyzedAt: new Date().toISOString(),
+      },
+    });
+    perBundle.push({ url: burl, bytes: body.length, endpoints: refs.length, enrolled, secrets: secretsFound.length, sourceMap });
+  }
+  if (perBundle.length > 0)
+    s.store.appendEvent(s.assessmentId, {
+      type: "note",
+      payload: { message: `📜 analyze_js ${pageUrl}: ${perBundle.length} bundle(s) → ${totalEnrolled} new endpoint screen(s), ${totalSecrets} secret hit(s)` },
+    });
+  return { page: pageUrl, analyzed: perBundle.length, endpointsEnrolled: totalEnrolled, secretsFound: totalSecrets, bundles: perBundle };
+}
+
 export function buildTools(s: PilotSession) {
   return [
     // ───────────────────────── survey (STAGE 1) ─────────────────────────
@@ -2903,110 +3018,14 @@ export function buildTools(s: PilotSession) {
           }
         }
         pageUrl = pageUrl || s.targetUrl;
-        if (!isInScope(pageUrl, s.scope)) return txt(`BLOCKED: ${pageUrl} is out of scope`);
-        let html = "";
-        try {
-          const r = await s.http.send({ method: "GET", url: pageUrl, headers: authHeaders(s), body: null });
-          bumpHttp(s, r.status);
-          html = r.body;
-        } catch (e) {
-          return txt(`ERROR fetching ${pageUrl}: ${String(e).slice(0, 150)}`);
-        }
-        // Collect in-scope <script src> bundles. The scope gate naturally keeps this FIRST-party — a third-party CDN
-        // jQuery/analytics bundle is out of scope and skipped, which is exactly what we want.
-        const already = s.store.analyzedJsUrls(s.assessmentId);
-        const srcs = new Set<string>();
-        for (const m of html.matchAll(/<script[^>]+src=["']([^"']+)["']/gi)) {
-          const raw = m[1];
-          if (!raw) continue;
-          let abs: string;
-          try {
-            abs = new URL(raw, pageUrl).toString();
-          } catch {
-            continue;
-          }
-          if (!/\.(m?js)(\?|#|$)/i.test(abs)) continue; // only .js/.mjs bundles
-          if (!isInScope(abs, s.scope) || already.has(abs)) continue;
-          srcs.add(abs);
-        }
-        const bundles = [...srcs].slice(0, 15);
-        if (bundles.length === 0)
-          return txt(JSON.stringify({ page: pageUrl, analyzed: 0, note: "no NEW in-scope first-party .js bundles (already-analyzed ones are skipped)" }));
-
-        const mask = (v: string): string => (v.length > 12 ? `${v.slice(0, 6)}…${v.slice(-4)}` : v);
-        const perBundle: Array<Record<string, unknown>> = [];
-        let totalEnrolled = 0;
-        let totalSecrets = 0;
-        for (const burl of bundles) {
-          let body = "";
-          try {
-            const r = await s.http.send({ method: "GET", url: burl, headers: authHeaders(s), body: null });
-            bumpHttp(s, r.status);
-            if (r.status >= 400) {
-              perBundle.push({ url: burl, error: `status ${r.status}` });
-              continue;
-            }
-            body = r.body;
-          } catch (e) {
-            perBundle.push({ url: burl, error: String(e).slice(0, 100) });
-            continue;
-          }
-          // (1) endpoints → enroll each NEW in-scope one as its own synthetic screen (diagnosed by Stage 3)
-          const refs = extractApiRefs([body], s.targetUrl);
-          let enrolled = 0;
-          for (const api of refs) {
-            const built = apiCallToBuiltScreen(api, s.targetUrl);
-            if (!built || !isInScope(built.observedUrl, s.scope) || isSessionDestroyingPath(built.observedUrl)) continue;
-            const { screen, isNew } = s.inv.ingestBuilt(built);
-            s.store.upsertScreen(s.assessmentId, screen);
-            if (isNew) enrolled += 1;
-          }
-          totalEnrolled += enrolled;
-          // (2) hardcoded secrets (values masked in the record; the agent re-verifies + record_finding for real ones)
-          const secretsFound = impactOracle(body)
-            .filter((i) => i.kind === "secret" || i.kind === "source-leak" || i.kind === "file-leak")
-            .map((i) => ({ kind: i.kind, detail: `${i.detail}: ${mask(i.marker)}` }));
-          totalSecrets += secretsFound.length;
-          // (3) source-map exposure — inline sourceMappingURL, or a reachable <bundle>.map
-          let sourceMap = /\/\/[#@]\s*sourceMappingURL=/.test(body);
-          if (!sourceMap) {
-            const b0 = burl.split(/[?#]/)[0] ?? burl;
-            const mapUrl = `${b0}.map`;
-            if (isInScope(mapUrl, s.scope)) {
-              try {
-                const mr = await s.http.send({ method: "GET", url: mapUrl, headers: authHeaders(s), body: null });
-                bumpHttp(s, mr.status);
-                sourceMap = mr.status === 200 && /"version"|"sources"/.test(mr.body.slice(0, 300));
-              } catch {
-                /* ignore */
-              }
-            }
-          }
-          s.store.appendEvent(s.assessmentId, {
-            type: "js_analyzed",
-            payload: {
-              url: burl,
-              bytes: body.length,
-              endpointsFound: refs.map((a) => `${a.method} ${a.urlTemplate}`),
-              secretsFound,
-              sourceMap,
-              analyzedAt: new Date().toISOString(),
-            },
-          });
-          perBundle.push({ url: burl, bytes: body.length, endpoints: refs.length, enrolled, secrets: secretsFound.length, sourceMap });
-        }
-        s.store.appendEvent(s.assessmentId, {
-          type: "note",
-          payload: { message: `📜 analyze_js ${pageUrl}: ${perBundle.length} bundle(s) → ${totalEnrolled} new endpoint screen(s), ${totalSecrets} secret hit(s)` },
-        });
+        const res = await analyzePageJs(s, pageUrl);
         return txt(
           JSON.stringify({
-            page: pageUrl,
-            analyzed: perBundle.length,
-            endpointsEnrolled: totalEnrolled,
-            secretsFound: totalSecrets,
-            bundles: perBundle,
-            hint: `${totalEnrolled} NEW endpoint screen(s) enrolled from JS (they will be diagnosed). For any secret hit, verify it is live and record_finding(secret-exposure). An exposed source map is itself a finding (info/low).`,
+            ...res,
+            hint:
+              res.analyzed > 0
+                ? `${res.endpointsEnrolled} NEW endpoint screen(s) enrolled from JS (they will be diagnosed). For any secret hit, verify it is live and record_finding(secret-exposure). An exposed source map is itself a finding (info/low).`
+                : (res.note ?? "nothing new to analyze"),
           }),
         );
       },

@@ -16,7 +16,7 @@ import { EvidenceStore, FetchHttpClient, fingerprintTech, stackAttackHints } fro
 import type { TechSample } from "@veritas/scanner";
 import type { BurpAuditConn } from "@veritas/scanner";
 import { join } from "node:path";
-import { buildTools, STAGE_TOOLS, dedupKey, isAuthWalled, loadCookieFile, mergeSetCookie, touchIsDead, stripHash, backfillParentPrefixes, availableRoles } from "./tools.js";
+import { buildTools, STAGE_TOOLS, dedupKey, isAuthWalled, loadCookieFile, mergeSetCookie, touchIsDead, stripHash, backfillParentPrefixes, availableRoles, analyzePageJs } from "./tools.js";
 import type { PilotSession, RoleSession } from "./tools.js";
 import { LiveControl } from "./live-control.js";
 import { DEFAULT_SCENARIOS, DIAGNOSE_PROMPT, FINGERPRINT_PROMPT, METHODOLOGY_PROMPT, RECON_GUESS_PROMPT, SCENARIO_PROMPT, SURVEY_PROMPT } from "./system.js";
@@ -716,6 +716,30 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         if (bf.enrolled > 0) opts.onText?.(`🧭 parent-prefix backfill: +${bf.enrolled} screen(s) from ${bf.probed} unmapped parent path(s)`);
       } catch (e) {
         opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: `⚠ parent-prefix backfill skipped: ${String(e).slice(0, 120)}` } });
+      }
+    }
+
+    // ── First-party JS recon (deterministic, no LLM) ── survey/backfill map the pages; here we fetch each app page's
+    //   OWN JS bundles and mine them for hidden API endpoints (enrolled as screens to diagnose), hardcoded secrets, and
+    //   source-map exposure. Endpoints/keys that link-following + XHR-capture never trigger live in the bundles. Bundles
+    //   are usually shared across pages and deduped by URL, so a handful of representative pages covers the app. Runs
+    //   before methodology so the newly-enrolled endpoints get planned. (The analyze_js tool is also available to the model.)
+    if (doSurvey && !session.done) {
+      try {
+        const root = session.targetUrl;
+        const pages = [root, ...session.inv.screens().map((sc) => sc.observedUrls[0]).filter((u): u is string => !!u && u !== root)].slice(0, 6);
+        let analyzed = 0;
+        let enrolled = 0;
+        let secrets = 0;
+        for (const p of pages) {
+          const r = await analyzePageJs(session, p);
+          analyzed += r.analyzed;
+          enrolled += r.endpointsEnrolled;
+          secrets += r.secretsFound;
+        }
+        if (analyzed > 0) opts.onText?.(`📜 JS recon: ${analyzed} bundle(s) analyzed → +${enrolled} endpoint screen(s), ${secrets} secret hit(s)`);
+      } catch (e) {
+        opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: `⚠ JS recon skipped: ${String(e).slice(0, 120)}` } });
       }
     }
 
