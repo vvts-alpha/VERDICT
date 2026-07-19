@@ -8,6 +8,7 @@ import type { BudgetState, StopReason } from "./budget.js";
 import type { HypoStatus } from "./hypothesis.js";
 import type { HandoffReason } from "./handoff.js";
 import type { ScreenScanStatus } from "./screen-scan.js";
+import type { JsAsset } from "./js-asset.js";
 
 interface EventEnvelope<TType extends string, TPayload> {
   /** Monotonically increasing within an assessment, starting at 1 */
@@ -39,6 +40,7 @@ export type StateEvent =
   | EventEnvelope<"handoff_resolved", { handoffId: string }>
   | EventEnvelope<"halted", { reason: StopReason; detail?: string }>
   | EventEnvelope<"control_changed", { paused: boolean; reason?: string }>
+  | EventEnvelope<"js_analyzed", JsAsset>
   | EventEnvelope<"note", { message: string }>;
 
 export type StateEventType = StateEvent["type"];

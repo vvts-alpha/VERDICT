@@ -9,6 +9,7 @@ import { join } from "node:path";
 
 import {
   AssessmentStore,
+  buildStateView,
   defaultBudget,
   deriveScopeFromSingleUrl,
   type Hypothesis,
@@ -44,6 +45,37 @@ test("createAssessment writes an empty assessment to state.sqlite (M0 completion
 
     // The file is actually written to disk
     assert.ok(existsSync(dbPath), "state.sqlite should exist on disk");
+  });
+});
+
+// analyzed-JS assets: js_analyzed events dedup the agent's bundle analysis (analyzedJsUrls) and project into the WebUI
+// state view (jsAssets, last-write-per-url). No new table — the append-only log carries it.
+test("js_analyzed events: analyzedJsUrls dedups + buildStateView projects jsAssets", () => {
+  withTempDb((dbPath) => {
+    const store = AssessmentStore.open(dbPath);
+    const { id } = store.createAssessment({
+      target: { kind: "single_url", url: "https://app.test/", followLinks: true, maxDepth: 2 },
+      scope: deriveScopeFromSingleUrl("https://app.test/"),
+      budget: defaultBudget(),
+    });
+    store.appendEvent(id, {
+      type: "js_analyzed",
+      payload: { url: "https://app.test/main.js", bytes: 1024, endpointsFound: ["GET /api/x"], secretsFound: [{ kind: "secret", detail: "Google API key: AIza…QXh4" }], sourceMap: true, analyzedAt: "2026-01-01T00:00:00Z" },
+    });
+    store.appendEvent(id, {
+      type: "js_analyzed",
+      payload: { url: "https://app.test/vendor.js", bytes: 2048, endpointsFound: [], secretsFound: [], sourceMap: false, analyzedAt: "2026-01-01T00:00:01Z" },
+    });
+
+    const urls = store.analyzedJsUrls(id); // dedup source the analyze_js tool reads
+    assert.ok(urls.has("https://app.test/main.js") && urls.has("https://app.test/vendor.js"));
+    assert.equal(urls.size, 2);
+
+    const view = buildStateView(store.loadAssessment(id)!); // WebUI projection
+    assert.equal(view.jsAssets.length, 2);
+    const main = view.jsAssets.find((a) => a.url.endsWith("main.js"));
+    assert.ok(main && main.endpointsFound.length === 1 && main.sourceMap === true && main.secretsFound.length === 1);
+    store.close();
   });
 });
 

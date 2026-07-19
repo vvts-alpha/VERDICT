@@ -7,6 +7,7 @@ import { SiteTree } from "./components/SiteTree";
 import { Findings } from "./components/Findings";
 import { ScreenView } from "./components/ScreenView";
 import { ApiList } from "./components/ApiList";
+import { JsAssets } from "./components/JsAssets";
 import { Log } from "./components/Log";
 import { Scenarios } from "./components/Scenarios";
 import { Index } from "./components/Index";
@@ -14,7 +15,7 @@ import { Sessions } from "./components/Sessions";
 import { Chat } from "./components/Chat";
 import { AsrView } from "./components/AsrView";
 
-type Tab = "screen" | "findings" | "scenarios" | "log" | "apis" | "sessions" | "ask";
+type Tab = "screen" | "findings" | "scenarios" | "log" | "apis" | "js" | "sessions" | "ask";
 
 // DESIGN §8 — left: SITE TREE (nav) + progress bar; right: tabs: Screen / Findings / Diagnostic log / APIs.
 export function App() {
@@ -109,6 +110,9 @@ export function App() {
             <button type="button" className={tab === "apis" ? "active" : ""} onClick={() => setTab("apis")}>
               APIs
             </button>
+            <button type="button" className={tab === "js" ? "active" : ""} onClick={() => setTab("js")}>
+              JS ({view.jsAssets.length})
+            </button>
             <button type="button" className={tab === "log" ? "active" : ""} onClick={() => setTab("log")}>
               Log ({view.events.length})
             </button>
@@ -135,6 +139,7 @@ export function App() {
             {tab === "findings" ? <Findings view={view} onJump={onSelect} /> : null}
             {tab === "scenarios" ? <Scenarios view={view} onJump={onSelect} /> : null}
             {tab === "apis" ? <ApiList view={view} onJump={onSelect} /> : null}
+            {tab === "js" ? <JsAssets view={view} /> : null}
             {tab === "log" ? <Log events={view.events} /> : null}
             {tab === "sessions" ? <Sessions id={view.id} /> : null}
             {tab === "ask" ? <Chat id={view.id} /> : null}

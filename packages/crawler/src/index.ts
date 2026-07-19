@@ -44,7 +44,7 @@ export { classifyScreenType, deriveLabels, describeScreen, guessParamType } from
 export { buildScreenFromObservation, InventoryBuilder } from "./inventory.js";
 export type { BuiltScreen } from "./inventory.js";
 
-export { parseOpenApiToScreens } from "./openapi-ingest.js";
+export { parseOpenApiToScreens, apiCallToBuiltScreen } from "./openapi-ingest.js";
 
 // screen_inventory.json I/O
 export { buildInventory, readScreenInventory, writeScreenInventory } from "./io.js";

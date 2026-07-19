@@ -199,3 +199,52 @@ export function parseOpenApiToScreens(rawDoc: unknown, baseUrl: string, existing
   }
   return inv.screens();
 }
+
+/**
+ * One statically-discovered ApiCall (e.g. from extractApiRefs over a JS bundle) → a synthetic BuiltScreen, so the pilot
+ * can enroll it via `inv.ingestBuilt(...)` + `store.upsertScreen(...)` and the diagnosis stage probes it as its own screen.
+ * No browser/network — the same construction parseOpenApiToScreens uses per operation. Returns null if baseUrl is unparseable.
+ */
+export function apiCallToBuiltScreen(api: ApiCall, baseUrl: string): BuiltScreen | null {
+  let origin: string;
+  try {
+    origin = new URL(baseUrl).origin;
+  } catch {
+    return null;
+  }
+  const template = api.urlTemplate; // already normalized by extractApiRefs
+  const observedUrl = origin + template.replace(/\{[^}]+\}/g, "1"); // a concrete, probeable URL
+  const params: Param[] = [];
+  const seen = new Set<string>();
+  const add = (p: Param): void => {
+    const k = `${p.in}:${p.name}`;
+    if (!seen.has(k)) {
+      seen.add(k);
+      params.push(p);
+    }
+  };
+  for (const m of template.matchAll(/\{([^}]+)\}/g)) if (m[1]) add({ name: m[1], in: "path", example: "1", guessedType: guessParamType(m[1], "path") });
+  if (api.reqSchema && api.reqSchema.type === "object")
+    for (const f of Object.keys(api.reqSchema.fields)) add({ name: f, in: "body", example: "", guessedType: guessParamType(f, "body") });
+  const screenType = classifyScreenType({ urlTemplate: template, finalUrl: observedUrl, forms: [], title: "", visibleText: "" });
+  const labels = deriveLabels(screenType, params, [api], "");
+  const domSkeletonHash = hashDomSkeleton(`api:${template}`); // DOM-less, deterministic, distinct from real skeleton hashes
+  const authState: AuthState = api.auth === "none" ? "unauth" : "post-login";
+  return {
+    dedupKey: `${template} ${domSkeletonHash}`,
+    observedUrl,
+    capTemplate: template,
+    screen: {
+      urlTemplate: template,
+      observedUrls: [observedUrl],
+      authState,
+      screenType,
+      description: describeScreen(screenType, template, params, [api]),
+      params,
+      apis: [api],
+      screenshot: "",
+      domSkeletonHash,
+      labels,
+    },
+  };
+}

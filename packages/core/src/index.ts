@@ -48,6 +48,8 @@ export type {
   ListingEntry,
   Asset,
   AssetInventory,
+  JsAsset,
+  JsSecret,
 } from "./types/index.js";
 
 // SQLite state store

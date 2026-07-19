@@ -8,6 +8,7 @@ import type {
   Finding,
   HumanHandoff,
   Hypothesis,
+  JsAsset,
   Phase,
   Screen,
   ScreenScan,
@@ -29,6 +30,8 @@ export interface StateView {
   hypotheses: Hypothesis[];
   findings: Finding[];
   handoffs: HumanHandoff[];
+  /** First-party JS bundles the agent analyzed (endpoints/secrets mined) — the JS tab + agent dedup. */
+  jsAssets: JsAsset[];
   /** Recent activity log (for the diagnosis-log tab). Capped to the last 300 since too many is heavy. */
   events: StateEvent[];
   /** Whether paused via a WebUI action (derived from control_changed events) */
@@ -50,6 +53,13 @@ function derivePaused(events: AssessmentState["events"]): boolean {
   return false;
 }
 
+/** Fold the append-only log into the analyzed-JS list (last write per url wins = free dedup). */
+function deriveJsAssets(events: AssessmentState["events"]): JsAsset[] {
+  const byUrl = new Map<string, JsAsset>();
+  for (const e of events) if (e.type === "js_analyzed") byUrl.set(e.payload.url, e.payload);
+  return [...byUrl.values()];
+}
+
 export function buildStateView(state: AssessmentState): StateView {
   const last = state.events[state.events.length - 1];
   return {
@@ -64,6 +74,7 @@ export function buildStateView(state: AssessmentState): StateView {
     hypotheses: state.hypotheses,
     findings: state.findings,
     handoffs: state.handoffs,
+    jsAssets: deriveJsAssets(state.events),
     events: state.events.slice(-300),
     paused: derivePaused(state.events),
     lastSeq: last ? last.seq : 0,

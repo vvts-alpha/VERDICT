@@ -1,9 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { parseOpenApiToScreens } from "./index.js";
+import { parseOpenApiToScreens, apiCallToBuiltScreen } from "./index.js";
 import { buildOpenApi } from "@veritas/core";
-import type { Screen } from "@veritas/core";
+import type { ApiCall, Screen } from "@veritas/core";
 
 const findApi = (screens: Screen[], method: string, template: string) =>
   screens.flatMap((s) => s.apis).find((a) => a.method === method && a.urlTemplate === template);
@@ -146,4 +146,23 @@ test("round-trip sanity: buildOpenApi(parseOpenApiToScreens(doc)) preserves the 
     [...ops].sort(),
     ["DELETE /a/{id}", "GET /a/{id}", "POST /b"].sort(),
   );
+});
+
+// A JS-discovered endpoint (from extractApiRefs over a bundle) → a synthetic, diagnosable screen. Used by the pilot's
+// analyze_js to enroll hidden endpoints so the diagnosis stage probes them.
+test("apiCallToBuiltScreen: JS-discovered endpoint → concrete, IDOR-typed synthetic screen", () => {
+  const api: ApiCall = { method: "GET", urlTemplate: "/api/v1/users/{id}", auth: "none", reqSchema: null, resSchema: null };
+  const built = apiCallToBuiltScreen(api, "https://app.test/");
+  assert.ok(built);
+  assert.equal(built!.screen.urlTemplate, "/api/v1/users/{id}");
+  assert.equal(built!.observedUrl, "https://app.test/api/v1/users/1"); // {id}→1, concrete + probeable
+  assert.deepEqual(built!.screen.observedUrls, ["https://app.test/api/v1/users/1"]);
+  assert.equal(built!.screen.apis[0]?.method, "GET");
+  const idp = built!.screen.params.find((p) => p.name === "id");
+  assert.ok(idp && idp.guessedType === "object_ref", "path {id} typed as an object ref (IDOR candidate)");
+  assert.ok(built!.screen.domSkeletonHash.length > 0, "distinct DOM-less skeleton hash so dedup keeps it separate");
+});
+
+test("apiCallToBuiltScreen: unparseable base URL → null", () => {
+  assert.equal(apiCallToBuiltScreen({ method: "GET", urlTemplate: "/x", auth: "none", reqSchema: null, resSchema: null }, "not a url"), null);
 });

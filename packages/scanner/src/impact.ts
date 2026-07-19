@@ -56,6 +56,8 @@ const DETECTORS: Detector[] = [
   { kind: "secret", severity: "high", re: /\bAKIA[0-9A-Z]{16}\b/, detail: "AWS access key id" },
   { kind: "secret", severity: "high", re: /\bxox[baprs]-[0-9A-Za-z-]{10,}/, detail: "Slack token" },
   { kind: "secret", severity: "high", re: /\bAIza[0-9A-Za-z_-]{35}\b/, detail: "Google API key" },
+  { kind: "secret", severity: "high", re: /\bsk_live_[0-9A-Za-z]{20,}\b/, detail: "Stripe live secret key" },
+  { kind: "secret", severity: "high", re: /\bgh[pousr]_[0-9A-Za-z]{36,}\b/, detail: "GitHub token" }, // ghp_/gho_/ghu_/ghs_/ghr_
   { kind: "secret", severity: "medium", re: /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{6,}/, detail: "JWT" },
   { kind: "secret", severity: "high", re: /\b[a-z][a-z0-9+.-]*:\/\/[^/\s:@]+:[^/\s:@]+@/i, detail: "credentials embedded in URL (user:pass@host)" },
   { kind: "secret", severity: "medium", re: /\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}/, detail: "bcrypt password hash" },

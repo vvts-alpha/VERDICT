@@ -14,6 +14,12 @@ test("detects concrete impact signals (passwd / private key / AWS key / uid / ph
   assert.ok(kinds("token eyJhbGciOiJIUzI1Ni19.eyJzdWIiOiIxIn0.abcdef here").includes("secret")); // JWT
 });
 
+test("detects Stripe live key + GitHub token (common first-party JS-bundle secrets)", () => {
+  assert.ok(kinds("stripe(\"sk_live_51H8xQ2eZvKYlo2Cabcdef12345ghijk\")").includes("secret"));
+  assert.ok(kinds("Authorization: token ghp_16C7e42F292c6912E7710c838347Ae178B4a01").includes("secret"));
+  assert.deepEqual(kinds("const publishable = 'pk_test_notasecret'"), []); // publishable/test keys are not flagged
+});
+
 test("suppresses documentation placeholders (no false secret)", () => {
   assert.deepEqual(kinds("aws_key = AKIAIOSFODNN7EXAMPLE"), []);
   assert.deepEqual(kinds("api_key: your-api-key-here"), []);

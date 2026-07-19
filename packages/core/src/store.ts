@@ -242,6 +242,23 @@ export class AssessmentStore {
     }
   }
 
+  /** URLs already recorded as analyzed JS — the dedup source so the agent skips re-fetching/re-analyzing a bundle.
+   *  Reads the append-only log (survives --resume, unlike an in-memory set). */
+  analyzedJsUrls(assessmentId: string): Set<string> {
+    const rows = this.db
+      .prepare("SELECT payload FROM events WHERE assessment_id = ? AND type = 'js_analyzed'")
+      .all(assessmentId) as Array<{ payload: string }>;
+    const urls = new Set<string>();
+    for (const r of rows) {
+      try {
+        urls.add((JSON.parse(r.payload) as { url: string }).url);
+      } catch {
+        /* skip malformed */
+      }
+    }
+    return urls;
+  }
+
   /** Transition to the halted phase and record the stop reason as a halted event. */
   halt(assessmentId: string, reason: StopReason, detail?: string): void {
     this.tx(() => {

@@ -21,3 +21,4 @@ export type { HandoffReason, HandoffStatus, HumanHandoff } from "./handoff.js";
 export type { StateEvent, StateEventType, StateEventInput } from "./event.js";
 export type { AssessmentState, AssessmentSummary } from "./state.js";
 export type { AssetSource, AssetBand, AssetScore, AssetTriage, AssetPathHit, FindingSeverity, AssetFinding, AssetTakeover, ListingEntry, Asset, AssetInventory } from "./asset.js";
+export type { JsAsset, JsSecret } from "./js-asset.js";
