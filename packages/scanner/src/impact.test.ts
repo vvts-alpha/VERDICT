@@ -14,9 +14,14 @@ test("detects concrete impact signals (passwd / private key / AWS key / uid / ph
   assert.ok(kinds("token eyJhbGciOiJIUzI1Ni19.eyJzdWIiOiIxIn0.abcdef here").includes("secret")); // JWT
 });
 
-test("detects Stripe live key + GitHub token (common first-party JS-bundle secrets)", () => {
+test("detects Stripe / GitHub / GitLab / npm / SendGrid / Google-OAuth / OpenAI keys (first-party JS-bundle secrets)", () => {
   assert.ok(kinds("stripe(\"sk_live_51H8xQ2eZvKYlo2Cabcdef12345ghijk\")").includes("secret"));
   assert.ok(kinds("Authorization: token ghp_16C7e42F292c6912E7710c838347Ae178B4a01").includes("secret"));
+  assert.ok(kinds("gitlab: glpat-ABCdef1234567890ghIJ").includes("secret"));
+  assert.ok(kinds("//_authToken=npm_abcdefghijklmnopqrstuvwxyz0123456789").includes("secret"));
+  assert.ok(kinds("SG.aBcDeFgHiJkLmNoPqRsTuv.aBcDeFgHiJkLmNoPqRsTuvWxYz01234567890123456").includes("secret"));
+  assert.ok(kinds("client_secret: GOCSPX-abcdef1234567890ABCDEF").includes("secret"));
+  assert.ok(kinds("openai='sk-proj-abcdef1234567890ABCDEFxyz'").includes("secret"));
   assert.deepEqual(kinds("const publishable = 'pk_test_notasecret'"), []); // publishable/test keys are not flagged
 });
 
