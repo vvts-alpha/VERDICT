@@ -84,6 +84,42 @@ interface SettledOptions {
 
 // --- functions that run in-page (serialized and executed in the browser) ---
 
+// Reduce the automation fingerprint (runs before page scripts). Lets an anti-bot CAPTCHA (Cloudflare Turnstile / Arkose /
+// PerimeterX) be SOLVED BY A HUMAN in attended mode instead of permanently rejecting the browser as automated. This is
+// NOT auto-solving — it only makes the browser look normal so the operator's handoff can pass. Defensive (only overrides
+// when needed, try/catch each) and MINIMAL — it does NOT touch WebGL / plugins / canvas (which could break app JS or the
+// recon extraction). navigator.webdriver is also cleared at the Chrome level by --disable-blink-features=AutomationControlled.
+const STEALTH_INIT = (): void => {
+  const nav = (globalThis as any).navigator;
+  const win = globalThis as any;
+  try {
+    if (nav && nav.webdriver) Object.defineProperty(nav, "webdriver", { get: () => undefined, configurable: true });
+  } catch {
+    /* ignore */
+  }
+  try {
+    if (win && !win.chrome) win.chrome = { runtime: {} };
+  } catch {
+    /* ignore */
+  }
+  try {
+    if (nav && (!nav.languages || nav.languages.length === 0)) Object.defineProperty(nav, "languages", { get: () => ["en-US", "en"], configurable: true });
+  } catch {
+    /* ignore */
+  }
+  try {
+    // A classic headless tell: Notification.permission says 'denied' while permissions.query returns 'prompt'. Make them agree.
+    const perms = nav && nav.permissions;
+    const N = (globalThis as any).Notification;
+    if (perms && perms.query && N) {
+      const orig = perms.query.bind(perms);
+      perms.query = (p: any): any => (p && p.name === "notifications" ? Promise.resolve({ state: N.permission }) : orig(p));
+    }
+  } catch {
+    /* ignore */
+  }
+};
+
 const INIT_SCRIPT = (): void => {
   const g = globalThis as any;
   g.__veritasRoutes = g.__veritasRoutes || [];
@@ -202,9 +238,12 @@ export class PlaywrightDriver implements Driver {
       userAgent: options.userAgent ?? DEFAULT_BROWSER_UA, // avoid the default "HeadlessChrome" UA that bot/WAF filters reject
       // Note: adding everything via extraHTTPHeaders would make custom headers turn cross-origin requests into CORS preflights
       // and break third-party CDN/analytics/other-subdomain APIs. The marker is added "same-origin only" via the routing below.
+      // Drop the automation fingerprint so an anti-bot CAPTCHA can be human-solved in attended mode (see STEALTH_INIT).
+      // Additive: full CDP control + all recon (route capture / XHR intercept / DOM extract) are unaffected.
+      args: ["--disable-blink-features=AutomationControlled", ...(options.args ?? [])],
+      ignoreDefaultArgs: ["--enable-automation"], // removes the "controlled by automated software" flag + infobar (a tell)
       ...(options.executablePath ? { executablePath: options.executablePath } : {}),
       ...(options.channel ? { channel: options.channel } : {}),
-      ...(options.args ? { args: options.args } : {}),
       ...(options.proxy ? { proxy: { server: options.proxy }, ignoreHTTPSErrors: true } : {}), // via Burp (only when set)
       ...(options.httpCredentials ? { httpCredentials: options.httpCredentials } : {}), // site-wide Basic/Digest (only when set)
     });
@@ -214,6 +253,7 @@ export class PlaywrightDriver implements Driver {
       settleMs: options.settleMs ?? 800,
       maxBodySample: options.maxBodySample ?? 4096,
     });
+    await context.addInitScript(STEALTH_INIT); // fingerprint-reduction first, then the route-capture hooks
     await context.addInitScript(INIT_SCRIPT);
     // The x-verdict marker is added only to **same-origin (+ document navigation)** requests. Never to cross-origin
     // at all (= even if scope includes other domains/APIs, the browser won't break third parties via a CORS preflight).
