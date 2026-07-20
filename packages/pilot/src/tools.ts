@@ -135,9 +135,9 @@ export const STAGE_TOOLS = {
   // recon extrapolation: after survey, read the mapped surface and forced-browse LLM-predicted unlinked endpoints.
   reconGuess: ["get_inventory", "probe_guesses", "browser_navigate", "guess_done"],
   methodology: ["get_inventory", "record_methodology", "methodology_done"],
-  diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_dom_xss", "probe_stored_xss", "probe_ssti", "probe_sqli", "probe_cmdi", "probe_traversal", "probe_redirect", "probe_jwt", "probe_csrf", "probe_oob", "probe_logic", "analyze_session", "verify_access", "probe_idor", "analyze_js", "browser_navigate", "browser_fill", "browser_click", "browser_upload", "record_finding", "screen_done", "skip_screen"],
+  diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_dom_xss", "probe_stored_xss", "probe_ssti", "probe_sqli", "probe_cmdi", "probe_traversal", "probe_redirect", "probe_jwt", "probe_csrf", "probe_oob", "probe_logic", "probe_race", "probe_reset_poison", "analyze_session", "verify_access", "probe_idor", "analyze_js", "browser_navigate", "browser_fill", "browser_click", "browser_upload", "record_finding", "screen_done", "skip_screen"],
   // scenario (A04 cross-cutting logic): overview the inventory + fire multi-step request chains via probe_scenario. Once, after per-screen diagnosis.
-  scenario: ["get_inventory", "login", "http_request", "browser_navigate", "browser_fill", "browser_click", "probe_scenario", "record_finding", "scenario_done"],
+  scenario: ["get_inventory", "login", "http_request", "browser_navigate", "browser_fill", "browser_click", "probe_scenario", "probe_race", "probe_reset_poison", "record_finding", "scenario_done"],
   // fingerprint (A06 known-vulnerable components): fingerprint_scan to collect versions, evaluate known CVEs (cve_lookup opt-in) and record.
   fingerprint: ["fingerprint_scan", "cve_lookup", "http_request", "record_finding", "fingerprint_done"],
 } as const;
@@ -288,7 +288,7 @@ export const BUSINESS_LOGIC_CATEGORIES = new Set<string>(["price-tampering", "qt
 
 /** Categories of the "confirmed when a specific marker appears in the response" type (judged by marker presence, not length delta).
  *  Business logic (probe_logic/probe_scenario) + reflected XSS (unescaped reflection) + open-redirect (Location is the OOB). */
-export const MARKER_BASED_CATEGORIES = new Set<string>([...BUSINESS_LOGIC_CATEGORIES, "xss-reflected", "xss-stored", "open-redirect", "ssti", "secret-exposure", "user-enumeration"]);
+export const MARKER_BASED_CATEGORIES = new Set<string>([...BUSINESS_LOGIC_CATEGORIES, "xss-reflected", "xss-stored", "open-redirect", "ssti", "secret-exposure", "user-enumeration", "race-condition", "account-takeover"]);
 
 /** Categories that don't allow verdict:"suspected". Deterministically observable, or low-value hygiene classes, make poor leads
  *  and just add noise (rate-limit/version-disclosure were being mass-produced as "suspected"). These are confirmed-or-skip only. */
@@ -3419,6 +3419,106 @@ export function buildTools(s: PilotSession) {
               verdict: distinct.length
                 ? `not confirmed by fuzzing: ${distinct.length} neighbour id(s) (${distinct.map((t) => t.id).join(", ")}) returned a populated 200 but cross-user OWNERSHIP couldn't be auto-proven (the body didn't clearly carry another user's identity). If these are plausibly other users' objects, record verdict:"suspected" citing one of these evidenceIds, or log in as a second role to get a real victim id and re-run.`
                 : `not confirmed by fuzzing: no neighbour id (${candidates.join(", ")}) returned another user's object — access control appears to hold, or these ids don't map to other users.${ctrl.status < 400 ? " NOTE: the non-existent control also returned 200 → this endpoint may be a catch-all, so id-based tests are inconclusive here." : ""}`,
+            }),
+          );
+        } catch (e) {
+          return txt(`ERROR: ${String(e).slice(0, 180)}`);
+        }
+      },
+    ),
+
+    // ───────────────────────── race condition (concurrency / TOCTOU) ─────────────────────────
+    tool(
+      "probe_race",
+      "Confirm a RACE CONDITION (TOCTOU / limit-overrun): fires N identical requests CONCURRENTLY and checks whether a single-use / limited action succeeds MORE THAN ONCE (a one-time coupon redeemed twice, a balance withdrawn/transferred twice, an OTP or invite accepted twice, a stock/quota overrun). Pass the request (url + method + body) and `successMarker` — a string that appears ONLY on success (e.g. \"redeemed\", a new balance, a confirmation id). It sends `count` (default 10, max 20) requests in parallel; if >=2 succeed when only 1 should, the limit was overrun by concurrency. Point it at a FRESH single-use resource (a just-created coupon/token) — the burst consumes it. Returns negativeControl (a rejected/sequential attempt proving the limit normally holds) + positiveReplays (2 concurrent successes) → record_finding(category race-condition).",
+      { url: z.string(), successMarker: z.string(), method: z.string().optional(), body: z.string().optional(), count: z.number().optional() },
+      async ({ url, successMarker, method, body, count }) => {
+        if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} is out of scope`);
+        const n = Math.min(Math.max(Math.floor(count ?? 10), 2), 20);
+        const req: HttpRequest = { method: (method ?? (body != null ? "POST" : "GET")).toUpperCase(), url, headers: authHeaders(s), body: body ?? null };
+        const isSuccess = (r: HttpResponse | null): r is HttpResponse => !!r && r.status < 400 && r.body.includes(successMarker);
+        const rec = (res: HttpResponse, kind: "negative_control" | "positive_replay", tag: string): string =>
+          s.evidence.record({ screenId: s.currentScreenId ?? "pilot", validator: "claude-pilot-race", kind, request: { ...req, headers: s.http.effectiveHeaders(req.headers) }, response: res, note: `race ${tag}` }).id;
+        try {
+          // ── concurrent burst: Promise.all fires a real parallel volley (the rate limiter's per-send delay is uniform,
+          //    so the batch resolves its waits together and hits ~simultaneously — the concurrency a TOCTOU needs). ──
+          const results = await Promise.all(
+            Array.from({ length: n }, () =>
+              s.http
+                .send({ ...req })
+                .then((res) => {
+                  bumpHttp(s, res.status);
+                  return res;
+                })
+                .catch(() => null),
+            ),
+          );
+          const ok = results.filter(isSuccess);
+          if (ok.length < 2)
+            return txt(JSON.stringify({ concurrentSuccesses: ok.length, of: n, verdict: `not confirmed: at most ${ok.length}/${n} concurrent requests succeeded — the limit looks concurrency-safe (or the marker/target was wrong; point at a FRESH single-use resource and pass the exact success marker).` }));
+          // control = a rejected concurrent attempt (the limit DID fire for it). If ALL succeeded, a sequential follow-up
+          // should now be denied (resource consumed) — if it also succeeds, the action simply isn't single-use.
+          const deniedRes = results.find((r): r is HttpResponse => !!r && !isSuccess(r));
+          let ctrlEv: string;
+          if (deniedRes) {
+            ctrlEv = rec(deniedRes, "negative_control", "a rejected concurrent attempt (limit held for this one)");
+          } else {
+            const seq = await s.http.send({ ...req });
+            bumpHttp(s, seq.status);
+            if (isSuccess(seq))
+              return txt(JSON.stringify({ concurrentSuccesses: ok.length, of: n, verdict: `not a RACE: ${ok.length}/${n} concurrent succeeded AND a sequential follow-up ALSO succeeds — the action is simply repeatable (no single-use limit to overrun). If it is SUPPOSED to be single-use, that is a separate logic bug.` }));
+            ctrlEv = rec(seq, "negative_control", "sequential follow-up denied (resource consumed) — the limit exists");
+          }
+          const p1 = rec(ok[0]!, "positive_replay", "concurrent success #1");
+          const p2 = rec(ok[1]!, "positive_replay", "concurrent success #2");
+          return txt(
+            JSON.stringify({
+              negativeControl: ctrlEv,
+              positiveReplays: [p1, p2],
+              effectMarker: successMarker,
+              concurrentSuccesses: ok.length,
+              of: n,
+              verdict: `RACE CONDITION CONFIRMED — ${ok.length}/${n} concurrent requests succeeded on a single-use/limited action while a rejected/sequential control shows the limit normally holds. TOCTOU / limit-overrun. record_finding(category race-condition) with these evidenceIds + effectMarker.`,
+            }),
+          );
+        } catch (e) {
+          return txt(`ERROR: ${String(e).slice(0, 180)}`);
+        }
+      },
+    ),
+    // ───────────────────────── reset host-header poisoning (account-takeover) ─────────────────────────
+    tool(
+      "probe_reset_poison",
+      'Confirm password-reset HOST-HEADER POISONING (an account-takeover primitive) IN-BAND: re-send the reset request with X-Forwarded-Host / X-Forwarded-Server / Forwarded set to an attacker host and check whether that host is REFLECTED into a URL in the RESPONSE (a reset link built from the forwarded host), while a clean control (no header) does NOT reflect it. Confirms only the in-band case; if the reset link is delivered ONLY by email (not echoed in the response), this cannot confirm — record verdict:"suspected" (account-takeover) and verify with a mailbox. Pass the reset endpoint url + the request body (with the victim email).',
+      { url: z.string(), method: z.string().optional(), body: z.string().optional() },
+      async ({ url, method, body }) => {
+        if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} is out of scope`);
+        const host = OOB_MARKER;
+        const poison: Record<string, string> = { "x-forwarded-host": host, "x-forwarded-server": host, forwarded: `host=${host}`, "x-host": host };
+        const send = async (extra: Record<string, string>, kind: "negative_control" | "positive_replay", tag: string) => {
+          const req: HttpRequest = { method: (method ?? "POST").toUpperCase(), url, headers: { ...authHeaders(s), ...extra }, body: body ?? null };
+          const res = await s.http.send(req);
+          bumpHttp(s, res.status);
+          const reflected = res.body.includes(host) || (res.headers["location"] ?? "").includes(host); // attacker host echoed in a URL/Location
+          const ev = s.evidence.record({ screenId: s.currentScreenId ?? "pilot", validator: "claude-pilot-reset-poison", kind, request: { ...req, headers: s.http.effectiveHeaders(req.headers) }, response: res, note: `reset-poison ${tag}` });
+          return { evId: ev.id, status: res.status, reflected };
+        };
+        try {
+          const ctrl = await send({}, "negative_control", "clean (no forwarded host)");
+          const p1 = await send(poison, "positive_replay", "poisoned #1");
+          const p2 = await send(poison, "positive_replay", "poisoned #2");
+          const confirmed = !ctrl.reflected && p1.reflected && p2.reflected;
+          return txt(
+            JSON.stringify({
+              negativeControl: ctrl.evId,
+              positiveReplays: [p1.evId, p2.evId],
+              effectMarker: host,
+              reflected: { control: ctrl.reflected, poisoned1: p1.reflected, poisoned2: p2.reflected },
+              verdict: confirmed
+                ? `RESET HOST-HEADER POISONING CONFIRMED (in-band) — the attacker host ${host} is reflected in the reset response (a reset link built from X-Forwarded-Host), absent in the clean control. record_finding(category account-takeover, high) with these evidenceIds + effectMarker.`
+                : ctrl.reflected
+                  ? `inconclusive: the host marker appears even in the CLEAN control — the app echoes the header unconditionally, which is not proof the reset LINK is poisoned.`
+                  : `not confirmed IN-BAND: the poisoned host is not reflected in the response. The reset link may still be poisoned in the DELIVERED EMAIL — if no mailbox is reachable, record verdict:"suspected" (account-takeover) citing the injectable header.`,
             }),
           );
         } catch (e) {
