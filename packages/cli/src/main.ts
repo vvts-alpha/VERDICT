@@ -1683,12 +1683,13 @@ async function cmdAsr(args: string[]): Promise<void> {
   // ② PROBE — dns resolve + HTTP liveness (scope-gated + rate-limited via FetchHttpClient)
   const http = new FetchHttpClient({ allow: (u) => isInScope(u, scope), minDelayMs, timeoutMs: 10_000 });
   const assets: Asset[] = [];
-  for (const cand of candidates) {
+  // Probe one candidate → Asset. A resolving-but-dead host costs ~20s (https 10s + http 10s timeout), so the loop below
+  // runs these CONCURRENTLY (each worker probes a DIFFERENT host, so no single host is hit more than its own 1-2 GETs).
+  const probeOne = async (cand: (typeof candidates)[number]): Promise<Asset> => {
     const host = cand.host;
-    let asset: Asset;
     if (trustLiveness && cand.hint && cand.hint.alive != null) {
       // --import-trust-liveness: trust the imported httpx liveness/fingerprint — no re-probe
-      asset = {
+      return {
         host,
         source: cand.source,
         resolved: [],
@@ -1700,43 +1701,55 @@ async function cmdAsr(args: string[]): Promise<void> {
         screenshot: null,
         inScope: isInScope(`https://${host}/`, scope),
       };
-    } else {
-      const p = await probeHost(
-        host,
-        async (h) => {
-          try {
-            return (await lookup(h, { all: true })).map((a) => a.address);
-          } catch {
-            return [];
-          }
-        },
-        (url) => http.send({ method: "GET", url }),
-        (h) => resolveCname(h).catch(() => []),
-      );
-      asset = {
-        host,
-        source: cand.source, // provenance from the merged candidate, not hardcoded
-        resolved: p.addresses,
-        alive: p.alive,
-        scheme: p.scheme,
-        status: p.status,
-        title: p.title,
-        tech: p.server ? [p.server] : [],
-        screenshot: null,
-        inScope: isInScope(`https://${host}/`, scope),
-      };
-      const tko = detectTakeover({ cnames: p.cnames, status: p.status, body: p.bodySample });
-      if (tko) {
-        asset.takeover = tko;
-        console.log(`  ! ${host}: possible subdomain takeover — ${tko.service} (${tko.confidence})`);
-      }
     }
-    assets.push(asset);
-    console.log(asset.alive ? `  ✓ ${host}  ${asset.status ?? ""} ${asset.title ?? ""}`.trimEnd() : `  · ${host}`);
-    // Incremental write → the WebUI (polling /assets) shows hosts appear + a progress bar (probed / discovered).
-    // Write every host for the first 10 (immediate feedback), then every 10 (bounded I/O on large runs).
-    if (assets.length <= 10 || assets.length % 10 === 0) writeAssetInventory(invPath, buildAssetInventory(apex, assets, new Date(), candidates.length));
-  }
+    const p = await probeHost(
+      host,
+      async (h) => {
+        try {
+          return (await lookup(h, { all: true })).map((a) => a.address);
+        } catch {
+          return [];
+        }
+      },
+      (url) => http.send({ method: "GET", url }),
+      (h) => resolveCname(h).catch(() => []),
+    );
+    const asset: Asset = {
+      host,
+      source: cand.source, // provenance from the merged candidate, not hardcoded
+      resolved: p.addresses,
+      alive: p.alive,
+      scheme: p.scheme,
+      status: p.status,
+      title: p.title,
+      tech: p.server ? [p.server] : [],
+      screenshot: null,
+      inScope: isInScope(`https://${host}/`, scope),
+    };
+    const tko = detectTakeover({ cnames: p.cnames, status: p.status, body: p.bodySample });
+    if (tko) {
+      asset.takeover = tko;
+      console.log(`  ! ${host}: possible subdomain takeover — ${tko.service} (${tko.confidence})`);
+    }
+    return asset;
+  };
+  // Bounded-concurrency probe pool: dead hosts (which each block ~20s on timeouts) overlap instead of stacking, so
+  // probing N hosts is ~(dead-host-seconds / concurrency) rather than the sum. Each worker takes a distinct candidate.
+  const PROBE_CONCURRENCY = 8;
+  let pIdx = 0;
+  const probeWorker = async (): Promise<void> => {
+    for (;;) {
+      const cand = candidates[pIdx++]; // idx++ is synchronous between awaits → each worker gets a distinct host
+      if (!cand) break;
+      const asset = await probeOne(cand);
+      assets.push(asset);
+      console.log(asset.alive ? `  ✓ ${asset.host}  ${asset.status ?? ""} ${asset.title ?? ""}`.trimEnd() : `  · ${asset.host}`);
+      // Incremental write → the WebUI (polling /assets) shows hosts appear. First 10 completions each write (immediate
+      // feedback), then every 10 (bounded I/O). Writes are synchronous so concurrent workers don't corrupt the file.
+      if (assets.length <= 10 || assets.length % 10 === 0) writeAssetInventory(invPath, buildAssetInventory(apex, assets, new Date(), candidates.length));
+    }
+  };
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(PROBE_CONCURRENCY, candidates.length)) }, () => probeWorker()));
   const live = assets.filter((a) => a.alive);
 
   // ③ SCREENSHOT (optional) — one nav per live host, scope-gated
