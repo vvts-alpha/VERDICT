@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import type { Asset, AssetInventory } from "@veritas/core";
-import { AssetTree, HostDetail, AssetFindings } from "./AssetTree";
+import { AssetTree, HostDetail, AssetFindings, SOURCE_META } from "./AssetTree";
 import { AsrLog } from "./AsrLog";
 
 // The ASR assessment viewer — SAME shape as the web/API viewer (StatusBar + Progress + .body[left tree | tabs]),
@@ -77,6 +77,16 @@ export function AsrView({ id }: { id: string }) {
   const live = assets.filter((a) => a.alive).length;
   const findingsCount = assets.reduce((n, a) => n + (a.findings?.length ?? 0), 0);
   const discovered = inv?.discovered;
+  // Discovery-source mix (S5): per-source counts + whether the run went ACTIVE (any brute-discovered host), and how
+  // many hosts have been promoted to a pilot run.
+  const bySource: Record<string, number> = {};
+  for (const a of assets) bySource[a.source] = (bySource[a.source] ?? 0) + 1;
+  const hasActive = (bySource["active"] ?? 0) > 0;
+  const promotedCount = assets.filter((a) => a.promoted).length;
+  const sourceMix = Object.entries(bySource)
+    .sort((x, y) => y[1] - x[1])
+    .map(([s, n]) => `${SOURCE_META[s]?.label ?? s} ${n}`)
+    .join(" · ");
 
   const onSelect = (asset: Asset, key: string): void => {
     setSelectedAsset(asset);
@@ -113,6 +123,22 @@ export function AsrView({ id }: { id: string }) {
         <span>
           findings: <b>{findingsCount}</b>
         </span>
+        {promotedCount > 0 ? (
+          <span title="hosts promoted to a pilot run">
+            piloted: <b>{promotedCount}</b>
+          </span>
+        ) : null}
+        {assets.length > 0 ? (
+          <span className="asr-srcmix">
+            <span
+              className={hasActive ? "active-tag" : "passive-tag"}
+              title={hasActive ? "this run included an active DNS brute (--brute)" : "passive discovery only (crt.sh / subfinder / import)"}
+            >
+              {hasActive ? "active" : "passive"}
+            </span>
+            <span className="muted" title="hosts by discovery source">{sourceMix}</span>
+          </span>
+        ) : null}
         <span style={{ marginLeft: "auto" }} />
         <AsrExport id={id} inv={inv} />
         <span className={`conn ${err ? "closed" : "open"}`} style={{ marginLeft: 12 }}>● {err ? "error" : "live"}</span>

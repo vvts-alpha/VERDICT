@@ -7,6 +7,17 @@ import type { Asset, AssetInventory, AssetFinding, FindingSeverity, ListingEntry
 
 const SEV_RANK: Record<FindingSeverity, number> = { critical: 4, high: 3, medium: 2, low: 1, info: 0 };
 
+// Discovery-source provenance (S5): a compact label + tooltip per AssetSource. `active` = an ACTIVE DNS brute (--brute),
+// the only source that sends resolution packets; the rest are passive/offline. Exported so the statusbar can summarize.
+export const SOURCE_META: Record<string, { label: string; title: string; active?: boolean }> = {
+    "crt.sh": { label: "CT", title: "crt.sh — passive certificate-transparency logs" },
+    import: { label: "import", title: "imported (subfinder / recon.sh httpx / hosts list)" },
+    active: { label: "brute", title: "active DNS brute (--brute: dnsx / native node:dns)", active: true },
+    seed: { label: "seed", title: "operator-seeded" },
+};
+const sourceLabel = (s: string): string => SOURCE_META[s]?.label ?? s;
+const sourceTitle = (s: string): string => SOURCE_META[s]?.title ?? s;
+
 function topSev(fs: AssetFinding[] | undefined): FindingSeverity | null {
     let top: FindingSeverity | null = null;
     for (const f of fs ?? []) if (top === null || SEV_RANK[f.severity] > SEV_RANK[top]) top = f.severity;
@@ -130,6 +141,10 @@ function Node({ node, collapsed, toggle, selected, onSelect }: {
                 <span className="seg" style={segStyle(node)}>{node.label}</span>
                 {node.kind === "port" ? <span className="stype" style={{ color: statusColor(node.status) }}>{node.status ?? ""}</span> : null}
                 {isHost && node.asset?.score ? <span className="stype" title={`score ${node.asset.score.total}`}>{node.asset.score.band}</span> : null}
+                {isHost && node.asset && node.asset.source !== "crt.sh" ? (
+                    <span className="asr-src" data-src={node.asset.source} title={sourceTitle(node.asset.source)}>{sourceLabel(node.asset.source)}</span>
+                ) : null}
+                {isHost && node.asset?.promoted ? <span className="asr-piloted-chip" title="promoted to a pilot run">piloted</span> : null}
                 {isHost && findings > 0 ? <span className="roll" title={`${findings} finding(s)`}>{findings}</span> : null}
             </div>
             {hasKids && open ? (
@@ -203,6 +218,9 @@ export function HostDetail({ id, asset }: { id: string; asset: Asset | null }) {
             <div className="asr-host-h">
                 <a href={`${scheme}://${asset.host}/`} target="_blank" rel="noreferrer">{asset.host} ↗</a>
                 {asset.score ? <span className="stype">{asset.score.band} · {asset.score.total}</span> : null}
+                {asset.promoted ? (
+                    <a className="asr-piloted-link" href={`?id=${encodeURIComponent(asset.promoted)}`} title="open the pilot run promoted from this host">→ piloted</a>
+                ) : null}
             </div>
             {thumb ? <img className="asr-shot" src={thumb} alt={asset.host} /> : null}
             {findings.length > 0 ? (
@@ -213,6 +231,7 @@ export function HostDetail({ id, asset }: { id: string; asset: Asset | null }) {
             ) : null}
             <div className="asr-metabox">
                 {meta("status", <span style={{ color: statusColor(asset.status) }}>{asset.status ?? "—"}</span>)}
+                {meta("source", <span title={sourceTitle(asset.source)}>{sourceLabel(asset.source)}</span>)}
                 {meta("scheme", asset.scheme ?? "—")}
                 {asset.title ? meta("title", asset.title) : null}
                 {meta("resolved", asset.resolved.length ? asset.resolved.join(", ") : "no DNS")}
