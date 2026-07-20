@@ -56,7 +56,7 @@ commands:
   manifest [--out <file.json>] [--force]   (alias: init)
             interactive scope-manifest generator: answer the prompts to produce the JSON pilot/assess read
             (target / in·out-of-scope hosts·path / rate / crawl / model / auth roles. password echo is masked)
-  pilot   --manifest <file.json> | --url <url> [--model <m>] [--fast-model <m>] [--max-turns <n>] [--max-screens <n>] [--max-survey-screens <n>] [--rate <ms>] [--headed] [--focus "<text>"] [--browser-path <bin>] [--no-sandbox] [--out <dir>]
+  pilot   --manifest <file.json> | --url <url> [--model <m>] [--fast-model <m>] [--max-turns <n>] [--max-screens <n>] [--max-survey-screens <n>] [--rate <ms>] [--headed] [--focus "<text>"] [--browser-path <bin>] [--browser-channel <name>] [--no-sandbox] [--out <dir>]
             --max-screens caps how many screens get diagnosed (default 40); --max-survey-screens caps how many the survey maps (default unlimited — stops exploring once reached)
             ★Claude-led: Claude drives the tools (browser/http/login/record) to autonomously explore, verify, and record
             --focus "<text>": operator emphasis injected as the TOP priority of the A04 scenario stage (not per-screen diagnosis). e.g. "focus on the payment flow and IDOR in /api/orders"
@@ -997,6 +997,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       model: { type: "string" },
       "fast-model": { type: "string" },
       "browser-path": { type: "string" },
+      "browser-channel": { type: "string" },
       "no-sandbox": { type: "boolean" },
       headed: { type: "boolean" },
       headless: { type: "boolean" },
@@ -1044,6 +1045,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
   const headed = attended || (!values.headless && !!values.headed);
   if (attended && values.headless) console.log("⚠ --attended needs a headed browser for manual login (--headless ignored)");
   const browserPath = values["browser-path"] ?? (process.env.VERDICT_BROWSER_PATH ?? process.env.VERITAS_BROWSER_PATH);
+  const browserChannel = values["browser-channel"] ?? process.env.VERDICT_BROWSER_CHANNEL; // e.g. "chrome" — real browser vs bundled Chromium (defeats more anti-bot)
   const surveyOnly = !!values["survey-only"];
 
   let id: string;
@@ -1176,6 +1178,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       ...(values["keepalive-url"] ? { keepAliveUrl: values["keepalive-url"] } : {}),
       ...(values["anchor-url"] ? { anchorUrl: values["anchor-url"] } : {}),
       ...(browserPath ? { browserPath } : {}),
+      ...(browserChannel ? { browserChannel } : {}),
       ...(values["no-sandbox"] ? { noSandbox: true } : {}),
       onText: (t) => console.log(`\n${t}`),
       onTool: (n, i) => console.log(`  ⚙ ${n.replace("mcp__veritas__", "")} ${JSON.stringify(i).slice(0, 160)}`),

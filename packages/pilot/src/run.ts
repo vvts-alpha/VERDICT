@@ -66,6 +66,9 @@ export interface RunPilotOptions {
   rateMs?: number;
   headless?: boolean;
   browserPath?: string;
+  /** Playwright browser channel (e.g. "chrome" / "msedge") — use a real installed browser instead of bundled Chromium
+   *  to defeat anti-bot CAPTCHAs that fingerprint Chromium. Opt-in (requires that browser installed). */
+  browserChannel?: string;
   noSandbox?: boolean;
   /** Cap on the number of screens to diagnose (default 40). */
   maxScreens?: number;
@@ -290,6 +293,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     // The x-verdict marker is added driver-side "same-origin only" (never cross-origin = doesn't break third parties).
     // Scope is a separate concept and may widen to include other domains/APIs (diagnosis can hit anything in-scope over the http path).
     ...(opts.browserPath ? { executablePath: opts.browserPath } : {}),
+    ...(opts.browserChannel ? { channel: opts.browserChannel } : {}), // e.g. "chrome" — real Chrome is far less bot-detectable than bundled Chromium
     ...(opts.noSandbox ? { args: ["--no-sandbox"] } : {}),
     ...(opts.burpProxy ? { proxy: opts.burpProxy } : {}),
     // Site-wide Basic/Digest: Playwright auto-responds to 401 (across all launched drivers = including attended role windows).
