@@ -44,7 +44,7 @@ import { assessLogicInventory, assessScreenLogic, authDiffScreen } from "@verita
 import type { RoleContext } from "@veritas/agent";
 import { runPilot, verifyBurpFindings, triageAndDeepDiveBurp, LiveControl } from "@veritas/pilot";
 import { BrowserChatAdapter, runLlmRedteam, defaultInjectedContextProbes, generateCanary } from "@veritas/llm-attacks";
-import { discoverCrtSh, fetchHttpGet, filterInScope, mergeCandidates, importRecon, probeHost, probeSurface, enumerateListing, detectTakeover, reconFindings, scoreAsset, triageAsset, buildAssetInventory, writeAssetInventory } from "@veritas/asr";
+import { discoverCrtSh, fetchHttpGet, filterInScope, mergeCandidates, importRecon, execFileRunTool, subfinderDiscover, probeHost, probeSurface, enumerateListing, detectTakeover, reconFindings, scoreAsset, triageAsset, buildAssetInventory, writeAssetInventory } from "@veritas/asr";
 import { startServer } from "@veritas/server";
 import { loadDotEnv } from "./dotenv.js";
 
@@ -105,7 +105,7 @@ commands:
             Phase2 business logic: hypothesis generation (LLM) → verify IDOR etc. with evidence discipline. --manifest injects auth headers for a spec-seeded API run.
   spec-import --spec <openapi.json> --url <base> [--id <existing>] [--manifest <m.json>] [--out <dir>]
             ingest an OpenAPI 3.x / Swagger 2.0 spec (JSON) → seed the screen inventory so the browser-free scan/logic can assess a pure-API target. --url = where the API lives (base). with --id, overlay the spec on an existing crawl (fills endpoints the UI never called). token-protected APIs: put Authorization: Bearer … in the manifest's http.headers.
-  asr     --domain <apex|*.wildcard> [--import <httpx.json|hosts.txt|dir> [--import-trust-liveness]] [--out-of-scope a.ex.com,b.ex.com] [--screenshot] [--paths] [--triage [--triage-top <n>] [--model <m>]] [--max-hosts <n>] [--rate <ms>] [--browser-path <bin>] [--no-sandbox] [--headed] [--out <dir>]
+  asr     --domain <apex|*.wildcard> [--tools subfinder|--no-tools] [--import <httpx.json|hosts.txt|dir> [--import-trust-liveness]] [--out-of-scope a.ex.com,b.ex.com] [--screenshot] [--paths] [--triage [--triage-top <n>] [--model <m>]] [--max-hosts <n>] [--rate <ms>] [--browser-path <bin>] [--no-sandbox] [--headed] [--out <dir>]
             Attack Surface Recon: passive discovery (crt.sh CT logs) → dns resolve + HTTP liveness → deterministic attack-target score (ranked) → runs/<id>/asset_inventory.json
             [--screenshot] per-host screenshot · [--paths] probe curated high-signal paths on live hosts (/.git/, /.env, /actuator, swagger, server-status…) → real exposure + auto-escalate
             [--triage] Claude classifies the top-N by score (default 15, --triage-top) → category / band / attack-angle (a lead, not a finding; claude CLI subscription, no metered API)
@@ -1511,6 +1511,8 @@ async function cmdAsr(args: string[]): Promise<void> {
       out: { type: "string" },
       import: { type: "string" },
       "import-trust-liveness": { type: "boolean" },
+      tools: { type: "string" },
+      "no-tools": { type: "boolean" },
       "browser-path": { type: "string" },
       "no-sandbox": { type: "boolean" },
       headed: { type: "boolean" },
@@ -1561,10 +1563,19 @@ async function cmdAsr(args: string[]): Promise<void> {
   }
   const crtCandidates = crtHosts.map((h) => ({ host: h, source: "crt.sh" as const }));
   const importCandidates = importPath ? importRecon(importPath) : [];
-  const merged = mergeCandidates(crtCandidates, importCandidates);
+  // subfinder (PASSIVE external tool: aggregates OSINT feeds, no brute) — auto-run if the binary is present, unless
+  // --no-tools; --tools <list> opts specific tools in/out. A missing binary degrades to [] + a one-line note.
+  const toolsList = values.tools ? values.tools.split(",").map((t) => t.trim()).filter(Boolean) : null;
+  const subfinderEnabled = !values["no-tools"] && (toolsList === null || toolsList.includes("subfinder"));
+  const sf = subfinderEnabled ? await subfinderDiscover(execFileRunTool, apex) : { candidates: [], missing: false };
+  if (subfinderEnabled && sf.missing) console.log("  subfinder not installed — skipping (install it or pass --no-tools to silence)");
+  else if (subfinderEnabled) console.log(`  subfinder: ${sf.candidates.length} host(s)`);
+  const merged = mergeCandidates(crtCandidates, importCandidates, sf.candidates);
   const inScopeHosts = new Set(filterInScope(merged.map((c) => c.host), { domain: apex, outOfScope })); // same filter as crt.sh
   let candidates = merged.filter((c) => inScopeHosts.has(c.host));
-  console.log(`  ${crtCandidates.length} crt.sh${importPath ? ` + ${importCandidates.length} import` : ""} → ${candidates.length} in-scope host(s)`);
+  console.log(
+    `  ${crtCandidates.length} crt.sh${importPath ? ` + ${importCandidates.length} import` : ""}${subfinderEnabled && !sf.missing ? ` + ${sf.candidates.length} subfinder` : ""} → ${candidates.length} in-scope host(s)`,
+  );
   if (candidates.length > maxHosts) {
     console.log(`  capping to --max-hosts ${maxHosts} (${candidates.length - maxHosts} dropped)`);
     candidates = candidates.slice(0, maxHosts);
