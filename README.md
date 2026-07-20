@@ -17,9 +17,10 @@ A Claude-led agent that maps your target, hunts vulns, and marks a finding **`co
 [![CI](https://github.com/veritas-rt/UmbraHands/actions/workflows/ci.yml/badge.svg)](https://github.com/veritas-rt/UmbraHands/actions/workflows/ci.yml)
 [![XBOW-Bench](https://img.shields.io/badge/XBOW--Bench-92%25%20(100%2F109)-2ea043)](benchmarks/xbow-bench)
 [![Juice Shop](https://img.shields.io/badge/OWASP%20Juice%20Shop-38%20findings-c0392b)](benchmarks/juice-shop)
+[![Web Security Academy](https://img.shields.io/badge/PortSwigger%20WSA-16%2F20%20detected-2ea043)](benchmarks/web-security-academy)
 ![status](https://img.shields.io/badge/status-active-blue)
 
-[Quickstart](#-quickstart) · [Benchmarks](#-benchmarks) · [Evidence](#-what-confirmed-means) · [How it works](#-how-it-works) · [Why VERDICT](#-why-verdict) · [Complex auth](#-complex-auth-sso--mfa) · [Burp](#-burp-integration) · [WebUI](#-webui)
+[Quickstart](#-quickstart) · [**Usage guide**](docs/USAGE.md) · [Benchmarks](#-benchmarks) · [Evidence](#-what-confirmed-means) · [How it works](#-how-it-works) · [Why VERDICT](#-why-verdict) · [Complex auth](#-complex-auth-sso--mfa) · [Burp](#-burp-integration) · [WebUI](#-webui)
 
 </div>
 
@@ -31,13 +32,17 @@ VERDICT runs a real browser and a scoped HTTP client through tools that **Claude
 
 ## 📊 Benchmarks
 
-**Measured, not asserted.** Every finding is backed by the agent's own recorded request/response evidence — click through to the per-run reports.
+**Measured, not asserted.** Every finding is backed by the agent's own recorded request/response evidence — click through to the per-run reports. VERDICT is scored on **two axes** — **① detection accuracy** (given a vuln, can it find and prove it — even through a defense?) and **② autonomous exploration** (from one URL, how much of an unknown app does it map and exploit unattended?). → **[Full cross-benchmark analysis](benchmarks/)**.
 
-<p align="center"><img src="benchmarks/xbow-bench/assets/progression.svg" alt="XBOW-Bench pwn rate over three iterations: v0 62% → v1 83% → v2 92%" width="640"></p>
+**① Detection accuracy** — small targets, known answer, measured as hit-rate:
 
-- 🏆 **XBOW-Bench (XBEN-24) — [92% · 100/109](benchmarks/xbow-bench)** across 104 benchmarks, up **62% → 83% → 92%** over three iterations with **zero regressions**. Unaided (no README hint): **91/91 = 100%**. → *full analysis, difficulty/hint breakdown, and 104 per-run reports.*
-- 🧃 **OWASP Juice Shop — [38 confirmed findings](benchmarks/juice-shop)** in a single autonomous run, across **16 vulnerability classes** — from a **critical SQLi auth-bypass to admin** to business-logic fraud (negative-quantity checkout, self-credit wallet) — plus 5 suspected CVE leads. → *full analysis + the evidence report for every finding.*
-- 🌐 **Beyond benchmarks** — VERDICT has also produced **confirmed, evidence-backed findings against live bug-bounty targets**. Specific programs and reports are withheld under coordinated disclosure — the benchmarks above are the reproducible proof.
+- 🏆 **XBOW-Bench (XBEN-24) — [92% · 100/109](benchmarks/xbow-bench)** across the 104-benchmark XBEN-24 suite. Unaided (without the benchmark's own description): **91/91 = 100%**. *Breadth × hit-rate across the class spectrum.* → *full analysis, per-class/difficulty breakdown, and 104 per-run reports.*
+- 🎓 **PortSwigger Web Security Academy — [16/20 detected](benchmarks/web-security-academy)** on the two hardest tiers (**Expert ×10 + Practitioner ×10**), scored on **vulnerability *detection*, not flag capture** — **12 confirmed** (failing negative control + ≥2 positive replays) through each lab's signature defense (strict cache-ability, an unkeyed-query cache, an AngularJS sandbox **and** CSP, HMAC-signed deserialization, OOB-only blind XXE) **+ 4 suspected leads**. Only 3 genuine blanks. *Can it still find the vuln when the app defends?* → *strict per-lab detection grades + evidence reports.*
+
+**② Autonomous exploration** — one URL, unknown surface, measured as coverage:
+
+- 🧃 **OWASP Juice Shop — [38 confirmed findings](benchmarks/juice-shop)** in a single autonomous run, across **16 vulnerability classes** — from a **critical SQLi auth-bypass to admin** to business-logic fraud (negative-quantity checkout, self-credit wallet) — plus 5 suspected CVE leads. *Nobody told it where to look.* → *full analysis + the evidence report for every finding.*
+- 🌐 **Live bug-bounty** — VERDICT has also produced **confirmed, evidence-backed findings against live bug-bounty targets** from one URL. Specific programs and reports are withheld under coordinated disclosure — the reproducible benchmarks above are the public proof.
 
 ## 🔬 What `confirmed` means
 
@@ -97,6 +102,8 @@ node packages/cli/dist/main.js scan --id <id> --manifest m.json && node packages
 
 Generate a manifest interactively with `node packages/cli/dist/main.js init`. Findings, screenshots, APIs and the diagnostic log fill the WebUI live; `runs/<id>/report.md` is written at the end.
 
+> 📖 **New here? Read the [Operator Usage Guide](docs/USAGE.md)** — a target from empty directory to signed-off report: the auth decision tree (creds / cookie file / attended login), the **WAF / Cloudflare playbook**, recon-first + resume, and pure-API runs.
+>
 > 🧪 Dev mode (no build): `pnpm --filter @veritas/cli dev <command>` resolves `src` directly.
 
 ## 🔍 How it works
@@ -138,6 +145,8 @@ node packages/cli/dist/main.js <command> [options]      # after pnpm -r build
 | `pilot --survey-only` | Map only (screens + screenshots + APIs); diagnose later with `--resume`. |
 | `pilot --resume --id <id>` | Continue an existing run (diagnose the still-queued screens). |
 | `pilot --attended[ a,b,c]` | Manual multi-session login (MFA/CAPTCHA): a headed window per role, log in by hand, diagnose on the live session. |
+| **`asr`** | Attack-surface recon (wide-shallow, to the *left* of `pilot`): `--domain <apex>` → discover (crt.sh passive + `--tools subfinder` + offline `--import` recon.sh + opt-in active `--brute`) → probe/score/rank hosts → `asset_inventory.json`. `--paths`/`--triage`/`--screenshot`. Its own WebUI viewer. |
+| `pilot --from-asr <asr-id>` | Promote an ASR run's top ranked **in-scope, first-party, live** hosts into per-host pilot assessments — scope **pinned** to the ASR boundary (never widened), triage angle seeded as `focus`. `--from-asr-top`/`--from-asr-band`/`--from-asr-concurrency`. |
 | `assess` | Deterministic one-shot: crawl → label → scan → logic → report. |
 | `serve` | Observability WebUI + state API/WS (`127.0.0.1:4317`; `--host 0.0.0.0` + `--password` to expose). |
 | `init` / `manifest` | Interactive scope-manifest generator. |
