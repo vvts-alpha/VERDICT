@@ -10,6 +10,7 @@ export function NewAsr({ onCancel }: { onCancel: () => void }) {
   const [screenshot, setScreenshot] = useState(false);
   const [paths, setPaths] = useState(false);
   const [triage, setTriage] = useState(false);
+  const [brute, setBrute] = useState(false);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -22,7 +23,7 @@ export function NewAsr({ onCancel }: { onCancel: () => void }) {
     const apex = d.replace(/^\*\./, "").replace(/\.$/, "");
     setBusy(true);
     setErr(null);
-    const options: Record<string, unknown> = { domain: d, screenshot, paths, triage };
+    const options: Record<string, unknown> = { domain: d, screenshot, paths, triage, brute };
     if (outOfScope.trim()) options.outOfScope = outOfScope.trim();
     if (maxHosts.trim()) options.maxHosts = Number.parseInt(maxHosts, 10);
     try {
@@ -52,7 +53,7 @@ export function NewAsr({ onCancel }: { onCancel: () => void }) {
           ← Back
         </button>
       </div>
-      <p className="mode-prompt">Map a domain's hosts (crt.sh → DNS → liveness), flag recon findings, then score &amp; triage attack targets.</p>
+      <p className="mode-prompt">Map a domain's hosts (crt.sh + subfinder + optional active brute → DNS → liveness), flag recon findings, then score &amp; triage attack targets.</p>
 
       <label className="nf-field">
         <span>Domain — wildcard or apex</span>
@@ -68,6 +69,9 @@ export function NewAsr({ onCancel }: { onCancel: () => void }) {
       </label>
 
       <div className="nf-checks">
+        <label title="ACTIVE DNS brute of a bundled ~130-word subdomain list (dnsx if installed, else native node:dns). The reliable path when crt.sh/subfinder can't reach the network. Sends DNS queries — opt-in.">
+          <input type="checkbox" checked={brute} onChange={(e) => setBrute(e.target.checked)} /> active brute
+        </label>
         <label title="capture each live host's homepage">
           <input type="checkbox" checked={screenshot} onChange={(e) => setScreenshot(e.target.checked)} /> screenshot
         </label>
@@ -86,7 +90,7 @@ export function NewAsr({ onCancel }: { onCancel: () => void }) {
         </button>
       </div>
       <p className="mode-prompt" style={{ marginTop: 16 }}>
-        Authorized targets only. crt.sh is passive OSINT; liveness / path probes touch the hosts (scope-gated, rate-limited).
+        Authorized targets only. crt.sh + subfinder are passive OSINT; active brute + liveness / path probes touch DNS / the hosts (scope-gated, rate-limited).
       </p>
     </div>
   );

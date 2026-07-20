@@ -29,6 +29,8 @@ export interface ToolDiscoverResult {
     candidates: HostCandidate[];
     /** the tool binary isn't installed — the caller logs a one-liner and continues (or falls back). */
     missing: boolean;
+    /** the binary ran but ERRORED (timeout / unreachable resolvers) — distinct from missing; the caller may fall back to native. */
+    failed?: boolean;
 }
 
 /**
@@ -58,7 +60,10 @@ export interface BruteOptions {
  */
 export async function dnsxBrute(runTool: RunTool, apex: string, opts?: BruteOptions): Promise<ToolDiscoverResult> {
     const args = ["-d", apex, ...(opts?.wordlist ? ["-w", opts.wordlist] : []), ...(opts?.resolvers ? ["-r", opts.resolvers] : []), "-a", "-silent", "-json"];
-    const r = await runTool("dnsx", args, { timeoutMs: opts?.timeoutMs ?? 300_000 });
+    // 60s cap (not 300s): a healthy dnsx resolves a ~130-word list in seconds; if its resolvers are unreachable it
+    // otherwise hangs to the timeout (dead air). On such a failure `failed` is set so the caller falls back to the native
+    // resolver rather than silently returning 0 — the exact 0-hosts trap when dnsx is installed but can't reach public resolvers.
+    const r = await runTool("dnsx", args, { timeoutMs: opts?.timeoutMs ?? 60_000 });
     if (r.missing) return { candidates: [], missing: true };
-    return { candidates: parseHostJsonl(r.stdout).map((host) => ({ host, source: "active" as const })), missing: false };
+    return { candidates: parseHostJsonl(r.stdout).map((host) => ({ host, source: "active" as const })), missing: false, failed: !r.ok };
 }

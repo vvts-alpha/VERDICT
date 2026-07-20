@@ -60,6 +60,14 @@ export interface StartRunInput {
     triage?: boolean;
     /** asr only: cap the number of discovered hosts probed. */
     maxHosts?: number;
+    /** asr only: opt-in ACTIVE DNS brute (dnsx if present, else native node:dns) — the reliable path when crt.sh/subfinder can't reach the network. */
+    brute?: boolean;
+    /** asr only: brute wordlist file path (default: bundled ~130). */
+    wordlist?: string;
+    /** asr only: trusted-resolver file path for the brute. */
+    resolvers?: string;
+    /** asr only: disable external passive tools (subfinder). */
+    noTools?: boolean;
   };
 }
 
@@ -118,6 +126,10 @@ export class Supervisor {
       if (o.paths) args.push("--paths");
       if (o.triage) args.push("--triage");
       if (o.maxHosts != null) args.push("--max-hosts", String(o.maxHosts));
+      if (o.brute) args.push("--brute"); // ACTIVE DNS brute (opt-in)
+      if (o.wordlist) args.push("--wordlist", String(o.wordlist));
+      if (o.resolvers) args.push("--resolvers", String(o.resolvers));
+      if (o.noTools) args.push("--no-tools");
       if (o.model) args.push("--model", o.model);
       if (o.rate != null) args.push("--rate", String(o.rate));
     } else {
@@ -171,6 +183,10 @@ export class Supervisor {
       if (o.paths) args.push("--paths");
       if (o.triage) args.push("--triage");
       if (o.maxHosts != null) args.push("--max-hosts", String(o.maxHosts));
+      if (o.brute) args.push("--brute"); // ACTIVE DNS brute (opt-in)
+      if (o.wordlist) args.push("--wordlist", String(o.wordlist));
+      if (o.resolvers) args.push("--resolvers", String(o.resolvers));
+      if (o.noTools) args.push("--no-tools");
       if (o.model) args.push("--model", o.model);
       if (o.rate != null) args.push("--rate", String(o.rate));
       this.spawnChild(id, "asr (re-scan)", args);

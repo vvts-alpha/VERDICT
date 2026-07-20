@@ -64,3 +64,11 @@ test("dnsxBrute: no resolvers → -r omitted; missing binary → degrade (caller
     assert.equal(r.missing, true);
     assert.equal(r.candidates.length, 0);
 });
+
+test("dnsxBrute: binary present but ERRORED (timeout / bad resolvers) → failed:true, not missing (caller falls back to native)", async () => {
+    const erroredRt: RunTool = async () => ({ ok: false, stdout: "", stderr: "timeout", missing: false }); // ran, non-zero exit
+    const r = await dnsxBrute(erroredRt, "example.com", { wordlist: "/wl.txt" });
+    assert.equal(r.missing, false);
+    assert.equal(r.failed, true);
+    assert.equal(r.candidates.length, 0);
+});

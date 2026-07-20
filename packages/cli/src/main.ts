@@ -1652,8 +1652,10 @@ async function cmdAsr(args: string[]): Promise<void> {
     if (!wlPathGiven) writeFileSync(dnsxWordlist, DEFAULT_SUBDOMAIN_WORDLIST.join("\n") + "\n");
     console.log(`▶ brute: resolving ${words.length} subdomain word(s) under *.${apex} (ACTIVE — dnsx or native node:dns)…`);
     const dx = await dnsxBrute(execFileRunTool, apex, { wordlist: dnsxWordlist, ...(values.resolvers ? { resolvers: values.resolvers } : {}) });
-    if (dx.missing) {
-      console.log("  dnsx not installed — falling back to native node:dns brute (slower, system resolver)");
+    if (dx.missing || dx.failed) {
+      // dnsx absent OR ran-but-errored (timeout / unreachable resolvers) → native node:dns brute (uses the system
+      // resolver, which works even where dnsx's public resolvers don't). Without this, a broken-resolver env silently returns 0.
+      console.log(dx.missing ? "  dnsx not installed — falling back to native node:dns brute (system resolver)" : "  dnsx failed/timed out (unreachable resolvers?) — falling back to native node:dns brute");
       bruteCandidates = await nativeBrute((h) => resolve4(h).catch(() => []), apex, words, { concurrency: 10 });
     } else {
       bruteCandidates = dx.candidates;
