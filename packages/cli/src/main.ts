@@ -7,7 +7,7 @@ import { parseArgs } from "node:util";
 import { createRequire } from "node:module";
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import { lookup, resolveCname } from "node:dns/promises";
+import { lookup, resolve4, resolveCname } from "node:dns/promises";
 
 import {
   AssessmentStore,
@@ -45,7 +45,8 @@ import { assessLogicInventory, assessScreenLogic, authDiffScreen } from "@verita
 import type { RoleContext } from "@veritas/agent";
 import { runPilot, verifyBurpFindings, triageAndDeepDiveBurp, LiveControl } from "@veritas/pilot";
 import { BrowserChatAdapter, runLlmRedteam, defaultInjectedContextProbes, generateCanary } from "@veritas/llm-attacks";
-import { discoverCrtSh, fetchHttpGet, filterInScope, mergeCandidates, importRecon, execFileRunTool, subfinderDiscover, probeHost, probeSurface, enumerateListing, detectTakeover, reconFindings, scoreAsset, triageAsset, buildAssetInventory, writeAssetInventory, readAssetInventory } from "@veritas/asr";
+import { discoverCrtSh, fetchHttpGet, filterInScope, mergeCandidates, importRecon, execFileRunTool, subfinderDiscover, dnsxBrute, nativeBrute, DEFAULT_SUBDOMAIN_WORDLIST, parseWordlist, probeHost, probeSurface, enumerateListing, detectTakeover, reconFindings, scoreAsset, triageAsset, buildAssetInventory, writeAssetInventory, readAssetInventory } from "@veritas/asr";
+import type { HostCandidate } from "@veritas/asr";
 import { runFromAsr, spawnPilotLauncher } from "./from-asr.js";
 import type { AsrScopePins } from "./from-asr.js";
 import { startServer } from "@veritas/server";
@@ -109,7 +110,7 @@ commands:
             Phase2 business logic: hypothesis generation (LLM) → verify IDOR etc. with evidence discipline. --manifest injects auth headers for a spec-seeded API run.
   spec-import --spec <openapi.json> --url <base> [--id <existing>] [--manifest <m.json>] [--out <dir>]
             ingest an OpenAPI 3.x / Swagger 2.0 spec (JSON) → seed the screen inventory so the browser-free scan/logic can assess a pure-API target. --url = where the API lives (base). with --id, overlay the spec on an existing crawl (fills endpoints the UI never called). token-protected APIs: put Authorization: Bearer … in the manifest's http.headers.
-  asr     --domain <apex|*.wildcard> [--tools subfinder|--no-tools] [--import <httpx.json|hosts.txt|dir> [--import-trust-liveness]] [--out-of-scope a.ex.com,b.ex.com] [--screenshot] [--paths] [--triage [--triage-top <n>] [--model <m>]] [--max-hosts <n>] [--rate <ms>] [--browser-path <bin>] [--no-sandbox] [--headed] [--out <dir>]
+  asr     --domain <apex|*.wildcard> [--tools subfinder|--no-tools] [--brute [--wordlist <file>] [--resolvers <file>]] [--import <httpx.json|hosts.txt|dir> [--import-trust-liveness]] [--out-of-scope a.ex.com,b.ex.com] [--screenshot] [--paths] [--triage [--triage-top <n>] [--model <m>]] [--max-hosts <n>] [--rate <ms>] [--browser-path <bin>] [--no-sandbox] [--headed] [--out <dir>]
             Attack Surface Recon: passive discovery (crt.sh CT logs) → dns resolve + HTTP liveness → deterministic attack-target score (ranked) → runs/<id>/asset_inventory.json
             [--screenshot] per-host screenshot · [--paths] probe curated high-signal paths on live hosts (/.git/, /.env, /actuator, swagger, server-status…) → real exposure + auto-escalate
             [--triage] Claude classifies the top-N by score (default 15, --triage-top) → category / band / attack-angle (a lead, not a finding; claude CLI subscription, no metered API)
@@ -1580,6 +1581,9 @@ async function cmdAsr(args: string[]): Promise<void> {
       "import-trust-liveness": { type: "boolean" },
       tools: { type: "string" },
       "no-tools": { type: "boolean" },
+      brute: { type: "boolean" },
+      wordlist: { type: "string" },
+      resolvers: { type: "string" },
       "browser-path": { type: "string" },
       "no-sandbox": { type: "boolean" },
       headed: { type: "boolean" },
@@ -1637,11 +1641,30 @@ async function cmdAsr(args: string[]): Promise<void> {
   const sf = subfinderEnabled ? await subfinderDiscover(execFileRunTool, apex) : { candidates: [], missing: false };
   if (subfinderEnabled && sf.missing) console.log("  subfinder not installed — skipping (install it or pass --no-tools to silence)");
   else if (subfinderEnabled) console.log(`  subfinder: ${sf.candidates.length} host(s)`);
-  const merged = mergeCandidates(crtCandidates, importCandidates, sf.candidates);
+  // --brute (ACTIVE, opt-in): resolve <word>.<apex> against a resolver pool. dnsx if present (needs a wordlist FILE, so
+  // the bundled default is materialized to a run-dir file), else the native node:dns fallback (zero external deps).
+  let bruteCandidates: HostCandidate[] = [];
+  if (values.brute) {
+    const wlPathGiven = values.wordlist;
+    const words = wlPathGiven ? parseWordlist(readFileSync(wlPathGiven, "utf8")) : DEFAULT_SUBDOMAIN_WORDLIST;
+    // dnsx reads a file; if none was given, write the bundled default beside the run so dnsx and native brute the same set.
+    const dnsxWordlist = wlPathGiven ?? join(runsDir, id, "brute-wordlist.txt");
+    if (!wlPathGiven) writeFileSync(dnsxWordlist, DEFAULT_SUBDOMAIN_WORDLIST.join("\n") + "\n");
+    console.log(`▶ brute: resolving ${words.length} subdomain word(s) under *.${apex} (ACTIVE — dnsx or native node:dns)…`);
+    const dx = await dnsxBrute(execFileRunTool, apex, { wordlist: dnsxWordlist, ...(values.resolvers ? { resolvers: values.resolvers } : {}) });
+    if (dx.missing) {
+      console.log("  dnsx not installed — falling back to native node:dns brute (slower, system resolver)");
+      bruteCandidates = await nativeBrute((h) => resolve4(h).catch(() => []), apex, words, { concurrency: 10 });
+    } else {
+      bruteCandidates = dx.candidates;
+    }
+    console.log(`  brute: ${bruteCandidates.length} host(s) resolved`);
+  }
+  const merged = mergeCandidates(crtCandidates, importCandidates, sf.candidates, bruteCandidates);
   const inScopeHosts = new Set(filterInScope(merged.map((c) => c.host), { domain: apex, outOfScope })); // same filter as crt.sh
   let candidates = merged.filter((c) => inScopeHosts.has(c.host));
   console.log(
-    `  ${crtCandidates.length} crt.sh${importPath ? ` + ${importCandidates.length} import` : ""}${subfinderEnabled && !sf.missing ? ` + ${sf.candidates.length} subfinder` : ""} → ${candidates.length} in-scope host(s)`,
+    `  ${crtCandidates.length} crt.sh${importPath ? ` + ${importCandidates.length} import` : ""}${subfinderEnabled && !sf.missing ? ` + ${sf.candidates.length} subfinder` : ""}${values.brute ? ` + ${bruteCandidates.length} brute` : ""} → ${candidates.length} in-scope host(s)`,
   );
   if (candidates.length > maxHosts) {
     console.log(`  capping to --max-hosts ${maxHosts} (${candidates.length - maxHosts} dropped)`);
