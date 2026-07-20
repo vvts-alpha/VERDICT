@@ -6,7 +6,7 @@
 import { parseArgs } from "node:util";
 import { createRequire } from "node:module";
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { lookup, resolveCname } from "node:dns/promises";
 
 import {
@@ -29,6 +29,7 @@ import {
   parseTargetUrl,
   type AssessmentState,
   type Asset,
+  type AssetBand,
   type Screen,
   type ScopeMode,
   type ScopePolicy,
@@ -44,7 +45,9 @@ import { assessLogicInventory, assessScreenLogic, authDiffScreen } from "@verita
 import type { RoleContext } from "@veritas/agent";
 import { runPilot, verifyBurpFindings, triageAndDeepDiveBurp, LiveControl } from "@veritas/pilot";
 import { BrowserChatAdapter, runLlmRedteam, defaultInjectedContextProbes, generateCanary } from "@veritas/llm-attacks";
-import { discoverCrtSh, fetchHttpGet, filterInScope, mergeCandidates, importRecon, execFileRunTool, subfinderDiscover, probeHost, probeSurface, enumerateListing, detectTakeover, reconFindings, scoreAsset, triageAsset, buildAssetInventory, writeAssetInventory } from "@veritas/asr";
+import { discoverCrtSh, fetchHttpGet, filterInScope, mergeCandidates, importRecon, execFileRunTool, subfinderDiscover, probeHost, probeSurface, enumerateListing, detectTakeover, reconFindings, scoreAsset, triageAsset, buildAssetInventory, writeAssetInventory, readAssetInventory } from "@veritas/asr";
+import { runFromAsr, spawnPilotLauncher } from "./from-asr.js";
+import type { AsrScopePins } from "./from-asr.js";
 import { startServer } from "@veritas/server";
 import { loadDotEnv } from "./dotenv.js";
 
@@ -68,6 +71,7 @@ commands:
             ※ by default, during survey the model dynamically prunes low-value CMS content trees etc. via ignore_paths (curbs frontier explosion).
               add [--exhaustive] to disable pruning and extract every screen (= full survey mode).
   pilot --resume --id <id> [--manifest <file.json>] [--browser-path <bin>] [--no-sandbox] [--out <dir>]
+  pilot --from-asr <asr-id|asset_inventory.json> [--from-asr-top <n>] [--from-asr-band critical|high|medium|low] [--from-asr-concurrency <n>] [--out <dir>]
             continue an existing run: skip survey/methodology, diagnose only undiagnosed (queued) screens (finish a crashed run)
   pilot --attended[ a,b,c] (--manifest <file.json> | --url <url>) [--login-url <u>] [--keepalive-min <n>] [...]
             manual multi-session auth (headed required): opens a persistent context per role for a human to log in (clear CAPTCHA/MFA/Arkose)
@@ -980,6 +984,55 @@ export function extractOptValueFlag(args: string[], flag: string): { args: strin
 }
 
 // Claude-led assessment: Claude drives the tools to autonomously explore, verify, and record (@veritas/pilot).
+// P3 handoff resolver: turn a `--from-asr <asr-id | asset_inventory.json | run-dir>` reference into the inventory path
+// + the ASR run's authorization boundary (pins), then promote. Pins come from the ASR run's STORED assessment (apex +
+// carve-outs) so promotion inherits exactly what ASR was authorized for — never widens. Apex-only fallback (with a
+// loud warning) only if no store is found beside the inventory.
+async function runFromAsrCli(ref: string, runsDir: string, o: { top: number; band?: string; concurrency: number }): Promise<void> {
+  const band = o.band;
+  if (band && !["critical", "high", "medium", "low"].includes(band)) fail("--from-asr-band must be one of critical|high|medium|low");
+  let dir: string;
+  let invPath: string;
+  if (ref.endsWith(".json")) {
+    invPath = resolve(ref);
+    dir = dirname(invPath);
+  } else if (isAbsolute(ref) || ref.includes("/") || ref.includes("\\")) {
+    dir = resolve(ref);
+    invPath = join(dir, "asset_inventory.json");
+  } else {
+    dir = join(runsDir, ref); // a bare asr-id → runs/<id>/
+    invPath = join(dir, "asset_inventory.json");
+  }
+  if (!existsSync(invPath)) fail(`pilot --from-asr: no asset_inventory.json at ${invPath}`);
+
+  // Pins = the ASR run's stored authorization boundary (id = the run-dir name). Promotion may only NARROW, never widen.
+  let stored: AssessmentState | null = null;
+  const dbPath = join(dir, "state.sqlite");
+  const storedId = basename(dir);
+  if (existsSync(dbPath)) {
+    const s = AssessmentStore.open(dbPath);
+    stored = s.loadAssessment(storedId);
+    s.close();
+  }
+  let pins: AsrScopePins;
+  if (stored) {
+    pins = { inScopeHosts: stored.scope.inScopeHosts, outOfScopeHosts: stored.scope.outOfScopeHosts };
+  } else {
+    const apex = readAssetInventory(invPath).apex;
+    pins = { inScopeHosts: [`*.${apex}`], outOfScopeHosts: [] };
+    console.log(`⚠ from-asr: no stored scope for ${storedId} — pinning apex-only *.${apex} (out-of-scope carve-outs not recoverable; keep the ASR run's state.sqlite present to inherit them)`);
+  }
+  console.log(`▶ pilot --from-asr ${storedId}: scope pinned to ${pins.inScopeHosts.join(",")}${pins.outOfScopeHosts.length ? ` (−${pins.outOfScopeHosts.join(",")})` : ""}`);
+
+  const results = await runFromAsr(
+    { invPath, runsDir, pins, top: o.top, ...(band ? { minBand: band as AssetBand } : {}), concurrency: o.concurrency, newId: newAssessmentId },
+    spawnPilotLauncher,
+  );
+  const ok = results.filter((r) => r.ok).length;
+  console.log(`\nfrom-asr: launched ${results.length} pilot run(s)${results.length ? ` (${ok} ok)` : ""} — promoted links written to ${invPath}`);
+  for (const r of results) console.log(`  ${r.ok ? "✓" : "✗"} ${r.host} → ${r.childId}`);
+}
+
 async function cmdPilot(rawArgs: string[]): Promise<void> {
   const a1 = extractAttendedRoles(rawArgs);
   const inlineAttendedRoles = a1.roles;
@@ -1022,12 +1075,26 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       "keepalive-url": { type: "string" }, // explicit URL for the keepalive touch (default: the authed page being diagnosed; never `/`)
       "anchor-url": { type: "string" }, // goto-safe authed hub (menu): reach cold-nav-bouncing routes by clicking their link from here; also the keepalive target
       "control-url": { type: "string" }, // attended×LiveHands: reverse-connection target for serve (supplied by the supervisor)
+      "from-asr": { type: "string" }, // P3 handoff: promote an ASR run's ranked assets into per-host pilot runs (arg = asr-id | asset_inventory.json)
+      "from-asr-top": { type: "string" }, // take the top-N promotable hosts (default 5)
+      "from-asr-band": { type: "string" }, // band floor: critical|high|medium|low (only promote at/above)
+      "from-asr-concurrency": { type: "string" }, // parallel child pilots (default 1 — Claude subscription concurrency)
     },
   });
   // --burp-proxy: active only when given. Address = the arg value -> env BURP_PROXY.
   const burpProxy = bp.present ? (bp.value ?? process.env.BURP_PROXY) : undefined;
   if (bp.present && !burpProxy) console.log("⚠ --burp-proxy was given but neither a value nor BURP_PROXY env is set (continuing without a proxy)");
   const runsDir = values.out ?? RUNS_DIR_DEFAULT;
+  // P3 — pilot --from-asr <asr-id|inventory.json>: promote an ASR run's ranked assets into per-host deep pilot runs.
+  // A distinct mode (no survey/manifest of its own); the child pilots inherit the ASR scope, pinned — never widened.
+  if (values["from-asr"]) {
+    await runFromAsrCli(values["from-asr"], runsDir, {
+      top: values["from-asr-top"] ? Math.max(1, Number.parseInt(values["from-asr-top"], 10)) : 5,
+      band: values["from-asr-band"],
+      concurrency: values["from-asr-concurrency"] ? Math.max(1, Number.parseInt(values["from-asr-concurrency"], 10)) : 1,
+    });
+    return;
+  }
   const resume = !!values.resume;
   // resume skips survey/methodology and resumes only diagnosis. Even without --manifest, it reads back the
   // runs/<id>/manifest.json persisted at start to restore the auth material (roleCreds/cookie/httpBasic/attended).

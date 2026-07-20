@@ -10,6 +10,7 @@ export * from "./sources.js";
 export * from "./import.js";
 export * from "./run-tool.js";
 export * from "./tools.js";
+export * from "./promote.js";
 export * from "./probe.js";
 export * from "./surface.js";
 export * from "./listing.js";
