@@ -84,3 +84,30 @@ test("discoverCrtSh: throws the last error when every attempt fails", async () =
         /503/,
     );
 });
+
+test("discoverCrtSh: a CONNECTION failure (fetch failed = unreachable) fails FAST — no retry/backoff", async () => {
+    let calls = 0;
+    await assert.rejects(
+        discoverCrtSh({ domain: "example.com" }, async () => {
+            calls++;
+            throw new TypeError("fetch failed"); // node fetch's connection-failure error
+        }, { attempts: 3, backoffMs: 9999 }), // big backoff: if it retried, the test would hang — it must NOT
+        /fetch failed/,
+    );
+    assert.equal(calls, 1, "an unreachable crt.sh must not be retried (retrying won't help + wastes ~12s of backoff)");
+});
+
+test("discoverCrtSh: a 502 IS still retried (transient server error)", async () => {
+    let calls = 0;
+    const hosts = await discoverCrtSh(
+        { domain: "example.com" },
+        async () => {
+            calls++;
+            if (calls < 2) throw new Error("crt.sh returned HTTP 502");
+            return JSON.stringify([{ name_value: "a.example.com" }]);
+        },
+        { attempts: 3, backoffMs: 0 },
+    );
+    assert.deepEqual(hosts, ["a.example.com"]);
+    assert.equal(calls, 2);
+});

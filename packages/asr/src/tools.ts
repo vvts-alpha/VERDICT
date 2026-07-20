@@ -39,9 +39,23 @@ export interface ToolDiscoverResult {
  * missing: true }. Provenance tag is "import" (the reserved external-tool slot; no core change).
  */
 export async function subfinderDiscover(runTool: RunTool, apex: string, opts?: { timeoutMs?: number }): Promise<ToolDiscoverResult> {
-    const r = await runTool("subfinder", ["-d", apex, "-all", "-silent", "-json"], { timeoutMs: opts?.timeoutMs ?? 120_000 });
+    // 45s cap (not 120s): a healthy subfinder aggregates its feeds in well under this; when the feeds are unreachable it
+    // would otherwise hang the full timeout = dead air with no hosts. On timeout it still returns any partial output.
+    const r = await runTool("subfinder", ["-d", apex, "-all", "-silent", "-json"], { timeoutMs: opts?.timeoutMs ?? 45_000 });
     if (r.missing) return { candidates: [], missing: true };
-    return { candidates: parseHostJsonl(r.stdout).map((host) => ({ host, source: "import" as const })), missing: false };
+    return { candidates: parseHostJsonl(r.stdout).map((host) => ({ host, source: "import" as const })), missing: false, failed: !r.ok };
+}
+
+/**
+ * Fast reachability probe for dnsx (~8s): resolve the apex itself (no wordlist). Returns false if dnsx is missing OR
+ * can't resolve the apex in time (its resolvers are unreachable). Lets the caller skip straight to the native brute
+ * instead of eating dnsx's full brute timeout as dead air. A healthy dnsx answers in well under a second.
+ */
+export async function dnsxReachable(runTool: RunTool, apex: string, opts?: { resolvers?: string; timeoutMs?: number }): Promise<boolean> {
+    const args = ["-d", apex, ...(opts?.resolvers ? ["-r", opts.resolvers] : []), "-a", "-silent", "-json"];
+    const r = await runTool("dnsx", args, { timeoutMs: opts?.timeoutMs ?? 8000 });
+    if (r.missing || !r.ok) return false;
+    return parseHostJsonl(r.stdout).some((h) => h === apex || h.endsWith("." + apex));
 }
 
 export interface BruteOptions {

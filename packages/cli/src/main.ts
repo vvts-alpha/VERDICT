@@ -45,7 +45,7 @@ import { assessLogicInventory, assessScreenLogic, authDiffScreen } from "@verita
 import type { RoleContext } from "@veritas/agent";
 import { runPilot, verifyBurpFindings, triageAndDeepDiveBurp, LiveControl } from "@veritas/pilot";
 import { BrowserChatAdapter, runLlmRedteam, defaultInjectedContextProbes, generateCanary } from "@veritas/llm-attacks";
-import { discoverCrtSh, fetchHttpGet, filterInScope, mergeCandidates, orderCandidatesForProbe, importRecon, execFileRunTool, subfinderDiscover, dnsxBrute, nativeBrute, DEFAULT_SUBDOMAIN_WORDLIST, parseWordlist, probeHost, probeSurface, enumerateListing, detectTakeover, reconFindings, scoreAsset, triageAsset, buildAssetInventory, writeAssetInventory, readAssetInventory } from "@veritas/asr";
+import { discoverCrtSh, fetchHttpGet, filterInScope, mergeCandidates, orderCandidatesForProbe, importRecon, execFileRunTool, subfinderDiscover, dnsxBrute, dnsxReachable, nativeBrute, DEFAULT_SUBDOMAIN_WORDLIST, parseWordlist, probeHost, probeSurface, enumerateListing, detectTakeover, reconFindings, scoreAsset, triageAsset, buildAssetInventory, writeAssetInventory, readAssetInventory } from "@veritas/asr";
 import type { HostCandidate } from "@veritas/asr";
 import { runFromAsr, spawnPilotLauncher } from "./from-asr.js";
 import type { AsrScopePins } from "./from-asr.js";
@@ -1651,14 +1651,17 @@ async function cmdAsr(args: string[]): Promise<void> {
     const dnsxWordlist = wlPathGiven ?? join(runsDir, id, "brute-wordlist.txt");
     if (!wlPathGiven) writeFileSync(dnsxWordlist, DEFAULT_SUBDOMAIN_WORDLIST.join("\n") + "\n");
     console.log(`▶ brute: resolving ${words.length} subdomain word(s) under *.${apex} (ACTIVE — dnsx or native node:dns)…`);
-    const dx = await dnsxBrute(execFileRunTool, apex, { wordlist: dnsxWordlist, ...(values.resolvers ? { resolvers: values.resolvers } : {}) });
-    if (dx.missing || dx.failed) {
-      // dnsx absent OR ran-but-errored (timeout / unreachable resolvers) → native node:dns brute (uses the system
-      // resolver, which works even where dnsx's public resolvers don't). Without this, a broken-resolver env silently returns 0.
-      console.log(dx.missing ? "  dnsx not installed — falling back to native node:dns brute (system resolver)" : "  dnsx failed/timed out (unreachable resolvers?) — falling back to native node:dns brute");
-      bruteCandidates = await nativeBrute((h) => resolve4(h).catch(() => []), apex, words, { concurrency: 10 });
+    // Fast reachability probe (~8s) so a dnsx whose resolvers are unreachable doesn't dead-air the full brute timeout
+    // (~60s) before we fall back. A healthy dnsx answers in well under a second. Then dnsx brute (native on error),
+    // else straight to the native node:dns brute (system resolver — works even where dnsx's public resolvers don't).
+    const dnsxOk = await dnsxReachable(execFileRunTool, apex, values.resolvers ? { resolvers: values.resolvers } : undefined);
+    if (dnsxOk) {
+      const dx = await dnsxBrute(execFileRunTool, apex, { wordlist: dnsxWordlist, ...(values.resolvers ? { resolvers: values.resolvers } : {}) });
+      if (dx.failed) console.log("  dnsx errored mid-run — native node:dns fallback");
+      bruteCandidates = dx.failed ? await nativeBrute((h) => resolve4(h).catch(() => []), apex, words, { concurrency: 10 }) : dx.candidates;
     } else {
-      bruteCandidates = dx.candidates;
+      console.log("  dnsx unavailable / resolvers unreachable — using native node:dns brute (system resolver)");
+      bruteCandidates = await nativeBrute((h) => resolve4(h).catch(() => []), apex, words, { concurrency: 10 });
     }
     console.log(`  brute: ${bruteCandidates.length} host(s) resolved`);
   }

@@ -93,6 +93,14 @@ export interface DiscoveryOptions {
  * isn't JSON** (an HTML rate-limit page served as 200) yields [] without retry (retrying won't help). If every
  * attempt errors, the last error is thrown — the caller (cmdAsr) logs it and continues with zero hosts.
  */
+/** Retry only a transient crt.sh error (5xx = server up but erroring, or a timeout). A CONNECTION failure ("fetch
+ *  failed" / ECONNREFUSED / DNS) won't recover in a few seconds of backoff — fail fast instead of burning ~12s. */
+function isRetryableCrtErr(e: unknown): boolean {
+    if (!(e instanceof Error)) return false;
+    if (e.name === "TimeoutError" || e.name === "AbortError") return true; // crt.sh was just slow — a retry may catch it
+    return /\b5\d\d\b|HTTP 5/i.test(e.message); // 5xx transient
+}
+
 export async function discoverCrtSh(scope: DiscoveryScope, httpGet: HttpGet, opts: DiscoveryOptions = {}): Promise<string[]> {
     const attempts = Math.max(1, opts.attempts ?? 3);
     const backoffMs = opts.backoffMs ?? 4000;
@@ -108,15 +116,16 @@ export async function discoverCrtSh(scope: DiscoveryScope, httpGet: HttpGet, opt
             }
         } catch (e) {
             lastErr = e;
+            if (!isRetryableCrtErr(e)) break; // unreachable (connection failure) → fail fast; retrying won't help
             if (i < attempts - 1) await new Promise((r) => setTimeout(r, backoffMs * (i + 1)));
         }
     }
     throw lastErr;
 }
 
-/** Default runtime `httpGet` using Node's global fetch (Node >= 24). */
+/** Default runtime `httpGet` using Node's global fetch (Node >= 24). 10s timeout so an unreachable crt.sh can't hang. */
 export const fetchHttpGet: HttpGet = async (url) => {
-    const res = await fetch(url, { headers: { "user-agent": "verdict-asr" } });
+    const res = await fetch(url, { headers: { "user-agent": "verdict-asr" }, signal: AbortSignal.timeout(10_000) });
     if (!res.ok) throw new Error(`crt.sh returned HTTP ${res.status}`);
     return res.text();
 };

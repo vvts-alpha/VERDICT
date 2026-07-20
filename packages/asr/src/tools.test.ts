@@ -3,7 +3,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseSubfinderJson, subfinderDiscover, dnsxBrute } from "./index.js";
+import { parseSubfinderJson, subfinderDiscover, dnsxBrute, dnsxReachable } from "./index.js";
 import type { RunTool } from "./index.js";
 
 test("parseSubfinderJson: -json lines → hosts; non-JSON / no-host lines skipped", () => {
@@ -71,4 +71,15 @@ test("dnsxBrute: binary present but ERRORED (timeout / bad resolvers) → failed
     assert.equal(r.missing, false);
     assert.equal(r.failed, true);
     assert.equal(r.candidates.length, 0);
+});
+
+test("dnsxReachable: apex resolves → true; missing/errored/no-answer → false (gates the brute so a broken dnsx fails fast)", async () => {
+    const ok: RunTool = async () => ({ ok: true, stdout: JSON.stringify({ host: "example.com", a: ["1.2.3.4"] }) + "\n", stderr: "", missing: false });
+    assert.equal(await dnsxReachable(ok, "example.com"), true);
+    const missing: RunTool = async () => ({ ok: false, stdout: "", stderr: "", missing: true });
+    assert.equal(await dnsxReachable(missing, "example.com"), false);
+    const errored: RunTool = async () => ({ ok: false, stdout: "", stderr: "timeout", missing: false }); // resolvers unreachable
+    assert.equal(await dnsxReachable(errored, "example.com"), false);
+    const noAnswer: RunTool = async () => ({ ok: true, stdout: "", stderr: "", missing: false });
+    assert.equal(await dnsxReachable(noAnswer, "example.com"), false);
 });

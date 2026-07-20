@@ -11,6 +11,7 @@ export function NewAsr({ onCancel }: { onCancel: () => void }) {
   const [paths, setPaths] = useState(false);
   const [triage, setTriage] = useState(false);
   const [brute, setBrute] = useState(false);
+  const [passiveTools, setPassiveTools] = useState(true);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -24,6 +25,7 @@ export function NewAsr({ onCancel }: { onCancel: () => void }) {
     setBusy(true);
     setErr(null);
     const options: Record<string, unknown> = { domain: d, screenshot, paths, triage, brute };
+    if (!passiveTools) options.noTools = true; // skip subfinder (e.g. when its feeds are unreachable → it just hangs)
     if (outOfScope.trim()) options.outOfScope = outOfScope.trim();
     if (maxHosts.trim()) options.maxHosts = Number.parseInt(maxHosts, 10);
     try {
@@ -69,6 +71,9 @@ export function NewAsr({ onCancel }: { onCancel: () => void }) {
       </label>
 
       <div className="nf-checks">
+        <label title="Passive OSINT via subfinder (auto if installed). Uncheck if its feeds are unreachable (it would just hang for ~45s).">
+          <input type="checkbox" checked={passiveTools} onChange={(e) => setPassiveTools(e.target.checked)} /> passive tools
+        </label>
         <label title="ACTIVE DNS brute of a bundled ~130-word subdomain list (dnsx if installed, else native node:dns). The reliable path when crt.sh/subfinder can't reach the network. Sends DNS queries — opt-in.">
           <input type="checkbox" checked={brute} onChange={(e) => setBrute(e.target.checked)} /> active brute
         </label>
