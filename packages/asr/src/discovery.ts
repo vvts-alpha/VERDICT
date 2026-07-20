@@ -50,26 +50,33 @@ export function crtShUrl(domain: string): string {
 }
 
 /**
+ * The single, safety-critical scope filter EVERY discovery source funnels through (crt.sh, import, subfinder, brute):
+ * normalize each candidate, admit only the apex itself or a subdomain of it, drop carve-outs, dedupe, sort. Pure.
+ * (The probe loop's `isInScope` remains the defense-in-depth backstop, so even a bug here can't put a host on the wire.)
+ */
+export function filterInScope(rawHosts: string[], scope: DiscoveryScope): string[] {
+    const apex = normalizeDomain(scope.domain);
+    const suffix = "." + apex;
+    const denies = (scope.outOfScope ?? []).map(normalizeDomain).filter((d) => d.length > 0);
+    const out = new Set<string>();
+    for (const raw of rawHosts) {
+        const h = normalizeHost(raw);
+        if (!h) continue;
+        if (h !== apex && !h.endsWith(suffix)) continue; // under the apex only
+        if (isDenied(h, denies)) continue; // carve-outs
+        out.add(h);
+    }
+    return [...out].sort();
+}
+
+/**
  * Parse crt.sh rows into a sorted, deduped list of in-scope hostnames under the apex. Pure.
  * Keeps the apex itself and any subdomain of it; strips "*." wildcard entries; drops foreign domains, carve-outs,
  * and anything that isn't a syntactically valid hostname.
  */
 export function parseCrtSh(rows: CrtShRow[], scope: DiscoveryScope): string[] {
-    const apex = normalizeDomain(scope.domain);
-    const suffix = "." + apex;
-    const denies = (scope.outOfScope ?? []).map(normalizeDomain).filter((d) => d.length > 0);
-    const out = new Set<string>();
-    for (const row of rows) {
-        const raw = `${row.name_value ?? ""}\n${row.common_name ?? ""}`;
-        for (const piece of raw.split("\n")) {
-            const h = normalizeHost(piece);
-            if (!h) continue;
-            if (h !== apex && !h.endsWith(suffix)) continue; // under the apex only
-            if (isDenied(h, denies)) continue; // carve-outs
-            out.add(h);
-        }
-    }
-    return [...out].sort();
+    const names = rows.flatMap((row) => `${row.name_value ?? ""}\n${row.common_name ?? ""}`.split("\n"));
+    return filterInScope(names, scope);
 }
 
 /** Retry policy for the (frequently-overloaded) crt.sh endpoint. */

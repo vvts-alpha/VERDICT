@@ -44,7 +44,7 @@ import { assessLogicInventory, assessScreenLogic, authDiffScreen } from "@verita
 import type { RoleContext } from "@veritas/agent";
 import { runPilot, verifyBurpFindings, triageAndDeepDiveBurp, LiveControl } from "@veritas/pilot";
 import { BrowserChatAdapter, runLlmRedteam, defaultInjectedContextProbes, generateCanary } from "@veritas/llm-attacks";
-import { discoverCrtSh, fetchHttpGet, probeHost, probeSurface, enumerateListing, detectTakeover, reconFindings, scoreAsset, triageAsset, buildAssetInventory, writeAssetInventory } from "@veritas/asr";
+import { discoverCrtSh, fetchHttpGet, filterInScope, mergeCandidates, importRecon, probeHost, probeSurface, enumerateListing, detectTakeover, reconFindings, scoreAsset, triageAsset, buildAssetInventory, writeAssetInventory } from "@veritas/asr";
 import { startServer } from "@veritas/server";
 import { loadDotEnv } from "./dotenv.js";
 
@@ -105,7 +105,7 @@ commands:
             Phase2 business logic: hypothesis generation (LLM) → verify IDOR etc. with evidence discipline. --manifest injects auth headers for a spec-seeded API run.
   spec-import --spec <openapi.json> --url <base> [--id <existing>] [--manifest <m.json>] [--out <dir>]
             ingest an OpenAPI 3.x / Swagger 2.0 spec (JSON) → seed the screen inventory so the browser-free scan/logic can assess a pure-API target. --url = where the API lives (base). with --id, overlay the spec on an existing crawl (fills endpoints the UI never called). token-protected APIs: put Authorization: Bearer … in the manifest's http.headers.
-  asr     --domain <apex|*.wildcard> [--out-of-scope a.ex.com,b.ex.com] [--screenshot] [--paths] [--triage [--triage-top <n>] [--model <m>]] [--max-hosts <n>] [--rate <ms>] [--browser-path <bin>] [--no-sandbox] [--headed] [--out <dir>]
+  asr     --domain <apex|*.wildcard> [--import <httpx.json|hosts.txt|dir> [--import-trust-liveness]] [--out-of-scope a.ex.com,b.ex.com] [--screenshot] [--paths] [--triage [--triage-top <n>] [--model <m>]] [--max-hosts <n>] [--rate <ms>] [--browser-path <bin>] [--no-sandbox] [--headed] [--out <dir>]
             Attack Surface Recon: passive discovery (crt.sh CT logs) → dns resolve + HTTP liveness → deterministic attack-target score (ranked) → runs/<id>/asset_inventory.json
             [--screenshot] per-host screenshot · [--paths] probe curated high-signal paths on live hosts (/.git/, /.env, /actuator, swagger, server-status…) → real exposure + auto-escalate
             [--triage] Claude classifies the top-N by score (default 15, --triage-top) → category / band / attack-angle (a lead, not a finding; claude CLI subscription, no metered API)
@@ -1509,6 +1509,8 @@ async function cmdAsr(args: string[]): Promise<void> {
       "max-hosts": { type: "string" },
       rate: { type: "string" },
       out: { type: "string" },
+      import: { type: "string" },
+      "import-trust-liveness": { type: "boolean" },
       "browser-path": { type: "string" },
       "no-sandbox": { type: "boolean" },
       headed: { type: "boolean" },
@@ -1546,58 +1548,84 @@ async function cmdAsr(args: string[]): Promise<void> {
   const invPath = join(runsDir, id, "asset_inventory.json");
   writeAssetInventory(invPath, buildAssetInventory(apex, [])); // write empty now so the WebUI detects an ASR run while it scans
 
-  // ① DISCOVER — passive, crt.sh CT logs (an OSINT lookup about the apex; no target host is touched here)
-  console.log(`▶ asr ${id}: discovering *.${apex} via crt.sh…`);
-  let hosts: string[] = [];
+  // ① DISCOVER — merge sources (passive crt.sh CT logs + offline --import of recon.sh output), then funnel the whole set
+  //   through the ONE scope filter (§1.2) + the probe-loop isInScope backstop. crt.sh touches no target host; import is offline.
+  const importPath = values.import;
+  const trustLiveness = !!values["import-trust-liveness"];
+  console.log(`▶ asr ${id}: discovering *.${apex} via crt.sh${importPath ? ` + import(${importPath})` : ""}…`);
+  let crtHosts: string[] = [];
   try {
-    hosts = await discoverCrtSh({ domain: apex, outOfScope }, fetchHttpGet);
+    crtHosts = await discoverCrtSh({ domain: apex, outOfScope }, fetchHttpGet);
   } catch (e) {
     console.error(`  crt.sh discovery failed: ${String(e).slice(0, 120)}`);
   }
-  if (hosts.length > maxHosts) {
-    console.log(`  ${hosts.length} hosts found; capping to --max-hosts ${maxHosts} (${hosts.length - maxHosts} dropped)`);
-    hosts = hosts.slice(0, maxHosts);
+  const crtCandidates = crtHosts.map((h) => ({ host: h, source: "crt.sh" as const }));
+  const importCandidates = importPath ? importRecon(importPath) : [];
+  const merged = mergeCandidates(crtCandidates, importCandidates);
+  const inScopeHosts = new Set(filterInScope(merged.map((c) => c.host), { domain: apex, outOfScope })); // same filter as crt.sh
+  let candidates = merged.filter((c) => inScopeHosts.has(c.host));
+  console.log(`  ${crtCandidates.length} crt.sh${importPath ? ` + ${importCandidates.length} import` : ""} → ${candidates.length} in-scope host(s)`);
+  if (candidates.length > maxHosts) {
+    console.log(`  capping to --max-hosts ${maxHosts} (${candidates.length - maxHosts} dropped)`);
+    candidates = candidates.slice(0, maxHosts);
   }
-  console.log(`  ${hosts.length} candidate host(s)`);
 
   // ② PROBE — dns resolve + HTTP liveness (scope-gated + rate-limited via FetchHttpClient)
   const http = new FetchHttpClient({ allow: (u) => isInScope(u, scope), minDelayMs, timeoutMs: 10_000 });
   const assets: Asset[] = [];
-  for (const host of hosts) {
-    const p = await probeHost(
-      host,
-      async (h) => {
-        try {
-          return (await lookup(h, { all: true })).map((a) => a.address);
-        } catch {
-          return [];
-        }
-      },
-      (url) => http.send({ method: "GET", url }),
-      (h) => resolveCname(h).catch(() => []),
-    );
-    const asset: Asset = {
-      host,
-      source: "crt.sh",
-      resolved: p.addresses,
-      alive: p.alive,
-      scheme: p.scheme,
-      status: p.status,
-      title: p.title,
-      tech: p.server ? [p.server] : [],
-      screenshot: null,
-      inScope: isInScope(`https://${host}/`, scope),
-    };
-    const tko = detectTakeover({ cnames: p.cnames, status: p.status, body: p.bodySample });
-    if (tko) {
-      asset.takeover = tko;
-      console.log(`  ! ${host}: possible subdomain takeover — ${tko.service} (${tko.confidence})`);
+  for (const cand of candidates) {
+    const host = cand.host;
+    let asset: Asset;
+    if (trustLiveness && cand.hint && cand.hint.alive != null) {
+      // --import-trust-liveness: trust the imported httpx liveness/fingerprint — no re-probe
+      asset = {
+        host,
+        source: cand.source,
+        resolved: [],
+        alive: cand.hint.alive,
+        scheme: cand.hint.scheme ?? (cand.hint.alive ? "https" : null),
+        status: cand.hint.status ?? null,
+        title: cand.hint.title ?? null,
+        tech: cand.hint.tech ?? (cand.hint.server ? [cand.hint.server] : []),
+        screenshot: null,
+        inScope: isInScope(`https://${host}/`, scope),
+      };
+    } else {
+      const p = await probeHost(
+        host,
+        async (h) => {
+          try {
+            return (await lookup(h, { all: true })).map((a) => a.address);
+          } catch {
+            return [];
+          }
+        },
+        (url) => http.send({ method: "GET", url }),
+        (h) => resolveCname(h).catch(() => []),
+      );
+      asset = {
+        host,
+        source: cand.source, // provenance from the merged candidate, not hardcoded
+        resolved: p.addresses,
+        alive: p.alive,
+        scheme: p.scheme,
+        status: p.status,
+        title: p.title,
+        tech: p.server ? [p.server] : [],
+        screenshot: null,
+        inScope: isInScope(`https://${host}/`, scope),
+      };
+      const tko = detectTakeover({ cnames: p.cnames, status: p.status, body: p.bodySample });
+      if (tko) {
+        asset.takeover = tko;
+        console.log(`  ! ${host}: possible subdomain takeover — ${tko.service} (${tko.confidence})`);
+      }
     }
     assets.push(asset);
-    console.log(p.alive ? `  ✓ ${host}  ${p.status ?? ""} ${p.title ?? ""}`.trimEnd() : `  · ${host}`);
+    console.log(asset.alive ? `  ✓ ${host}  ${asset.status ?? ""} ${asset.title ?? ""}`.trimEnd() : `  · ${host}`);
     // Incremental write → the WebUI (polling /assets) shows hosts appear + a progress bar (probed / discovered).
     // Write every host for the first 10 (immediate feedback), then every 10 (bounded I/O on large runs).
-    if (assets.length <= 10 || assets.length % 10 === 0) writeAssetInventory(invPath, buildAssetInventory(apex, assets, new Date(), hosts.length));
+    if (assets.length <= 10 || assets.length % 10 === 0) writeAssetInventory(invPath, buildAssetInventory(apex, assets, new Date(), candidates.length));
   }
   const live = assets.filter((a) => a.alive);
 
@@ -1680,7 +1708,7 @@ async function cmdAsr(args: string[]): Promise<void> {
   }
 
   // ⑤ persist the asset inventory (overwrite the early empty file with the scored, ranked set)
-  writeAssetInventory(invPath, buildAssetInventory(apex, assets, new Date(), hosts.length));
+  writeAssetInventory(invPath, buildAssetInventory(apex, assets, new Date(), candidates.length));
   console.log(`\nasr ${id}: ${assets.length} asset(s), ${live.length} live → ${invPath}`);
   const top = assets.filter((a) => a.alive).slice(0, 10);
   if (top.length > 0) {

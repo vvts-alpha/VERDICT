@@ -6,6 +6,8 @@
 //
 // P0 lands in slices; this file re-exports each module as it arrives.
 export * from "./discovery.js";
+export * from "./sources.js";
+export * from "./import.js";
 export * from "./probe.js";
 export * from "./surface.js";
 export * from "./listing.js";

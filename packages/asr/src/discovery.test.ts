@@ -1,7 +1,19 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { crtShUrl, parseCrtSh, discoverCrtSh } from "./index.js";
+import { crtShUrl, parseCrtSh, discoverCrtSh, filterInScope } from "./index.js";
+
+// filterInScope is the ONE scope filter every source (crt.sh, import, brute) funnels through (S1). Lock its admission rules.
+test("filterInScope: admits apex + subdomains, strips *., drops carve-outs / foreign / invalid", () => {
+    const scope = { domain: "example.com", outOfScope: ["secret.example.com"] };
+    assert.deepEqual(
+        filterInScope(
+            ["example.com", "api.example.com", "*.cdn.example.com", "secret.example.com", "sub.secret.example.com", "evil.com", "a.example.com.evil.com", "not_a_host"],
+            scope,
+        ),
+        ["api.example.com", "cdn.example.com", "example.com"],
+    );
+});
 
 const ROWS = [
     { name_value: "*.example.com\nexample.com", common_name: "example.com" },
