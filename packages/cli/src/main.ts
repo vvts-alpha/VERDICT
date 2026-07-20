@@ -1638,6 +1638,7 @@ async function cmdAsr(args: string[]): Promise<void> {
   // --no-tools; --tools <list> opts specific tools in/out. A missing binary degrades to [] + a one-line note.
   const toolsList = values.tools ? values.tools.split(",").map((t) => t.trim()).filter(Boolean) : null;
   const subfinderEnabled = !values["no-tools"] && (toolsList === null || toolsList.includes("subfinder"));
+  if (subfinderEnabled) console.log("▶ subfinder: querying passive feeds…"); // pre-run line so the Log doesn't look stuck on the crt.sh error during subfinder's ~45s
   const sf = subfinderEnabled ? await subfinderDiscover(execFileRunTool, apex) : { candidates: [], missing: false };
   if (subfinderEnabled && sf.missing) console.log("  subfinder not installed — skipping (install it or pass --no-tools to silence)");
   else if (subfinderEnabled) console.log(`  subfinder: ${sf.candidates.length} host(s)`);
