@@ -48,6 +48,8 @@ export interface Probe {
 export interface ProbeEval {
   positive: boolean;
   reason: string;
+  /** Optional per-outcome severity override (e.g. CORS is High WITH credentials, Low without) — falls back to Validator.severity. */
+  severity?: Severity;
 }
 
 export interface Validator {
@@ -102,7 +104,7 @@ export async function runValidator(
   let negResponse: HttpResponse | null = null;
   const outcomes: ProbeOutcome[] = [];
 
-  const finish = (probe: Probe, status: ProbeStatus, reason: string, evidenceIds: string[]): ProbeOutcome => ({
+  const finish = (probe: Probe, status: ProbeStatus, reason: string, evidenceIds: string[], severity?: Severity): ProbeOutcome => ({
     validator: v.name,
     probeId: probe.id,
     status,
@@ -110,7 +112,7 @@ export async function runValidator(
     evidenceIds,
     title: v.title(target, probe),
     description: v.describe(target, probe),
-    severity: v.severity,
+    severity: severity ?? v.severity, // per-outcome override (ProbeEval.severity) wins over the validator default
   });
 
   for (const probe of v.probes(target)) {
@@ -170,7 +172,7 @@ export async function runValidator(
         }).id,
       );
     }
-    outcomes.push(finish(probe, "confirmed", firstEval.reason, evidenceIds));
+    outcomes.push(finish(probe, "confirmed", firstEval.reason, evidenceIds, firstEval.severity));
   }
 
   return outcomes;

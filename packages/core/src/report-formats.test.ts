@@ -112,8 +112,8 @@ test("CSV renderers escape and list rows", () => {
     const m = buildReportModel(store.loadAssessment("a-1")!);
     store.close();
     const fcsv = renderFindingsCsv(m);
-    assert.match(fcsv, /index,severity,title/);
-    assert.match(fcsv, /high,Exposed sensitive file/);
+    assert.match(fcsv, /index,severity,verdict,title/); // verdict column so suspected ≠ confirmed for CSV consumers
+    assert.match(fcsv, /high,confirmed,Exposed sensitive file/);
     assert.match(fcsv, /artifacts\/s-0001\/ev-1\/ \| artifacts\/s-0001\/ev-2\//);
     const scsv = renderScreensCsv(m);
     assert.match(scsv, /screen_id,url,type/);

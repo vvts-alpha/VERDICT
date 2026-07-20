@@ -630,13 +630,24 @@ export function normalizeVolatile(body: string): string {
  *  occurrences — they FP'd infiniteathlete.ai's Next.js pages (marker matched inside the RSC flight data). */
 export function reflectionIsLive(body: string, marker: string): boolean {
   if (!marker) return false;
+  // Containers whose content is NOT parsed as active HTML markup — a tag reflected inside them is INERT and cannot
+  // execute: <script> is JS; <title>/<textarea> are RCDATA (tags don't instantiate); <style> is raw text; <!-- --> is a
+  // comment. Only excluding <script> (the old behaviour) false-confirmed reflections into a page <title> or a JSON blob.
+  const inertPairs: Array<[string, string]> = [
+    ["<script", "</script>"],
+    ["<title", "</title>"],
+    ["<textarea", "</textarea>"],
+    ["<style", "</style>"],
+    ["<!--", "-->"],
+  ];
   let from = 0;
   for (;;) {
     const i = body.indexOf(marker, from);
     if (i < 0) return false;
-    const pre = body.slice(0, i);
-    if (pre.lastIndexOf("<script") <= pre.lastIndexOf("</script>")) return true; // this occurrence is in live HTML
-    from = i + marker.length; // inside a <script> blob → skip, try the next occurrence
+    const pre = body.slice(0, i).toLowerCase(); // HTML tags are case-insensitive; the marker match above stays case-sensitive
+    const inert = inertPairs.some(([open, close]) => pre.lastIndexOf(open) > pre.lastIndexOf(close));
+    if (!inert) return true; // this occurrence is in a LIVE HTML position (not inside any inert container)
+    from = i + marker.length; // inert → skip, try the next occurrence
   }
 }
 
@@ -807,11 +818,16 @@ export function checkEvidenceDiscipline(
 export function checkLogicEvidence(
   control: { status: number; hasMarker: boolean },
   positives: ReadonlyArray<{ status: number; hasMarker: boolean }>,
+  opts: { requireSuccess?: boolean } = {},
 ): { ok: true } | { ok: false; reason: string } {
+  // requireSuccess (default true) enforces status<400 = "the manipulation was ACCEPTED" (business-logic / redirect). For
+  // REFLECTED XSS it must be false: a payload reflected into a custom 403/404 error page still executes in the browser,
+  // so the marker — not the status — is what confirms it. Gating XSS on status<400 wrongly refutes error-page XSS.
+  const requireSuccess = opts.requireSuccess ?? true;
   if (positives.length < 2) return { ok: false, reason: "need >=2 positive replays of the manipulated request" };
   if (control.hasMarker) return { ok: false, reason: "the effectMarker is ALSO present in the legitimate baseline — pick a marker that only appears when the manipulation takes effect" };
   if (!positives.every((p) => p.hasMarker)) return { ok: false, reason: "the effectMarker is absent in a manipulated replay — the manipulation was not accepted (not confirmed)" };
-  if (!positives.every((p) => p.status < 400)) return { ok: false, reason: "a manipulated replay was rejected (status >=400) — not accepted" };
+  if (requireSuccess && !positives.every((p) => p.status < 400)) return { ok: false, reason: "a manipulated replay was rejected (status >=400) — not accepted" };
   if (!positives.every((p) => p.status === positives[0]!.status)) return { ok: false, reason: "manipulated replays disagree (unstable)" };
   return { ok: true };
 }
@@ -1780,9 +1796,10 @@ export function buildTools(s: PilotSession) {
           }
           if (!r) continue;
           tried.push(c.name);
-          // Survivor = the payload's tag reflects UNESCAPED in a LIVE HTML position — NOT inside a <script>/flight-data
-          // JSON blob (where `<` is serialized to < and the tag is inert). reflectionIsLive enforces that.
-          if (r.status < 500 && reflectionIsLive(r.body, c.marker)) {
+          // Survivor = the payload's tag reflects UNESCAPED in a LIVE HTML position, on an HTML response — NOT inside a
+          // <script>/RCDATA/comment (inert), and NOT in a JSON/text response (browsers don't parse it as HTML).
+          // reflectionIsLive enforces the position; r.html enforces the content-type.
+          if (r.status < 500 && r.html && reflectionIsLive(r.body, c.marker)) {
             winner = c;
             htmlCtx = r.html;
             break;
@@ -1805,6 +1822,7 @@ export function buildTools(s: PilotSession) {
         const verdict = checkLogicEvidence(
           { status: ctrl.status, hasMarker: reflectionIsLive(ctrl.body, winner.marker) },
           [w1, w2].map((p) => ({ status: p.status, hasMarker: reflectionIsLive(p.body, winner!.marker) })),
+          { requireSuccess: false }, // XSS reflects on a 4xx error page too — the marker confirms it, not the status
         );
         return txt(
           JSON.stringify({
@@ -1876,13 +1894,15 @@ export function buildTools(s: PilotSession) {
             const r = await rawSend(p);
             if (!r || r.status >= 500) continue;
             if (r.body.includes(product) && !benign.body.includes(product)) {
-              // Confirm: keep proof as a distinguishable evidence body (rce uses a length gate).
-              const proof = `COMMAND INJECTION CONFIRMED (output-based) — payload="${p}" made the shell compute ${a}*${b}=${product}, which appears in the response (the literal expression does not contain the product, so it was EXECUTED, not echoed).`;
-              const p1 = await send(p, "positive_replay", "out-proof#1", proof);
-              const p2 = await send(p, "positive_replay", "out-proof#2", proof);
-              const ctl = await send("1", "negative_control", "out baseline", "baseline — no command injected, product absent.");
-              if (p1 && p2 && ctl)
-                return txt(JSON.stringify({ technique: "output-based", negativeControl: ctl.evId, positiveReplays: [p1.evId, p2.evId], effectMarker: product, verdict: `OS COMMAND INJECTION CONFIRMED (output): payload ${p} → shell computed ${product}. record_finding(category rce, critical) with these evidenceIds.` }));
+              // Re-verify on TWO fresh sends and record the REAL responses. A single echo can be a flaky / load-balanced
+              // hit; the old code fabricated the ×2 "replays" from a CONSTANT proof string, so record_finding's stability
+              // gate passed by construction. Require BOTH real replays to actually carry the product (baseline absent).
+              const ctl = await send("1", "negative_control", "out baseline");
+              const p1 = await send(p, "positive_replay", "out#1");
+              const p2 = await send(p, "positive_replay", "out#2");
+              if (ctl && p1 && p2 && p1.body.includes(product) && p2.body.includes(product) && !ctl.body.includes(product))
+                return txt(JSON.stringify({ technique: "output-based", negativeControl: ctl.evId, positiveReplays: [p1.evId, p2.evId], effectMarker: product, verdict: `OS COMMAND INJECTION CONFIRMED (output): payload ${p} → shell computed ${product}, present in 2 STABLE replays (baseline absent). record_finding(category rce, critical) with these evidenceIds.` }));
+              continue; // single/flaky echo not reproduced on replay → not a reliable injection; try the next payload
             }
           }
           // ── time-based (blind) ──
@@ -2845,7 +2865,7 @@ export function buildTools(s: PilotSession) {
           const existing = s.findingsByKey.get(key);
           if (existing) {
             existing.evidenceIds = [...new Set([...existing.evidenceIds, ...evidenceIds])];
-            existing.severity = maxSev(existing.severity, normSev);
+            if (v === "confirmed") existing.severity = maxSev(existing.severity, normSev); // an unproven SUSPECTED re-report must not inflate a confirmed finding's severity
             if (v === "confirmed" && findingVerdict(existing) === "suspected") {
               existing.verdict = "confirmed"; // 後から証明 → 昇格(降格は無い)
               existing.anomaly = undefined;
@@ -2935,6 +2955,7 @@ export function buildTools(s: PilotSession) {
           const verdict = checkLogicEvidence(
             { status: negRec.response.status, hasMarker: hasMarker(negRec.response) },
             posRecs.map((r) => ({ status: r!.response.status, hasMarker: hasMarker(r!.response) })),
+            { requireSuccess: !isXss }, // reflected XSS confirms on a 4xx error page too — don't gate it on status<400
           );
           if (!verdict.ok) return txt(`REJECTED (logic evidence): ${verdict.reason}.`);
         } else if (category !== "auth-bypass") {

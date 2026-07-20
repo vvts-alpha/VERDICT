@@ -33,3 +33,14 @@ test("reflectionIsLive: absent marker is not live", () => {
   assert.equal(reflectionIsLive("<h1>nothing here</h1>", "<img onerror=alert('tok')>"), false);
   assert.equal(reflectionIsLive("<h1>x</h1>", ""), false);
 });
+
+// A4: reflectionIsLive must exclude RCDATA / raw-text / comment contexts too, not just <script> — a payload reflected
+// into <title>/<textarea>/<style> or an HTML comment is INERT (the tag doesn't instantiate) and false-confirmed before.
+test("reflectionIsLive: a reflection inside RCDATA/comment (title/textarea/style/comment) is NOT live", () => {
+  const M = "<img src=x onerror=alert(1)>";
+  assert.ok(!reflectionIsLive(`<title>${M}</title>`, M));
+  assert.ok(!reflectionIsLive(`<textarea>${M}</textarea>`, M));
+  assert.ok(!reflectionIsLive(`<style>${M}</style>`, M));
+  assert.ok(!reflectionIsLive(`<!-- ${M} -->`, M));
+  assert.ok(reflectionIsLive(`<div>${M}</div>`, M)); // a genuinely live position is still detected
+});

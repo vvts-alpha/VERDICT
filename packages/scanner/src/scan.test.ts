@@ -143,3 +143,26 @@ test("auth_required is BEARER-only: a cookie-authed API returning data unauth is
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// B7: CORS severity is dynamic — reflecting an arbitrary Origin WITH credentials (reads authenticated responses) is HIGH;
+// without credentials (only unauthenticated data) is LOW. Flat Medium both over-rated the no-cred case and buried the other.
+test("cors severity: HIGH with credentials, LOW without", async () => {
+  const { ev, dir } = freshEvidence();
+  const corsHttp = (withCreds: boolean): FakeHttpClient =>
+    new FakeHttpClient((req) => {
+      if (new URL(req.url).pathname !== "/api/products/1") return { status: 404, body: "" };
+      const origin = req.headers?.["origin"];
+      if (!origin) return { status: 200, body: "{}" };
+      const headers: Record<string, string> = { "access-control-allow-origin": origin };
+      if (withCreds) headers["access-control-allow-credentials"] = "true";
+      return { status: 200, body: "{}", headers };
+    });
+  try {
+    const hi = await scanScreen(screen({ apis: [cookieApi] }), corsHttp(true), ev, new Set());
+    assert.equal(hi.findings.find((f) => f.title.startsWith("CORS"))?.severity, "high");
+    const lo = await scanScreen(screen({ apis: [cookieApi] }), corsHttp(false), ev, new Set());
+    assert.equal(lo.findings.find((f) => f.title.startsWith("CORS"))?.severity, "low");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

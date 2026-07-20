@@ -179,10 +179,11 @@ export function renderReportHtml(m: ReportModel): string {
 
 /** findings.csv — one finding per row. */
 export function renderFindingsCsv(m: ReportModel): string {
-  const header = ["index", "severity", "title", "screen", "source", "scope_basis", "evidence", "repro"];
+  const header = ["index", "severity", "verdict", "title", "screen", "source", "scope_basis", "evidence", "repro"];
   const rows = m.findings.map((f) => [
     f.index,
     f.severity,
+    f.verdict, // so a suspected lead can't be mistaken for (or counted as) a confirmed finding by a CSV consumer
     f.title,
     f.screenId ?? "(cross-screen)",
     `${f.sourceKind}:${f.sourceName}`,

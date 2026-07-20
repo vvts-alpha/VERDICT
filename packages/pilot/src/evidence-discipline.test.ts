@@ -57,3 +57,12 @@ test("logic reject: a manipulated replay was rejected (>=400)", () => {
 test("logic reject: fewer than 2 positives", () => {
   assert.equal(checkLogicEvidence(lr(200, false), [lr(200, true)]).ok, false);
 });
+
+// B6: reflected XSS confirms on a 4xx error page too (a payload reflected into a custom 403/404 still executes). The
+// status<400 "accepted" gate is right for business-logic but wrong for reflection classes — requireSuccess:false skips it.
+test("checkLogicEvidence: requireSuccess:false confirms a marker on a 4xx page (status doesn't gate reflection)", () => {
+  const ctrl = { status: 200, hasMarker: false };
+  const pos403 = [{ status: 403, hasMarker: true }, { status: 403, hasMarker: true }];
+  assert.equal(checkLogicEvidence(ctrl, pos403).ok, false); // default (business-logic): status>=400 rejected
+  assert.equal(checkLogicEvidence(ctrl, pos403, { requireSuccess: false }).ok, true); // XSS: error-page reflection still executes
+});

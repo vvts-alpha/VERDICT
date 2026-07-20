@@ -120,7 +120,7 @@ export const vulnJsCheck: PassiveCheck = {
           const key = `vuln-js-${lib.name.toLowerCase().replace(/\s+/g, "")}-${ver}`;
           if (seen.has(key)) continue;
           seen.add(key);
-          out.push({ key, severity: "medium", title: `Vulnerable JS: ${lib.name} ${ver}`, detail: `${lib.note} (ref: ${ref})` });
+          out.push({ key, severity: "low", title: `Vulnerable JS: ${lib.name} ${ver}`, detail: `${lib.note} (ref: ${ref}) — presence-only; sink reachability not verified` });
         }
       }
     }
