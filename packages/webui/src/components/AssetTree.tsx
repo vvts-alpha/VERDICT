@@ -185,6 +185,7 @@ function Finding({ f, host, onJump }: { f: AssetFinding; host?: string; onJump?:
         <div className={`finding sev-${f.severity}`}>
             <div className="finding-head">
                 <span className={`sevpill sev-${f.severity}`}>{f.severity}</span>
+                <span className="finding-cat" title="finding category">{f.category}</span>
                 <span className="finding-title">{f.title}</span>
                 {host ? (
                     <span className="finding-id">

@@ -59,7 +59,9 @@ export const spawnPilotLauncher: PilotLauncher = ({ manifest, childId, runsDir }
         writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
         // process.execArgv carries the tsx loader in dev ([] when built); process.argv[1] is this CLI's entry — so the
         // child runs the same code path in either mode. No shell: childId/paths are argv, never interpolated into a command line.
-        const child = spawn(process.execPath, [...process.execArgv, process.argv[1] ?? "", "pilot", "--manifest", manifestPath, "--id", childId, "--out", runsDir], { stdio: "inherit" });
+        // --disable-warning=ExperimentalWarning keeps node:sqlite's first-use warning out of the child's output (dev
+        // execArgv already carries it via the tsx script; a duplicate flag is harmless — this covers the built CLI).
+        const child = spawn(process.execPath, [...process.execArgv, "--disable-warning=ExperimentalWarning", process.argv[1] ?? "", "pilot", "--manifest", manifestPath, "--id", childId, "--out", runsDir], { stdio: "inherit" });
         child.on("error", () => resolve({ ok: false }));
         child.on("exit", (code) => resolve({ ok: code === 0 }));
     });

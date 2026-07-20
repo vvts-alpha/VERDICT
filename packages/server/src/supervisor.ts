@@ -252,7 +252,10 @@ export class Supervisor {
     const existing = this.procs.get(id);
     if (existing && existing.status === "running") return; // prevent double launch
     const log = this.cfg.onLog ?? ((): void => {});
-    const child = spawn(this.cfg.nodePath, args, { cwd: process.cwd(), env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+    // --disable-warning=ExperimentalWarning: the CLI uses node:sqlite, whose first-use ExperimentalWarning would
+    // otherwise hit the child's stderr → run.log → the ASR Log tab (looks like a "SQLite read error"). args[0] is the
+    // CLI script path, so the node flag must precede it.
+    const child = spawn(this.cfg.nodePath, ["--disable-warning=ExperimentalWarning", ...args], { cwd: process.cwd(), env: process.env, stdio: ["ignore", "pipe", "pipe"] });
     const rec: RunProc = { id, command, child, startedAt: new Date().toISOString(), status: "running", exitCode: null };
     this.procs.set(id, rec);
     // Tee the child's stdout/stderr to runs/<id>/run.log, one timestamped line at a time (the WebUI ASR Log tab

@@ -305,6 +305,10 @@ button:hover { background: #353d4a; }
 .logline.lt-finding_created .log-msg { color: var(--warn); font-weight: 600; }
 .logline.lt-phase_changed .log-msg { color: var(--accent); }
 .logline.lt-halted .log-msg { color: var(--err); }
+/* ASR run-log line types (parity with the web diagnostic log's colour coding) */
+.logline.lt-ok .log-msg { color: var(--ok); }
+.logline.lt-alert .log-msg { color: var(--warn); font-weight: 600; }
+.logline.lt-dead .log-msg { color: var(--muted); }
 .log-empty { padding: 14px; }
 
 /* ASR viewer — Host detail + Findings (uses the design-system variables so it matches the web/API viewer). */
@@ -381,6 +385,7 @@ button:hover { background: #353d4a; }
 .finding-title { font-weight: 600; color: #fff; }
 .finding-id { margin-left: auto; font-size: 11px; white-space: nowrap; }
 .finding-desc { margin: 8px 0 6px; color: var(--fg); white-space: pre-wrap; }
+.finding-cat { font-size: 10px; letter-spacing: 0.3px; color: var(--muted); background: #232831; border: 1px solid var(--line); padding: 1px 7px; border-radius: 9px; font-family: ui-monospace, monospace; white-space: nowrap; }
 .finding details { color: var(--muted); }
 .finding details pre { white-space: pre-wrap; background: #11141a; padding: 8px; border-radius: 4px; margin: 6px 0 0; }
 

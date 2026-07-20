@@ -1,7 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { Asset, AssetInventory } from "@veritas/core";
 import { AssetTree, HostDetail, AssetFindings, SOURCE_META } from "./AssetTree";
-import { AsrLog } from "./AsrLog";
+import { AsrLog, parseLogLines } from "./AsrLog";
 
 // The ASR assessment viewer — SAME shape as the web/API viewer (StatusBar + Progress + .body[left tree | tabs]),
 // just ASR content and only the applicable tabs (Host / Findings / Log — no Scenarios/APIs/Sessions). The UI shape
@@ -49,6 +49,7 @@ export function AsrView({ id }: { id: string }) {
   const [selected, setSelected] = useState<string | null>(null);
   const [selectedAsset, setSelectedAsset] = useState<Asset | null>(null);
   const [tab, setTab] = useState<Tab>("host");
+  const [logText, setLogText] = useState("");
 
   useEffect(() => {
     let alive = true;
@@ -72,6 +73,26 @@ export function AsrView({ id }: { id: string }) {
       window.clearInterval(t);
     };
   }, [id]);
+
+  // The run log is owned here (not in AsrLog) so the tab can show "Log (N)" like the web viewer, even before it's opened.
+  useEffect(() => {
+    let alive = true;
+    const load = (): void => {
+      fetch(`/api/assessments/${encodeURIComponent(id)}/run-log`)
+        .then((r) => (r.ok ? r.text() : ""))
+        .then((t) => {
+          if (alive) setLogText(t);
+        })
+        .catch(() => {});
+    };
+    load();
+    const t = window.setInterval(load, 3000);
+    return () => {
+      alive = false;
+      window.clearInterval(t);
+    };
+  }, [id]);
+  const logLines = useMemo(() => parseLogLines(logText), [logText]);
 
   const assets = inv?.assets ?? [];
   const live = assets.filter((a) => a.alive).length;
@@ -185,13 +206,13 @@ export function AsrView({ id }: { id: string }) {
               Findings ({findingsCount})
             </button>
             <button type="button" className={tab === "log" ? "active" : ""} onClick={() => setTab("log")}>
-              Log
+              Log ({logLines.length})
             </button>
           </div>
           <div className="tabbody">
             {tab === "host" ? <HostDetail id={id} asset={selectedAsset} /> : null}
             {tab === "findings" ? <AssetFindings assets={assets} onJump={jumpTo} /> : null}
-            {tab === "log" ? <AsrLog id={id} /> : null}
+            {tab === "log" ? <AsrLog lines={logLines} /> : null}
           </div>
         </main>
       </div>
