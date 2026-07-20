@@ -362,6 +362,18 @@ export function nonexistentIdLike(id: string): string {
 /** A safe marker that never attempts external reachability (for open-redirect / reflection detection; a non-resolving domain). */
 const OOB_MARKER = "veritas-oob.example";
 
+/** Does the Location header actually REDIRECT to `host` (its parsed target host), rather than merely mention it as a
+ *  substring? A same-site interstitial like `Location: /leaving?url=https://host/` reflects the payload but redirects
+ *  ON-SITE — `loc.includes(host)` false-confirms it as an open redirect; the parsed hostname does not. */
+export function locationTargetsHost(location: string | undefined, base: string, host: string): boolean {
+  if (!location) return false;
+  try {
+    return new URL(location, base).hostname.toLowerCase() === host.toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
 /** High-signal hidden-parameter set for probe_params (ones the app doesn't normally send). */
 const PARAM_PROBES: Array<{ name: string; value: string; kind: "idor" | "redirect" | "debug" | "file" }> = [
   ...["id", "userId", "user_id", "user", "account", "accountId", "uid", "customerId", "orderId", "order"].map(
@@ -637,9 +649,28 @@ export function diffThreshold(noise: number, floor = 64, k = 2): number {
 
 export type AccessVerdict = "not_bypass" | "needs_judgment" | "inconclusive";
 
+/** Does the UNAUTH response actually reproduce the authenticated PROTECTED content (a real bypass), rather than being a
+ *  generic/public 200 that merely isn't the login page? Normalizes volatile tokens, then requires the unauth body to
+ *  equal — or reproduce a substantial contiguous chunk of — the authed body. Without this mechanical check, ANY unauth
+ *  200 non-login page (marketing, a different view, an error) reached needs_judgment and could be recorded as auth-bypass
+ *  on the model's say-so alone. */
+export function protectedContentLeaked(unauthBody: string, authBody: string): boolean {
+  const u = normalizeVolatile(unauthBody).replace(/\s+/g, " ").trim();
+  const a = normalizeVolatile(authBody).replace(/\s+/g, " ").trim();
+  if (u.length < 32 || a.length < 32) return false;
+  if (u === a) return true; // identical protected content served without auth
+  for (const frac of [0.25, 0.5, 0.75]) {
+    const start = Math.floor(a.length * frac);
+    const chunk = a.slice(start, start + 60);
+    if (chunk.length >= 40 && u.includes(chunk)) return true; // unauth reproduces a substantial chunk of the authed content
+  }
+  return false;
+}
+
 /** Unauthenticated/authenticated responses → machine verdict for auth-bypass.
  *  302→login / 401 / 403 / non-200 / login body are all **not_bypass (auth is enforced, can't be overturned)**.
- *  Only unauth 200 AND non-login is **needs_judgment** (Claude reads the body and decides if it's protected data). */
+ *  A **needs_judgment** now additionally requires the unauth body to REPRODUCE the authed protected content (mechanical
+ *  body-match) — so a generic/public 200 can't be recorded as auth-bypass on judgment alone. */
 export function classifyAccess(
   unauth: { status: number; location?: string; body: string },
   auth: { status: number; body: string } | null,
@@ -655,7 +686,11 @@ export function classifyAccess(
   if (!auth) return { verdict: "inconclusive", reason: "no authenticated session to compare — login(role) first" };
   if (auth.status >= 300 || looksLikeLogin(auth.body))
     return { verdict: "inconclusive", reason: "authenticated baseline is itself login/redirect — cannot establish protected content" };
-  return { verdict: "needs_judgment", reason: "unauth returned 200 & non-login; judge whether it IS the protected content" };
+  // Mechanical body-match: a real bypass means the UNAUTH response reproduces the authed protected content. A generic/
+  // public 200 that merely differs from the login page is NOT a bypass — hard veto so it can't be recorded.
+  if (!protectedContentLeaked(unauth.body, auth.body))
+    return { verdict: "not_bypass", reason: "unauth 200 body does NOT reproduce the authenticated protected content — a generic/public page, not a bypass" };
+  return { verdict: "needs_judgment", reason: "unauth 200 reproduces the authenticated protected content — confirm it IS sensitive/private data" };
 }
 
 /** Return the in-scope URLs from observed links that should go on the frontier (pure).
@@ -2232,7 +2267,7 @@ export function buildTools(s: PilotSession) {
             response: res,
             note: `redirect ${tag} ${param}`,
           });
-          return { evId: ev.id, status: res.status, toOob: loc.includes(marker), location: loc.slice(0, 200) };
+          return { evId: ev.id, status: res.status, toOob: locationTargetsHost(loc, u, marker), location: loc.slice(0, 200) };
         };
         let ctrl: Awaited<ReturnType<typeof send>>;
         let p1: Awaited<ReturnType<typeof send>>;
@@ -2890,10 +2925,13 @@ export function buildTools(s: PilotSession) {
           // マーカーは body だけでなくヘッダも見る(open-redirect の印は Location ヘッダに出る)。
           // XSS は「live HTML 位置での反射」= 実行可能文脈のみ有効(<script>/flight-data JSON 内の反射は不活性 → refute)。
           const isXss = category === "xss-reflected" || category === "xss-stored";
-          const hasMarker = (r: { body: string; headers: Record<string, string> }): boolean =>
+          const isRedirect = category === "open-redirect";
+          const hasMarker = (r: { body: string; headers: Record<string, string>; finalUrl?: string }): boolean =>
             isXss
               ? reflectionIsLive(r.body, effectMarker)
-              : r.body.includes(effectMarker) || JSON.stringify(r.headers ?? {}).includes(effectMarker);
+              : isRedirect
+                ? locationTargetsHost(r.headers?.["location"], r.finalUrl ?? "", effectMarker) // parsed Location target host, not a substring (a same-site ?url= reflection doesn't count)
+                : r.body.includes(effectMarker) || JSON.stringify(r.headers ?? {}).includes(effectMarker);
           const verdict = checkLogicEvidence(
             { status: negRec.response.status, hasMarker: hasMarker(negRec.response) },
             posRecs.map((r) => ({ status: r!.response.status, hasMarker: hasMarker(r!.response) })),

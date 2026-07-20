@@ -28,6 +28,7 @@ function screen(over: Partial<Screen> = {}): Screen {
 }
 
 const cookieApi: ApiCall = { method: "GET", urlTemplate: "/api/products/{id}", auth: "cookie", reqSchema: null, resSchema: null };
+const bearerApi: ApiCall = { method: "GET", urlTemplate: "/api/products/{id}", auth: "bearer", reqSchema: null, resSchema: null };
 
 function byPath(routes: Record<string, () => { status: number; body?: string; headers?: Record<string, string> }>): FakeResponder {
   return (req) => {
@@ -50,7 +51,7 @@ test("exposed_file + auth_required confirm and land in the store + coverage ledg
     target: { kind: "single_url", url: "https://shop.test/", followLinks: true, maxDepth: 2 },
     scope: deriveScopeFromSingleUrl("https://shop.test/"),
   });
-  const s = screen({ apis: [cookieApi] });
+  const s = screen({ apis: [bearerApi] }); // Bearer API returning data unauth = a real auth_required bypass (cookie APIs are excluded — cookies auto-send)
   store.upsertScreen("a-1", s);
 
   const http = new FakeHttpClient(
@@ -123,6 +124,21 @@ test("cors_misconfig confirms only when an arbitrary Origin is reflected", async
     const cors = r.outcomes.find((o) => o.validator === "cors_misconfig");
     assert.equal(cors?.status, "confirmed");
     assert.ok(r.findings.some((f) => f.title.startsWith("CORS")));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// A1: auth_required is BEARER-only. A cookie is auto-sent by the browser to every same-origin request, so detectAuth
+// labels public GETs as auth:"cookie" — probing those unauthenticated yields a 200 and a false "unauthenticated access".
+test("auth_required is BEARER-only: a cookie-authed API returning data unauth is NOT flagged", async () => {
+  const { ev, dir } = freshEvidence();
+  try {
+    const http = new FakeHttpClient(byPath({ "/api/products/1": () => ({ status: 200, body: '{"id":1,"name":"Widget","price":9}' }) }));
+    const cookieRun = await scanScreen(screen({ apis: [cookieApi] }), http, ev, new Set());
+    assert.ok(!cookieRun.outcomes.some((o) => o.validator === "auth_required"), "cookie API is not an auth_required target (would be a false positive)");
+    const bearerRun = await scanScreen(screen({ apis: [bearerApi] }), http, ev, new Set());
+    assert.ok(bearerRun.outcomes.some((o) => o.validator === "auth_required" && o.status === "confirmed"), "the same endpoint as a Bearer API returning data unauth IS a real bypass");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

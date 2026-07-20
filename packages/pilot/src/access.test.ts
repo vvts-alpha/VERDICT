@@ -40,3 +40,18 @@ test("session/comparison unavailable is inconclusive (don't let it claim a bypas
     "inconclusive",
   );
 });
+
+// A2: needs_judgment now requires the unauth response to REPRODUCE the authed protected content (mechanical body-match),
+// so a generic/public 200 can't be recorded as auth-bypass on the model's judgment alone.
+test("auth-bypass: unauth 200 with DIFFERENT content than authed → not_bypass (generic page, mechanical veto)", () => {
+  const v = classifyAccess(
+    { status: 200, body: "<html><body><h1>Welcome</h1><p>Our marketing homepage — sign up for great deals today, everyone is welcome!</p></body></html>" },
+    { status: 200, body: '{"account":"12345","balance":9900,"transactions":[{"id":1,"amt":50},{"id":2,"amt":75}],"private":true}' },
+  );
+  assert.equal(v.verdict, "not_bypass");
+});
+
+test("auth-bypass: unauth 200 that REPRODUCES the authed protected content → needs_judgment", () => {
+  const secret = '{"account":"12345","balance":9900,"transactions":[{"id":1,"amt":50},{"id":2,"amt":75}],"private":true}';
+  assert.equal(classifyAccess({ status: 200, body: secret }, { status: 200, body: secret }).verdict, "needs_judgment");
+});
