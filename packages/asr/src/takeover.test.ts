@@ -28,8 +28,21 @@ test("detectTakeover: a claimed bucket (normal 200, no fingerprint) → null", (
     assert.equal(detectTakeover({ cnames: ["app.s3.amazonaws.com"], status: 200, body: "<html>my site</html>" }), null);
 });
 
-test("detectTakeover: a non-vulnerable service (Shopify) is flagged but vulnerable:false", () => {
+// Comprehensive claimed-vs-dangling review: a SERVING host behind a service that's generally NOT takeover-able is a
+// CLAIMED live resource, not a takeover. These lock the CloudFront-403 false positive (secure.sophos.co.jp) shut.
+test("detectTakeover: claimed CloudFront (serves the generic 403 error, CNAME resolves) → null, NOT a takeover", () => {
+    const t = detectTakeover({ cnames: ["d30v7i0kora5sx.cloudfront.net"], status: 403, body: "ERROR: The request could not be satisfied" });
+    assert.equal(t, null); // was wrongly flagged "likely / medium" — a live CloudFront distribution is claimed
+});
+
+test("detectTakeover: a serving Shopify (shop unavailable page) → null, NOT a takeover (usually claimed)", () => {
     const t = detectTakeover({ cnames: ["shop.myshopify.com"], status: 404, body: "Sorry, this shop is currently unavailable" });
-    assert.equal(t?.service, "Shopify");
-    assert.equal(t?.vulnerable, false);
+    assert.equal(t, null);
+});
+
+test("detectTakeover: a vulnerable:true service serving its SPECIFIC unclaimed page is still a real lead", () => {
+    // guards against over-suppressing: S3 NoSuchBucket served with a 404 must remain a takeover lead
+    const t = detectTakeover({ cnames: ["gone.s3.amazonaws.com"], status: 404, body: "<Code>NoSuchBucket</Code>" });
+    assert.equal(t?.vulnerable, true);
+    assert.equal(t?.confidence, "likely");
 });

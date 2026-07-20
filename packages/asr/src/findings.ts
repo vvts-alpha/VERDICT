@@ -29,7 +29,11 @@ export function reconFindings(asset: Asset): AssetFinding[] {
         const t = asset.takeover;
         out.push({
             category: "subdomain-takeover",
-            severity: t.vulnerable ? (t.confidence === "likely" ? "critical" : "high") : "medium",
+            // vulnerable+likely = the service serves its specific unclaimed page + a matching CNAME (S3 NoSuchBucket …).
+            // vulnerable+potential = dangling CNAME or fingerprint-without-CNAME. The vulnerable:false branch is defensive:
+            // detectTakeover now suppresses claimed (serving) vulnerable:false hosts, so an edge-case that still reaches
+            // here is informational, not medium (kills the CloudFront-403 false positive).
+            severity: t.vulnerable ? (t.confidence === "likely" ? "critical" : "high") : "info",
             title: `Possible subdomain takeover — ${t.service}`,
             detail: `${t.confidence}${t.cname ? ` · CNAME → ${t.cname}` : ""}. ${t.note}`,
         });

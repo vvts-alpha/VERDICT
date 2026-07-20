@@ -49,3 +49,25 @@ export function mergeCandidates(...lists: HostCandidate[][]): HostCandidate[] {
     }
     return [...byHost.values()].sort((a, b) => (a.host < b.host ? -1 : a.host > b.host ? 1 : 0));
 }
+
+/**
+ * Probe-budget priority for a candidate host (LOWER = probe first). Under `--max-hosts`, a flood of auto-generated
+ * ephemeral hosts (deep chains + random-hex leftmost labels — e.g. `1jwqo068-cloudhub-eu-west-1.qa.hydra.example.com`
+ * pulled from CT logs) would otherwise starve the budget of high-value named hosts (`portal.example.com`). This orders
+ * named/shallow hosts ahead of deep/random ones so the cap keeps the interesting surface. Pure heuristic; it only
+ * affects ordering *under* the cap — it never drops a candidate, and dictionary labels (dev/qa/api) are never penalized.
+ */
+export function probePriority(host: string): number {
+    const labels = host.split(".");
+    const left = labels[0] ?? "";
+    let p = 0;
+    p += Math.max(0, labels.length - 3) * 12; // subdomain depth beyond apex+1 (apex = 2 labels; one named label = 3)
+    if (left.length >= 8 && /\d/.test(left) && /[a-z]/i.test(left)) p += 8; // random-looking leftmost (mixes digits + letters)
+    if (left.length > 20) p += 8; // very long leftmost label
+    return p;
+}
+
+/** Order candidates for the probe budget: named/shallow first (probePriority), then alphabetical. Stable + pure. */
+export function orderCandidatesForProbe(candidates: HostCandidate[]): HostCandidate[] {
+    return [...candidates].sort((a, b) => probePriority(a.host) - probePriority(b.host) || a.host.localeCompare(b.host));
+}

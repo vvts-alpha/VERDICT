@@ -39,11 +39,20 @@ export function detectTakeover(input: { cnames: string[]; status: number | null;
     // Strongest signal: the service is serving its "unclaimed" page.
     for (const fp of TAKEOVER_FINGERPRINTS) {
         if (!fp.fingerprint || !fp.fingerprint.test(input.body)) continue;
+        // A takeover requires the CNAME'd resource to be UNCLAIMED. A host that SERVED a response (status != null) via a
+        // service that is generally NOT takeover-able (vulnerable:false — CloudFront/Shopify/Zendesk) is a CLAIMED, live
+        // resource, not a dangling one: e.g. CloudFront returns "ERROR: The request could not be satisfied" for a
+        // live-but-blocked distribution (host-header/WAF/geo), NOT only for an unclaimed alias. Flagging that as a
+        // takeover is a false positive (surfaced on secure.sophos.co.jp: CNAME resolved to 12 live CloudFront IPs).
+        // So a serving vulnerable:false match is a claimed third-party host — no takeover lead. (vulnerable:true services
+        // key on a SPECIFIC unclaimed signature — S3 "NoSuchBucket", GH "There isn't a site here" — which is real.)
+        if (!fp.vulnerable && input.status !== null) continue;
         const cname = input.cnames.find((c) => fp.cname.some((re) => re.test(c)));
         return {
             service: fp.service,
             vulnerable: fp.vulnerable,
-            confidence: cname ? "likely" : "potential",
+            // "likely" only for a takeover-able service showing its specific unclaimed page with a matching CNAME.
+            confidence: fp.vulnerable && cname ? "likely" : "potential",
             ...(cname ? { cname } : {}),
             note: fp.note,
         };

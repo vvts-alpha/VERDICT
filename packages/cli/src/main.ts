@@ -45,7 +45,7 @@ import { assessLogicInventory, assessScreenLogic, authDiffScreen } from "@verita
 import type { RoleContext } from "@veritas/agent";
 import { runPilot, verifyBurpFindings, triageAndDeepDiveBurp, LiveControl } from "@veritas/pilot";
 import { BrowserChatAdapter, runLlmRedteam, defaultInjectedContextProbes, generateCanary } from "@veritas/llm-attacks";
-import { discoverCrtSh, fetchHttpGet, filterInScope, mergeCandidates, importRecon, execFileRunTool, subfinderDiscover, dnsxBrute, nativeBrute, DEFAULT_SUBDOMAIN_WORDLIST, parseWordlist, probeHost, probeSurface, enumerateListing, detectTakeover, reconFindings, scoreAsset, triageAsset, buildAssetInventory, writeAssetInventory, readAssetInventory } from "@veritas/asr";
+import { discoverCrtSh, fetchHttpGet, filterInScope, mergeCandidates, orderCandidatesForProbe, importRecon, execFileRunTool, subfinderDiscover, dnsxBrute, nativeBrute, DEFAULT_SUBDOMAIN_WORDLIST, parseWordlist, probeHost, probeSurface, enumerateListing, detectTakeover, reconFindings, scoreAsset, triageAsset, buildAssetInventory, writeAssetInventory, readAssetInventory } from "@veritas/asr";
 import type { HostCandidate } from "@veritas/asr";
 import { runFromAsr, spawnPilotLauncher } from "./from-asr.js";
 import type { AsrScopePins } from "./from-asr.js";
@@ -1667,7 +1667,10 @@ async function cmdAsr(args: string[]): Promise<void> {
     `  ${crtCandidates.length} crt.sh${importPath ? ` + ${importCandidates.length} import` : ""}${subfinderEnabled && !sf.missing ? ` + ${sf.candidates.length} subfinder` : ""}${values.brute ? ` + ${bruteCandidates.length} brute` : ""} → ${candidates.length} in-scope host(s)`,
   );
   if (candidates.length > maxHosts) {
-    console.log(`  capping to --max-hosts ${maxHosts} (${candidates.length - maxHosts} dropped)`);
+    // Order by probe priority BEFORE the cap so a flood of auto-generated ephemeral hosts (deep CNAME chains / random
+    // leftmost labels, e.g. *.hydra.<apex> from CT logs) doesn't starve the budget of high-value named hosts.
+    candidates = orderCandidatesForProbe(candidates);
+    console.log(`  capping to --max-hosts ${maxHosts} (${candidates.length - maxHosts} dropped; named/shallow hosts prioritized over ephemeral)`);
     candidates = candidates.slice(0, maxHosts);
   }
 
