@@ -64,8 +64,10 @@ test("normalizeSeverity clamps each class into its band (consistent severities)"
 test("suspected is scoped to serious classes — hygiene/deterministic classes are excluded (noise control)", () => {
   // low-value / deterministically observable classes can't be suspected (confirmed or skip).
   for (const c of ["rate-limit", "headers", "info-disclosure", "misconfig"]) assert.ok(SUSPECT_EXCLUDED_CATEGORIES.has(c), `${c} should be excluded from suspected`);
-  // serious exploitation classes may be suspected.
-  for (const c of ["idor", "sqli", "ssti", "rce", "path-traversal", "ssrf", "mass-assignment", "vulnerable-component", "secret-exposure", "xss-stored"])
+  // XSS is marker-provable (reflectionIsLive) — confirm-or-skip, never a "suspected" hypothesis off a field name.
+  for (const c of ["xss-reflected", "xss-stored"]) assert.ok(SUSPECT_EXCLUDED_CATEGORIES.has(c), `${c} should be excluded from suspected (marker-provable)`);
+  // serious exploitation classes that are NOT marker-provable-in-one-request may be suspected.
+  for (const c of ["idor", "sqli", "ssti", "rce", "path-traversal", "ssrf", "mass-assignment", "vulnerable-component", "secret-exposure"])
     assert.ok(!SUSPECT_EXCLUDED_CATEGORIES.has(c), `${c} should be allowed as suspected`);
 });
 

@@ -290,9 +290,13 @@ export const BUSINESS_LOGIC_CATEGORIES = new Set<string>(["price-tampering", "qt
  *  Business logic (probe_logic/probe_scenario) + reflected XSS (unescaped reflection) + open-redirect (Location is the OOB). */
 export const MARKER_BASED_CATEGORIES = new Set<string>([...BUSINESS_LOGIC_CATEGORIES, "xss-reflected", "xss-stored", "open-redirect", "ssti", "secret-exposure", "user-enumeration", "race-condition", "account-takeover"]);
 
-/** Categories that don't allow verdict:"suspected". Deterministically observable, or low-value hygiene classes, make poor leads
- *  and just add noise (rate-limit/version-disclosure were being mass-produced as "suspected"). These are confirmed-or-skip only. */
-export const SUSPECT_EXCLUDED_CATEGORIES = new Set<string>(["rate-limit", "headers", "info-disclosure", "misconfig"]);
+/** Categories that don't allow verdict:"suspected". Two reasons to exclude: (1) low-value hygiene classes that just add noise
+ *  (rate-limit/headers/info-disclosure/misconfig — were being mass-produced as "suspected"); (2) MARKER-PROVABLE classes where a
+ *  "suspected" is really an untested hypothesis. XSS is confirmed via reflectionIsLive (inject the payload → it reflects UNESCAPED
+ *  in a live HTML context or it doesn't), so a field-name guess ("this field carries raw HTML") or a "sibling was confirmed" claim
+ *  is not a lead: drive probe_stored_xss/probe_dom_xss to the actual render sink and confirm, else mark the class tested-clean /
+ *  not-applicable. All of these are confirmed-or-skip only. */
+export const SUSPECT_EXCLUDED_CATEGORIES = new Set<string>(["rate-limit", "headers", "info-disclosure", "misconfig", "xss-reflected", "xss-stored"]);
 
 /** probe_paths' "simple directory list" = a curated wordlist for hitting unlinked endpoints.
  *  ※ Do **not** include logout/signout paths. GETting them under an authenticated session destroys the server-side session,
@@ -2907,8 +2911,14 @@ export function buildTools(s: PilotSession) {
           // ノイズ抑制: suspected は「深刻な exploitation クラス × medium+」限定。低価値/決定的クラスは confirmed か skip。
           if (normSev === "info" || normSev === "low")
             return txt(`REJECTED: 'suspected' is only for medium+ leads worth a human's verification. An info/low observation is either deterministically confirmable (record verdict:"confirmed") or not worth surfacing — do not mark it suspected.`);
-          if (SUSPECT_EXCLUDED_CATEGORIES.has(category))
-            return txt(`REJECTED: '${category}' is deterministically observable (you either saw it or you didn't), not a "suspected" class — if you saw it record verdict:"confirmed" (control + 2 replays), else skip. Reserve 'suspected' for serious exploitation classes you could not fully confirm this run (idor/idor-write/sqli/ssti/rce/path-traversal/ssrf/xxe/auth-bypass/mass-assignment/vulnerable-component/secret-exposure/xss-*).`);
+          if (SUSPECT_EXCLUDED_CATEGORIES.has(category)) {
+            const isXssCat = category === "xss-reflected" || category === "xss-stored";
+            return txt(
+              isXssCat
+                ? `REJECTED: XSS is marker-provable, not a "suspected" class. Either a unique payload reflected UNESCAPED in a live HTML context (→ record verdict:"confirmed" with control + 2 replays + effectMarker via probe_xss / probe_stored_xss / probe_dom_xss) or you have NOT observed XSS. A field name that "looks like" a raw-HTML sink, an admin-rendered field, or a sibling you believe was confirmed is a HYPOTHESIS — drive probe_stored_xss(store, renderUrl) / probe_dom_xss to the actual render sink and confirm it, otherwise mark the class tested-clean / not-applicable(reason). Do NOT file it suspected.`
+                : `REJECTED: '${category}' is deterministically observable (you either saw it or you didn't), not a "suspected" class — if you saw it record verdict:"confirmed" (control + 2 replays), else skip. Reserve 'suspected' for serious exploitation classes you could not fully confirm this run (idor/idor-write/sqli/ssti/rce/path-traversal/ssrf/xxe/auth-bypass/mass-assignment/vulnerable-component/secret-exposure).`,
+            );
+          }
           // version-based CVE(未 exploit)は High/Critical(RCE/path-traversal/auth-bypass 級)だけ surface。
           //   medium/EOL-only の版ノートはアクション性が低くノイズ(PHP EOL・Bootstrap EOL・dev server 等)。
           if (category === "vulnerable-component" && normSev !== "high" && normSev !== "critical")
