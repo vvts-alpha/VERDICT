@@ -112,5 +112,11 @@ export interface AssetInventory {
     apex: string;
     /** Total candidate hosts discovered (for scan-progress); undefined until discovery completes. */
     discovered?: number;
+    /**
+     * Set when a PRIMARY discovery source (crt.sh) failed and the run either aborted or proceeded on partial
+     * sources (--import / --allow-degraded): the asset map is INCOMPLETE and must not be read as a full surface.
+     * Absent = every requested source ran. Readers (WebUI / pilot --from-asr) should surface `reason`.
+     */
+    degraded?: { reason: string };
     assets: Asset[];
 }

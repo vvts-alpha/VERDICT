@@ -5,8 +5,21 @@ import { readFileSync, writeFileSync } from "node:fs";
 
 import type { Asset, AssetInventory } from "@veritas/core";
 
-export function buildAssetInventory(apex: string, assets: Asset[], now: Date = new Date(), discovered?: number): AssetInventory {
-    return { version: 1, generatedAt: now.toISOString(), apex, ...(discovered !== undefined ? { discovered } : {}), assets };
+export function buildAssetInventory(
+    apex: string,
+    assets: Asset[],
+    now: Date = new Date(),
+    discovered?: number,
+    degraded?: { reason: string },
+): AssetInventory {
+    return {
+        version: 1,
+        generatedAt: now.toISOString(),
+        apex,
+        ...(discovered !== undefined ? { discovered } : {}),
+        ...(degraded ? { degraded } : {}),
+        assets,
+    };
 }
 
 export function writeAssetInventory(path: string, inventory: AssetInventory): void {

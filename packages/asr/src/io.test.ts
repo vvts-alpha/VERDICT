@@ -31,6 +31,16 @@ test("buildAssetInventory: stamps version/apex/generatedAt and carries the asset
     assert.equal(inv.assets.length, 1);
 });
 
+test("buildAssetInventory: brands a degraded run (primary source failed), omits the field when complete", () => {
+    // A full run carries NO degraded marker — its absence is what tells a reader the map is complete.
+    const complete = buildAssetInventory("example.com", [asset()], AT, 5);
+    assert.equal(complete.degraded, undefined);
+    // crt.sh failed but the run proceeded (--import/--allow-degraded): the inventory is branded INCOMPLETE, discovered count still carried.
+    const partial = buildAssetInventory("example.com", [asset()], AT, 5, { reason: "crt.sh (primary source) failed: fetch failed — INCOMPLETE" });
+    assert.equal(partial.degraded?.reason.includes("crt.sh"), true);
+    assert.equal(partial.discovered, 5);
+});
+
 test("write/read round-trips the inventory (incl. a dead host)", () => {
     const dir = mkdtempSync(join(tmpdir(), "asr-io-"));
     try {

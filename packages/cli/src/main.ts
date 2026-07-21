@@ -110,7 +110,7 @@ commands:
             Phase2 business logic: hypothesis generation (LLM) → verify IDOR etc. with evidence discipline. --manifest injects auth headers for a spec-seeded API run.
   spec-import --spec <openapi.json> --url <base> [--id <existing>] [--manifest <m.json>] [--out <dir>]
             ingest an OpenAPI 3.x / Swagger 2.0 spec (JSON) → seed the screen inventory so the browser-free scan/logic can assess a pure-API target. --url = where the API lives (base). with --id, overlay the spec on an existing crawl (fills endpoints the UI never called). token-protected APIs: put Authorization: Bearer … in the manifest's http.headers.
-  asr     --domain <apex|*.wildcard> [--tools subfinder|--no-tools] [--brute [--wordlist <file>] [--resolvers <file>]] [--import <httpx.json|hosts.txt|dir> [--import-trust-liveness]] [--out-of-scope a.ex.com,b.ex.com] [--screenshot] [--paths] [--triage [--triage-top <n>] [--model <m>]] [--max-hosts <n>] [--rate <ms>] [--browser-path <bin>] [--no-sandbox] [--headed] [--out <dir>]
+  asr     --domain <apex|*.wildcard> [--tools subfinder|--no-tools] [--brute [--wordlist <file>] [--resolvers <file>]] [--import <httpx.json|hosts.txt|dir> [--import-trust-liveness]] [--allow-degraded] [--out-of-scope a.ex.com,b.ex.com] [--screenshot] [--paths] [--triage [--triage-top <n>] [--model <m>]] [--max-hosts <n>] [--rate <ms>] [--browser-path <bin>] [--no-sandbox] [--headed] [--out <dir>]
             Attack Surface Recon: passive discovery (crt.sh CT logs) → dns resolve + HTTP liveness → deterministic attack-target score (ranked) → runs/<id>/asset_inventory.json
             [--screenshot] per-host screenshot · [--paths] probe curated high-signal paths on live hosts (/.git/, /.env, /actuator, swagger, server-status…) → real exposure + auto-escalate
             [--triage] Claude classifies the top-N by score (default 15, --triage-top) → category / band / attack-angle (a lead, not a finding; claude CLI subscription, no metered API)
@@ -1579,6 +1579,7 @@ async function cmdAsr(args: string[]): Promise<void> {
       out: { type: "string" },
       import: { type: "string" },
       "import-trust-liveness": { type: "boolean" },
+      "allow-degraded": { type: "boolean" },
       tools: { type: "string" },
       "no-tools": { type: "boolean" },
       brute: { type: "boolean" },
@@ -1627,10 +1628,12 @@ async function cmdAsr(args: string[]): Promise<void> {
   const trustLiveness = !!values["import-trust-liveness"];
   console.log(`▶ asr ${id}: discovering *.${apex} via crt.sh${importPath ? ` + import(${importPath})` : ""}…`);
   let crtHosts: string[] = [];
+  let crtFailed: string | null = null;
   try {
     crtHosts = await discoverCrtSh({ domain: apex, outOfScope }, fetchHttpGet);
   } catch (e) {
-    console.error(`  crt.sh discovery failed: ${String(e).slice(0, 120)}`);
+    crtFailed = String(e).slice(0, 160);
+    console.error(`  crt.sh discovery failed: ${crtFailed}`);
   }
   const crtCandidates = crtHosts.map((h) => ({ host: h, source: "crt.sh" as const }));
   const importCandidates = importPath ? importRecon(importPath) : [];
@@ -1672,6 +1675,31 @@ async function cmdAsr(args: string[]): Promise<void> {
   console.log(
     `  ${crtCandidates.length} crt.sh${importPath ? ` + ${importCandidates.length} import` : ""}${subfinderEnabled && !sf.missing ? ` + ${sf.candidates.length} subfinder` : ""}${values.brute ? ` + ${bruteCandidates.length} brute` : ""} → ${candidates.length} in-scope host(s)`,
   );
+  // crt.sh is the PRIMARY passive source (SOURCE_PRIORITY[0]) — a hundreds-of-hosts CT map is the backbone of a
+  // discovery run. If it ERRORED (transport/5xx, not merely "0 results"), silently continuing would present a
+  // misleadingly-thin inventory as a COMPLETE map — the exact trust erosion VERDICT exists to avoid. Fail hard
+  // unless the operator opted into an alternate primary (--import) or an explicitly partial run (--allow-degraded).
+  let degraded: { reason: string } | undefined;
+  if (crtFailed) {
+    const partialOk = !!importPath || !!values["allow-degraded"];
+    if (!partialOk) {
+      writeAssetInventory(
+        invPath,
+        buildAssetInventory(apex, [], new Date(), undefined, {
+          reason: `crt.sh (primary source) failed: ${crtFailed} — discovery aborted; re-run when crt.sh recovers, or pass --import/--allow-degraded`,
+        }),
+      );
+      fail(
+        `discovery DEGRADED — crt.sh (the primary source) failed: ${crtFailed}\n` +
+          `  Not writing a 'complete' inventory: crt.sh normally returns far more than the ${candidates.length} host(s) the other sources found, so this would understate the surface.\n` +
+          `  → retry when crt.sh recovers (it 502s under load), or re-run with --import <recon.json|hosts.txt> or --allow-degraded to proceed on partial sources.`,
+      );
+    }
+    degraded = {
+      reason: `crt.sh (primary source) failed: ${crtFailed} — map built from partial sources${importPath ? " (import + subfinder/brute)" : " (subfinder/brute)"}; INCOMPLETE`,
+    };
+    console.log(`  ⚠ DEGRADED: proceeding without crt.sh — this asset map is INCOMPLETE (via ${importPath ? "--import" : "--allow-degraded"}).`);
+  }
   if (candidates.length > maxHosts) {
     // Order by probe priority BEFORE the cap so a flood of auto-generated ephemeral hosts (deep CNAME chains / random
     // leftmost labels, e.g. *.hydra.<apex> from CT logs) doesn't starve the budget of high-value named hosts.
@@ -1746,7 +1774,7 @@ async function cmdAsr(args: string[]): Promise<void> {
       console.log(asset.alive ? `  ✓ ${asset.host}  ${asset.status ?? ""} ${asset.title ?? ""}`.trimEnd() : `  · ${asset.host}`);
       // Incremental write → the WebUI (polling /assets) shows hosts appear. First 10 completions each write (immediate
       // feedback), then every 10 (bounded I/O). Writes are synchronous so concurrent workers don't corrupt the file.
-      if (assets.length <= 10 || assets.length % 10 === 0) writeAssetInventory(invPath, buildAssetInventory(apex, assets, new Date(), candidates.length));
+      if (assets.length <= 10 || assets.length % 10 === 0) writeAssetInventory(invPath, buildAssetInventory(apex, assets, new Date(), candidates.length, degraded));
     }
   };
   await Promise.all(Array.from({ length: Math.max(1, Math.min(PROBE_CONCURRENCY, candidates.length)) }, () => probeWorker()));
@@ -1831,7 +1859,7 @@ async function cmdAsr(args: string[]): Promise<void> {
   }
 
   // ⑤ persist the asset inventory (overwrite the early empty file with the scored, ranked set)
-  writeAssetInventory(invPath, buildAssetInventory(apex, assets, new Date(), candidates.length));
+  writeAssetInventory(invPath, buildAssetInventory(apex, assets, new Date(), candidates.length, degraded));
   console.log(`\nasr ${id}: ${assets.length} asset(s), ${live.length} live → ${invPath}`);
   const top = assets.filter((a) => a.alive).slice(0, 10);
   if (top.length > 0) {
