@@ -7,6 +7,8 @@
 // The parse is pure and offline-testable; the fetch is a thin wrapper with an injectable `httpGet` so tests never
 // hit the network (VERDICT test discipline: no real network/LLM in node:test).
 
+import { get as httpsGet } from "node:https";
+
 /** The apex + carve-outs a discovery run is scoped to. `domain` may be given as a wildcard ("*.example.com"). */
 export interface DiscoveryScope {
     /** Registrable domain / apex the wildcard covers, e.g. "example.com" (a leading "*." is tolerated and stripped). */
@@ -123,9 +125,33 @@ export async function discoverCrtSh(scope: DiscoveryScope, httpGet: HttpGet, opt
     throw lastErr;
 }
 
-/** Default runtime `httpGet` using Node's global fetch (Node >= 24). 10s timeout so an unreachable crt.sh can't hang. */
-export const fetchHttpGet: HttpGet = async (url) => {
-    const res = await fetch(url, { headers: { "user-agent": "verdict-asr" }, signal: AbortSignal.timeout(10_000) });
-    if (!res.ok) throw new Error(`crt.sh returned HTTP ${res.status}`);
-    return res.text();
-};
+/**
+ * Default runtime `httpGet`, forcing IPv4 (`family: 4`). crt.sh is dual-stack (A + AAAA); on a host with a dead IPv6
+ * egress — common under WSL / containers — Node's global `fetch` grabs the AAAA and black-holes (surfacing as
+ * "fetch failed" / ETIMEDOUT) without falling back to the reachable A record: Happy-Eyeballs still opens the v6 socket
+ * regardless of `--dns-result-order=ipv4first`, so ordering alone doesn't help. `node:https` with `family: 4` resolves
+ * A-only and connects over v4 — zero extra dep, no global Happy-Eyeballs disable. 10s timeout so an unreachable crt.sh
+ * can't hang; a 5xx or a timeout is surfaced as a *retryable* error (see `isRetryableCrtErr` / `discoverCrtSh`).
+ */
+export const fetchHttpGet: HttpGet = (url) =>
+    new Promise<string>((resolve, reject) => {
+        const req = httpsGet(url, { family: 4, headers: { "user-agent": "verdict-asr" }, timeout: 10_000 }, (res) => {
+            const status = res.statusCode ?? 0;
+            if (status < 200 || status >= 300) {
+                res.resume(); // drain the body so the socket is released
+                reject(new Error(`crt.sh returned HTTP ${status}`));
+                return;
+            }
+            let body = "";
+            res.setEncoding("utf8");
+            res.on("data", (chunk) => (body += chunk));
+            res.on("end", () => resolve(body));
+            res.on("error", reject);
+        });
+        req.on("error", reject);
+        req.on("timeout", () => {
+            const e = new Error("crt.sh request timed out");
+            e.name = "TimeoutError"; // preserve discoverCrtSh's retry-on-timeout (isRetryableCrtErr checks the name)
+            req.destroy(e);
+        });
+    });
