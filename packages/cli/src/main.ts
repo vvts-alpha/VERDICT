@@ -45,7 +45,7 @@ import { assessLogicInventory, assessScreenLogic, authDiffScreen } from "@verita
 import type { RoleContext } from "@veritas/agent";
 import { runPilot, verifyBurpFindings, triageAndDeepDiveBurp, LiveControl } from "@veritas/pilot";
 import { BrowserChatAdapter, runLlmRedteam, defaultInjectedContextProbes, generateCanary } from "@veritas/llm-attacks";
-import { discoverCrtSh, fetchHttpGet, filterInScope, mergeCandidates, orderCandidatesForProbe, importRecon, execFileRunTool, subfinderDiscover, dnsxBrute, dnsxReachable, nativeBrute, DEFAULT_SUBDOMAIN_WORDLIST, parseWordlist, probeHost, probeSurface, enumerateListing, detectTakeover, reconFindings, scoreAsset, triageAsset, buildAssetInventory, writeAssetInventory, readAssetInventory } from "@veritas/asr";
+import { discoverCrtSh, fetchHttpGet, primarySourceFailureAction, filterInScope, mergeCandidates, orderCandidatesForProbe, importRecon, execFileRunTool, subfinderDiscover, dnsxBrute, dnsxReachable, nativeBrute, DEFAULT_SUBDOMAIN_WORDLIST, parseWordlist, probeHost, probeSurface, enumerateListing, detectTakeover, reconFindings, scoreAsset, triageAsset, buildAssetInventory, writeAssetInventory, readAssetInventory } from "@veritas/asr";
 import type { HostCandidate } from "@veritas/asr";
 import { runFromAsr, spawnPilotLauncher } from "./from-asr.js";
 import type { AsrScopePins } from "./from-asr.js";
@@ -1675,30 +1675,24 @@ async function cmdAsr(args: string[]): Promise<void> {
   console.log(
     `  ${crtCandidates.length} crt.sh${importPath ? ` + ${importCandidates.length} import` : ""}${subfinderEnabled && !sf.missing ? ` + ${sf.candidates.length} subfinder` : ""}${values.brute ? ` + ${bruteCandidates.length} brute` : ""} → ${candidates.length} in-scope host(s)`,
   );
-  // crt.sh is the PRIMARY passive source (SOURCE_PRIORITY[0]) — a hundreds-of-hosts CT map is the backbone of a
-  // discovery run. If it ERRORED (transport/5xx, not merely "0 results"), silently continuing would present a
-  // misleadingly-thin inventory as a COMPLETE map — the exact trust erosion VERDICT exists to avoid. Fail hard
-  // unless the operator opted into an alternate primary (--import) or an explicitly partial run (--allow-degraded).
+  // A crt.sh (primary-source) outage DEGRADES the map but does NOT discard a run other sources still populated:
+  // subfinder / --import / brute routinely carry a run on their own (subfinder alone returned 2564 hosts where crt.sh
+  // timed out). We refuse only to present a degraded map as COMPLETE — brand it `degraded` + warn loudly — and hard-stop
+  // solely when the whole result is empty, cleanly (a one-line error, NOT the usage dump) and overridable with --allow-degraded.
   let degraded: { reason: string } | undefined;
   if (crtFailed) {
-    const partialOk = !!importPath || !!values["allow-degraded"];
-    if (!partialOk) {
-      writeAssetInventory(
-        invPath,
-        buildAssetInventory(apex, [], new Date(), undefined, {
-          reason: `crt.sh (primary source) failed: ${crtFailed} — discovery aborted; re-run when crt.sh recovers, or pass --import/--allow-degraded`,
-        }),
+    const action = primarySourceFailureAction({ primaryFailed: true, otherHostCount: candidates.length, allowDegraded: !!values["allow-degraded"] });
+    degraded = { reason: `crt.sh (a primary source) failed: ${crtFailed} — map built from the remaining sources (subfinder/import/brute); may be INCOMPLETE` };
+    if (action.abort) {
+      writeAssetInventory(invPath, buildAssetInventory(apex, [], new Date(), undefined, degraded));
+      console.error(
+        `\nerror: discovery found 0 hosts and crt.sh (a primary source) failed: ${crtFailed}\n` +
+          `  nothing to assess — this looks like a source outage, not necessarily an empty surface.\n` +
+          `  → retry when crt.sh recovers (it 502s under load), add --import <recon.json|hosts.txt>, or pass --allow-degraded to accept an empty result.`,
       );
-      fail(
-        `discovery DEGRADED — crt.sh (the primary source) failed: ${crtFailed}\n` +
-          `  Not writing a 'complete' inventory: crt.sh normally returns far more than the ${candidates.length} host(s) the other sources found, so this would understate the surface.\n` +
-          `  → retry when crt.sh recovers (it 502s under load), or re-run with --import <recon.json|hosts.txt> or --allow-degraded to proceed on partial sources.`,
-      );
+      process.exit(1);
     }
-    degraded = {
-      reason: `crt.sh (primary source) failed: ${crtFailed} — map built from partial sources${importPath ? " (import + subfinder/brute)" : " (subfinder/brute)"}; INCOMPLETE`,
-    };
-    console.log(`  ⚠ DEGRADED: proceeding without crt.sh — this asset map is INCOMPLETE (via ${importPath ? "--import" : "--allow-degraded"}).`);
+    console.log(`  ⚠ DEGRADED: crt.sh failed — proceeding with ${candidates.length} host(s) from the other sources; asset map marked INCOMPLETE.`);
   }
   if (candidates.length > maxHosts) {
     // Order by probe priority BEFORE the cap so a flood of auto-generated ephemeral hosts (deep CNAME chains / random

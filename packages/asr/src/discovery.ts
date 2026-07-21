@@ -155,3 +155,19 @@ export const fetchHttpGet: HttpGet = (url) =>
             req.destroy(e);
         });
     });
+
+/**
+ * Policy for a failed PRIMARY discovery source (crt.sh). A primary outage always DEGRADES the map — it may be missing
+ * what crt.sh would have added — but it only ABORTS the run when NOTHING ELSE was found. subfinder / --import / brute
+ * routinely carry a run on their own (subfinder alone can return thousands of hosts where crt.sh times out), and
+ * discarding those would be the far worse failure. `allowDegraded` lets the operator accept even an empty result.
+ * Pure; unit-tested — the CLI (`cmdAsr`) owns the messages, this owns the decision.
+ */
+export function primarySourceFailureAction(opts: {
+    primaryFailed: boolean;
+    otherHostCount: number;
+    allowDegraded: boolean;
+}): { degraded: boolean; abort: boolean } {
+    if (!opts.primaryFailed) return { degraded: false, abort: false };
+    return { degraded: true, abort: opts.otherHostCount === 0 && !opts.allowDegraded };
+}

@@ -1,7 +1,20 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { crtShUrl, parseCrtSh, discoverCrtSh, filterInScope } from "./index.js";
+import { crtShUrl, parseCrtSh, discoverCrtSh, filterInScope, primarySourceFailureAction } from "./index.js";
+
+// A crt.sh (primary-source) outage must DEGRADE the map but keep a run other sources populated — aborting only when
+// the whole result is empty. This locks the corrected policy after an over-strict version discarded a 2564-host run.
+test("primarySourceFailureAction: crt.sh outage degrades but keeps a populated run; aborts only when empty", () => {
+    // primary healthy → nothing special.
+    assert.deepEqual(primarySourceFailureAction({ primaryFailed: false, otherHostCount: 0, allowDegraded: false }), { degraded: false, abort: false });
+    // primary failed but subfinder/import/brute found hosts → DEGRADE + KEEP (the 2564-host case). No abort.
+    assert.deepEqual(primarySourceFailureAction({ primaryFailed: true, otherHostCount: 2564, allowDegraded: false }), { degraded: true, abort: false });
+    // primary failed AND nothing else found → abort (the genuine "it didn't work").
+    assert.deepEqual(primarySourceFailureAction({ primaryFailed: true, otherHostCount: 0, allowDegraded: false }), { degraded: true, abort: true });
+    // --allow-degraded accepts even an empty result → no abort.
+    assert.deepEqual(primarySourceFailureAction({ primaryFailed: true, otherHostCount: 0, allowDegraded: true }), { degraded: true, abort: false });
+});
 
 // filterInScope is the ONE scope filter every source (crt.sh, import, brute) funnels through (S1). Lock its admission rules.
 test("filterInScope: admits apex + subdomains, strips *., drops carve-outs / foreign / invalid", () => {
