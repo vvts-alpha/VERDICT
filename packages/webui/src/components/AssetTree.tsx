@@ -241,7 +241,7 @@ export function HostDetail({ id, asset }: { id: string; asset: Asset | null }) {
             </div>
             {asset.ai ? (
                 <div className="asr-ai">
-                    <div className="asr-ai-h">AI triage — {asset.ai.category} ({asset.ai.band})</div>
+                    <div className="asr-ai-h" title="a prioritization lead from the triage model — NOT a confirmed finding">AI triage lead — {asset.ai.category} ({asset.ai.band})</div>
                     {asset.ai.rationale ? <div className="asr-ai-r">{asset.ai.rationale}</div> : null}
                     {asset.ai.angle ? <div className="asr-ai-a"><b>angle:</b> {asset.ai.angle}</div> : null}
                 </div>

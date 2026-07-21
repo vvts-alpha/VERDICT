@@ -110,6 +110,12 @@ export interface AssetInventory {
     generatedAt: string;
     /** The apex the run was scoped to, e.g. "example.com". */
     apex: string;
+    /**
+     * The run's Phase (core `Phase` enum) at write time — mirrors the store's phase so the ASR viewer shows the
+     * SAME phase vocabulary as the web/pilot header (`phase1_recon` while running, `report` when complete).
+     * Absent on legacy inventories ⇒ readers fall back to `phase1_recon`.
+     */
+    phase?: string;
     /** Total candidate hosts discovered (for scan-progress); undefined until discovery completes. */
     discovered?: number;
     /**

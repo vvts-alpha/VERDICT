@@ -11,11 +11,13 @@ export function buildAssetInventory(
     now: Date = new Date(),
     discovered?: number,
     degraded?: { reason: string },
+    phase?: string,
 ): AssetInventory {
     return {
         version: 1,
         generatedAt: now.toISOString(),
         apex,
+        ...(phase ? { phase } : {}),
         ...(discovered !== undefined ? { discovered } : {}),
         ...(degraded ? { degraded } : {}),
         assets,

@@ -1618,9 +1618,12 @@ async function cmdAsr(args: string[]): Promise<void> {
     // fresh run; a --id re-scan (resume) reuses the existing assessment row (avoids a UNIQUE conflict)
     store.createAssessment({ id, target: { kind: "single_url", url: base, followLinks: false, maxDepth: 0 }, scope });
   }
-  store.close(); // assets persist to asset_inventory.json, not the store (a store table is a later slice)
+  // Drive the assessment phase so the WebUI project list shows a live phase (recon → done) instead of a stuck "init"
+  // like the pilot does. (Assets persist to asset_inventory.json; the store row just carries phase/scope. Kept open
+  // through the run and closed at the end / on the degraded-abort.)
+  store.setPhase(id, "phase1_recon");
   const invPath = join(runsDir, id, "asset_inventory.json");
-  writeAssetInventory(invPath, buildAssetInventory(apex, [])); // write empty now so the WebUI detects an ASR run while it scans
+  writeAssetInventory(invPath, buildAssetInventory(apex, [], new Date(), undefined, undefined, "phase1_recon")); // write empty now so the WebUI detects an ASR run while it scans
 
   // ① DISCOVER — merge sources (passive crt.sh CT logs + offline --import of recon.sh output), then funnel the whole set
   //   through the ONE scope filter (§1.2) + the probe-loop isInScope backstop. crt.sh touches no target host; import is offline.
@@ -1684,7 +1687,8 @@ async function cmdAsr(args: string[]): Promise<void> {
     const action = primarySourceFailureAction({ primaryFailed: true, otherHostCount: candidates.length, allowDegraded: !!values["allow-degraded"] });
     degraded = { reason: `crt.sh (a primary source) failed: ${crtFailed} — map built from the remaining sources (subfinder/import/brute); may be INCOMPLETE` };
     if (action.abort) {
-      writeAssetInventory(invPath, buildAssetInventory(apex, [], new Date(), undefined, degraded));
+      writeAssetInventory(invPath, buildAssetInventory(apex, [], new Date(), undefined, degraded, "phase1_recon"));
+      store.close();
       console.error(
         `\nerror: discovery found 0 hosts and crt.sh (a primary source) failed: ${crtFailed}\n` +
           `  nothing to assess — this looks like a source outage, not necessarily an empty surface.\n` +
@@ -1768,7 +1772,7 @@ async function cmdAsr(args: string[]): Promise<void> {
       console.log(asset.alive ? `  ✓ ${asset.host}  ${asset.status ?? ""} ${asset.title ?? ""}`.trimEnd() : `  · ${asset.host}`);
       // Incremental write → the WebUI (polling /assets) shows hosts appear. First 10 completions each write (immediate
       // feedback), then every 10 (bounded I/O). Writes are synchronous so concurrent workers don't corrupt the file.
-      if (assets.length <= 10 || assets.length % 10 === 0) writeAssetInventory(invPath, buildAssetInventory(apex, assets, new Date(), candidates.length, degraded));
+      if (assets.length <= 10 || assets.length % 10 === 0) writeAssetInventory(invPath, buildAssetInventory(apex, assets, new Date(), candidates.length, degraded, "phase1_recon"));
     }
   };
   await Promise.all(Array.from({ length: Math.max(1, Math.min(PROBE_CONCURRENCY, candidates.length)) }, () => probeWorker()));
@@ -1853,7 +1857,7 @@ async function cmdAsr(args: string[]): Promise<void> {
   }
 
   // ⑤ persist the asset inventory (overwrite the early empty file with the scored, ranked set)
-  writeAssetInventory(invPath, buildAssetInventory(apex, assets, new Date(), candidates.length, degraded));
+  writeAssetInventory(invPath, buildAssetInventory(apex, assets, new Date(), candidates.length, degraded, "report"));
   console.log(`\nasr ${id}: ${assets.length} asset(s), ${live.length} live → ${invPath}`);
   const top = assets.filter((a) => a.alive).slice(0, 10);
   if (top.length > 0) {
@@ -1863,6 +1867,33 @@ async function cmdAsr(args: string[]): Promise<void> {
     }
   }
   console.log(`  view in the WebUI: serve → open ${id} → Assets tab`);
+
+  // Persist recon findings into the store too (they otherwise live only in asset_inventory.json). This makes them show
+  // up in the shared report renderer (`report` command / the WebUI Export → Report) AND in the project-list findings
+  // count — the SAME surfaces a web/pilot run's findings use. Recon findings are attack-surface *leads*, not
+  // control+2-replay confirmations, so they are recorded as `suspected` (the honest verdict — never hand-mark
+  // `confirmed`; the report headlines confirmed and lists suspected under "needs manual verification"). Stable ids
+  // (`asr-<host>-<category>-<i>`) make a re-scan idempotent.
+  for (const a of assets) {
+    (a.findings ?? []).forEach((f, i) => {
+      store.upsertFinding(id, {
+        id: `asr-${a.host.replace(/[^a-zA-Z0-9.-]/g, "_")}-${f.category}-${i}`,
+        screenId: null,
+        title: `[${f.category}] ${f.title}`,
+        severity: f.severity,
+        verdict: "suspected",
+        anomaly: `${a.host}: ${f.detail}`,
+        source: { kind: "validator", validatorName: "asr-recon" },
+        description: `${f.detail} (host: ${a.host}${a.status ? `, HTTP ${a.status}` : ""})`,
+        reproSteps: `Recon observation on ${a.scheme}://${a.host} — manually verify before relying on it.`,
+        evidenceIds: [],
+        scopeBasis: "authorized in-scope host (recon)",
+      });
+    });
+  }
+
+  store.setPhase(id, "report");
+  store.close();
 }
 
 // Info-level security-header audit (deterministic, no LLM). Checks each screen's response headers in an existing run

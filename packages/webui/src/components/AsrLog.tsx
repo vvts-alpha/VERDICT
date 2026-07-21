@@ -1,8 +1,6 @@
-import { useEffect, useRef } from "react";
-
 // ASR Log tab — renders the run's child output (runs/<id>/run.log, timestamped by the supervisor) with the SAME
-// .log / .logline / .log-ts / .log-msg markup + per-line-type colouring as the web diagnostic log. The fetch/count
-// live in AsrView (so the tab shows "Log (N)" like the web viewer even before it's opened); this is a pure renderer.
+// .log / .logline / .log-ts / .log-msg markup + per-line-type colouring AND ordering as the web diagnostic log
+// (newest-first). The fetch/count/300-cap live in AsrView; this is a pure renderer.
 
 export interface LogLine {
   ts: string;
@@ -45,21 +43,16 @@ export function parseLogLines(text: string): LogLine[] {
 }
 
 export function AsrLog({ lines }: { lines: LogLine[] }) {
-  const endRef = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    endRef.current?.scrollIntoView({ block: "end" });
-  }, [lines.length]);
-
   if (lines.length === 0) return <p className="muted log-empty">No activity yet.</p>;
+  const rows = [...lines].reverse(); // newest first — what's happening now on top, exactly like the web Log
   return (
     <div className="log">
-      {lines.map((l, i) => (
+      {rows.map((l, i) => (
         <div key={i} className={`logline ${l.cls}`}>
           <span className="log-ts">{l.ts}</span>
           <span className="log-msg">{l.msg}</span>
         </div>
       ))}
-      <div ref={endRef} />
     </div>
   );
 }

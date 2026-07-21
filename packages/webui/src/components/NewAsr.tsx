@@ -58,7 +58,7 @@ export function NewAsr({ onCancel }: { onCancel: () => void }) {
       <p className="mode-prompt">Map a domain's hosts (crt.sh + subfinder + optional active brute → DNS → liveness), flag recon findings, then score &amp; triage attack targets.</p>
 
       <label className="nf-field">
-        <span>Domain — wildcard or apex</span>
+        <span>Domain — e.g. example.com or *.example.com</span>
         <input value={domain} onChange={(e) => setDomain(e.target.value)} placeholder="*.example.com" autoFocus />
       </label>
       <label className="nf-field">

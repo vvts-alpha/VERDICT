@@ -58,7 +58,7 @@ body { background: var(--bg); color: var(--fg); font-size: 13px; }
 .phasepill { font-size: 10px; letter-spacing: 0.3px; color: var(--muted); background: #232831;
   border: 1px solid var(--line); padding: 2px 8px; border-radius: 9px; text-transform: lowercase; }
 .phasepill.done, .phasepill.report { color: var(--ok); border-color: #2f5b3f; }
-.phasepill.scan, .phasepill.logic, .phasepill.diagnose { color: var(--accent); border-color: #2f486b; }
+.phasepill.scan, .phasepill.logic, .phasepill.diagnose, .phasepill.phase1_recon { color: var(--accent); border-color: #2f486b; }
 .idxnew { margin-left: 12px; background: #1d3a4f; border-color: #2f6f8f; color: #cfe; }
 .idxnew:hover { background: #244a63; }
 .rolebadge { font-size: 10px; font-weight: 700; letter-spacing: 0.5px; text-transform: uppercase; padding: 2px 8px;
@@ -134,7 +134,8 @@ body { background: var(--bg); color: var(--fg); font-size: 13px; }
 .statusbar .brand { font-weight: 700; letter-spacing: 1px; color: var(--accent); text-decoration: none; cursor: pointer; }
 .statusbar a.brand:hover { text-decoration: underline; }
 .statusbar b { color: #fff; }
-.statusbar .conn { margin-left: auto; color: var(--muted); }
+.statusbar .sb-spacer { margin-left: auto; } /* pushes the trailing controls group (pause·export·sign out·conn) right */
+.statusbar .conn { color: var(--muted); }
 .statusbar .conn.open { color: var(--ok); }
 .statusbar .conn.connecting { color: var(--warn); }
 .statusbar .conn.closed { color: var(--err); }
@@ -252,7 +253,7 @@ table.kv th { color: var(--muted); font-weight: 500; }
 
 button { font-family: inherit; font-size: 12px; cursor: pointer; background: #2b3340; color: var(--fg); border: 1px solid var(--line); border-radius: 4px; padding: 3px 10px; }
 button:hover { background: #353d4a; }
-.statusbar .pausebtn { margin-left: auto; }
+.statusbar .pausebtn { /* right-alignment now handled by .sb-spacer, so the group stays together with or without a pause button */ }
 .statusbar .conn { margin-left: 12px; }
 .detail .pane-title .excludebtn { float: right; margin-right: 12px; }
 
@@ -327,11 +328,34 @@ button:hover { background: #353d4a; }
 .asr-finding-host { font-size: 12px; color: var(--accent); }
 .asr-finding-d { font-size: 12px; color: var(--muted); font-family: ui-monospace, monospace; word-break: break-word; }
 .sev { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.3px; border: 1px solid; border-radius: 999px; padding: 0 6px; }
-.asr-ai { background: #171326; border: 1px solid #2e2350; border-radius: 8px; padding: 10px 12px; }
-.asr-ai-h { font-size: 12px; color: #a78bfa; font-weight: 700; margin-bottom: 5px; }
+.asr-ai { background: color-mix(in srgb, var(--accent) 6%, var(--panel)); border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent); border-radius: 8px; padding: 10px 12px; }
+.asr-ai-h { font-size: 12px; color: var(--accent); font-weight: 700; margin-bottom: 5px; }
 .asr-ai-r { font-size: 12.5px; color: var(--muted); margin-bottom: 5px; }
 .asr-ai-a { font-size: 12.5px; color: var(--fg); }
-.asr-ai-a b { color: #a78bfa; }
+.asr-ai-a b { color: var(--accent); }
+
+/* Assets table (the sortable host list) — same ink/line tokens as the rest of the UI, no bespoke palette */
+.asr-table-wrap { overflow-x: auto; padding: 4px 2px 2rem; }
+.asr-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.asr-table thead th { position: sticky; top: 0; background: var(--bg); text-align: left; padding: 7px 10px; color: var(--muted); font-weight: 600; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.asr-table th.sortable { cursor: pointer; user-select: none; }
+.asr-table th.sortable:hover { color: var(--fg); }
+.asr-table th.sorted { color: var(--accent); }
+.asr-table .sortarrow { font-size: 10px; }
+.asr-table tbody td { padding: 6px 10px; border-bottom: 1px solid color-mix(in srgb, var(--line) 60%, transparent); white-space: nowrap; }
+.asr-table tbody tr { cursor: pointer; }
+.asr-table tbody tr:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.asr-table tbody tr.sel { background: color-mix(in srgb, var(--accent) 15%, transparent); }
+.asr-table td.host { color: var(--fg); font-weight: 600; }
+.asr-table tbody tr.dead td.host { color: var(--muted); font-weight: 400; }
+.asr-table td.num { text-align: right; }
+
+/* band badge (shared by the Assets table; same colours as the Findings severity pills) */
+.bandpill { font-size: 10px; font-weight: 700; letter-spacing: 0.4px; text-transform: uppercase; padding: 1px 7px; border-radius: 8px; border: 1px solid transparent; }
+.bandpill.band-critical { color: #fff; background: #c0392b; }
+.bandpill.band-high { color: #2a0d10; background: var(--err); }
+.bandpill.band-medium { color: #2a1e08; background: var(--warn); }
+.bandpill.band-low { color: var(--muted); background: #232831; border-color: var(--line); }
 
 /* 進捗バー(global, run の現在地) */
 .progress { padding: 6px 14px; border-bottom: 1px solid var(--line); background: var(--panel); }
