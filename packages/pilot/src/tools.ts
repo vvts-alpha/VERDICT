@@ -290,12 +290,12 @@ export const BUSINESS_LOGIC_CATEGORIES = new Set<string>(["price-tampering", "qt
  *  Business logic (probe_logic/probe_scenario) + reflected XSS (unescaped reflection) + open-redirect (Location is the OOB). */
 export const MARKER_BASED_CATEGORIES = new Set<string>([...BUSINESS_LOGIC_CATEGORIES, "xss-reflected", "xss-stored", "open-redirect", "ssti", "secret-exposure", "user-enumeration", "race-condition", "account-takeover"]);
 
-/** Categories that don't allow verdict:"suspected". Two reasons to exclude: (1) low-value hygiene classes that just add noise
- *  (rate-limit/headers/info-disclosure/misconfig — were being mass-produced as "suspected"); (2) MARKER-PROVABLE classes where a
- *  "suspected" is really an untested hypothesis. XSS is confirmed via reflectionIsLive (inject the payload → it reflects UNESCAPED
- *  in a live HTML context or it doesn't), so a field-name guess ("this field carries raw HTML") or a "sibling was confirmed" claim
- *  is not a lead: drive probe_stored_xss/probe_dom_xss to the actual render sink and confirm, else mark the class tested-clean /
- *  not-applicable. All of these are confirmed-or-skip only. */
+/** Categories that don't allow verdict:"suspected". Two reasons: (1) low-value hygiene classes that just add noise
+ *  (rate-limit/headers/info-disclosure/misconfig — were being mass-produced as "suspected"); (2) XSS, where even the general
+ *  substance gate (an observation that DIFFERS from a control) can't discriminate: an injected marker reflects whether it is
+ *  ESCAPED (not XSS) or LIVE (confirmable via reflectionIsLive → record confirmed), so there is no honest "suspected" state
+ *  between them — a field-name guess or a "sibling was confirmed" claim is a hypothesis. Drive probe_stored_xss/probe_dom_xss
+ *  to the render sink and confirm, else mark the class tested-clean / not-applicable. All of these are confirmed-or-skip only. */
 export const SUSPECT_EXCLUDED_CATEGORIES = new Set<string>(["rate-limit", "headers", "info-disclosure", "misconfig", "xss-reflected", "xss-stored"]);
 
 /** probe_paths' "simple directory list" = a curated wordlist for hitting unlinked endpoints.
@@ -416,6 +416,15 @@ export function idBearingParamLocs(params: ReadonlyArray<Param>): Array<{ name: 
     out.push({ name: p.name, example: p.example, loc });
   }
   return out;
+}
+
+/** Substance check for a SUSPECTED lead (the ①-core of the suspected gate): did the cited observation actually SHOW an
+ *  anomaly, or is it just the endpoint's shape? True iff the observation measurably DIFFERS from a cited control — a
+ *  status flip, a >64-byte length delta, or an effectMarker that appears ONLY in the observation. A structural lead (a
+ *  client-controlled id, a field name, "no positive evidence obtained") produces no such differential, so it fails. */
+export function observationDiffersFromControl(ctrl: { status: number; body: string } | undefined, obs: { status: number; body: string }, marker?: string): boolean {
+  if (!ctrl) return false;
+  return ctrl.status !== obs.status || Math.abs(ctrl.body.length - obs.body.length) > 64 || (!!marker && obs.body.includes(marker) && !ctrl.body.includes(marker));
 }
 
 /** A safe marker that never attempts external reachability (for open-redirect / reflection detection; a non-resolving domain). */
@@ -2894,7 +2903,7 @@ export function buildTools(s: PilotSession) {
     ),
     tool(
       "record_finding",
-      "Record a vulnerability at one of TWO confidence tiers. verdict='confirmed' (default) requires evidence discipline: ONE `negativeControl` evidenceId (the bug absent, should FAIL) + >=2 `positiveReplays` evidenceIds (the bug reproduced, stable, distinguishable from the control). verdict='suspected' is for a real LEAD you cannot yet fully prove (e.g. a likely IDOR you can't confirm without a second account, or an upload you couldn't deliver): it needs ONE cited `observation` evidenceId + a concrete `anomaly` (>=40 chars: what you saw + why it's a lead). Suspected NEVER counts in the confirmed total — it surfaces the lead for manual verification, and is auto-upgraded to confirmed if you later prove it. Pick the canonical `category`; pass the vulnerable `endpoint` (e.g. /orders/{id}) and `param` — findings DEDUPE by (category, endpoint, param). Prefer suspected over silently dropping a screen as clean when you saw something off.",
+      "Record a vulnerability at one of TWO confidence tiers. verdict='confirmed' (default) requires evidence discipline: ONE `negativeControl` evidenceId (the bug absent, should FAIL) + >=2 `positiveReplays` evidenceIds (the bug reproduced, stable, distinguishable from the control). verdict='suspected' is for a real LEAD you cannot yet fully prove (e.g. a likely IDOR you can't confirm without a second account): it needs a concrete `anomaly` (>=40 chars: what you saw + why it's a lead) AND an OBSERVED anomaly in evidence — either a `negativeControl` + an `observation` evidenceId that measurably DIFFER (a status flip / >64B length delta / an effectMarker only in the observation), or an `observation` that carries a concrete impact (leaked secret / cross-user data / command output). A structural shape alone (a client-controlled id, a field name, an admin-ish path, 'no positive evidence obtained') is NOT a lead and is rejected. Suspected NEVER counts in the confirmed total — it surfaces the lead for manual verification, and is auto-upgraded to confirmed if you later prove it. Pick the canonical `category`; pass the vulnerable `endpoint` (e.g. /orders/{id}) and `param` — findings DEDUPE by (category, endpoint, param). Prefer suspected over silently dropping a screen as clean when you saw something off.",
       {
         title: z.string(),
         severity: z.enum(["info", "low", "medium", "high", "critical"]),
@@ -2982,7 +2991,24 @@ export function buildTools(s: PilotSession) {
             return txt(`REJECTED: a suspected finding requires ONE cited 'observation' evidenceId from a probe/http_request THIS run (the single observed anomaly).`);
           if (!anomaly || anomaly.trim().length < 40)
             return txt(`REJECTED: a suspected finding requires a concrete 'anomaly' (>=40 chars): WHAT you observed and WHY it is a lead (e.g. "GET /orders/8123 returned a populated object for an id this session was never authorized to list, while /orders/999999 returned the blank template").`);
-          return txt(commit("suspected", [observation], anomaly.trim()));
+          // ── SUBSTANCE (A) ── the cited observation must SHOW an anomaly, not merely exist. Either (a) it DIFFERS from a
+          //    cited negativeControl (a clean baseline — a non-existent id / benign input), or (b) it carries a concrete
+          //    impact the oracle sees (leaked secret / cross-user data / command output). A structural shape (a client-
+          //    controlled id, a field name, an admin-ish path, "no positive evidence obtained") yields NEITHER → rejected.
+          //    vulnerable-component is exempt: a version banner is proven by IDENTIFICATION, not a differential (its own
+          //    High/Critical-CVE gate above is the substance check).
+          const obsRec = s.evidence.records.find((r) => r.id === observation)!;
+          const ctrlRec = negativeControl ? s.evidence.records.find((r) => r.id === negativeControl) : undefined;
+          if (category !== "vulnerable-component") {
+            const differs = observationDiffersFromControl(ctrlRec ? { status: ctrlRec.response.status, body: ctrlRec.response.body } : undefined, { status: obsRec.response.status, body: obsRec.response.body }, effectMarker);
+            const carriesImpact = impactOracle(obsRec.response.body).length > 0;
+            if (!differs && !carriesImpact)
+              return txt(
+                `REJECTED (no observed anomaly): observation ${observation} demonstrates nothing on its own — it neither DIFFERS from a cited 'negativeControl' (a clean baseline: a non-existent id / benign input) nor carries a concrete impact (leaked secret / cross-user data / command output) the oracle can see. A suspected lead needs an anomaly you OBSERVED, not the endpoint's shape (a client-controlled id, a field name, an admin-ish path). Cite a 'negativeControl' the observation visibly differs from (a status flip / >64B length delta / an 'effectMarker' present only in the observation), or an observation that carries a real impact — or confirm it outright (control + 2 replays). If the effect is genuinely out-of-band (nothing observable in-band), mark the class tested with that note instead of filing a suspected finding.`,
+              );
+          }
+          const suspectEv = ctrlRec ? [negativeControl!, observation] : [observation];
+          return txt(commit("suspected", suspectEv, anomaly.trim()));
         }
 
         // ── CONFIRMED 経路 ── schema を optional 化したので、まず存在を手で強制(その後は従来どおり)。
@@ -3531,7 +3557,7 @@ export function buildTools(s: PilotSession) {
             );
           const known = knownObjectIds(s);
           const victimsFor = (name: string): string[] => known.filter((k) => k.startsWith(`${name}=`)).map((k) => k.slice(name.length + 1)).slice(0, 4);
-          const swept: Array<{ param: string; via: string; tried: string[]; populated: Array<{ id: string; evId: string; status: number }> }> = [];
+          const swept: Array<{ param: string; via: string; control?: string; tried: string[]; populated: Array<{ id: string; evId: string; status: number }> }> = [];
           for (const f of fields) {
             const self = f.example;
             const victims = [...(victimId ? [victimId] : []), ...victimsFor(f.name)];
@@ -3565,16 +3591,17 @@ export function buildTools(s: PilotSession) {
                 );
               if (r.p1.status < 400 && Math.abs(r.p1.len - ctrl.len) > 64) populated.push({ id: vid, evId: r.p1.evId, status: r.p1.status });
             }
-            swept.push({ param: f.name, via: f.loc.via, tried: candidates, populated });
+            swept.push({ param: f.name, via: f.loc.via, control: ctrl.evId, tried: candidates, populated });
           }
           const anyPopulated = swept.filter((x) => x.populated.length > 0);
+          const lead = anyPopulated[0];
           return txt(
             JSON.stringify({
               mode: "sweep",
               sweptFields: swept.map((x) => `${x.param}(${x.via})`),
               observed: swept,
-              verdict: anyPopulated.length
-                ? `not auto-confirmed, but ${anyPopulated.length} id field(s) (${anyPopulated.map((x) => x.param).join(", ")}) returned a POPULATED object for a neighbour id while a non-existent id was denied — a real cross-user anomaly whose ownership couldn't be auto-proven. If plausibly another user's object, record verdict:"suspected" citing one of these evidenceIds (${anyPopulated.flatMap((x) => x.populated.map((p) => p.evId)).slice(0, 3).join(", ")}); or log in as a second role for a real victim id and re-run.`
+              verdict: lead
+                ? `not auto-confirmed, but ${anyPopulated.length} id field(s) (${anyPopulated.map((x) => x.param).join(", ")}) returned a POPULATED object for a neighbour id while a non-existent id was denied — a real cross-user anomaly whose ownership couldn't be auto-proven. If plausibly another user's object, record verdict:"suspected" with negativeControl:"${lead.control}" + observation:"${lead.populated[0]!.evId}" (that control-vs-observation pair IS the observed differential the suspected gate requires); or log in as a second role for a real victim id and re-run.`
                 : `CLEAN (id-scoping holds): swept ${swept.length} id-bearing field(s) [${swept.map((x) => `${x.param}(${x.via})`).join(", ")}] with neighbour + known-object ids; none returned another user's object and non-existent controls were denied. Mark idor tested-clean for this screen.`,
             }),
           );

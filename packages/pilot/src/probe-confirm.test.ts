@@ -1,7 +1,7 @@
 // #2 The pure part of the confirmation tools: JWT alg:none forgery + marker-based category routing.
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { forgeAlgNone, MARKER_BASED_CATEGORIES, BUSINESS_LOGIC_CATEGORIES, SUSPECT_EXCLUDED_CATEGORIES, normalizeSeverity, checkLogicEvidence } from "./tools.js";
+import { forgeAlgNone, MARKER_BASED_CATEGORIES, BUSINESS_LOGIC_CATEGORIES, SUSPECT_EXCLUDED_CATEGORIES, normalizeSeverity, checkLogicEvidence, observationDiffersFromControl } from "./tools.js";
 
 const b64url = (o: unknown): string =>
   Buffer.from(JSON.stringify(o), "utf8").toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
@@ -80,4 +80,26 @@ test("ssti routes through marker-based confirmation (eval-result marker)", () =>
   assert.equal(checkLogicEvidence(lr(200, false), [lr(200, true), lr(200, true)]).ok, true);
   // literal echo only (payload reflected but NOT evaluated → product absent) → not confirmed.
   assert.equal(checkLogicEvidence(lr(200, false), [lr(200, false), lr(200, false)]).ok, false);
+});
+
+// ── SUSPECTED substance gate (A): a lead must show an OBSERVED anomaly (a control-vs-observation differential),
+//    not the endpoint's shape. This is what rejects "no positive evidence obtained" structural leads.
+test("observationDiffersFromControl: a status flip / >64B length delta / marker-only-in-observation = a real anomaly", () => {
+  const body = (n: number) => "x".repeat(n);
+  // status flip (control denied, observation populated) → differs.
+  assert.equal(observationDiffersFromControl({ status: 404, body: body(20) }, { status: 200, body: body(20) }), true);
+  // same status, >64-byte length delta (blank template vs populated object) → differs.
+  assert.equal(observationDiffersFromControl({ status: 200, body: body(10) }, { status: 200, body: body(200) }), true);
+  // an effectMarker present only in the observation → differs.
+  assert.equal(observationDiffersFromControl({ status: 200, body: "clean" }, { status: 200, body: "clean victim@corp.com" }, "victim@corp.com"), true);
+});
+
+test("observationDiffersFromControl: no control, or an identical/near-identical response = NO anomaly (structural lead rejected)", () => {
+  const body = (n: number) => "x".repeat(n);
+  // no control cited at all → can't be a differential (must carry an impact instead, checked separately) → false.
+  assert.equal(observationDiffersFromControl(undefined, { status: 200, body: body(100) }), false);
+  // same status, <=64-byte delta, no distinguishing marker → the shape looks the same → false.
+  assert.equal(observationDiffersFromControl({ status: 200, body: body(100) }, { status: 200, body: body(140) }), false);
+  // a marker that appears in BOTH control and observation is not distinguishing → false.
+  assert.equal(observationDiffersFromControl({ status: 200, body: "id=5 ok" }, { status: 200, body: "id=6 ok" }, "ok"), false);
 });
