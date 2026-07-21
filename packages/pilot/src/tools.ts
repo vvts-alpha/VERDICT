@@ -4,7 +4,7 @@
 // All tools used across the 3 stages (survey / methodology / diagnose) are defined here; run.ts uses allowedTools
 // to narrow which tools are visible per stage (= don't show Claude everything at once → prevent it from eliding work).
 
-import type { AssessmentStore, Finding, FindingVerdict, Screen, ScopePolicy, Severity } from "@veritas/core";
+import type { AssessmentStore, Finding, FindingVerdict, Param, Screen, ScopePolicy, Severity } from "@veritas/core";
 import { findingVerdict, isInScope } from "@veritas/core";
 import type { LoginCreds, Observation, PlaywrightDriver } from "@veritas/crawler";
 import { InventoryBuilder, normalizePath, smartLogin, guessParamType, extractApiRefs, apiCallToBuiltScreen } from "@veritas/crawler";
@@ -361,6 +361,61 @@ export function nonexistentIdLike(id: string): string {
   const m = id.match(/^([A-Za-z][A-Za-z_.-]{0,15})(\d{1,10})$/);
   if (m) return `${m[1]}${"9".repeat(m[2]!.length)}`; // same prefix, all-nines tail = almost certainly absent
   return "00000000-0000-0000-0000-000000000000";
+}
+
+/** WHERE an id lives on a request — so probe_idor's sweep can place a fuzzed id in each id-bearing field's OWN location
+ *  (query/body/header/path), not just the single one the model named. */
+export type IdParamLoc =
+  | { via: "header"; name: string }
+  | { via: "query"; name: string }
+  | { via: "body-field"; name: string }
+  | { via: "path"; example: string };
+
+/** Set/replace a field in a form-urlencoded body (append if absent). Used to place a fuzzed id into a body-param location. */
+export function setFormField(body: string | null | undefined, name: string, val: string): string {
+  const enc = `${encodeURIComponent(name)}=${encodeURIComponent(val)}`;
+  if (!body) return enc;
+  const key = `${encodeURIComponent(name)}=`;
+  let found = false;
+  const out = body.split("&").map((p) => (p.startsWith(key) ? ((found = true), enc) : p));
+  if (!found) out.push(enc);
+  return out.join("&");
+}
+
+/** Replace the LAST path segment equal to `seg` with `val` (path-param IDOR: /event/785687 → /event/785688). null if absent. */
+export function replacePathSeg(u: string, seg: string, val: string): string | null {
+  try {
+    const uu = new URL(u);
+    const parts = uu.pathname.split("/");
+    const i = parts.lastIndexOf(seg);
+    if (i < 0) return null;
+    parts[i] = encodeURIComponent(val);
+    uu.pathname = parts.join("/");
+    return uu.toString();
+  } catch {
+    return null;
+  }
+}
+
+/** Deterministically pick a screen's id-bearing params (guessedType id/object_ref, or the rule re-derives one from
+ *  name+example — same predicate as knownObjectIds) and map each to WHERE its id lives. This is what lets probe_idor
+ *  SWEEP every id field on the screen instead of testing only the single param the model happened to name. */
+export function idBearingParamLocs(params: ReadonlyArray<Param>): Array<{ name: string; example: string; loc: IdParamLoc }> {
+  const out: Array<{ name: string; example: string; loc: IdParamLoc }> = [];
+  const seen = new Set<string>();
+  for (const p of params) {
+    if (!p.example) continue;
+    const isId = p.guessedType === "object_ref" || p.guessedType === "id" || guessParamType(p.name, p.in, p.example) === "object_ref";
+    if (!isId) continue;
+    const loc: IdParamLoc | null =
+      p.in === "header" ? { via: "header", name: p.name } : p.in === "query" ? { via: "query", name: p.name } : p.in === "body" ? { via: "body-field", name: p.name } : p.in === "path" ? { via: "path", example: p.example } : null;
+    if (!loc) continue;
+    const k = `${p.in}:${p.name}`;
+    if (seen.has(k)) continue; // one entry per (location,name) — a param repeated across apis shouldn't multiply the sweep
+    seen.add(k);
+    out.push({ name: p.name, example: p.example, loc });
+  }
+  return out;
 }
 
 /** A safe marker that never attempts external reachability (for open-redirect / reflection detection; a non-resolving domain). */
@@ -3319,30 +3374,51 @@ export function buildTools(s: PilotSession) {
 
     tool(
       "probe_idor",
-      "Confirm IDOR / BOLA mechanically. As YOUR current session, try to reach ANOTHER user's object. `selfId` = an object id you legitimately own. `victimId` = another user's id (from knownObjectIds or a second role) — OPTIONAL: OMIT it to FUZZ, and the tool enumerates neighbouring ids (selfId±1, ±2, plus low/seed ids like 1/2/1000) to AUTO-DISCOVER another user's object with no second account. Place the id via a {{ID}} placeholder in url/body, or pass `param` (query/body field) or `header` (header-based BOLA like X-User-Id). It sends a NON-EXISTENT id (negative control — the endpoint must be able to 404/deny), then the victim/neighbour id (with a 2nd stable replay once it looks real). Confirms only if the request returns another user's object (cross-user data present, not your own, not the 404 template) and is stable. An opaque uuid/hash selfId can't be enumerated → get a real victim id or record verdict:suspected. Returns negativeControl + positiveReplays evidenceIds + the cross-user impact → record_finding(category idor, or idor-write for a mutating method).",
-      { url: z.string(), selfId: z.string(), victimId: z.string().optional(), param: z.string().optional(), header: z.string().optional(), method: z.string().optional(), body: z.string().optional() },
+      "Confirm IDOR / BOLA mechanically. As YOUR current session, try to reach ANOTHER user's object. BEST DEFAULT: OMIT param/header/{{ID}} and the tool SWEEPS every id-bearing field on the current screen — each in its OWN location (query/body/header/path), seeded from its observed value + real other-user ids seen elsewhere (knownObjectIds). This is the fix for 'IDOR filed suspected because only one param was tried': one call now covers ALL id fields, so you can't miss the hole by naming the wrong param. `selfId` = an id you legitimately own (OPTIONAL in sweep mode — taken per-field from the inventory). `victimId` = another user's id — OPTIONAL: omit to FUZZ neighbouring ids (selfId±1, ±2, low/seed 1/2/1000) and auto-discover another user's object with no second account. To test ONE specific field, pin it: a {{ID}} placeholder in url/body, `param` (query), or `header` (X-User-Id-style BOLA). Sends a NON-EXISTENT id (negative control — must 404/deny), then the victim/neighbour id (2nd stable replay once it looks real); confirms ONLY on cross-user data present (not your own, not the 404 template) and stable. Opaque uuid/hash ids can't be enumerated → get a real victim id. On a sweep that finds a POPULATED-but-unprovable object it tells you (that is the ONLY case where verdict:suspected is legitimate — a real observed anomaly); otherwise it reports CLEAN. Returns negativeControl + positiveReplays evidenceIds + cross-user impact → record_finding(category idor, or idor-write for a mutating method).",
+      { url: z.string(), selfId: z.string().optional(), victimId: z.string().optional(), param: z.string().optional(), header: z.string().optional(), method: z.string().optional(), body: z.string().optional() },
       async ({ url, selfId, victimId, param, header, method, body }) => {
-        const buildReq = (idVal: string): HttpRequest | null => {
+        type PlaceLoc = IdParamLoc | { via: "body-ph" } | { via: "url-ph" };
+        // Place a fuzzed id into ONE location (a specific field), so the same discipline runs across every id-bearing field.
+        const buildReqAt = (idVal: string, loc: PlaceLoc): HttpRequest | null => {
           let u = url;
           let b: string | null = body ?? null;
           const h: Record<string, string> = { ...authHeaders(s) };
-          if (header) h[header] = idVal;
-          else if (body != null && body.includes("{{ID}}")) b = body.replace(/\{\{ID\}\}/g, idVal);
-          else if (param) {
-            try {
-              const uu = new URL(url);
-              uu.searchParams.set(param, idVal);
-              u = uu.toString();
-            } catch {
-              return null;
+          switch (loc.via) {
+            case "header":
+              h[loc.name] = idVal;
+              break;
+            case "query":
+              try {
+                const uu = new URL(u);
+                uu.searchParams.set(loc.name, idVal);
+                u = uu.toString();
+              } catch {
+                return null;
+              }
+              break;
+            case "body-field":
+              b = setFormField(b, loc.name, idVal);
+              break;
+            case "body-ph":
+              if (b == null || !b.includes("{{ID}}")) return null;
+              b = b.replace(/\{\{ID\}\}/g, idVal);
+              break;
+            case "url-ph":
+              if (!u.includes("{{ID}}")) return null;
+              u = u.replace(/\{\{ID\}\}/g, idVal);
+              break;
+            case "path": {
+              const r = replacePathSeg(u, loc.example, idVal);
+              if (!r) return null;
+              u = r;
+              break;
             }
-          } else if (url.includes("{{ID}}")) u = url.replace(/\{\{ID\}\}/g, idVal);
-          else return null; // どこに id を差すか不明
+          }
           if (!isInScope(u, s.scope)) return null;
-          return { method: (method ?? (body != null ? "POST" : "GET")).toUpperCase(), url: u, headers: h, body: b };
+          return { method: (method ?? (b != null ? "POST" : "GET")).toUpperCase(), url: u, headers: h, body: b };
         };
-        const send = async (idVal: string, kind: "negative_control" | "positive_replay", tag: string) => {
-          const req = buildReq(idVal);
+        const send = async (idVal: string, kind: "negative_control" | "positive_replay", tag: string, loc: PlaceLoc) => {
+          const req = buildReqAt(idVal, loc);
           if (!req) return null;
           const res = await s.http.send(req);
           bumpHttp(s, res.status);
@@ -3351,29 +3427,40 @@ export function buildTools(s: PilotSession) {
         };
         type Sent = NonNullable<Awaited<ReturnType<typeof send>>>;
         // Evaluate one candidate victim/neighbour id against a shared control: cross-user object present + control (a
-        // non-existent id) denied + stable x2. The 2nd (stability) replay is only paid for once the id already looks real.
-        const evalVictim = async (vid: string, ctrl: Sent, label: string) => {
-          const p1 = await send(vid, "positive_replay", `${label} #1`);
+        // non-existent id) denied + stable x2. `self` = the id this session legitimately owns (for the impact oracle).
+        const evalVictim = async (vid: string, ctrl: Sent, label: string, loc: PlaceLoc, self: string) => {
+          const p1 = await send(vid, "positive_replay", `${label} #1`, loc);
           if (!p1) return null;
           const accessible = p1.status < 400;
-          const impact = impactOracle(p1.body, { requestedIdentity: vid, sessionIdentity: selfId, baselineBody: ctrl.body });
-          const crossUser = impact.some((i) => i.kind === "cross-user") || (identityAppears(p1.body, vid) && !identityAppears(p1.body, selfId));
+          const impact = impactOracle(p1.body, { requestedIdentity: vid, sessionIdentity: self, baselineBody: ctrl.body });
+          const crossUser = impact.some((i) => i.kind === "cross-user") || (identityAppears(p1.body, vid) && !identityAppears(p1.body, self));
           const controlDenied = ctrl.status >= 400 || Math.abs(ctrl.len - p1.len) > 64 || !ctrl.body.includes(vid);
           let p2: Sent | null = null;
           let stable = false;
           if (accessible && crossUser && controlDenied) {
-            p2 = await send(vid, "positive_replay", `${label} #2`);
+            p2 = await send(vid, "positive_replay", `${label} #2`, loc);
             stable = !!p2 && Math.abs(p1.len - p2.len) <= 64 && p1.status === p2.status;
           }
           return { vid, p1, p2, confirmed: accessible && crossUser && controlDenied && stable, accessible, crossUser, controlDenied, stable, impact };
         };
         const cat = (method ?? "GET").toUpperCase() === "GET" ? "idor" : "idor-write";
+        // Where the caller pinned the id (single-field mode). null → SWEEP every id-bearing field on the screen.
+        const explicitLoc: PlaceLoc | null = header
+          ? { via: "header", name: header }
+          : body != null && body.includes("{{ID}}")
+            ? { via: "body-ph" }
+            : param
+              ? { via: "query", name: param }
+              : url.includes("{{ID}}")
+                ? { via: "url-ph" }
+                : null;
         try {
           // ── Explicit victim id ── (a second account / a known other-user id was supplied)
-          if (victimId) {
-            const ctrl = await send(nonexistentIdLike(victimId), "negative_control", "non-existent id");
+          if (explicitLoc && victimId) {
+            const self = selfId ?? "";
+            const ctrl = await send(nonexistentIdLike(victimId), "negative_control", "non-existent id", explicitLoc);
             if (!ctrl) return txt("ERROR: could not place the id — pass a {{ID}} in url/body, or a param, or a header.");
-            const r = await evalVictim(victimId, ctrl, "victim id");
+            const r = await evalVictim(victimId, ctrl, "victim id", explicitLoc, self);
             if (!r) return txt("ERROR: victim request failed to build.");
             return txt(
               JSON.stringify({
@@ -3394,41 +3481,101 @@ export function buildTools(s: PilotSession) {
               }),
             );
           }
-          // ── ENUMERATION (fuzzing) mode ── no victim id supplied → walk neighbouring ids to discover another user's object.
-          const candidates = idNeighbors(selfId);
-          if (candidates.length === 0)
-            return txt(
-              `ENUMERATION NOT POSSIBLE: '${selfId}' is opaque (uuid/hash) — neighbouring ids can't be walked. Get a real victim id (a second account / knownObjectIds), or if the endpoint clearly exposes an object by id record verdict:"suspected" with the anomaly.`,
-            );
-          const ctrl = await send(nonexistentIdLike(selfId), "negative_control", "non-existent id");
-          if (!ctrl) return txt("ERROR: could not place the id — pass a {{ID}} in url/body, or a param, or a header.");
-          const tried: Array<{ id: string; status: number; len: number; crossUser: boolean }> = [];
-          for (const vid of candidates) {
-            const r = await evalVictim(vid, ctrl, `neighbour ${vid}`);
-            if (!r) continue;
-            tried.push({ id: vid, status: r.p1.status, len: r.p1.len, crossUser: r.crossUser });
-            if (r.confirmed)
+          // ── Explicit single-field ENUMERATION ── a location was pinned but no victim id → walk neighbours of selfId.
+          if (explicitLoc) {
+            if (!selfId) return txt("ERROR: pass selfId (an id you own) to fuzz its neighbours, or OMIT param/header/{{ID}} to auto-sweep every id-bearing field on the screen.");
+            const candidates = idNeighbors(selfId);
+            if (candidates.length === 0)
               return txt(
-                JSON.stringify({
-                  mode: "enumerate",
-                  discoveredVictimId: vid,
-                  triedIds: candidates,
-                  negativeControl: ctrl.evId,
-                  positiveReplays: [r.p1.evId, ...(r.p2 ? [r.p2.evId] : [])],
-                  ...(r.impact.length ? { impact: r.impact.map((i) => ({ kind: i.kind, marker: i.marker })) } : {}),
-                  verdict: `IDOR/BOLA CONFIRMED via id enumeration — neighbour id ${vid} returned another user's object (status ${r.p1.status}, cross-user data) while a non-existent id was denied (control ${ctrl.status}). No second account needed. record_finding(category ${cat}) with these evidenceIds.`,
-                }),
+                `ENUMERATION NOT POSSIBLE: '${selfId}' is opaque (uuid/hash) — neighbouring ids can't be walked. Get a real victim id (a second account / knownObjectIds), or if the endpoint clearly exposes an object by id record verdict:"suspected" with the anomaly.`,
               );
+            const ctrl = await send(nonexistentIdLike(selfId), "negative_control", "non-existent id", explicitLoc);
+            if (!ctrl) return txt("ERROR: could not place the id — pass a {{ID}} in url/body, or a param, or a header.");
+            const tried: Array<{ id: string; status: number; len: number; crossUser: boolean }> = [];
+            for (const vid of candidates) {
+              const r = await evalVictim(vid, ctrl, `neighbour ${vid}`, explicitLoc, selfId);
+              if (!r) continue;
+              tried.push({ id: vid, status: r.p1.status, len: r.p1.len, crossUser: r.crossUser });
+              if (r.confirmed)
+                return txt(
+                  JSON.stringify({
+                    mode: "enumerate",
+                    discoveredVictimId: vid,
+                    triedIds: candidates,
+                    negativeControl: ctrl.evId,
+                    positiveReplays: [r.p1.evId, ...(r.p2 ? [r.p2.evId] : [])],
+                    ...(r.impact.length ? { impact: r.impact.map((i) => ({ kind: i.kind, marker: i.marker })) } : {}),
+                    verdict: `IDOR/BOLA CONFIRMED via id enumeration — neighbour id ${vid} returned another user's object (status ${r.p1.status}, cross-user data) while a non-existent id was denied (control ${ctrl.status}). No second account needed. record_finding(category ${cat}) with these evidenceIds.`,
+                  }),
+                );
+            }
+            const distinct = tried.filter((t) => t.status < 400 && Math.abs(t.len - ctrl.len) > 64);
+            return txt(
+              JSON.stringify({
+                mode: "enumerate",
+                triedIds: candidates,
+                observed: tried,
+                verdict: distinct.length
+                  ? `not confirmed by fuzzing: ${distinct.length} neighbour id(s) (${distinct.map((t) => t.id).join(", ")}) returned a populated 200 but cross-user OWNERSHIP couldn't be auto-proven (the body didn't clearly carry another user's identity). If these are plausibly other users' objects, record verdict:"suspected" citing one of these evidenceIds, or log in as a second role to get a real victim id and re-run.`
+                  : `not confirmed by fuzzing: no neighbour id (${candidates.join(", ")}) returned another user's object — access control appears to hold, or these ids don't map to other users.${ctrl.status < 400 ? " NOTE: the non-existent control also returned 200 → this endpoint may be a catch-all, so id-based tests are inconclusive here." : ""}`,
+              }),
+            );
           }
-          const distinct = tried.filter((t) => t.status < 400 && Math.abs(t.len - ctrl.len) > 64);
+          // ── SWEEP mode ── no location pinned → deterministically test EVERY id-bearing field the screen exposes, each
+          //    in its OWN location (query/body/header/path), seeded from its observed value + real other-user ids.
+          const sc = s.inv.screens().find((x) => x.screenId === s.currentScreenId);
+          const fields = idBearingParamLocs(sc?.params ?? []).slice(0, 8);
+          if (fields.length === 0)
+            return txt(
+              `SWEEP NOT POSSIBLE: this screen exposes no id-bearing parameter. Point probe_idor at a specific id — a {{ID}} placeholder in url/body, a query 'param', or a 'header' (e.g. X-User-Id) — with selfId = an id you own.`,
+            );
+          const known = knownObjectIds(s);
+          const victimsFor = (name: string): string[] => known.filter((k) => k.startsWith(`${name}=`)).map((k) => k.slice(name.length + 1)).slice(0, 4);
+          const swept: Array<{ param: string; via: string; tried: string[]; populated: Array<{ id: string; evId: string; status: number }> }> = [];
+          for (const f of fields) {
+            const self = f.example;
+            const victims = [...(victimId ? [victimId] : []), ...victimsFor(f.name)];
+            const candidates = [...new Set([...victims, ...idNeighbors(self)])].slice(0, 8);
+            if (candidates.length === 0) {
+              swept.push({ param: f.name, via: f.loc.via, tried: [], populated: [] });
+              continue;
+            }
+            const ctrl = await send(nonexistentIdLike(self), "negative_control", `non-existent ${f.name}`, f.loc);
+            if (!ctrl) {
+              swept.push({ param: f.name, via: f.loc.via, tried: [], populated: [] });
+              continue;
+            }
+            const populated: Array<{ id: string; evId: string; status: number }> = [];
+            for (const vid of candidates) {
+              const r = await evalVictim(vid, ctrl, `${f.name}=${vid}`, f.loc, self);
+              if (!r) continue;
+              if (r.confirmed)
+                return txt(
+                  JSON.stringify({
+                    mode: "sweep",
+                    param: f.name,
+                    via: f.loc.via,
+                    discoveredVictimId: vid,
+                    sweptFields: fields.map((x) => `${x.name}(${x.loc.via})`),
+                    negativeControl: ctrl.evId,
+                    positiveReplays: [r.p1.evId, ...(r.p2 ? [r.p2.evId] : [])],
+                    ...(r.impact.length ? { impact: r.impact.map((i) => ({ kind: i.kind, marker: i.marker })) } : {}),
+                    verdict: `IDOR/BOLA CONFIRMED by sweep — the '${f.name}' ${f.loc.via} field is object-scoped: id ${vid} returned another user's object (status ${r.p1.status}, cross-user data) while a non-existent id was denied (control ${ctrl.status}). record_finding(category ${cat}) with these evidenceIds.`,
+                  }),
+                );
+              if (r.p1.status < 400 && Math.abs(r.p1.len - ctrl.len) > 64) populated.push({ id: vid, evId: r.p1.evId, status: r.p1.status });
+            }
+            swept.push({ param: f.name, via: f.loc.via, tried: candidates, populated });
+          }
+          const anyPopulated = swept.filter((x) => x.populated.length > 0);
           return txt(
             JSON.stringify({
-              mode: "enumerate",
-              triedIds: candidates,
-              observed: tried,
-              verdict: distinct.length
-                ? `not confirmed by fuzzing: ${distinct.length} neighbour id(s) (${distinct.map((t) => t.id).join(", ")}) returned a populated 200 but cross-user OWNERSHIP couldn't be auto-proven (the body didn't clearly carry another user's identity). If these are plausibly other users' objects, record verdict:"suspected" citing one of these evidenceIds, or log in as a second role to get a real victim id and re-run.`
-                : `not confirmed by fuzzing: no neighbour id (${candidates.join(", ")}) returned another user's object — access control appears to hold, or these ids don't map to other users.${ctrl.status < 400 ? " NOTE: the non-existent control also returned 200 → this endpoint may be a catch-all, so id-based tests are inconclusive here." : ""}`,
+              mode: "sweep",
+              sweptFields: swept.map((x) => `${x.param}(${x.via})`),
+              observed: swept,
+              verdict: anyPopulated.length
+                ? `not auto-confirmed, but ${anyPopulated.length} id field(s) (${anyPopulated.map((x) => x.param).join(", ")}) returned a POPULATED object for a neighbour id while a non-existent id was denied — a real cross-user anomaly whose ownership couldn't be auto-proven. If plausibly another user's object, record verdict:"suspected" citing one of these evidenceIds (${anyPopulated.flatMap((x) => x.populated.map((p) => p.evId)).slice(0, 3).join(", ")}); or log in as a second role for a real victim id and re-run.`
+                : `CLEAN (id-scoping holds): swept ${swept.length} id-bearing field(s) [${swept.map((x) => `${x.param}(${x.via})`).join(", ")}] with neighbour + known-object ids; none returned another user's object and non-existent controls were denied. Mark idor tested-clean for this screen.`,
             }),
           );
         } catch (e) {

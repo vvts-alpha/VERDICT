@@ -4,7 +4,8 @@
 
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { idNeighbors, nonexistentIdLike } from "./tools.js";
+import { idNeighbors, nonexistentIdLike, idBearingParamLocs, setFormField, replacePathSeg } from "./tools.js";
+import type { Param } from "@veritas/core";
 
 test("idNeighbors: a numeric id walks ±1/±2/±3 plus low/seed ids, excludes self, capped at 6", () => {
   const n = idNeighbors("1024");
@@ -39,4 +40,44 @@ test("nonexistentIdLike: a shape-matching non-existent control (so a catch-all 2
   assert.equal(nonexistentIdLike("42"), "2147483646"); // numeric → large absent value
   assert.equal(nonexistentIdLike("user-0007"), "user-9999"); // prefix + all-nines, width preserved
   assert.equal(nonexistentIdLike("550e8400-e29b-41d4-a716-446655440000"), "00000000-0000-0000-0000-000000000000");
+});
+
+// ── probe_idor SWEEP: test EVERY id-bearing field on a screen (each in its own location), not just the one param the
+//    model guessed. These lock the deterministic field-picking + placement so a wrong-param guess can't dump to suspected.
+
+test("idBearingParamLocs: picks only id-bearing params, each mapped to its OWN location; dedups (loc,name)", () => {
+  const params: Param[] = [
+    { name: "event_id", in: "query", example: "785687", guessedType: "object_ref" },
+    { name: "owner_id", in: "body", example: "826533", guessedType: "id" },
+    { name: "title", in: "body", example: "My Event", guessedType: "free_text" }, // NOT id → excluded
+    { name: "id", in: "path", example: "42", guessedType: "object_ref" },
+    { name: "ref", in: "query", example: "550e8400-e29b-41d4-a716-446655440000", guessedType: "unknown" }, // id name → rule re-derives
+    { name: "event_id", in: "query", example: "785687", guessedType: "object_ref" }, // dup (query,event_id) → dropped
+    { name: "X-User-Id", in: "header", example: "826533", guessedType: "object_ref" },
+  ];
+  const locs = idBearingParamLocs(params);
+  assert.deepEqual(
+    locs.map((l) => `${l.name}:${l.loc.via}`),
+    ["event_id:query", "owner_id:body-field", "id:path", "ref:query", "X-User-Id:header"],
+  );
+  assert.ok(!locs.some((l) => l.name === "title"), "a free_text field is not swept");
+  // a path param carries its example (to locate the segment to swap); field params carry the name.
+  assert.deepEqual(locs.find((l) => l.name === "id")?.loc, { via: "path", example: "42" });
+});
+
+test("idBearingParamLocs: a param with no example is skipped (nothing to seed / walk)", () => {
+  assert.equal(idBearingParamLocs([{ name: "user_id", in: "query", example: "", guessedType: "object_ref" }]).length, 0);
+});
+
+test("setFormField: appends when absent, replaces when present, url-encodes", () => {
+  assert.equal(setFormField(null, "id", "5"), "id=5");
+  assert.equal(setFormField("a=1&b=2", "id", "5"), "a=1&b=2&id=5");
+  assert.equal(setFormField("a=1&id=9&b=2", "id", "5"), "a=1&id=5&b=2"); // replace in place, order preserved
+  assert.equal(setFormField("", "user id", "a b"), "user%20id=a%20b");
+});
+
+test("replacePathSeg: swaps the LAST matching segment, preserves the rest; null when the segment is absent", () => {
+  assert.equal(replacePathSeg("https://x.test/api/event/785687", "785687", "785688"), "https://x.test/api/event/785688");
+  assert.equal(replacePathSeg("https://x.test/785687/edit", "785687", "1"), "https://x.test/1/edit");
+  assert.equal(replacePathSeg("https://x.test/api/event/785687?x=1", "999", "1"), null);
 });
