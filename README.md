@@ -14,7 +14,7 @@ A Claude-led agent that maps your target, hunts vulns, and marks a finding **`co
 ![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)
 ![LLM](https://img.shields.io/badge/LLM-Claude%20(CLI%20sub)-D97757?logo=anthropic&logoColor=white)
 ![Playwright](https://img.shields.io/badge/Browser-Playwright%20chromium-2EAD33?logo=playwright&logoColor=white)
-[![CI](https://github.com/veritas-rt/UmbraHands/actions/workflows/ci.yml/badge.svg)](https://github.com/veritas-rt/UmbraHands/actions/workflows/ci.yml)
+[![CI](https://github.com/vvts-alpha/verdict-pub/actions/workflows/ci.yml/badge.svg)](https://github.com/vvts-alpha/verdict-pub/actions/workflows/ci.yml)
 [![XBOW-Bench](https://img.shields.io/badge/XBOW--Bench-92%25%20(100%2F109)-2ea043)](benchmarks/xbow-bench)
 [![Juice Shop](https://img.shields.io/badge/OWASP%20Juice%20Shop-38%20findings-c0392b)](benchmarks/juice-shop)
 [![Web Security Academy](https://img.shields.io/badge/PortSwigger%20WSA-16%2F20%20detected-2ea043)](benchmarks/web-security-academy)
