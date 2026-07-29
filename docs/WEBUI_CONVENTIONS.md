@@ -111,7 +111,8 @@ brand logo · [rolebadge] · {metrics} · «sb-spacer» · {actions} · {exportM
 - **Findings count = the store's finding count** (`state.findings.length`). A view whose findings live only in a
   side file will read **0 here** — persist to the store so the dashboard is truthful (this is why ASR now
   upserts recon findings).
-- Per-type action verb: running → `◼ Stop`; idle → `▶ Resume` for web/API, `↻ Re-scan` for ASR.
+- Idle-run action is `▶ Resume` for **all** types (running → `◼ Stop`). A per-type behavioural nuance (ASR's
+  resume re-scans from scratch rather than continuing) goes in a `title=` tooltip — **not** a different label.
 
 ## Terminology & colour
 

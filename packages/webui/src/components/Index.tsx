@@ -159,8 +159,13 @@ export function Index() {
                       ◼ Stop
                     </button>
                   ) : (
-                    <button type="button" className="resumebtn" onClick={runCtl(r.id, "resume")}>
-                      {r.type === "asr" ? "↻ Re-scan" : "▶ Resume"}
+                    <button
+                      type="button"
+                      className="resumebtn"
+                      onClick={runCtl(r.id, "resume")}
+                      title={r.type === "asr" ? "re-runs discovery + probe (ASR re-scans from scratch — it has no partial resume)" : undefined}
+                    >
+                      ▶ Resume
                     </button>
                   )}
                 </td>
