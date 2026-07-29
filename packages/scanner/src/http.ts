@@ -45,6 +45,19 @@ export interface FetchHttpClientOptions {
   proxy?: string;
 }
 
+/** Merge header maps case-insensitively, last-wins by lowercased name (keeping the last casing seen for a name). A
+ *  caller's "User-Agent" thus replaces a default "user-agent" instead of producing two keys undici comma-combines. */
+export function foldHeaders(...maps: Array<Record<string, string> | undefined>): Record<string, string> {
+  const byLc = new Map<string, { key: string; value: string }>();
+  for (const m of maps) {
+    if (!m) continue;
+    for (const [k, v] of Object.entries(m)) byLc.set(k.toLowerCase(), { key: k, value: v });
+  }
+  const out: Record<string, string> = {};
+  for (const { key, value } of byLc.values()) out[key] = value;
+  return out;
+}
+
 export class FetchHttpClient implements HttpClient {
   private lastSentAt = 0;
   private dispatcher: unknown | null = null;
@@ -69,11 +82,7 @@ export class FetchHttpClient implements HttpClient {
 
   /** The headers actually sent (default user-agent + opts.headers + per-call). Used to record the "whole request" in evidence. */
   effectiveHeaders(reqHeaders?: Record<string, string>): Record<string, string> {
-    return {
-      "user-agent": this.opts.userAgent ?? DEFAULT_BROWSER_UA,
-      ...(this.opts.headers ?? {}),
-      ...(reqHeaders ?? {}),
-    };
+    return foldHeaders({ "user-agent": this.opts.userAgent ?? DEFAULT_BROWSER_UA }, this.opts.headers, reqHeaders);
   }
 
   async send(req: HttpRequest): Promise<HttpResponse> {
@@ -91,11 +100,9 @@ export class FetchHttpClient implements HttpClient {
     const timer = setTimeout(() => controller.abort(), this.opts.timeoutMs ?? 15_000);
     try {
       const dispatcher = await this.getDispatcher();
-      const reqHeaders: Record<string, string> = {
-        "user-agent": this.opts.userAgent ?? DEFAULT_BROWSER_UA,
-        ...(this.opts.headers ?? {}),
-        ...(req.headers ?? {}),
-      };
+      // Fold case-insensitively so a caller's e.g. "User-Agent" REPLACES the default "user-agent" rather than colliding
+      // into two keys that undici would comma-combine (which silently neutered header-injection probes + garbled evidence).
+      const reqHeaders: Record<string, string> = foldHeaders({ "user-agent": this.opts.userAgent ?? DEFAULT_BROWSER_UA }, this.opts.headers, req.headers);
       let bodyInit: unknown = req.body ?? undefined;
       if (req.multipart) {
         // Generate correct multipart via undici's FormData (boundary/CRLF/Content-Type are automatic). Don't let the caller's

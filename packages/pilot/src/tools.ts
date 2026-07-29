@@ -11,6 +11,7 @@ import { InventoryBuilder, normalizePath, smartLogin, guessParamType, extractApi
 import type { LlmClient } from "@veritas/llm";
 import type { BurpAuditConn, EvidenceStore, FetchHttpClient, HttpRequest, HttpResponse, TechComponent, TechSample } from "@veritas/scanner";
 import { oobPayload, oobPoll, fingerprintTech, formatTechInventory, lookupCves, formatCveResults, impactOracle, identityAppears } from "@veritas/scanner";
+import { placePayload, parseLocation, oobFilesToMultipart, filesHaveOobPlaceholder } from "./inject.js";
 import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { join } from "node:path";
@@ -1908,24 +1909,37 @@ export function buildTools(s: PilotSession) {
     ),
     tool(
       "probe_cmdi",
-      "Confirm OS COMMAND INJECTION — output-based AND time-based (BLIND). Inject into `param` or a `body` with {{CMD}}. Output-based: injects shell payloads (separators ; | && , command-substitution $() and backticks) that compute an ARITHMETIC PRODUCT of two random numbers; if the response contains the PRODUCT (not the literal expression), the shell evaluated it = injection (distinguishes execution from echo, like SSTI). Time-based: injects sleep 5 / ping payloads and confirms a consistent ~5s DELAY vs a fast baseline (for the blind case with no output). Returns negativeControl + positiveReplays evidenceIds + the technique → record_finding(category rce). USE on any value that could reach a shell: ping/host/dns tools, filename/path handed to a converter, export/format, git/curl wrappers.",
-      { url: z.string(), param: z.string().optional(), method: z.string().optional(), body: z.string().optional() },
-      async ({ url, param, method, body }) => {
+      "Confirm OS COMMAND INJECTION — output-based AND time-based (BLIND). Inject into `param` or a `body` with {{CMD}} — OR aim any other location with `location`: \"header:User-Agent\" / \"cookie:sid\" / \"path:-1\" / \"json:/host\" (+ `contentType` so a JSON API parses the body). Output-based: injects shell payloads (separators ; | && , command-substitution $() and backticks) that compute an ARITHMETIC PRODUCT of two random numbers; if the response contains the PRODUCT (not the literal expression), the shell evaluated it = injection (distinguishes execution from echo, like SSTI). Time-based: injects sleep 5 / ping payloads and confirms a consistent ~5s DELAY vs a fast baseline (for the blind case with no output — works from ANY location). Returns negativeControl + positiveReplays evidenceIds + the technique → record_finding(category rce). USE on any value that could reach a shell: ping/host/dns tools, filename/path handed to a converter, export/format, git/curl wrappers.",
+      { url: z.string(), param: z.string().optional(), method: z.string().optional(), body: z.string().optional(), location: z.string().optional(), contentType: z.string().optional() },
+      async ({ url, param, method, body, location, contentType }) => {
         const buildReq = (val: string): HttpRequest | null => {
-          let u = url;
-          let b: string | null = null;
-          if (body != null) b = body.replace(/\{\{CMD\}\}/g, val);
-          else if (param) {
-            try {
-              const uu = new URL(url);
-              uu.searchParams.set(param, val);
-              u = uu.toString();
-            } catch {
-              return null;
+          let req: HttpRequest;
+          if (location) {
+            const loc = parseLocation(location);
+            if (!loc) return null;
+            const base: HttpRequest = { method: (method ?? (loc.kind === "json" || body != null ? "POST" : "GET")).toUpperCase(), url, headers: authHeaders(s), body: body ?? null };
+            const placed = placePayload(base, loc, val, contentType);
+            if (!placed) return null;
+            req = placed;
+          } else {
+            let u = url;
+            let b: string | null = null;
+            if (body != null) b = body.replace(/\{\{CMD\}\}/g, val);
+            else if (param) {
+              try {
+                const uu = new URL(url);
+                uu.searchParams.set(param, val);
+                u = uu.toString();
+              } catch {
+                return null;
+              }
             }
+            const hdrs = authHeaders(s);
+            if (contentType && body != null) hdrs["content-type"] = contentType;
+            req = { method: (method ?? (body != null ? "POST" : "GET")).toUpperCase(), url: u, headers: hdrs, body: b };
           }
-          if (!isInScope(u, s.scope)) return null;
-          return { method: (method ?? (body != null ? "POST" : "GET")).toUpperCase(), url: u, headers: authHeaders(s), body: b };
+          if (!isInScope(req.url, s.scope)) return null;
+          return req;
         };
         const send = async (val: string, kind: "negative_control" | "positive_replay", tag: string, overrideBody?: string) => {
           const req = buildReq(val);
@@ -2224,24 +2238,37 @@ export function buildTools(s: PilotSession) {
     ),
     tool(
       "probe_sqli",
-      "Confirm SQL INJECTION — boolean-based (in-band) AND time-based (BLIND). Inject into `param` (query) or a `body` containing {{SQLI}}. Runs: an error probe (a lone quote → SQL-error signature), a boolean pair (TRUE vs FALSE — a stable content DIFFERENCE = injection), and a time-based test (SLEEP(5)/pg_sleep(5)/WAITFOR — a consistent ~5s DELAY vs a fast baseline = blind injection; MySQL/Postgres/MSSQL tried). Returns negativeControl + positiveReplays evidenceIds + the confirming technique, ready for record_finding(category sqli). USE on any value reaching a query: search/id/sort/filter/login. (An error signature alone is a HINT — confirm with boolean or time.)",
-      { url: z.string(), param: z.string().optional(), method: z.string().optional(), body: z.string().optional() },
-      async ({ url, param, method, body }) => {
+      "Confirm SQL INJECTION — boolean-based (in-band) AND time-based (BLIND). Inject into `param` (query) or a `body` containing {{SQLI}} — OR aim any other location with `location`: \"header:X-Forwarded-For\" / \"cookie:sid\" / \"path:-1\" (a path segment) / \"json:/user/id\" (a field in a JSON body). Set `contentType` (e.g. application/json) so a content-type-dispatching API actually parses your body payload. Runs: an error probe (a lone quote → SQL-error signature), a boolean pair (TRUE vs FALSE — a stable content DIFFERENCE = injection), and a time-based test (SLEEP(5)/pg_sleep(5)/WAITFOR — a consistent ~5s DELAY vs a fast baseline = blind injection; MySQL/Postgres/MSSQL tried) — the time oracle works from ANY location, so header/cookie/path blind SQLi is now confirmable. Returns negativeControl + positiveReplays evidenceIds + the confirming technique, ready for record_finding(category sqli). USE on any value reaching a query: search/id/sort/filter/login, XFF/User-Agent (logging INSERTs). (An error signature alone is a HINT — confirm with boolean or time.)",
+      { url: z.string(), param: z.string().optional(), method: z.string().optional(), body: z.string().optional(), location: z.string().optional(), contentType: z.string().optional() },
+      async ({ url, param, method, body, location, contentType }) => {
         const buildReq = (val: string): HttpRequest | null => {
-          let u = url;
-          let b: string | null = null;
-          if (body != null) b = body.replace(/\{\{SQLI\}\}/g, val);
-          else if (param) {
-            try {
-              const uu = new URL(url);
-              uu.searchParams.set(param, val);
-              u = uu.toString();
-            } catch {
-              return null;
+          let req: HttpRequest;
+          if (location) {
+            const loc = parseLocation(location);
+            if (!loc) return null;
+            const base: HttpRequest = { method: (method ?? (loc.kind === "json" || body != null ? "POST" : "GET")).toUpperCase(), url, headers: authHeaders(s), body: body ?? null };
+            const placed = placePayload(base, loc, val, contentType);
+            if (!placed) return null;
+            req = placed;
+          } else {
+            let u = url;
+            let b: string | null = null;
+            if (body != null) b = body.replace(/\{\{SQLI\}\}/g, val);
+            else if (param) {
+              try {
+                const uu = new URL(url);
+                uu.searchParams.set(param, val);
+                u = uu.toString();
+              } catch {
+                return null;
+              }
             }
+            const hdrs = authHeaders(s);
+            if (contentType && body != null) hdrs["content-type"] = contentType;
+            req = { method: (method ?? (body != null ? "POST" : "GET")).toUpperCase(), url: u, headers: hdrs, body: b };
           }
-          if (!isInScope(u, s.scope)) return null;
-          return { method: (method ?? (body != null ? "POST" : "GET")).toUpperCase(), url: u, headers: authHeaders(s), body: b };
+          if (!isInScope(req.url, s.scope)) return null;
+          return req;
         };
         const send = async (val: string, kind: "negative_control" | "positive_replay", tag: string, overrideBody?: string) => {
           const req = buildReq(val);
@@ -2650,12 +2677,12 @@ export function buildTools(s: PilotSession) {
     ),
     tool(
       "probe_oob",
-      "Confirm a BLIND / out-of-band vuln via Burp Collaborator: blind SSRF, blind XXE, blind SQLi (DNS/HTTP exfil), OS command injection, header SSRF (X-Forwarded-Host / Referer / Host), email/webhook SSRF — anything where the EFFECT is the SERVER making an external request, not a visible response. Requires the VERDICT Audit REST extension with Collaborator enabled (BURP_AUDIT_API). Put a {{OOB}} placeholder where the callback host belongs (a URL field, an XXE SYSTEM entity `<!ENTITY x SYSTEM \"http://{{OOB}}/\">`, a hostname, a header value). The tool generates a unique Collaborator host, injects it (in-scope target request), and polls ~waitSec for a DNS/HTTP/SMTP callback FROM the target; a callback = the server reached our host out-of-band = confirmed. Records a benign control + the injected request → negativeControl + positiveReplays evidenceIds for record_finding(category ssrf / rce as appropriate). NOTE: callbacks can lag seconds; nothing back after waitSec = not confirmed (try other params/headers/schemes).",
-      { method: z.string(), url: z.string(), headers: z.record(z.string()).optional(), body: z.string().nullable().optional(), waitSec: z.number().optional(), note: z.string().optional() },
-      async ({ method, url, headers, body, waitSec, note }) => {
+      "Confirm a BLIND / out-of-band vuln via Burp Collaborator: blind SSRF, blind XXE, blind SQLi (DNS/HTTP exfil), OS command injection, header SSRF (X-Forwarded-Host / Referer / Host), email/webhook SSRF — anything where the EFFECT is the SERVER making an external request, not a visible response. Requires the VERDICT Audit REST extension with Collaborator enabled (BURP_AUDIT_API). Put a {{OOB}} placeholder where the callback host belongs (a URL field, an XXE SYSTEM entity `<!ENTITY x SYSTEM \"http://{{OOB}}/\">`, a hostname, a header value, OR inside an uploaded file's text content — see `files`). The tool generates a unique Collaborator host, injects it (in-scope target request), and polls ~waitSec for a DNS/HTTP/SMTP callback FROM the target; a callback = the server reached our host out-of-band = confirmed. FILE-BORNE OOB: for a blind SSRF/XXE that must live INSIDE an uploaded file (FFmpeg/HLS video-SSRF, ImageMagick, an uploaded SVG/DOCX with a SYSTEM entity), pass `files` (each {name, filename, contentType?, and `content` text OR `base64` bytes}) with {{OOB}} in a file's text `content` — it is sent as multipart/form-data and the callback confirms the file-borne case. Records a benign control + the injected request → negativeControl + positiveReplays evidenceIds for record_finding(category ssrf / rce as appropriate). NOTE: callbacks can lag seconds; nothing back after waitSec = not confirmed (try other params/headers/schemes).",
+      { method: z.string(), url: z.string(), headers: z.record(z.string()).optional(), body: z.string().nullable().optional(), files: z.array(z.object({ name: z.string(), filename: z.string(), contentType: z.string().optional(), content: z.string().optional(), base64: z.string().optional() })).optional(), waitSec: z.number().optional(), note: z.string().optional() },
+      async ({ method, url, headers, body, files, waitSec, note }) => {
         if (!s.oob) return txt("OOB NOT AVAILABLE: set BURP_AUDIT_API (+ enable Collaborator in Burp) to use probe_oob. Without it, blind SSRF/XXE/SQLi cannot be confirmed out-of-band.");
-        const inPlaceholder = url.includes("{{OOB}}") || (body?.includes("{{OOB}}") ?? false) || Object.values(headers ?? {}).some((v) => v.includes("{{OOB}}"));
-        if (!inPlaceholder) return txt("ERROR: put a {{OOB}} placeholder where the callback host should be injected (in url, body, or a header value).");
+        const inPlaceholder = url.includes("{{OOB}}") || (body?.includes("{{OOB}}") ?? false) || Object.values(headers ?? {}).some((v) => v.includes("{{OOB}}")) || filesHaveOobPlaceholder(files, "{{OOB}}");
+        if (!inPlaceholder) return txt("ERROR: put a {{OOB}} placeholder where the callback host should be injected (in url, body, a header value, or an uploaded file's text content via `files`).");
         let payload: { host: string; id: string };
         try {
           payload = await oobPayload(s.oob);
@@ -2670,6 +2697,9 @@ export function buildTools(s: PilotSession) {
           const hdr: Record<string, string> = {};
           for (const [k, v] of Object.entries(headers ?? {})) hdr[k] = sub(v, host);
           const req: HttpRequest = { method: method.toUpperCase(), url: u, headers: { ...authHeaders(s), ...hdr }, body: body != null ? sub(body, host) : null };
+          // File-borne OOB: substitute the callback host into each file's text content and send as multipart (body is
+          // then ignored by the sender). This is what makes blind file-SSRF / uploaded-SVG XXE confirmable, not just suspected.
+          if (files && files.length) req.multipart = oobFilesToMultipart(files, (v) => sub(v, host));
           const res = await s.http.send(req);
           bumpHttp(s, res.status);
           // 証拠の body は OOB の結果(マーカー= collaborator host)に差し替える。ブラインドなので HTTP 応答自体は無意味。
