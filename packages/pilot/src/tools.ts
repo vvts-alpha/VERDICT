@@ -2955,7 +2955,7 @@ export function buildTools(s: PilotSession) {
         // モデルの severity をカテゴリのバンドに clamp(同クラスでの High/Medium 混在を是正)。
         const normSev = normalizeSeverity(category, severity as Severity);
         // ── 共通コミット(dedup/merge/construct)。confirmed/suspected 両経路が使う。verdict は **昇格のみ**。 ──
-        const commit = (v: FindingVerdict, evidenceIds: string[], anomalyText?: string): string => {
+        const commit = async (v: FindingVerdict, evidenceIds: string[], anomalyText?: string): Promise<string> => {
           s.recordCalls += 1;
           if (v === "confirmed") s.screenVerdict = "finding";
           else if (s.screenVerdict !== "finding") s.screenVerdict = "suspected"; // finding は上書きしない
@@ -2977,8 +2977,18 @@ export function buildTools(s: PilotSession) {
             return `merged into ${existing.id} (same ${key}); now ${existing.evidenceIds.length} evidence, severity ${existing.severity}, verdict ${findingVerdict(existing)}. Do not re-report this endpoint+param.`;
           }
           s.findCounter += 1;
+          const fid = `f-${String(s.findCounter).padStart(3, "0")}`;
+          // Capture a browser screenshot of the current state as visual evidence (best-effort — a request/response
+          // alone is hard to read; the screenshot shows what the operator would see). Skipped silently if it fails.
+          let shot: string | undefined;
+          try {
+            const rel = `findings/${fid}.png`;
+            if (await s.driver.saveScreenshot(join(s.artifactsDir, rel))) shot = rel;
+          } catch {
+            /* no browser page / capture failed — findings still record without it */
+          }
           const f: Finding = {
-            id: `f-${String(s.findCounter).padStart(3, "0")}`,
+            id: fid,
             screenId: s.currentScreenId,
             title: `[${category}] ${title}`,
             severity: normSev,
@@ -2989,6 +2999,7 @@ export function buildTools(s: PilotSession) {
             reproSteps,
             evidenceIds,
             scopeBasis: `authorized target ${s.targetUrl}`,
+            ...(shot ? { screenshot: shot } : {}),
           };
           s.findings.push(f);
           s.findingsByKey.set(key, f);
@@ -3038,7 +3049,7 @@ export function buildTools(s: PilotSession) {
               );
           }
           const suspectEv = ctrlRec ? [negativeControl!, observation] : [observation];
-          return txt(commit("suspected", suspectEv, anomaly.trim()));
+          return txt(await commit("suspected", suspectEv, anomaly.trim()));
         }
 
         // ── CONFIRMED 経路 ── schema を optional 化したので、まず存在を手で強制(その後は従来どおり)。
@@ -3088,7 +3099,7 @@ export function buildTools(s: PilotSession) {
             return txt(`REJECTED (evidence discipline): ${verdict.reason}. Get a negative control that fails + >=2 stable positive replays, then record.`);
         }
         const evidenceIds = [...new Set([negativeControl, ...positiveReplays])];
-        return txt(commit("confirmed", evidenceIds));
+        return txt(await commit("confirmed", evidenceIds));
       },
     ),
     tool(

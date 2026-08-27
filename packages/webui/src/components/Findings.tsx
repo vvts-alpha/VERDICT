@@ -67,6 +67,14 @@ export function Findings({ view, onJump }: { view: StateView; onJump: (screenId:
                   <pre>{f.reproSteps}</pre>
                 </details>
               ) : null}
+              {f.screenshot ? (
+                <details open>
+                  <summary>screenshot</summary>
+                  <a href={`/api/assessments/${encodeURIComponent(view.id)}/findings/${encodeURIComponent(f.id)}/screenshot`} target="_blank" rel="noreferrer">
+                    <img className="finding-shot" src={`/api/assessments/${encodeURIComponent(view.id)}/findings/${encodeURIComponent(f.id)}/screenshot`} alt={`${f.id} screenshot`} />
+                  </a>
+                </details>
+              ) : null}
               {f.evidenceIds.length > 0 ? <EvidenceList assessmentId={view.id} evidenceIds={f.evidenceIds} /> : null}
             </div>
           );

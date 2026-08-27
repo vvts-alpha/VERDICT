@@ -1,5 +1,6 @@
 // 💬 Ask — a read-only Q&A that asks Claude about this assessment (findings/screens/scope).
-// POST the conversation history to /api/assessments/:id/chat and show the answer. History is held client-side.
+// POST the conversation to /api/assessments/:id/chat and show the answer. History is persisted server-side
+// (runs/<id>/chat.json) and loaded on mount, so past exchanges survive a reload.
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { useRole } from "../api";
 
@@ -15,6 +16,20 @@ export function Chat({ id }: { id: string }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
+
+  // Load the persisted conversation on mount (survives reload).
+  useEffect(() => {
+    let alive = true;
+    fetch(`/api/assessments/${encodeURIComponent(id)}/chat`)
+      .then((r) => r.json())
+      .then((d: { messages?: Msg[] }) => {
+        if (alive && Array.isArray(d.messages)) setMessages(d.messages);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [id]);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });

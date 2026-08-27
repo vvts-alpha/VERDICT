@@ -28,4 +28,7 @@ export interface Finding {
   evidenceIds: string[];
   /** Scope basis (why it is in-scope) */
   scopeBasis: string;
+  /** Relative path (under artifacts/) to a browser screenshot captured when the finding was recorded — visual
+   *  context beyond the raw request/response. e.g. "findings/f-003.png". Absent when no browser page was available. */
+  screenshot?: string;
 }

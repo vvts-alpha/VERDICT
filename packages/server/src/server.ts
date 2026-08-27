@@ -613,6 +613,21 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptio
     sendJson(res, 200, relay?.rolesFor(decodeURIComponent(sess[1] ?? "")) ?? []);
     return;
   }
+  // Ask history: the persisted conversation for this run (so history survives a reload). (POST → handleControl.)
+  const chatHist = url.match(/^\/api\/assessments\/([^/?]+)\/chat$/);
+  if (chatHist) {
+    const id = decodeURIComponent(chatHist[1] ?? "");
+    let history: Array<{ role: string; content: string }> = [];
+    if (/^[a-z0-9_-]+$/i.test(id)) {
+      try {
+        history = JSON.parse(readFileSync(join(opts.runsDir, id, "chat.json"), "utf8")) as typeof history;
+      } catch {
+        history = [];
+      }
+    }
+    sendJson(res, 200, { messages: history });
+    return;
+  }
   // Screen screenshot: serve runs/<id>/artifacts/screens/<screenId>.png (for WebUI display).
   const shot = url.match(/^\/api\/assessments\/([^/]+)\/screens\/([^/?]+)\/screenshot/);
   if (shot) {
@@ -624,6 +639,26 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptio
       return;
     }
     const file = join(opts.runsDir, sid, "artifacts", "screens", `${scr}.png`);
+    if (existsSync(file) && statSync(file).isFile()) {
+      res.writeHead(200, { "content-type": "image/png", "cache-control": "no-cache", "access-control-allow-origin": "*" });
+      res.end(readFileSync(file));
+    } else {
+      res.writeHead(404);
+      res.end("no screenshot");
+    }
+    return;
+  }
+  // Finding screenshot: serve runs/<id>/artifacts/findings/<findingId>.png (visual evidence, captured at record time).
+  const fshot = url.match(/^\/api\/assessments\/([^/]+)\/findings\/([^/?]+)\/screenshot/);
+  if (fshot) {
+    const sid = decodeURIComponent(fshot[1] ?? "");
+    const fid = decodeURIComponent(fshot[2] ?? "");
+    if (!/^[a-z0-9_-]+$/i.test(sid) || !/^[a-z0-9_-]+$/i.test(fid)) {
+      res.writeHead(400);
+      res.end("bad id");
+      return;
+    }
+    const file = join(opts.runsDir, sid, "artifacts", "findings", `${fid}.png`);
     if (existsSync(file) && statSync(file).isFile()) {
       res.writeHead(200, { "content-type": "image/png", "cache-control": "no-cache", "access-control-allow-origin": "*" });
       res.end(readFileSync(file));
@@ -834,6 +869,12 @@ async function serveChat(res: ServerResponse, runsDir: string, id: string, messa
       prompt: `${transcript}\n\nAssistant:`,
       timeoutMs: 120_000,
     });
+    // Persist the full conversation so the Ask history survives a reload (part of the run's record).
+    try {
+      writeFileSync(join(runsDir, id, "chat.json"), `${JSON.stringify([...messages, { role: "assistant", content: r.text }], null, 2)}\n`);
+    } catch {
+      /* non-fatal: the answer is still returned even if persistence fails */
+    }
     sendJson(res, 200, { answer: r.text, model: r.model });
   } catch (e) {
     sendJson(res, 500, { error: `chat failed: ${String(e).slice(0, 200)}` });

@@ -425,6 +425,7 @@ button:hover { background: #353d4a; }
 .finding-title { font-weight: 600; color: #fff; }
 .finding-id { margin-left: auto; font-size: 11px; white-space: nowrap; }
 .finding-desc { margin: 8px 0 6px; color: var(--fg); white-space: pre-wrap; }
+.finding-shot { display: block; max-width: 100%; max-height: 360px; border: 1px solid var(--line); border-radius: 4px; margin-top: 6px; }
 .finding-cat { font-size: 10px; letter-spacing: 0.3px; color: var(--muted); background: #232831; border: 1px solid var(--line); padding: 1px 7px; border-radius: 9px; font-family: ui-monospace, monospace; white-space: nowrap; }
 .finding details { color: var(--muted); }
 .finding details pre { white-space: pre-wrap; background: #11141a; padding: 8px; border-radius: 4px; margin: 6px 0 0; }
