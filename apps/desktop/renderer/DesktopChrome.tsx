@@ -1,4 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react";
+import { AttendedBrowser } from "./AttendedBrowser";
 
 // Desktop app chrome: a custom (frameless-window) title bar with window controls, rendered ONLY when running
 // inside the Electron shell (window.verdictDesktop present). In a plain browser it is a pass-through — the
@@ -28,6 +29,9 @@ function WinIcon({ kind }: { kind: "min" | "max" | "restore" | "close" }) {
 export function DesktopChrome({ children }: { children: ReactNode }) {
     const desktop = typeof window !== "undefined" ? window.verdictDesktop : undefined;
     const [maximized, setMaximized] = useState(false);
+    // Debug: VERDICT_ATTB_URL (via ?attb=<url>) auto-opens the attended browser to a URL for screenshot verification.
+    const attbDebug = typeof window !== "undefined" ? new URLSearchParams(window.location.search).get("attb") : null;
+    const [browserOpen, setBrowserOpen] = useState(!!attbDebug);
 
     useEffect(() => {
         if (!desktop) return;
@@ -45,6 +49,14 @@ export function DesktopChrome({ children }: { children: ReactNode }) {
                     VERDICT
                 </span>
                 <div className="desk-drag" />
+                <button
+                    type="button"
+                    className={`desk-tool${browserOpen ? " active" : ""}`}
+                    onClick={() => setBrowserOpen((v) => !v)}
+                    title="Attended browser — log in to the target by hand, then capture the session for the scan"
+                >
+                    Browser
+                </button>
                 <div className="desk-winctl">
                     <button type="button" className="desk-wbtn" onClick={() => desktop.minimize()} aria-label="Minimize" title="Minimize">
                         <WinIcon kind="min" />
@@ -57,7 +69,10 @@ export function DesktopChrome({ children }: { children: ReactNode }) {
                     </button>
                 </div>
             </div>
-            <div className="desk-content">{children}</div>
+            <div className="desk-content">
+                {children}
+                {browserOpen ? <AttendedBrowser initialUrl={attbDebug ?? "about:blank"} onClose={() => setBrowserOpen(false)} /> : null}
+            </div>
         </div>
     );
 }

@@ -15,4 +15,21 @@ contextBridge.exposeInMainWorld("verdictDesktop", {
         ipcRenderer.on("win:maximize-changed", h);
         return () => ipcRenderer.removeListener("win:maximize-changed", h);
     },
+
+    // Attended embedded browser (Electron's own Chromium as an in-window view for human login / session capture).
+    browser: {
+        open: (url) => ipcRenderer.invoke("attbrowser:open", url),
+        setBounds: (b) => ipcRenderer.send("attbrowser:set-bounds", b),
+        close: () => ipcRenderer.send("attbrowser:close"),
+        navigate: (url) => ipcRenderer.invoke("attbrowser:navigate", url),
+        back: () => ipcRenderer.send("attbrowser:back"),
+        forward: () => ipcRenderer.send("attbrowser:forward"),
+        reload: () => ipcRenderer.send("attbrowser:reload"),
+        capture: (assessmentId) => ipcRenderer.invoke("attbrowser:capture", assessmentId),
+        onNavigated: (cb) => {
+            const h = (_e, s) => cb(s);
+            ipcRenderer.on("attbrowser:navigated", h);
+            return () => ipcRenderer.removeListener("attbrowser:navigated", h);
+        },
+    },
 });

@@ -23,3 +23,48 @@
 /* the app content fills the space under the title bar; full-height children (.page/.app) shrink to fit */
 .desk-content { flex: 1 1 auto; min-height: 0; overflow: auto; position: relative; }
 .desk-content > .page, .desk-content > .app { height: 100%; }
+
+/* titlebar tool button (e.g. the attended-browser toggle) */
+.desk-tool {
+  -webkit-app-region: no-drag;
+  display: flex; align-items: center; padding: 0 12px; height: 100%;
+  border: 0; background: transparent; color: var(--muted); font: inherit; font-size: 12px; cursor: default;
+  transition: background 0.12s, color 0.12s;
+}
+.desk-tool:hover { background: color-mix(in srgb, var(--fg) 8%, transparent); color: var(--fg); }
+.desk-tool.active { color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
+
+/* ── attended embedded browser panel (overlays the content; the native WebContentsView fills .attb-view) ── */
+.attb {
+  position: absolute; inset: 0; z-index: 20;
+  display: flex; flex-direction: column; background: var(--bg);
+}
+.attb-bar {
+  display: flex; align-items: center; gap: 6px; padding: 6px 8px;
+  background: var(--panel); border-bottom: 1px solid var(--line);
+}
+.attb-btn {
+  width: 30px; height: 28px; border: 1px solid var(--line); border-radius: 6px;
+  background: #0d0f13; color: var(--fg); font-size: 15px; line-height: 1; cursor: default;
+}
+.attb-btn:disabled { opacity: 0.35; }
+.attb-btn:not(:disabled):hover { background: #1a1f27; }
+.attb-url {
+  flex: 1 1 auto; height: 28px; padding: 0 10px;
+  background: #0d0f13; color: var(--fg); border: 1px solid var(--line); border-radius: 6px; font: inherit; font-size: 12px;
+}
+.attb-capture {
+  height: 28px; padding: 0 12px; border-radius: 6px; font-weight: 700; font-size: 12px; cursor: default;
+  background: #1d3a4f; border: 1px solid #2f6f8f; color: #cfe;
+}
+.attb-capture:hover { background: #244a63; }
+.attb-close {
+  height: 28px; padding: 0 12px; border-radius: 6px; font-size: 12px; cursor: default;
+  background: transparent; border: 1px solid var(--line); color: var(--muted);
+}
+.attb-close:hover { color: var(--fg); background: #1a1f27; }
+.attb-note { padding: 5px 12px; font-size: 12px; border-bottom: 1px solid var(--line); }
+.attb-note.ok { color: var(--accent); }
+.attb-note.err { color: var(--err); }
+/* placeholder the native Chromium view is drawn over — keep it empty (a subtle ground while it loads) */
+.attb-view { flex: 1 1 auto; min-height: 0; background: #0d0f13; }

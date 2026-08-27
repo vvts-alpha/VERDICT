@@ -6,6 +6,31 @@ export {};
 declare module "*.css";
 
 declare global {
+    interface AttBrowserNavState {
+        url: string;
+        title: string;
+        canGoBack: boolean;
+        canGoForward: boolean;
+        loading: boolean;
+    }
+    interface AttBrowserCapture {
+        ok: boolean;
+        path?: string;
+        count?: number;
+        host?: string;
+        error?: string;
+    }
+    interface AttendedBrowserBridge {
+        open(url: string): Promise<void>;
+        setBounds(b: { x: number; y: number; width: number; height: number }): void;
+        close(): void;
+        navigate(url: string): Promise<void>;
+        back(): void;
+        forward(): void;
+        reload(): void;
+        capture(assessmentId?: string): Promise<AttBrowserCapture>;
+        onNavigated(cb: (s: AttBrowserNavState) => void): () => void;
+    }
     interface VerdictDesktop {
         platform: string;
         minimize(): void;
@@ -13,6 +38,7 @@ declare global {
         close(): void;
         isMaximized(): Promise<boolean>;
         onMaximizeChange(cb: (maximized: boolean) => void): () => void;
+        browser: AttendedBrowserBridge;
     }
     interface Window {
         verdictDesktop?: VerdictDesktop;

@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import { existsSync, mkdirSync } from "node:fs";
 import { startServer, type RunningServer, type RunLauncherConfig } from "@veritas/server";
+import { setupAttendedBrowser } from "./attended-browser.js";
 
 /** App root (apps/desktop) — main.js lives in dist/, so one level up. Used to locate the preload. */
 const APP_ROOT = fileURLToPath(new URL("..", import.meta.url));
@@ -93,6 +94,9 @@ async function boot(): Promise<void> {
     ipcMain.handle("win:is-maximized", () => !!win?.isMaximized());
     win.on("maximize", () => win?.webContents.send("win:maximize-changed", true));
     win.on("unmaximize", () => win?.webContents.send("win:maximize-changed", false));
+
+    // Attended embedded browser (human login / CAPTCHA inside the one window; session handoff to the auto pilot).
+    const attb = setupAttendedBrowser(win, runsDir);
     // Open target/external links in the system browser, not inside the app window.
     win.webContents.setWindowOpenHandler(({ url }) => {
         if (!url.startsWith(server?.url ?? "http://127.0.0.1")) {
@@ -103,6 +107,19 @@ async function boot(): Promise<void> {
     });
     win.webContents.on("did-fail-load", (_e, code, desc, url) => console.error(`[verdict] did-fail-load ${code} ${desc} ${url}`));
     await win.loadURL(server.url); // resolves after the page finishes loading
+
+    // Debug self-test: VERDICT_ATTB_URL loads that URL in the embedded browser, captures the VIEW (proving Electron's
+    // own Chromium rendered the real page) + captures the session cookies (the handoff primitive), then exits.
+    const attbUrl = process.env.VERDICT_ATTB_URL;
+    if (attbUrl) {
+        await attb.open(attbUrl);
+        await new Promise((r) => setTimeout(r, 1500));
+        if (process.env.VERDICT_ATTB_SHOT) await attb.captureViewPng(process.env.VERDICT_ATTB_SHOT);
+        const cap = await attb.captureCookies();
+        console.log("[verdict] attb self-test:", JSON.stringify(cap));
+        await server?.close();
+        app.exit(cap.ok ? 0 : 3);
+    }
 
     // Debug/CI: VERDICT_SHOT=<path> captures the rendered window to a PNG (loadURL already resolved = loaded), then exits.
     const shotPath = process.env.VERDICT_SHOT;
