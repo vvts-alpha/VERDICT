@@ -204,3 +204,87 @@ test("halt records the stop reason and flips phase", () => {
     store.close();
   });
 });
+
+// Live control channel: control_command events are the cross-process contract the running pilot polls to
+// reconfigure a scan mid-run. controlCommandsSince(seq) is the "only apply NEW commands" filter.
+test("control_command: appendControlCommand round-trips and controlCommandsSince filters by seq", () => {
+  withTempDb((dbPath) => {
+    const store = AssessmentStore.open(dbPath);
+    const { id } = store.createAssessment({
+      target: { kind: "single_url", url: "https://app.test/", followLinks: true, maxDepth: 2 },
+      scope: deriveScopeFromSingleUrl("https://app.test/"),
+      budget: defaultBudget(),
+    });
+
+    // nothing queued yet
+    assert.deepEqual(store.controlCommandsSince(id, 0), []);
+
+    const e1 = store.appendControlCommand(id, { rateMs: 500, note: "slow down" });
+    const e2 = store.appendControlCommand(id, { addHosts: ["api.app.test"], maxScreens: 80 });
+    assert.ok(e2.seq > e1.seq, "seq is monotonic");
+
+    // from 0: both, in order
+    const all = store.controlCommandsSince(id, 0);
+    assert.equal(all.length, 2);
+    assert.equal(all[0]?.cmd.rateMs, 500);
+    assert.deepEqual(all[1]?.cmd.addHosts, ["api.app.test"]);
+    assert.equal(all[1]?.cmd.maxScreens, 80);
+
+    // from the first command's seq: only the second (the "apply new-only" mechanism)
+    const afterFirst = store.controlCommandsSince(id, e1.seq);
+    assert.equal(afterFirst.length, 1);
+    assert.equal(afterFirst[0]?.seq, e2.seq);
+
+    // from the latest seq: nothing pending
+    assert.deepEqual(store.controlCommandsSince(id, e2.seq), []);
+    store.close();
+  });
+});
+
+test("controlCommandsSince ignores interleaved non-control events", () => {
+  withTempDb((dbPath) => {
+    const store = AssessmentStore.open(dbPath);
+    const { id } = store.createAssessment({
+      target: { kind: "single_url", url: "https://app.test/", followLinks: true, maxDepth: 2 },
+      scope: deriveScopeFromSingleUrl("https://app.test/"),
+      budget: defaultBudget(),
+    });
+    store.appendEvent(id, { type: "note", payload: { message: "hi" } });
+    store.appendControlCommand(id, { rateMs: 100 });
+    store.setPaused(id, true, "test"); // control_changed, NOT control_command
+    store.appendControlCommand(id, { maxScreens: 10 });
+
+    const cmds = store.controlCommandsSince(id, 0);
+    assert.equal(cmds.length, 2, "only control_command events, not note / control_changed");
+    assert.equal(cmds[0]?.cmd.rateMs, 100);
+    assert.equal(cmds[1]?.cmd.maxScreens, 10);
+    store.close();
+  });
+});
+
+// Operator-injected targets: target_injected events are the pilot's poll for URLs added mid-run.
+test("target_injected: appendTargetInjection round-trips and targetInjectionsSince filters by seq + type", () => {
+  withTempDb((dbPath) => {
+    const store = AssessmentStore.open(dbPath);
+    const { id } = store.createAssessment({
+      target: { kind: "single_url", url: "https://app.test/", followLinks: true, maxDepth: 2 },
+      scope: deriveScopeFromSingleUrl("https://app.test/"),
+      budget: defaultBudget(),
+    });
+    assert.deepEqual(store.targetInjectionsSince(id, 0), []);
+
+    store.appendEvent(id, { type: "note", payload: { message: "noise" } });
+    const a = store.appendTargetInjection(id, "https://app.test/admin");
+    const b = store.appendTargetInjection(id, "https://api.app.test/v1/users/1");
+
+    const all = store.targetInjectionsSince(id, 0);
+    assert.equal(all.length, 2, "only target_injected events, not the note");
+    assert.equal(all[0]?.url, "https://app.test/admin");
+    assert.equal(all[1]?.url, "https://api.app.test/v1/users/1");
+
+    // seq filter: only NEW injections apply (the pilot's high-water mark)
+    assert.deepEqual(store.targetInjectionsSince(id, a.seq).map((x) => x.url), ["https://api.app.test/v1/users/1"]);
+    assert.deepEqual(store.targetInjectionsSince(id, b.seq), []);
+    store.close();
+  });
+});

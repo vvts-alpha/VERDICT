@@ -1096,7 +1096,7 @@ export type EnrolOutcome = "enrolled" | "duplicate" | "not_found" | "bounced" | 
  *  referer-gated flagging, or the input sweep — used by the post-survey passes (parent-prefix backfill, LLM endpoint
  *  guessing) where onward discovery is moot. A 404 / error-or-login catch-all is NOT enrolled; a real page becomes a
  *  screen (deduped by DOM skeleton, so an echo/empty page collapses onto an existing one → "duplicate"). Best-effort. */
-async function enrolByNavigate(
+export async function enrolByNavigate(
   s: PilotSession,
   url: string,
 ): Promise<{ outcome: EnrolOutcome; screenId?: string; status?: number; finalUrl?: string }> {

@@ -62,8 +62,15 @@ export class FetchHttpClient implements HttpClient {
   private lastSentAt = 0;
   private dispatcher: unknown | null = null;
   private dispatcherInit = false;
+  /** Live rate override (ms). When set, takes precedence over opts.minDelayMs — lets a running scan be re-throttled. */
+  private rateOverrideMs?: number;
 
   constructor(private readonly opts: FetchHttpClientOptions = {}) {}
+
+  /** Change the inter-request delay (rate) on a live client. Read per-send, so it applies to the next request. */
+  setRate(minDelayMs: number): void {
+    this.rateOverrideMs = Math.max(0, minDelayMs);
+  }
 
   /** Lazily create an undici ProxyAgent only when a proxy is set (skip TLS verification for Burp's intercepting CA). Non-fatal on failure. */
   private async getDispatcher(): Promise<unknown | undefined> {
@@ -89,7 +96,7 @@ export class FetchHttpClient implements HttpClient {
     if (this.opts.allow && !this.opts.allow(req.url)) {
       throw new Error(`out-of-scope request blocked: ${req.url}`);
     }
-    const minDelay = this.opts.minDelayMs ?? 0;
+    const minDelay = this.rateOverrideMs ?? this.opts.minDelayMs ?? 0;
     if (minDelay > 0) {
       const wait = this.lastSentAt + minDelay - Date.now();
       if (wait > 0) await new Promise((r) => setTimeout(r, wait));

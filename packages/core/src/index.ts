@@ -35,6 +35,7 @@ export type {
   StateEvent,
   StateEventType,
   StateEventInput,
+  ControlCommand,
   AssessmentState,
   AssessmentSummary,
   AssetSource,

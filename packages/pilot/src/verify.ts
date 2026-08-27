@@ -16,6 +16,8 @@ import type { AssessmentStore, Finding, FindingVerdict, ScopePolicy, Severity } 
 import { readEvidenceArtifact, classifyBurpName } from "@veritas/scanner";
 import type { EvidenceStore, FetchHttpClient, HttpRequest, HttpResponse } from "@veritas/scanner";
 import type { PlaywrightDriver } from "@veritas/crawler";
+import { resolveLlmConfig } from "@veritas/llm";
+import { runOpenAiAgentLoop, type PilotToolDef } from "./agent-loop.js";
 
 export interface VerifyBurpDeps {
   store: AssessmentStore;
@@ -103,6 +105,66 @@ export function endpointOf(f: Finding): string | null {
 }
 
 const txt = (s: string): { content: { type: "text"; text: string }[] } => ({ content: [{ type: "text", text: s }] });
+
+// Run a small bounded tool-loop for a burp re-verify / lead-selection stage. Default = the Claude Agent SDK (query());
+// VERDICT_LLM_PROVIDER=openai routes the SAME tools through the OpenAI-compatible loop instead (OpenCodeGo etc.), with
+// the allowlist as the locked toolbox. The tools' handlers write their result into a closure box; shouldStop reads it.
+async function runVerifyToolLoop(
+    deps: { onText?: (t: string) => void; onTool?: (n: string, i: unknown) => void; model?: string },
+    p: { tools: unknown[]; allowed: string[]; system: string; goal: string; maxTurns: number; shouldStop: () => boolean; label: string },
+): Promise<void> {
+    const vcfg = resolveLlmConfig(process.env);
+    if (vcfg.provider === "openai") {
+        if (!vcfg.baseURL || !vcfg.model) throw new Error("VERDICT_LLM_PROVIDER=openai needs VERDICT_LLM_BASE_URL + VERDICT_LLM_MODEL for burp re-verify");
+        await runOpenAiAgentLoop({
+            baseURL: vcfg.baseURL,
+            ...(vcfg.apiKey ? { apiKey: vcfg.apiKey } : {}),
+            model: vcfg.model,
+            system: p.system,
+            goal: p.goal,
+            tools: p.tools as unknown as PilotToolDef[],
+            allowed: p.allowed,
+            maxTurns: p.maxTurns,
+            mode: (process.env.VERDICT_LLM_TOOL_MODE as "native" | "text" | "auto" | undefined) ?? "auto",
+            onText: (t) => deps.onText?.(t),
+            onToolUse: (n, i) => deps.onTool?.(n, i),
+            shouldStop: p.shouldStop,
+        });
+        return;
+    }
+    const server = createSdkMcpServer({ name: "veritas", version: "1.0.0", tools: p.tools as never });
+    const q = query({
+        prompt: p.goal,
+        options: {
+            mcpServers: { veritas: server },
+            allowedTools: p.allowed.map((n) => `mcp__veritas__${n}`),
+            disallowedTools: DISALLOWED,
+            permissionMode: "bypassPermissions",
+            hooks: { PreToolUse: [{ hooks: [onlyVeritasToolsHook] }] },
+            ...(deps.model ? { model: deps.model } : {}),
+            systemPrompt: { type: "preset", preset: "claude_code", append: p.system },
+            maxTurns: p.maxTurns,
+        },
+    });
+    try {
+        for await (const msg of q) {
+            if (msg.type === "assistant") {
+                for (const block of msg.message.content) {
+                    if (block.type === "text" && block.text.trim()) deps.onText?.(block.text.trim());
+                    else if (block.type === "tool_use") deps.onTool?.(block.name, block.input);
+                }
+            }
+            if (p.shouldStop()) break;
+        }
+    } catch (e) {
+        deps.onText?.(`⚠ ${p.label} ended early: ${String(e instanceof Error ? e.message : e).slice(0, 140)}`);
+    }
+    try {
+        await q.return?.(undefined as never);
+    } catch {
+        /* generator already done */
+    }
+}
 
 function pick(h: Record<string, string>, keys: string[]): Record<string, string> {
   const o: Record<string, string> = {};
@@ -313,41 +375,17 @@ async function deepDiveOne(
       },
     );
 
-    const server = createSdkMcpServer({ name: "veritas", version: "1.0.0", tools: [burpEvidence, httpRequest, ...(domXss ? [domXss] : []), verdict] });
     const domXssHint = domXss ? " For an XSS lead whose input reflects but does not clearly execute in the HTTP body, use probe_dom_xss (real browser) before deciding — do not refute a possible DOM sink." : "";
     const goal = `Re-verify Burp finding ${f.id}: [${f.severity}] ${f.title.replace(/^\[burp\]\s*/, "")}${endpoint ? ` at ${endpoint}` : ""}. Start with burp_evidence, reproduce it (control + >=2 positives), then call verdict.${domXssHint}`;
-
-    const q = query({
-      prompt: goal,
-      options: {
-        mcpServers: { veritas: server },
-        allowedTools: ["burp_evidence", "http_request", ...(domXss ? ["probe_dom_xss"] : []), "verdict"].map((n) => `mcp__veritas__${n}`),
-        disallowedTools: DISALLOWED,
-        permissionMode: "bypassPermissions",
-        hooks: { PreToolUse: [{ hooks: [onlyVeritasToolsHook] }] },
-        ...(deps.model ? { model: deps.model } : {}),
-        systemPrompt: { type: "preset", preset: "claude_code", append: VERIFY_SYSTEM },
-        maxTurns,
-      },
+    await runVerifyToolLoop(deps, {
+      tools: [burpEvidence, httpRequest, ...(domXss ? [domXss] : []), verdict],
+      allowed: ["burp_evidence", "http_request", ...(domXss ? ["probe_dom_xss"] : []), "verdict"],
+      system: VERIFY_SYSTEM,
+      goal,
+      maxTurns,
+      shouldStop: () => !!box.outcome, // one verdict per finding
+      label: `verify ${f.id}`,
     });
-    try {
-      for await (const msg of q) {
-        if (msg.type === "assistant") {
-          for (const block of msg.message.content) {
-            if (block.type === "text" && block.text.trim()) deps.onText?.(block.text.trim());
-            else if (block.type === "tool_use") deps.onTool?.(block.name, block.input);
-          }
-        }
-        if (box.outcome) break; // stop as soon as a verdict is in (one verdict per finding)
-      }
-    } catch (e) {
-      deps.onText?.(`⚠ verify ${f.id} ended early: ${String(e instanceof Error ? e.message : e).slice(0, 140)}`);
-    }
-    try {
-      await q.return?.(undefined as never);
-    } catch {
-      /* generator already done */
-    }
 
     // Ended without a verdict (maxTurns etc.) → INCONCLUSIVE, not refuted: running out of budget is not evidence of a
     // false positive, so it must not drop the finding to info. Keep it as a lead at its current severity.
@@ -420,38 +458,15 @@ export async function triageAndDeepDiveBurp(
       return txt(`selected ${ids.length} of ${leads.length}`);
     },
   );
-  const server = createSdkMcpServer({ name: "veritas", version: "1.0.0", tools: [selectLeads] });
-  const q = query({
-    prompt: `${leads.length} lower-severity Burp issues (format: id [severity] title @ endpoint «heuristic hint»):\n${listing}\n\nReview the titles and pick the ones worth deep-diving, then call select_leads.`,
-    options: {
-      mcpServers: { veritas: server },
-      allowedTools: ["select_leads"].map((n) => `mcp__veritas__${n}`),
-      disallowedTools: DISALLOWED,
-      permissionMode: "bypassPermissions",
-      hooks: { PreToolUse: [{ hooks: [onlyVeritasToolsHook] }] },
-      ...(deps.model ? { model: deps.model } : {}),
-      systemPrompt: { type: "preset", preset: "claude_code", append: SELECT_SYSTEM },
-      maxTurns: 4,
-    },
+  await runVerifyToolLoop(deps, {
+    tools: [selectLeads],
+    allowed: ["select_leads"],
+    system: SELECT_SYSTEM,
+    goal: `${leads.length} lower-severity Burp issues (format: id [severity] title @ endpoint «heuristic hint»):\n${listing}\n\nReview the titles and pick the ones worth deep-diving, then call select_leads.`,
+    maxTurns: 4,
+    shouldStop: () => picked.ids.length > 0,
+    label: "burp triage selection",
   });
-  try {
-    for await (const msg of q) {
-      if (msg.type === "assistant") {
-        for (const block of msg.message.content) {
-          if (block.type === "text" && block.text.trim()) deps.onText?.(block.text.trim());
-          else if (block.type === "tool_use") deps.onTool?.(block.name, block.input);
-        }
-      }
-      if (picked.ids.length) break;
-    }
-  } catch (e) {
-    deps.onText?.(`⚠ burp triage selection ended early: ${String(e instanceof Error ? e.message : e).slice(0, 140)}`);
-  }
-  try {
-    await q.return?.(undefined as never);
-  } catch {
-    /* generator already done */
-  }
 
   const cap = opts.maxDeepDives ?? 12;
   const chosen = leads.filter((f) => picked.ids.includes(f.id)).slice(0, cap);

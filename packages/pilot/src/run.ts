@@ -11,12 +11,13 @@ import type { AssessmentStore, Screen, ScopePolicy } from "@veritas/core";
 import { isInScope, isScannable, recordTokens } from "@veritas/core";
 import type { LoginCreds } from "@veritas/crawler";
 import { InventoryBuilder, PlaywrightDriver, smartLogin } from "@veritas/crawler";
-import { ClaudeCliClient } from "@veritas/llm";
+import { makeLlmClient, resolveLlmConfig } from "@veritas/llm";
+import { runOpenAiAgentLoop, type PilotToolDef } from "./agent-loop.js";
 import { EvidenceStore, FetchHttpClient, fingerprintTech, stackAttackHints } from "@veritas/scanner";
 import type { TechSample } from "@veritas/scanner";
 import type { BurpAuditConn } from "@veritas/scanner";
 import { join } from "node:path";
-import { buildTools, STAGE_TOOLS, dedupKey, isAuthWalled, loadCookieFile, mergeSetCookie, touchIsDead, stripHash, backfillParentPrefixes, availableRoles, analyzePageJs } from "./tools.js";
+import { buildTools, STAGE_TOOLS, dedupKey, isAuthWalled, loadCookieFile, mergeSetCookie, touchIsDead, stripHash, backfillParentPrefixes, availableRoles, analyzePageJs, enrolByNavigate } from "./tools.js";
 import type { PilotSession, RoleSession } from "./tools.js";
 import { LiveControl } from "./live-control.js";
 import { DEFAULT_SCENARIOS, DIAGNOSE_PROMPT, FINGERPRINT_PROMPT, METHODOLOGY_PROMPT, RECON_GUESS_PROMPT, SCENARIO_PROMPT, SURVEY_PROMPT } from "./system.js";
@@ -82,8 +83,8 @@ export interface RunPilotOptions {
   /** Survey only: run just the survey stage, no methodology/diagnosis (emits screens/screenshots/APIs, no findings).
    *  Can later be chained into diagnosis via `resume` (map now / diagnose later). */
   surveyOnly?: boolean;
-  /** Upstream proxy such as Burp (e.g. http://127.0.0.1:8080). Routes HTTP + browser through it only when set. Unset = as-is. */
-  burpProxy?: string;
+  /** Upstream proxy for ALL traffic (any proxy, e.g. Burp http://127.0.0.1:8080). Routes raw HTTP + browser through it only when set. Unset = as-is (byte-identical). */
+  proxy?: string;
   /** Keep the auth session alive: during diagnosis, if the gap between screens exceeds this many minutes, do a raw-HTTP
    *  GET of a safe authed URL (NOT the top page — some sites reset the session on a cold hit to `/` or a full reload,
    *  and an SPA holding auth in memory is rebooted by any page load) and re-sync the rotated cookie. No browser
@@ -295,7 +296,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     ...(opts.browserPath ? { executablePath: opts.browserPath } : {}),
     ...(opts.browserChannel ? { channel: opts.browserChannel } : {}), // e.g. "chrome" — real Chrome is far less bot-detectable than bundled Chromium
     ...(opts.noSandbox ? { args: ["--no-sandbox"] } : {}),
-    ...(opts.burpProxy ? { proxy: opts.burpProxy } : {}),
+    ...(opts.proxy ? { proxy: opts.proxy } : {}),
     // Site-wide Basic/Digest: Playwright auto-responds to 401 (across all launched drivers = including attended role windows).
     ...(opts.httpBasic ? { httpCredentials: { username: opts.httpBasic.user, password: opts.httpBasic.pass } } : {}),
     // Operator's custom headers (WAF evasion etc.). Applied same-origin only (gated driver-side).
@@ -330,7 +331,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     // Launch each role and resolve auth. cookie -> inject / creds -> smartLogin (manual on failure) / no material -> manual.
     // viaWeb manual roles are registered together later and their Done awaited in parallel (N tabs at once). CLI (non-viaWeb) is sequential Enter as before.
     const manual: Array<{ role: string; driver: PlaywrightDriver }> = [];
-    const earlyLlm = viaWeb ? new ClaudeCliClient({ defaultModel: opts.fastModel ?? "claude-sonnet-5" }) : undefined;
+    const earlyLlm = viaWeb ? makeLlmClient(resolveLlmConfig(process.env, { claudeDefaultModel: "claude-sonnet-5" })) : undefined; // smartLogin helper — honors VERDICT_LLM_PROVIDER
     // Each role's login entry: its own loginUrl (user vs admin log in at different pages) → global loginUrl → target.
     const roleLoginUrl = (role: string): string => opts.roleLoginUrls?.get(role) ?? opts.loginUrl ?? opts.targetUrl;
     for (const role of roles) {
@@ -411,13 +412,23 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       ...(opts.httpBasic ? { authorization: `Basic ${Buffer.from(`${opts.httpBasic.user}:${opts.httpBasic.pass}`, "utf8").toString("base64")}` } : {}),
       ...(opts.customHeaders ?? {}), // apply operator's custom headers (WAF evasion etc.) to the raw http path too
     },
-    ...(opts.burpProxy ? { proxy: opts.burpProxy } : {}),
+    ...(opts.proxy ? { proxy: opts.proxy } : {}),
   });
 
+  // LLM provider: default is the Claude Agent SDK (query()); VERDICT_LLM_PROVIDER=openai drives the pilot's agentic loop
+  // through an OpenAI-compatible endpoint (OpenCodeGo etc.) instead — no `claude` subprocess. See ./agent-loop.ts.
+  const llmCfg = resolveLlmConfig(process.env);
+  const useOpenAi = llmCfg.provider === "openai";
+  // Tool transport for the openai loop: auto (default) = native function-calling with a text-protocol fallback for
+  // models/endpoints without native tool support; force with VERDICT_LLM_TOOL_MODE=native|text.
+  const llmToolMode = (process.env.VERDICT_LLM_TOOL_MODE as "native" | "text" | "auto" | undefined) ?? "auto";
+  if (useOpenAi && !llmCfg.baseURL) throw new Error("VERDICT_LLM_PROVIDER=openai needs VERDICT_LLM_BASE_URL for the pilot");
+  if (useOpenAi && !llmCfg.model) throw new Error("VERDICT_LLM_PROVIDER=openai needs VERDICT_LLM_MODEL for the pilot");
+
   // Model tiering: deep = high-value diagnosis screens (opus etc.), fast = survey/methodology/login/low-value screens (sonnet etc.).
-  // If fastModel is unset, same as deep = no tiering (behaviour unchanged).
-  const deepModel = opts.model;
-  const fastModel = opts.fastModel ?? opts.model;
+  // If fastModel is unset, same as deep = no tiering (behaviour unchanged). Under openai the models are the configured ones.
+  const deepModel = useOpenAi ? llmCfg.model! : opts.model;
+  const fastModel = useOpenAi ? (process.env.VERDICT_LLM_FAST_MODEL ?? llmCfg.model!) : (opts.fastModel ?? opts.model);
 
   // ── keepalive (raw-HTTP touch) ── the warm target is a concrete, in-scope, non-root, non-logout URL. Never `/`:
   //    some sites reset the session on a cold hit to root or a full reload, and an SPA holding auth in memory is
@@ -463,7 +474,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     roleCookieFiles: opts.roleCookieFiles ?? new Map(),
     roleLoginUrls: opts.roleLoginUrls,
     roleDescriptions: opts.roleDescriptions ?? new Map(),
-    loginLlm: new ClaudeCliClient({ defaultModel: fastModel ?? "claude-sonnet-5" }),
+    loginLlm: makeLlmClient(resolveLlmConfig(process.env, { claudeDefaultModel: "claude-sonnet-5" })), // smartLogin helper — honors VERDICT_LLM_PROVIDER
     currentCookie: primaryCookie, // attended starts with the primary role's live cookie (normally "")
     currentBearer: "", // login() loads each role's localStorage Bearer JWT
     currentRole: primaryRole,
@@ -512,7 +523,8 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     if (stripHash(u) !== stripHash(opts.targetUrl)) session.frontier.add(stripHash(u));
   }
 
-  const server = createSdkMcpServer({ name: "veritas", version: "1.0.0", tools: buildTools(session) });
+  const toolDefs = buildTools(session); // the veritas tool registry — feeds BOTH the SDK MCP server and the OpenAI loop
+  const server = createSdkMcpServer({ name: "veritas", version: "1.0.0", tools: toolDefs });
   // rolesLine drives the survey's "log in EACH role before survey_done" gate (authClause below). It MUST list the same
   // roles login() can actually switch to — availableRoles(session): in attended mode the live-session keys (INCLUDING
   // pure-manual roles that carry no creds/cookie), otherwise the creds + cookie-file keys. Computing it from
@@ -586,6 +598,39 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     model?: string;
     shouldStop: () => boolean;
   }): Promise<number> => {
+    // OpenAI-compatible provider (OpenCodeGo etc.): drive the SAME veritas tools via a chat/completions tool-calling
+    // loop instead of the Claude Agent SDK. The stage allowlist (p.allowed) is the locked toolbox — enforced by the loop.
+    if (useOpenAi) {
+      const res = await runOpenAiAgentLoop({
+        baseURL: llmCfg.baseURL!,
+        ...(llmCfg.apiKey ? { apiKey: llmCfg.apiKey } : {}),
+        model: p.model ?? deepModel ?? llmCfg.model!, // under openai llmCfg.model is guaranteed (checked at startup)
+        system: p.system,
+        goal: p.goal,
+        tools: toolDefs as unknown as PilotToolDef[],
+        allowed: p.allowed,
+        maxTurns: p.maxTurns,
+        mode: llmToolMode,
+        onText: (t) => {
+          opts.onText?.(t);
+          opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: t.slice(0, 400) } });
+        },
+        onToolUse: (n, i) => opts.onTool?.(n, i),
+        onTokens: (delta) => {
+          runTokens += delta;
+          if (budget) {
+            budget = recordTokens(budget, delta);
+            opts.store.updateBudget(opts.assessmentId, budget);
+          }
+        },
+        shouldStop: () => p.shouldStop() || session.done,
+      });
+      if (res.stopped === "error") {
+        opts.onText?.(`⚠ stage ended early: ${res.error}`);
+        opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: `⚠ stage ended early: ${res.error}` } });
+      }
+      return res.turns;
+    }
     let turns = 0;
     // Token tally: the result message (cumulative usage at query end) arrives after shouldStop's early break, so
     // collapsing the stage with a done tool almost always left it unread at 0. So we accumulate per-turn assistant
@@ -891,8 +936,111 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         lastTouch = Date.now();
       };
 
+      // ── live control channel ── operator reconfigure (rate / scope-widen / max-screens) applied between screens, plus
+      //    the WebUI pause finally honored by a running pilot. Only control_command events issued during THIS process apply
+      //    (seq > the max seen at start); scope changes are journaled via updateScope so a replay reconstructs the same gate.
+      let maxScan = opts.maxScreens ?? 40;
+      let lastControlSeq = ((): number => {
+        const seen = opts.store.controlCommandsSince(opts.assessmentId, 0);
+        return seen.length ? (seen[seen.length - 1]?.seq ?? 0) : 0;
+      })();
+      const applyPendingControls = (): void => {
+        for (const { seq, cmd } of opts.store.controlCommandsSince(opts.assessmentId, lastControlSeq)) {
+          lastControlSeq = seq;
+          let scopeChanged = false;
+          for (const raw of cmd.addHosts ?? []) {
+            const host = raw.trim().toLowerCase();
+            if (host && !opts.scope.inScopeHosts.includes(host)) {
+              opts.scope.inScopeHosts.push(host); // opts.scope === session.scope === the http allow-closure's scope (same ref)
+              scopeChanged = true;
+            }
+          }
+          for (const p of cmd.addInScopePathPrefixes ?? []) {
+            if (p && !opts.scope.inScopePathPrefixes.includes(p)) {
+              opts.scope.inScopePathPrefixes.push(p);
+              scopeChanged = true;
+            }
+          }
+          if (typeof cmd.rateMs === "number" && cmd.rateMs >= 0) {
+            http.setRate(cmd.rateMs);
+            opts.onText?.(`⚙ rate → ${cmd.rateMs}ms (live)`);
+          }
+          if (typeof cmd.maxScreens === "number" && cmd.maxScreens > 0) {
+            maxScan = cmd.maxScreens;
+            opts.onText?.(`⚙ max-screens → ${cmd.maxScreens} (live)`);
+          }
+          if (scopeChanged) {
+            opts.store.updateScope(opts.assessmentId, opts.scope); // journal (replayable); the live gate already sees it via the shared ref
+            opts.onText?.(`⚙ scope widened → hosts=[${opts.scope.inScopeHosts.join(",")}] (live)`);
+          }
+          if (cmd.note) opts.onText?.(`⚙ control note: ${cmd.note}`);
+        }
+      };
+
+      // ── operator-injected targets ── URLs added mid-run via the WebUI (target_injected events). enrolByNavigate is the
+      //    one safe enroll path: it cold-GETs the URL, rejects catch-alls, and populates BOTH session.inv (so get_screen
+      //    resolves it) and the store (queued) — a store-only insert would be invisible to the diagnosis tools (tools.ts:1637).
+      let lastInjectSeq = ((): number => {
+        const seen = opts.store.targetInjectionsSince(opts.assessmentId, 0);
+        return seen.length ? (seen[seen.length - 1]?.seq ?? 0) : 0;
+      })();
+      const ingestInjectedTargets = async (): Promise<void> => {
+        const pending = opts.store.targetInjectionsSince(opts.assessmentId, lastInjectSeq);
+        if (pending.length === 0) return;
+        // Re-sync the live scope from the persisted (server-widened) scope IN PLACE, so the http allow-closure (run.ts:406,
+        // captures opts.scope) and every isInScope(u, session.scope) — same object ref — immediately honor the widening.
+        const persisted = opts.store.loadAssessment(opts.assessmentId)?.scope;
+        if (persisted) {
+          opts.scope.inScopeHosts = persisted.inScopeHosts;
+          opts.scope.outOfScopeHosts = persisted.outOfScopeHosts;
+          opts.scope.inScopePathPrefixes = persisted.inScopePathPrefixes;
+          opts.scope.outOfScopePathPrefixes = persisted.outOfScopePathPrefixes;
+          opts.scope.approvalPathPrefixes = persisted.approvalPathPrefixes;
+          opts.scope.approvalMethods = persisted.approvalMethods;
+          opts.scope.rate = persisted.rate;
+        }
+        for (const { seq, url } of pending) {
+          lastInjectSeq = seq;
+          const r = await enrolByNavigate(session, url);
+          if (r.outcome === "enrolled") {
+            maxScan += 1; // injected targets are exempt from the maxScreens cap — the operator asked for them explicitly
+            opts.onText?.(`➕ injected target enrolled: ${url} → ${r.screenId} (queued for diagnosis)`);
+            opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: `➕ operator injected ${url} → ${r.screenId}` } });
+          } else {
+            const why =
+              r.outcome === "duplicate"
+                ? "already mapped"
+                : r.outcome === "out_of_scope"
+                  ? "still out of scope (re-add with extendScope)"
+                  : `cold-GET did not reach a real page (${r.outcome}${r.status ? ` ${r.status}` : ""})`;
+            const msg = `➕ injected target ${url} not enrolled — ${why}`;
+            opts.onText?.(msg);
+            opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: msg } });
+          }
+        }
+      };
+
       // Diagnose one screen (shared body called from both the primary path and the drain). "break" stops the outer loop.
       const diagnoseOne = async (sc: Screen): Promise<"continue" | "break"> => {
+        // ── between-screens checkpoint ── apply any queued reconfigure, then honor an operator (WebUI) pause. This is the
+        //    only safe apply point: the SDK agent is autonomous mid-query, so control lands strictly on the next screen.
+        applyPendingControls();
+        // Operator pause: HOLD here (don't exit) until resumed via the WebUI toggle, keeping the live authed session warm so
+        //   resume continues instantly with no re-login/re-survey. A stop (SIGTERM) kills the held process; the current screen
+        //   is still queued (we haven't marked it scanning), so it stays resumable, and a --resume start clears paused (see above).
+        if (opts.store.isPaused(opts.assessmentId)) {
+          opts.onText?.("⏸ paused by operator — holding between screens (session kept warm); resume to continue");
+          opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: "⏸ paused by operator" } });
+          while (opts.store.isPaused(opts.assessmentId) && !session.done) {
+            await keepSessionWarm(opts.anchorUrl ?? lastWarmUrl); // no-op until keepAliveMs elapses; keeps auth alive across a long pause
+            await new Promise((r) => setTimeout(r, 2000)); // poll cadence for the pause flag (cheap SELECT)
+          }
+          if (!session.done) {
+            opts.onText?.("▶ resumed by operator");
+            opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: "▶ resumed by operator" } });
+            applyPendingControls(); // apply anything reconfigured while paused
+          }
+        }
         const scUrl = warmTarget(sc.observedUrls?.[0]); // the authed page we're about to diagnose = a safe warm target
         await keepSessionWarm(opts.anchorUrl ?? scUrl); // with an anchor set, keep warming the stable hub
         if (scUrl && !opts.anchorUrl) lastWarmUrl = scUrl; // else remember it for attended/Burp keepalive (no per-screen context)
@@ -951,7 +1099,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       };
 
       const handled = new Set<string>();
-      const maxScan = opts.maxScreens ?? 40;
+      // maxScan is declared above (let) so a live control_command can raise/lower it mid-run.
       // primary path: run the start-time snapshot (in priority order).
       for (const sc of screens) {
         if (session.done) break;
@@ -965,7 +1113,9 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       //    screens up to maxScan / pause. Called after each stage.
       const drainQueued = async (): Promise<void> => {
         let drained = 0;
+        await ingestInjectedTargets(); // enrol any operator-injected URLs first (may raise maxScan) so an at-cap run still runs them
         while (!session.done && handled.size < maxScan) {
+          await ingestInjectedTargets(); // catch targets injected while this drain is in progress
           const live = opts.store.loadAssessment(opts.assessmentId);
           if (!live) break;
           const scanById = new Map(live.screenScans.map((s) => [s.screenId, s] as const));

@@ -7,10 +7,10 @@ import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "
 import { extname, join, normalize } from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
 
-import { AssessmentStore, buildReportModel, buildStateView, parseTargetUrl, renderFindingsCsv, renderInventoryHtml, renderMarkdown, renderReportHtml, renderScreensCsv } from "@veritas/core";
-import type { TargetInput, WsMessage } from "@veritas/core";
+import { AssessmentStore, buildReportModel, buildStateView, isInScope, parseTargetUrl, renderFindingsCsv, renderInventoryHtml, renderMarkdown, renderReportHtml, renderScreensCsv } from "@veritas/core";
+import type { TargetInput, WsMessage, ControlCommand, ScopePolicy } from "@veritas/core";
 import { htmlToPdf } from "@veritas/crawler";
-import { ClaudeCliClient } from "@veritas/llm";
+import { resolveLlmConfig, makeLlmClient } from "@veritas/llm";
 import type { AssessmentState } from "@veritas/core";
 import { handleAuthSubmit, handleLogout, roleForReq, loginPageHtml } from "./auth.js";
 import type { AuthConfig, Role } from "./auth.js";
@@ -366,7 +366,138 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
     return;
   }
 
+  // Live reconfigure of a running scan. body = { addHosts?, addInScopePathPrefixes?, rateMs?, maxScreens?, note? }.
+  // Appends a control_command event the pilot applies at its next between-screens checkpoint (operator-only; viewer POSTs are 403'd above).
+  m = url.match(/^\/api\/assessments\/([^/]+)\/reconfigure$/);
+  if (m) {
+    const id = decodeURIComponent(m[1] ?? "");
+    const store = openStore(id);
+    if (!store) return sendJson(res, 404, { error: "not found" });
+    let body = "";
+    let tooBig = false;
+    req.on("data", (c) => {
+      body += c;
+      if (body.length > 64 * 1024) {
+        tooBig = true;
+        req.destroy();
+      }
+    });
+    req.on("end", () => {
+      if (tooBig) return;
+      let cmd: ControlCommand;
+      try {
+        const j = JSON.parse(body) as Record<string, unknown>;
+        const strs = (v: unknown): string[] | undefined =>
+          Array.isArray(v) ? v.filter((x): x is string => typeof x === "string" && x.trim().length > 0) : undefined;
+        cmd = {};
+        const addHosts = strs(j.addHosts);
+        if (addHosts?.length) cmd.addHosts = addHosts;
+        const addPaths = strs(j.addInScopePathPrefixes);
+        if (addPaths?.length) cmd.addInScopePathPrefixes = addPaths;
+        if (typeof j.rateMs === "number" && Number.isFinite(j.rateMs) && j.rateMs >= 0) cmd.rateMs = j.rateMs;
+        if (typeof j.maxScreens === "number" && Number.isFinite(j.maxScreens) && j.maxScreens > 0) cmd.maxScreens = Math.floor(j.maxScreens);
+        if (typeof j.note === "string" && j.note.trim().length > 0) cmd.note = j.note.slice(0, 500);
+      } catch {
+        try {
+          store.close();
+        } catch {
+          /* noop */
+        }
+        return sendJson(res, 400, { error: "invalid JSON body" });
+      }
+      if (Object.keys(cmd).length === 0) {
+        try {
+          store.close();
+        } catch {
+          /* noop */
+        }
+        return sendJson(res, 400, { error: "no applicable fields (addHosts / addInScopePathPrefixes / rateMs / maxScreens / note)" });
+      }
+      mutateAndReply(id, store, () => store.appendControlCommand(id, cmd));
+    });
+    return;
+  }
+
+  // Add a target URL to a running (or resumable) scan for extra investigation. body = { url, extendScope? }.
+  // Refuses to silently widen scope (authorized-targets invariant): an out-of-scope host needs extendScope:true
+  // (the operator confirming it is within their authorization). Appends a target_injected event the pilot enrolls
+  // at its next drain checkpoint; on an idle run it is picked up on the next Resume. Operator-only (viewer POSTs 403'd above).
+  m = url.match(/^\/api\/assessments\/([^/]+)\/add-target$/);
+  if (m) {
+    const id = decodeURIComponent(m[1] ?? "");
+    const store = openStore(id);
+    if (!store) return sendJson(res, 404, { error: "not found" });
+    let body = "";
+    let tooBig = false;
+    req.on("data", (c) => {
+      body += c;
+      if (body.length > 8 * 1024) {
+        tooBig = true;
+        req.destroy();
+      }
+    });
+    req.on("end", () => {
+      if (tooBig) return;
+      const closeQuietly = (): void => {
+        try {
+          store.close();
+        } catch {
+          /* noop */
+        }
+      };
+      let target: URL;
+      let extendScope = false;
+      try {
+        const j = JSON.parse(body) as { url?: unknown; extendScope?: unknown };
+        if (typeof j.url !== "string" || j.url.trim().length === 0) throw new Error("missing url");
+        target = parseTargetUrl(j.url.trim()); // rejects schemeless / non-http(s) with an actionable message
+        extendScope = j.extendScope === true;
+      } catch (e) {
+        closeQuietly();
+        return sendJson(res, 400, { error: `invalid target: ${String(e instanceof Error ? e.message : e).slice(0, 160)}` });
+      }
+      const state = store.loadAssessment(id);
+      if (!state) {
+        closeQuietly();
+        return sendJson(res, 404, { error: "not found" });
+      }
+      let scope = state.scope;
+      if (!isInScope(target.href, scope)) {
+        if (!extendScope) {
+          closeQuietly();
+          return sendJson(res, 400, { error: `out of scope: ${target.host}${target.pathname}. Set extendScope:true to widen (confirm the host is within your authorization).` });
+        }
+        const widened = widenScopeForUrl(scope, target);
+        if (!widened) {
+          closeQuietly();
+          return sendJson(res, 400, { error: `cannot widen scope to ${target.href}: blocked by an out-of-scope rule` });
+        }
+        scope = widened;
+      }
+      mutateAndReply(id, store, () => {
+        if (scope !== state.scope) store.updateScope(id, scope); // persist the widening (live re-sync + resume both read it)
+        store.appendTargetInjection(id, target.href);
+      });
+    });
+    return;
+  }
+
   sendJson(res, 404, { error: "unknown control endpoint" });
+}
+
+/** Widen a scope just enough to bring `u` in-scope: add its host (and, if the scope is path-restricted, its path prefix).
+ *  Returns null if an out-of-scope rule still blocks it (never silently overrides an explicit exclusion). */
+function widenScopeForUrl(scope: ScopePolicy, u: URL): ScopePolicy | null {
+  const host = u.host.toLowerCase();
+  let s: ScopePolicy = {
+    ...scope,
+    inScopeHosts: [...new Set([...scope.inScopeHosts, host])],
+    outOfScopeHosts: scope.outOfScopeHosts.filter((h) => h.toLowerCase() !== host),
+  };
+  if (isInScope(u.href, s)) return s;
+  // path-restricted scope: also add this URL's path prefix
+  s = { ...s, inScopePathPrefixes: [...new Set([...s.inScopePathPrefixes, u.pathname])] };
+  return isInScope(u.href, s) ? s : null; // still blocked (e.g. an outOfScopePathPrefix) → refuse
 }
 
 function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptions, supervisor?: Supervisor, relay?: Relay): void {
@@ -647,7 +778,7 @@ async function serveChat(res: ServerResponse, runsDir: string, id: string, messa
   }
   const transcript = messages.map((m) => `${m.role === "assistant" ? "Assistant" : "User"}: ${m.content}`).join("\n\n");
   try {
-    const llm = new ClaudeCliClient({ defaultModel: "claude-sonnet-5" });
+    const llm = makeLlmClient(resolveLlmConfig(process.env, { claudeDefaultModel: "claude-sonnet-5" }));
     const r = await llm.complete({
       system: `${CHAT_SYSTEM}\n\n# Assessment data\n${buildChatContext(state)}`,
       prompt: `${transcript}\n\nAssistant:`,

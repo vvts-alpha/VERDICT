@@ -13,9 +13,10 @@ import { Scenarios } from "./components/Scenarios";
 import { Index } from "./components/Index";
 import { Sessions } from "./components/Sessions";
 import { Chat } from "./components/Chat";
+import { Control } from "./components/Control";
 import { AsrView } from "./components/AsrView";
 
-type Tab = "screen" | "findings" | "scenarios" | "log" | "apis" | "js" | "sessions" | "ask";
+type Tab = "screen" | "findings" | "scenarios" | "log" | "apis" | "js" | "sessions" | "ask" | "control";
 
 // DESIGN §8 — left: SITE TREE (nav) + progress bar; right: tabs: Screen / Findings / Diagnostic log / APIs.
 export function App() {
@@ -127,6 +128,9 @@ export function App() {
             <button type="button" className={tab === "ask" ? "active" : ""} onClick={() => setTab("ask")}>
               💬 Ask
             </button>
+            <button type="button" className={tab === "control" ? "active" : ""} onClick={() => setTab("control")}>
+              Control
+            </button>
           </div>
           <div className="tabbody">
             {tab === "screen" ? (
@@ -143,6 +147,7 @@ export function App() {
             {tab === "log" ? <Log events={view.events} /> : null}
             {tab === "sessions" ? <Sessions id={view.id} /> : null}
             {tab === "ask" ? <Chat id={view.id} /> : null}
+            {tab === "control" ? <Control view={view} /> : null}
           </div>
         </main>
       </div>

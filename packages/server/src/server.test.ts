@@ -62,6 +62,79 @@ test("HTTP API lists assessments and projects a StateView", async () => {
   }
 });
 
+test("reconfigure endpoint appends a control_command the running pilot will apply", async () => {
+  const runsDir = mkdtempSync(join(tmpdir(), "veritas-srv-"));
+  const store = seed(runsDir, "a-rc");
+  store.close();
+  const srv = await startServer({ runsDir, pollMs: 50 });
+  try {
+    // valid reconfigure → 200 (+ a StateView back)
+    const ok = await fetch(`${srv.url}/api/assessments/a-rc/reconfigure`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ addHosts: ["api.shop.test"], rateMs: 400, maxScreens: 25, note: "widen", bogus: "ignored" }),
+    });
+    assert.equal(ok.status, 200);
+
+    // the command landed on the append-only log as a control_command with only the valid fields
+    const check = AssessmentStore.open(join(runsDir, "a-rc", "state.sqlite"));
+    const pending = check.controlCommandsSince("a-rc", 0);
+    check.close();
+    assert.equal(pending.length, 1);
+    assert.deepEqual(pending[0]?.cmd, { addHosts: ["api.shop.test"], rateMs: 400, maxScreens: 25, note: "widen" });
+
+    // empty / no-applicable-fields body → 400
+    const empty = await fetch(`${srv.url}/api/assessments/a-rc/reconfigure`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ bogus: 1 }),
+    });
+    assert.equal(empty.status, 400);
+  } finally {
+    await srv.close();
+    rmSync(runsDir, { recursive: true, force: true });
+  }
+});
+
+test("add-target endpoint: injects an in-scope URL, refuses silent scope-widen, widens with extendScope", async () => {
+  const runsDir = mkdtempSync(join(tmpdir(), "veritas-srv-"));
+  const store = seed(runsDir, "a-at"); // scope = shop.test
+  store.close();
+  const srv = await startServer({ runsDir, pollMs: 50 });
+  const post = (bodyObj: unknown) =>
+    fetch(`${srv.url}/api/assessments/a-at/add-target`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(bodyObj),
+    });
+  try {
+    // in-scope URL → 200, appended as a target_injected
+    assert.equal((await post({ url: "https://shop.test/admin" })).status, 200);
+
+    // schemeless / invalid URL → 400
+    assert.equal((await post({ url: "shop.test/x" })).status, 400);
+
+    // out-of-scope host WITHOUT extendScope → 400 (never widen silently)
+    assert.equal((await post({ url: "https://evil.test/x" })).status, 400);
+
+    // out-of-scope host WITH extendScope → 200, and the scope is now widened to include it
+    assert.equal((await post({ url: "https://api.shop.test/v1/orders/1", extendScope: true })).status, 200);
+
+    const check = AssessmentStore.open(join(runsDir, "a-at", "state.sqlite"));
+    const injected = check.targetInjectionsSince("a-at", 0).map((x) => x.url);
+    const scope = check.loadAssessment("a-at")!.scope;
+    check.close();
+
+    // evil.test was refused (not appended); the two allowed ones landed
+    assert.deepEqual(injected, ["https://shop.test/admin", "https://api.shop.test/v1/orders/1"]);
+    assert.ok(scope.inScopeHosts.includes("api.shop.test"), "extendScope widened the persisted scope");
+    assert.ok(!scope.inScopeHosts.includes("evil.test"), "refused host was never added to scope");
+  } finally {
+    await srv.close();
+    rmSync(runsDir, { recursive: true, force: true });
+  }
+});
+
 test("auth gate: password-protects WebUI/API with login form + signed cookie", async () => {
   const runsDir = mkdtempSync(join(tmpdir(), "veritas-srv-"));
   const store = seed(runsDir, "a-auth");

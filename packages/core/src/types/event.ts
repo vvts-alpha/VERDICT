@@ -40,8 +40,26 @@ export type StateEvent =
   | EventEnvelope<"handoff_resolved", { handoffId: string }>
   | EventEnvelope<"halted", { reason: StopReason; detail?: string }>
   | EventEnvelope<"control_changed", { paused: boolean; reason?: string }>
+  | EventEnvelope<"control_command", ControlCommand>
+  | EventEnvelope<"target_injected", { url: string }>
   | EventEnvelope<"js_analyzed", JsAsset>
   | EventEnvelope<"note", { message: string }>;
+
+/** A live reconfigure command for a running scan, applied by the pilot at its next between-screens checkpoint.
+ *  All fields are optional — only the present ones are applied. Scope widening (addHosts / addInScopePathPrefixes)
+ *  touches the "Authorized targets only" invariant, so the server exposes it operator-only (viewer POSTs are 403). */
+export interface ControlCommand {
+  /** Hosts to ADD to the in-scope host set (widen). */
+  addHosts?: string[];
+  /** Path prefixes to ADD to the in-scope path set. */
+  addInScopePathPrefixes?: string[];
+  /** New raw-HTTP inter-request delay in ms (live rate change). */
+  rateMs?: number;
+  /** New cap on the number of screens to diagnose (drain bound). */
+  maxScreens?: number;
+  /** Free-text note for the audit log / operator visibility. */
+  note?: string;
+}
 
 export type StateEventType = StateEvent["type"];
 

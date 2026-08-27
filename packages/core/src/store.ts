@@ -23,6 +23,7 @@ import type {
   ScreenScanStatus,
   StateEvent,
   StateEventInput,
+  ControlCommand,
   StopReason,
   TargetInput,
 } from "./types/index.js";
@@ -225,6 +226,57 @@ export class AssessmentStore {
       this.insertEvent(assessmentId, { type: "control_changed", payload: { paused, reason } });
       this.touch(assessmentId, new Date().toISOString());
     });
+  }
+
+  /** Queue a live reconfigure command for a running scan (applied by the pilot at its next between-screens checkpoint). */
+  appendControlCommand(assessmentId: string, cmd: ControlCommand): StateEvent {
+    return this.tx(() => {
+      const ev = this.insertEvent(assessmentId, { type: "control_command", payload: cmd });
+      this.touch(assessmentId, ev.ts);
+      return ev;
+    });
+  }
+
+  /** control_command events with seq > sinceSeq, in order — a cheap poll for the live control loop. */
+  controlCommandsSince(assessmentId: string, sinceSeq: number): Array<{ seq: number; cmd: ControlCommand }> {
+    const rows = this.db
+      .prepare("SELECT seq, payload FROM events WHERE assessment_id = ? AND type = 'control_command' AND seq > ? ORDER BY seq ASC")
+      .all(assessmentId, sinceSeq) as Array<{ seq: number; payload: string }>;
+    const out: Array<{ seq: number; cmd: ControlCommand }> = [];
+    for (const r of rows) {
+      try {
+        out.push({ seq: r.seq, cmd: JSON.parse(r.payload) as ControlCommand });
+      } catch {
+        /* skip malformed */
+      }
+    }
+    return out;
+  }
+
+  /** Queue an operator-injected URL for the running scan to enroll + diagnose (picked up at the next drain checkpoint,
+   *  or on resume). Scope widening for the URL is persisted separately via updateScope. */
+  appendTargetInjection(assessmentId: string, url: string): StateEvent {
+    return this.tx(() => {
+      const ev = this.insertEvent(assessmentId, { type: "target_injected", payload: { url } });
+      this.touch(assessmentId, ev.ts);
+      return ev;
+    });
+  }
+
+  /** target_injected URLs with seq > sinceSeq, in order — the pilot's poll for operator-added targets. */
+  targetInjectionsSince(assessmentId: string, sinceSeq: number): Array<{ seq: number; url: string }> {
+    const rows = this.db
+      .prepare("SELECT seq, payload FROM events WHERE assessment_id = ? AND type = 'target_injected' AND seq > ? ORDER BY seq ASC")
+      .all(assessmentId, sinceSeq) as Array<{ seq: number; payload: string }>;
+    const out: Array<{ seq: number; url: string }> = [];
+    for (const r of rows) {
+      try {
+        out.push({ seq: r.seq, url: (JSON.parse(r.payload) as { url: string }).url });
+      } catch {
+        /* skip malformed */
+      }
+    }
+    return out;
   }
 
   /** Return whether paused per the latest control_changed (for a lightweight crawl/scan-loop check). */

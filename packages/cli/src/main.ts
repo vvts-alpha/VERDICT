@@ -37,7 +37,7 @@ import {
 } from "@veritas/core";
 import { PlaywrightDriver, buildInventory, crawl, exploreScreen, htmlToPdf, labelInventory, normalizePath, parseOpenApiToScreens, smartLogin, writeScreenInventory } from "@veritas/crawler";
 import type { LoginCreds } from "@veritas/crawler";
-import { ClaudeCliClient } from "@veritas/llm";
+import { resolveLlmConfig, makeLlmClient } from "@veritas/llm";
 import { EvidenceStore, FetchHttpClient, SECURITY_HEADERS, auditHeaders, parseBurpReport, pickBurpConfigs, readEvidenceArtifact, scanInventory, startBurpScan, getBurpScan, dedupSeedUrls, submitAudit, getAuditStatusAll, getAuditIssues, resetAudit, buildRawRequest, mergeBurpIssues as scannerMergeBurpIssues, triageBurpInfo, formatBurpLeads } from "@veritas/scanner";
 import type { BurpAuditConn } from "@veritas/scanner";
 import type { BurpIssue } from "@veritas/scanner";
@@ -51,6 +51,7 @@ import { runFromAsr, spawnPilotLauncher } from "./from-asr.js";
 import type { AsrScopePins } from "./from-asr.js";
 import { startServer } from "@veritas/server";
 import { loadDotEnv } from "./dotenv.js";
+import { resolveUpstreamProxy, proxyFlagGivenButEmpty } from "./proxy.js";
 
 const RUNS_DIR_DEFAULT = "runs";
 
@@ -78,7 +79,8 @@ commands:
             manual multi-session auth (headed required): opens a persistent context per role for a human to log in (clear CAPTCHA/MFA/Arkose)
             → Enter to confirm → explore/diagnose on the live session. diagnosis uses per-role live cookies and keeps sessions warm between screens (re-login requested on expiry)
             roles can be given inline via --attended admin,userA,userB (no manifest needed / overrides). bare --attended uses the manifest's auth.roles
-            ※ Burp integration (env by default, overridable by args): [--burp-proxy [url]] route all traffic through Burp (env BURP_PROXY if no value).
+            [--proxy [url]] route ALL traffic (browser + raw http) through an upstream proxy — ANY proxy (env VERDICT_PROXY/BURP_PROXY if no value); or set "proxy" in the manifest. Off unless given.
+            ※ Burp integration (env by default, overridable by args): [--burp-proxy [url]] alias of --proxy aimed at Burp (env BURP_PROXY if no value).
               [--burp-scan [--burp-api url]] after diagnosis, also run a Burp active scan against the same run → merge results → AI re-verifies the High+ imports (connection via env BURP_API/BURP_API_KEY/BURP_RESOURCE_POOL). both off by default. [--no-burp-verify] skips the verify phase.
                  ※ set env BURP_AUDIT_API=http://<host>:1338 (+ BURP_AUDIT_TOKEN) to route --burp-scan through the VERDICT Audit REST extension instead: it submits the AUTHENTICATED raw requests (session in the request) so it scans behind login — see tools/burp-audit-ext/.
   burp-scan --id <id> [--burp-api <url>] [--api-key <key>] [--config "<named config>"]... [--resource-pool <name>] [--manifest <m.json>] [--max-min <n>] [--poll <sec>] [--no-burp-verify] [--model <m>] [--out <dir>]
@@ -536,8 +538,9 @@ async function cmdLabel(args: string[]): Promise<void> {
     fail("no screens to label — run `crawl` first");
   }
 
-  const model = values.model ?? "claude-sonnet-5";
-  const client = new ClaudeCliClient({ defaultModel: model });
+  const llmCfg = resolveLlmConfig(process.env, { explicitModel: values.model, claudeDefaultModel: "claude-sonnet-5" });
+  const model = llmCfg.model ?? "claude-sonnet-5"; // effective model, also passed per-request to labelInventory below
+  const client = makeLlmClient(llmCfg);
   console.log(`labeling ${state.screens.length} screens with ${model} ...`);
   try {
     const result = await labelInventory(state.screens, client, {
@@ -579,6 +582,10 @@ interface AssessManifest {
   /** Operator focus hint (free text). Injected as the top-priority objective of the scenario stage (same as --focus). */
   focus?: string;
   model?: string;
+  /** Upstream HTTP proxy for ALL traffic (browser + raw http), e.g. http://127.0.0.1:8080. Same as --proxy.
+   *  Present = activates the proxy (explicit operator config); absent = no proxy (unchanged). Any secrets in the URL
+   *  stay local — the manifest is gitignored. A --proxy/--burp-proxy flag overrides this. */
+  proxy?: string;
   /** Redteam / assistant-mode config (the redteam command). The canary must be planted out-of-band by the
    *  operator (system prompt / custom instructions); the file-upload seedMode that plants it lands in a later slice. */
   assistant?: {
@@ -745,7 +752,8 @@ async function cmdAssess(args: string[]): Promise<void> {
   const scope: ScopePolicy = { ...deriveScopeFromUrls(seeds, manifest?.scopeMode ?? "same-origin"), ...(manifest?.scope ?? {}) };
   const followLinks = manifest?.crawl?.followLinks ?? true;
   const maxDepth = manifest?.crawl?.maxDepth ?? (values["max-depth"] ? Number.parseInt(values["max-depth"], 10) : 3);
-  const model = values.model ?? manifest?.model ?? "claude-sonnet-5";
+  const llmCfg = resolveLlmConfig(process.env, { explicitModel: values.model ?? manifest?.model, claudeDefaultModel: "claude-sonnet-5" });
+  const model = llmCfg.model ?? "claude-sonnet-5"; // effective model label (also passed per-request to explore/login/label below)
   const rate = values.rate ? Number.parseInt(values.rate, 10) : 250;
 
   const id = values.id ?? newAssessmentId(); // server-spawned runs supply --id; otherwise generate
@@ -762,7 +770,7 @@ async function cmdAssess(args: string[]): Promise<void> {
   const screensNow = () => store.loadAssessment(id)?.screens ?? [];
   const httpBasic = manifestHttpBasic(manifest); // site-wide Basic/Digest (if any)
   const assessCustomHeaders = manifestCustomHeaders(manifest); // WAF-bypass / mandated headers (if any)
-  const claude = new ClaudeCliClient({ defaultModel: model });
+  const claude = makeLlmClient(llmCfg);
   const http = new FetchHttpClient({ allow: (u) => isInScope(u, scope), minDelayMs: rate, headers: manifestAuthHeaders(manifest) }); // basic + custom headers (was httpBasic only)
   const evidence = new EvidenceStore(join(runsDir, id, "artifacts"));
 
@@ -1037,8 +1045,10 @@ async function runFromAsrCli(ref: string, runsDir: string, o: { top: number; ban
 async function cmdPilot(rawArgs: string[]): Promise<void> {
   const a1 = extractAttendedRoles(rawArgs);
   const inlineAttendedRoles = a1.roles;
-  // --burp-proxy is an optional-value flag: bare uses env BURP_PROXY, with a value uses that (env by default, overridden by the arg).
-  const bp = extractOptValueFlag(a1.args, "--burp-proxy");
+  // --proxy [url] (general) and its compat alias --burp-proxy [url] are optional-value flags: with a value -> that URL;
+  // bare --proxy -> env VERDICT_PROXY/BURP_PROXY, bare --burp-proxy -> env BURP_PROXY. Extract both before parseArgs.
+  const pf = extractOptValueFlag(a1.args, "--proxy");
+  const bp = extractOptValueFlag(pf.args, "--burp-proxy");
   const { values } = parseArgs({
     args: bp.args,
     options: {
@@ -1082,9 +1092,6 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       "from-asr-concurrency": { type: "string" }, // parallel child pilots (default 1 — Claude subscription concurrency)
     },
   });
-  // --burp-proxy: active only when given. Address = the arg value -> env BURP_PROXY.
-  const burpProxy = bp.present ? (bp.value ?? process.env.BURP_PROXY) : undefined;
-  if (bp.present && !burpProxy) console.log("⚠ --burp-proxy was given but neither a value nor BURP_PROXY env is set (continuing without a proxy)");
   const runsDir = values.out ?? RUNS_DIR_DEFAULT;
   // P3 — pilot --from-asr <asr-id|inventory.json>: promote an ASR run's ranked assets into per-host deep pilot runs.
   // A distinct mode (no survey/manifest of its own); the child pilots inherit the ASR scope, pinned — never widened.
@@ -1106,6 +1113,11 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       ? loadManifest(join(runsDir, values.id, "manifest.json"))
       : null;
   const model = values.model ?? manifest?.model ?? "claude-opus-4-8"; // deep model default = Opus (high-value screens / scenario / CVE)
+  // Upstream proxy (general --proxy > compat --burp-proxy > manifest proxy; bare flag reads env). A bare env var
+  // alone never activates it, so unset flag + unset manifest = no proxy (byte-identical to proxy-off). See ./proxy.ts.
+  const proxy = resolveUpstreamProxy({ proxyFlag: pf, burpFlag: bp, manifestProxy: manifest?.proxy, env: process.env });
+  if (proxyFlagGivenButEmpty(pf, bp, proxy))
+    console.log("⚠ --proxy/--burp-proxy was given but no value/env (VERDICT_PROXY/BURP_PROXY) and no manifest proxy is set (continuing without a proxy)");
   const rate = values.rate ? Number.parseInt(values.rate, 10) : 250;
   const maxTurns = values["max-turns"] ? Number.parseInt(values["max-turns"], 10) : 80;
   // On resume, re-derive attended from the manifest's manual roles (neither creds nor cookie).
@@ -1172,7 +1184,14 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
 
   const mode = `${surveyOnly ? " · survey-only" : resume ? " · resume" : ""}${attended ? " · attended (manual multi-session)" : ""}`;
   console.log(`▶ pilot ${id}  (Claude-led${mode})`);
-  console.log(`  target ${seedUrl} | scope hosts=[${scope.inScopeHosts.join(",")}] | model ${model}${values["fast-model"] ? ` (deep) / ${values["fast-model"]} (fast)` : ""} | rate ${rate}ms`);
+  console.log(`  target ${seedUrl} | scope hosts=[${scope.inScopeHosts.join(",")}] | model ${model}${values["fast-model"] ? ` (deep) / ${values["fast-model"]} (fast)` : ""} | rate ${rate}ms${proxy ? ` | proxy ${proxy}` : ""}`);
+  // VERDICT_LLM_PROVIDER=openai drives the pilot's agentic loop through an OpenAI-compatible endpoint (OpenCodeGo etc.)
+  // instead of the Claude Agent SDK — no `claude` subprocess. The deep/fast models are then the configured openai ones.
+  {
+    const _llm = resolveLlmConfig(process.env);
+    if (_llm.provider === "openai")
+      console.log(`  ⚙ LLM provider: openai-compatible — model ${_llm.model} via ${_llm.baseURL} (pilot agentic loop; experimental). The 'model ${model}' above is ignored under this provider.`);
+  }
   // Roles to open windows for in attended: the inline CSV (--attended a,b,c) takes priority; otherwise all role names from the manifest
   // (including manual-only roles with no creds/cookie). Also used for the listing display.
   const attendedRoles = attended ? (inlineAttendedRoles ?? (manifest?.auth?.roles ?? []).map((r) => r.name)) : [];
@@ -1241,7 +1260,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       ...(values["no-default-scenarios"] ? { defaultScenarios: false } : {}), // ON by default. Set to drop only the built-in scenarios
       ...(values["no-fingerprint"] ? { fingerprintPass: false } : {}), // ON by default. Set to drop A06 fingerprinting
       ...(values["cve-lookup"] ? { cveLookup: true } : {}), // OFF by default. Set to enable online CVE DB lookups
-      ...(burpProxy ? { burpProxy } : {}),
+      ...(proxy ? { proxy } : {}),
       ...(values["keepalive-min"] ? { keepAliveMinutes: Number.parseInt(values["keepalive-min"], 10) } : {}),
       ...(values["keepalive-url"] ? { keepAliveUrl: values["keepalive-url"] } : {}),
       ...(values["anchor-url"] ? { anchorUrl: values["anchor-url"] } : {}),
@@ -1320,7 +1339,7 @@ function resolveWebRoot(): string | undefined {
 async function cmdScan(args: string[]): Promise<void> {
   const { values } = parseArgs({
     args,
-    options: { id: { type: "string" }, out: { type: "string" }, rate: { type: "string" }, manifest: { type: "string" }, "burp-proxy": { type: "string" } },
+    options: { id: { type: "string" }, out: { type: "string" }, rate: { type: "string" }, manifest: { type: "string" }, proxy: { type: "string" }, "burp-proxy": { type: "string" } },
   });
   if (!values.id) fail("scan requires --id <assessment-id>");
   const runsDir = values.out ?? RUNS_DIR_DEFAULT;
@@ -1340,7 +1359,7 @@ async function cmdScan(args: string[]): Promise<void> {
 
   const minDelayMs = values.rate ? Number.parseInt(values.rate, 10) : 250;
   const authHeaders = manifestAuthHeaders(values.manifest ? loadManifest(values.manifest) : null);
-  const scanProxy = values["burp-proxy"] ?? process.env.BURP_PROXY;
+  const scanProxy = values.proxy ?? values["burp-proxy"] ?? process.env.VERDICT_PROXY ?? process.env.BURP_PROXY;
   const http = new FetchHttpClient({ allow: (url) => isInScope(url, state.scope), minDelayMs, ...(Object.keys(authHeaders).length ? { headers: authHeaders } : {}), ...(scanProxy ? { proxy: scanProxy } : {}) });
   const evidence = new EvidenceStore(join(runsDir, values.id, "artifacts"));
   console.log(`scanning ${state.screens.length} screens (scope-gated, rate ${minDelayMs}ms) ...`);
@@ -1374,6 +1393,7 @@ async function cmdLogic(args: string[]): Promise<void> {
       screen: { type: "string" },
       rate: { type: "string" },
       manifest: { type: "string" },
+      proxy: { type: "string" },
       "burp-proxy": { type: "string" },
     },
   });
@@ -1394,9 +1414,9 @@ async function cmdLogic(args: string[]): Promise<void> {
   }
 
   const minDelayMs = values.rate ? Number.parseInt(values.rate, 10) : 250;
-  const llm = new ClaudeCliClient(values.model ? { defaultModel: values.model } : {});
+  const llm = makeLlmClient(resolveLlmConfig(process.env, { explicitModel: values.model, claudeDefaultModel: "claude-sonnet-5" }));
   const authHeaders = manifestAuthHeaders(values.manifest ? loadManifest(values.manifest) : null);
-  const logicProxy = values["burp-proxy"] ?? process.env.BURP_PROXY;
+  const logicProxy = values.proxy ?? values["burp-proxy"] ?? process.env.VERDICT_PROXY ?? process.env.BURP_PROXY;
   const http = new FetchHttpClient({ allow: (url) => isInScope(url, state.scope), minDelayMs, ...(Object.keys(authHeaders).length ? { headers: authHeaders } : {}), ...(logicProxy ? { proxy: logicProxy } : {}) });
   const evidence = new EvidenceStore(join(runsDir, values.id, "artifacts"));
   const hypoOpts = values.model ? { model: values.model } : {};
@@ -1843,7 +1863,7 @@ async function cmdAsr(args: string[]): Promise<void> {
     const topN = values["triage-top"] ? Math.max(1, Number.parseInt(values["triage-top"], 10)) : 15;
     const targets = assets.filter((a) => a.alive).slice(0, topN);
     if (targets.length > 0) {
-      const llm = new ClaudeCliClient({});
+      const llm = makeLlmClient(resolveLlmConfig(process.env, { explicitModel: values.model, claudeDefaultModel: "claude-sonnet-5" }));
       console.log(`▶ AI triage on the top ${targets.length} live host(s)…`);
       for (const a of targets) {
         try {
@@ -2295,7 +2315,12 @@ async function runBurpScanOnRun(
     console.log("⚠ burp-scan: couldn't get scan status (timeout) — skipping");
     return 0;
   }
-  if (last.status !== "succeeded") console.log(`⚠ scan ended status=${last.status} — importing the issues found so far`);
+  if (last.status !== "succeeded") {
+    // Non-succeeded on loop exit usually means the ${maxMin}m deadline hit mid-scan → issues below are PARTIAL.
+    const msg = `⚠ burp-scan ended status=${last.status} (likely the ${o.maxMin}m timeout) — imported issues may be PARTIAL. Let Burp finish, then import the rest: burp-import --id ${id} --report <burp.xml>.`;
+    console.log(msg);
+    store.appendEvent(id, { type: "note", payload: { message: msg } });
+  }
 
   const { added, skipped, oos } = mergeBurpIssues(store, id, state, runsDir, last.issues, "bs");
   console.log(`\nburp-scan ${id}: ${last.issues.length} issue(s) → +${added} net-new(dup ${skipped} / out-of-scope ${oos})`);
@@ -2498,6 +2523,7 @@ async function runBurpAuditOnRun(
   console.log(`  submitted ${submitted}; polling every ${o.pollSec}s (timeout ${o.maxMin}m)…`);
 
   const deadline = Date.now() + o.maxMin * 60_000;
+  let finished = false;
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, o.pollSec * 1000));
     await o.onPoll?.();
@@ -2511,7 +2537,17 @@ async function runBurpAuditOnRun(
     const mine = statuses.filter((s) => hostKeys.has(s.host));
     const reqs = mine.reduce((n, s) => n + s.requestsMade, 0);
     console.log(`  [${mine.map((s) => s.status).join(", ") || "?"}] ${reqs} requests`);
-    if (mine.length > 0 && mine.every((s) => /finished|succeeded|failed|paused/i.test(s.status))) break;
+    if (mine.length > 0 && mine.every((s) => /finished|succeeded|failed|paused/i.test(s.status))) {
+      finished = true;
+      break;
+    }
+  }
+  // Deadline hit while Burp was still auditing → the /issues snapshot below is PARTIAL, not Burp's full result.
+  // Surface it loudly (console + WebUI note) so the "N issue(s)" line isn't mistaken for completion: let Burp finish, then burp-import the XML.
+  if (!finished) {
+    const msg = `⚠ burp-audit timed out at ${o.maxMin}m while Burp was still scanning — imported issues are PARTIAL. Let Burp finish, then import the rest: burp-import --id ${id} --report <burp.xml> (or raise the audit timeout).`;
+    console.log(msg);
+    store.appendEvent(id, { type: "note", payload: { message: msg } });
   }
 
   let issues;
@@ -2703,6 +2739,7 @@ async function cmdManifest(args: string[]): Promise<void> {
     const maxDepth = await askInt("max depth", 10);
 
     const model = await ask("\nModel", "claude-sonnet-5");
+    const proxy = await ask("\nUpstream proxy for ALL traffic (optional, e.g. http://127.0.0.1:8080)");
 
     console.log("\n--- auth roles (empty name + Enter to finish) ---");
     console.log("  either credentials or a pre-captured cookie file. [0]=primary login, multiple = auth-diff.");
@@ -2738,6 +2775,7 @@ async function cmdManifest(args: string[]): Promise<void> {
       },
       crawl: { followLinks, maxDepth },
       model,
+      ...(proxy ? { proxy } : {}),
     };
     if (roles.length) manifest.auth = { roles };
 

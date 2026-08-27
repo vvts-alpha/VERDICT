@@ -46,6 +46,8 @@ export interface StartRunInput {
     burpScan?: boolean;
     /** pilot only: route all traffic through the Burp proxy (connection via env BURP_PROXY). */
     burpProxy?: boolean;
+    /** pilot only: route ALL traffic through this upstream proxy — any proxy, e.g. http://127.0.0.1:8080. Passed as --proxy. Unset = no proxy. */
+    proxy?: string;
     /** redteam only: positive replays required to confirm a canary leak (default 2). */
     maxReplays?: number;
     /** asr only: the wildcard/apex to recon (e.g. "*.example.com"). */
@@ -148,6 +150,7 @@ export class Supervisor {
       if (o.anchorUrl) args.push("--anchor-url", o.anchorUrl);
       if (input.command === "pilot" && o.burpScan) args.push("--burp-scan");
       if (input.command === "pilot" && o.burpProxy) args.push("--burp-proxy");
+      if (input.command === "pilot" && o.proxy) args.push("--proxy", o.proxy); // general upstream proxy (any proxy)
     }
     // attended×LiveHands: the child reverse-connects to serve and screencasts role sessions (token auth).
     if ((input.command === "pilot" || input.command === "redteam") && o.attended && this.relay && this.controlBase) {
@@ -197,7 +200,9 @@ export class Supervisor {
     if (existsSync(manifestPath)) args.push("--manifest", manifestPath);
     if (o.model) args.push("--model", o.model);
     if (o.fastModel) args.push("--fast-model", o.fastModel);
+    if (o.burpScan) args.push("--burp-scan"); // re-arm the post-diagnosis Burp active-scan phase (an interrupted burp-enabled run only reaches it on resume)
     if (o.burpProxy) args.push("--burp-proxy"); // valueless flag (reads from BURP_PROXY env)
+    if (o.proxy) args.push("--proxy", o.proxy); // general upstream proxy (any proxy)
     if (o.loginUrl) args.push("--login-url", o.loginUrl);
     if (o.maxScreens != null) args.push("--max-screens", String(o.maxScreens));
     if (o.focus) args.push("--focus", o.focus);

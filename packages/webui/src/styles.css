@@ -109,6 +109,7 @@ body { background: var(--bg); color: var(--fg); font-size: 13px; }
 .nf-launch:hover { background: #244a63; }
 .nf-launch:disabled { opacity: 0.5; cursor: default; }
 .nf-err { color: var(--err); font-size: 12px; margin: 10px 0 0; }
+.ctl-ok { color: var(--accent); font-size: 12px; margin: 10px 0 0; }
 
 /* attended×LiveHands Sessions タブ */
 .sess { display: flex; flex-direction: column; gap: 10px; }
