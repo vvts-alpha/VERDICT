@@ -1,0 +1,10 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "paths": {
+      "@veritas/core": ["../../packages/core/src/index.ts"],
+      "@veritas/server": ["../../packages/server/src/index.ts"]
+    }
+  },
+  "include": ["src/**/*.ts"]
+}

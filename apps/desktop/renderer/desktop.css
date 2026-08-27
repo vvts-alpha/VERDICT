@@ -1,0 +1,25 @@
+/* Desktop chrome styles (custom title bar). Uses the web UI's CSS tokens (--panel/--line/--accent/--fg/--err),
+   which webui/styles.css defines on :root and is imported before this file. Desktop-only — never in the web build. */
+.desk-shell { display: flex; flex-direction: column; height: 100vh; }
+.desk-titlebar {
+  display: flex; align-items: stretch; height: 38px; flex: 0 0 38px;
+  background: var(--panel); border-bottom: 1px solid var(--line);
+  -webkit-app-region: drag; user-select: none;
+}
+.desk-brand {
+  display: flex; align-items: center; gap: 8px;
+  padding: 0 14px; font-size: 12px; font-weight: 700; letter-spacing: 2px; color: var(--fg);
+}
+.desk-mark { width: 9px; height: 9px; border-radius: 2px; background: var(--accent); display: inline-block; }
+.desk-drag { flex: 1 1 auto; }
+.desk-winctl { display: flex; align-items: stretch; -webkit-app-region: no-drag; }
+.desk-wbtn {
+  display: flex; align-items: center; justify-content: center;
+  width: 44px; height: 100%; padding: 0; border: 0; background: transparent;
+  color: var(--muted); cursor: default; transition: background 0.12s, color 0.12s;
+}
+.desk-wbtn:hover { background: color-mix(in srgb, var(--fg) 10%, transparent); color: var(--fg); }
+.desk-wclose:hover { background: var(--err); color: #fff; }
+/* the app content fills the space under the title bar; full-height children (.page/.app) shrink to fit */
+.desk-content { flex: 1 1 auto; min-height: 0; overflow: auto; position: relative; }
+.desk-content > .page, .desk-content > .app { height: 100%; }

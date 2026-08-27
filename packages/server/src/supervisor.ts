@@ -14,6 +14,12 @@ export interface RunLauncherConfig {
   cliPath: string;
   /** The node executable used to launch child processes (default process.execPath). */
   nodePath: string;
+  /** Environment for child processes (default process.env). The Electron shell injects ELECTRON_RUN_AS_NODE=1
+   *  (+ VERDICT_LLM_PROVIDER / VERDICT_BROWSER_PATH) so process.execPath runs as plain Node inside a packaged app. */
+  childEnv?: NodeJS.ProcessEnv;
+  /** Working directory for child processes (default process.cwd()). The desktop app passes an absolute dir since
+   *  its cwd is the read-only install dir, not the repo. */
+  cwd?: string;
   onLog?: (m: string) => void;
 }
 
@@ -276,7 +282,7 @@ export class Supervisor {
     // --disable-warning=ExperimentalWarning: the CLI uses node:sqlite, whose first-use ExperimentalWarning would
     // otherwise hit the child's stderr → run.log → the ASR Log tab (looks like a "SQLite read error"). args[0] is the
     // CLI script path, so the node flag must precede it.
-    const child = spawn(this.cfg.nodePath, ["--disable-warning=ExperimentalWarning", ...args], { cwd: process.cwd(), env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(this.cfg.nodePath, ["--disable-warning=ExperimentalWarning", ...args], { cwd: this.cfg.cwd ?? process.cwd(), env: this.cfg.childEnv ?? process.env, stdio: ["ignore", "pipe", "pipe"] });
     const rec: RunProc = { id, command, child, startedAt: new Date().toISOString(), status: "running", exitCode: null };
     this.procs.set(id, rec);
     // Tee the child's stdout/stderr to runs/<id>/run.log, one timestamped line at a time (the WebUI ASR Log tab
