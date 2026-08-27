@@ -581,6 +581,9 @@ interface AssessManifest {
   http?: { headers?: Record<string, string> };
   /** Operator focus hint (free text). Injected as the top-priority objective of the scenario stage (same as --focus). */
   focus?: string;
+  /** Enabled skills (plugin capabilities) as { skillId: config }. Each contributes tools to the pilot (see
+   *  packages/pilot/src/skills.ts). Config may hold secrets (mailbox creds etc.) — the manifest is gitignored. */
+  skills?: Record<string, Record<string, unknown>>;
   model?: string;
   /** Upstream HTTP proxy for ALL traffic (browser + raw http), e.g. http://127.0.0.1:8080. Same as --proxy.
    *  Present = activates the proxy (explicit operator config); absent = no proxy (unchanged). Any secrets in the URL
@@ -1227,6 +1230,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       ...(customHeaders ? { customHeaders } : {}),
       ...(oobConn ? { oob: oobConn } : {}),
       ...((values.focus ?? manifest?.focus) ? { focus: values.focus ?? manifest?.focus } : {}),
+      ...(manifest?.skills ? { skills: manifest.skills } : {}), // enabled plugin capabilities (skills.ts)
       ...(values["no-input-sweep"] ? { inputSweep: false } : {}),
       ...(values["safe-forms"] ? { aggressiveForms: false } : {}),
       profileDir: join(runsDir, id, "browser-profile"),

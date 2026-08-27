@@ -18,6 +18,7 @@ import type { TechSample } from "@veritas/scanner";
 import type { BurpAuditConn } from "@veritas/scanner";
 import { join } from "node:path";
 import { buildTools, STAGE_TOOLS, dedupKey, isAuthWalled, loadCookieFile, mergeSetCookie, touchIsDead, stripHash, backfillParentPrefixes, availableRoles, analyzePageJs, enrolByNavigate } from "./tools.js";
+import { resolveSkills, buildSkillTools, skillToolNamesForStage, type Stage } from "./skills.js";
 import type { PilotSession, RoleSession } from "./tools.js";
 import { LiveControl } from "./live-control.js";
 import { DEFAULT_SCENARIOS, DIAGNOSE_PROMPT, FINGERPRINT_PROMPT, METHODOLOGY_PROMPT, RECON_GUESS_PROMPT, SCENARIO_PROMPT, SURVEY_PROMPT } from "./system.js";
@@ -77,6 +78,9 @@ export interface RunPilotOptions {
   maxSurveyScreens?: number;
   /** Resume an existing run: skip survey/methodology and diagnose only the un-diagnosed (non-terminal) screens. */
   resume?: boolean;
+  /** Enabled skills (plugin capabilities) as { skillId: config }. Each contributes veritas tools to the stages it
+   *  declares (see ./skills.ts). Unset/empty = core tools only (unchanged). */
+  skills?: Record<string, Record<string, unknown>>;
   /** Exhaustive (screen survey): disable survey's dynamic pruning (ignore_paths) and map every screen.
    *  If unset, ignore_paths is active (the model prunes low-value CMS content trees etc. itself to curb frontier blow-up). */
   exhaustiveSurvey?: boolean;
@@ -533,7 +537,16 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     if (stripHash(u) !== stripHash(opts.targetUrl)) session.frontier.add(stripHash(u));
   }
 
-  const toolDefs = buildTools(session); // the veritas tool registry — feeds BOTH the SDK MCP server and the OpenAI loop
+  // Skills (plugin capabilities): resolve the enabled ones + build their tools once. They extend the core tool set and
+  // each stage's allowlist (allowedFor) — so a skill tool is only callable when its skill is enabled AND allowed in the
+  // current stage (containment preserved). Empty skills = core tools only (unchanged).
+  const enabledSkills = resolveSkills(opts.skills, (id) => opts.onText?.(`⚠ unknown skill '${id}' — ignored`));
+  const skillTools = buildSkillTools(session, enabledSkills);
+  if (enabledSkills.length) opts.onText?.(`🧩 skills enabled: ${enabledSkills.map((e) => e.skill.id).join(", ")} (+${skillTools.length} tool(s))`);
+  /** A stage's allowlist = its core tools + any enabled-skill tools declared for that stage. */
+  const allowedFor = (stage: Stage): readonly string[] => [...STAGE_TOOLS[stage], ...skillToolNamesForStage(skillTools, stage)];
+
+  const toolDefs = [...buildTools(session), ...skillTools.map((e) => e.tool)]; // core + skill tools → SDK MCP server + OpenAI loop
   const server = createSdkMcpServer({ name: "veritas", version: "1.0.0", tools: toolDefs });
   // rolesLine drives the survey's "log in EACH role before survey_done" gate (authClause below). It MUST list the same
   // roles login() can actually switch to — availableRoles(session): in attended mode the live-session keys (INCLUDING
@@ -757,7 +770,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       turns += await runStage({
         system: SURVEY_PROMPT,
         goal: surveyGoal,
-        allowed: STAGE_TOOLS.survey,
+        allowed: allowedFor("survey"),
         maxTurns,
         model: fastModel, // survey is mechanical -> fast
         shouldStop: () => session.surveyDone || session.done,
@@ -812,7 +825,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       turns += await runStage({
         system: RECON_GUESS_PROMPT,
         goal: `${session.inv.screens().length} screens were mapped. Call get_inventory, infer the app's URL/naming convention, then probe_guesses the endpoints you predict exist but were not linked (missing CRUD actions on known controllers, sibling controllers by analogy, admin/privileged variants, API resources matching the observed style). Real pages are enrolled automatically; wrong guesses are dropped. Iterate AT MOST twice, then guess_done.`,
-        allowed: STAGE_TOOLS.reconGuess,
+        allowed: allowedFor("reconGuess"),
         maxTurns: Math.min(maxTurns, 12),
         model: fastModel, // guessing is mechanical -> fast
         shouldStop: () => session.reconGuessDone || session.done,
@@ -867,7 +880,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       turns += await runStage({
         system: METHODOLOGY_PROMPT,
         goal: `${techClause}${session.inv.screens().length} screens were mapped. Call get_inventory, then record_methodology for EVERY screen, then methodology_done.`,
-        allowed: STAGE_TOOLS.methodology,
+        allowed: allowedFor("methodology"),
         maxTurns: Math.min(maxTurns, 30),
         model: fastModel, // methodology is fast too (structured plan authoring)
         shouldStop: () => session.methodologyDone || session.done,
@@ -1084,7 +1097,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         turns += await runStage({
           system: DIAGNOSE_PROMPT,
           goal: `Diagnose screen ${sc.screenId} (${sc.urlTemplate}). Call get_screen for its detail and plan, test that plan with evidence discipline, then screen_done.`,
-          allowed: STAGE_TOOLS.diagnose,
+          allowed: allowedFor("diagnose"),
           maxTurns: perScreen,
           model: screenIsHighValue(sc) ? deepModel : fastModel, // only high-value screens go deep (opus)
           shouldStop: () => session.screenDone || session.done,
@@ -1193,7 +1206,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         turns += await runStage({
           system: SCENARIO_PROMPT,
           goal: `${focusClause}${defaultClause}Per-screen diagnosis is done. Call get_inventory, then (a) carry out the STANDING OBJECTIVES above, and (b) decide FROM THE INVENTORY whether this app has any multi-step / state-changing workflow worth abusing (e.g. a cart→checkout→order flow, a coupon/voucher redemption, a fund/points transfer, a multi-step registration/approval, a role/privilege change). For each workflow: log in, walk the legitimate flow once, then build probe_scenario(control, exploit, effectMarker) threading captured ids via {{var}}, and record_finding only on a confirmed verdict. Call scenario_done ONLY after the standing objectives AND every workflow have been covered${defaultsOn ? " (if there are no workflows, still finish the standing objectives before scenario_done)" : opts.focus ? " (if there is none beyond the operator focus, finish the focus first)" : " — if there is no workflow and nothing else to do, call scenario_done"}.`,
-          allowed: STAGE_TOOLS.scenario,
+          allowed: allowedFor("scenario"),
           maxTurns: Math.min(maxTurns, 40),
           model: deepModel, // discovering and building workflows is the hardest reasoning -> pinned deep
           shouldStop: () => session.scenarioDone || session.done,
@@ -1207,7 +1220,8 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         session.fingerprintDone = false;
         opts.onText?.(`🔎 fingerprint stage: collecting tech/version banners → ${session.cveLookup ? "online CVE-DB (OSV/NVD)" : "model-knowledge"} CVE assessment (A06)`);
         // When CVE DB lookup is off, don't offer cve_lookup (avoids wasted turns).
-        const fpTools = session.cveLookup ? STAGE_TOOLS.fingerprint : STAGE_TOOLS.fingerprint.filter((t) => t !== "cve_lookup");
+        const fpCore = session.cveLookup ? STAGE_TOOLS.fingerprint : STAGE_TOOLS.fingerprint.filter((t) => t !== "cve_lookup");
+        const fpTools = [...fpCore, ...skillToolNamesForStage(skillTools, "fingerprint")];
         const cveClause = session.cveLookup
           ? "After fingerprint_scan, call cve_lookup with the detected components to get AUTHORITATIVE CVE ids from OSV/NVD, and cite those ids. "
           : "Assess each (component, version) against your own CVE/EOL knowledge (online CVE-DB lookup is off). ";
