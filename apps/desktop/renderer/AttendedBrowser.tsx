@@ -85,6 +85,31 @@ export function AttendedBrowser({ initialUrl, onClose }: { initialUrl: string; o
         }
     };
 
+    // Option B: inject the captured session into the run currently open (?id=) — it applies mid-scan at the pilot's
+    // next between-screens checkpoint, so a running scan becomes authenticated without a restart.
+    const currentRunId = typeof window !== "undefined" ? new URLSearchParams(window.location.search).get("id") : null;
+    const inject = async (): Promise<void> => {
+        if (!captured || !currentRunId) return;
+        setLaunching(true);
+        try {
+            const res = await fetch(`/api/assessments/${encodeURIComponent(currentRunId)}/inject-session`, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ cookieFile: captured.path }),
+            });
+            if (res.ok) {
+                setNote({ ok: true, text: `session injected into the running scan — it continues authenticated at the next screen` });
+            } else {
+                const j = (await res.json().catch(() => ({}))) as { error?: string };
+                setNote({ ok: false, text: j.error ?? `inject failed (${res.status})` });
+            }
+        } catch (e) {
+            setNote({ ok: false, text: String(e) });
+        } finally {
+            setLaunching(false);
+        }
+    };
+
     // Attended → auto handoff: launch a headless authenticated scan of this target using the captured session cookie.
     const scan = async (): Promise<void> => {
         if (!captured) return;
@@ -127,9 +152,14 @@ export function AttendedBrowser({ initialUrl, onClose }: { initialUrl: string; o
                     placeholder="https://target/login"
                 />
                 <button type="button" className="attb-capture" onClick={() => void capture()} title="Save the login session for the scan">Capture session</button>
+                {captured && currentRunId ? (
+                    <button type="button" className="attb-scan" disabled={launching} onClick={() => void inject()} title="Inject this session into the scan you're viewing — it continues authenticated, no restart">
+                        {launching ? "Injecting…" : "Inject into this run →"}
+                    </button>
+                ) : null}
                 {captured ? (
-                    <button type="button" className="attb-scan" disabled={launching} onClick={() => void scan()} title={`Start a headless authenticated scan of ${captured.host} with this session`}>
-                        {launching ? "Starting…" : "Scan with session →"}
+                    <button type="button" className="attb-scan" disabled={launching} onClick={() => void scan()} title={`Start a new headless authenticated scan of ${captured.host} with this session`}>
+                        {launching ? "Starting…" : "Scan (new run) →"}
                     </button>
                 ) : null}
                 <button type="button" className="attb-close" onClick={onClose} title="Close">Close</button>

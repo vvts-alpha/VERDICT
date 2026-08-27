@@ -950,11 +950,15 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       //    the WebUI pause finally honored by a running pilot. Only control_command events issued during THIS process apply
       //    (seq > the max seen at start); scope changes are journaled via updateScope so a replay reconstructs the same gate.
       let maxScan = opts.maxScreens ?? 40;
-      let lastControlSeq = ((): number => {
+      // Fresh run: apply EVERY control command (the run id didn't exist before launch, so all commands are new — incl.
+      // ones issued during survey/methodology, before diagnosis). Resume: skip commands already applied in the prior
+      // process (seq ≤ the current max), so a resumed run doesn't re-apply old reconfigures/injections.
+      let lastControlSeq = 0;
+      if (opts.resume) {
         const seen = opts.store.controlCommandsSince(opts.assessmentId, 0);
-        return seen.length ? (seen[seen.length - 1]?.seq ?? 0) : 0;
-      })();
-      const applyPendingControls = (): void => {
+        lastControlSeq = seen.length ? (seen[seen.length - 1]?.seq ?? 0) : 0;
+      }
+      const applyPendingControls = async (): Promise<void> => {
         for (const { seq, cmd } of opts.store.controlCommandsSince(opts.assessmentId, lastControlSeq)) {
           lastControlSeq = seq;
           let scopeChanged = false;
@@ -982,6 +986,23 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
           if (scopeChanged) {
             opts.store.updateScope(opts.assessmentId, opts.scope); // journal (replayable); the live gate already sees it via the shared ref
             opts.onText?.(`⚙ scope widened → hosts=[${opts.scope.inScopeHosts.join(",")}] (live)`);
+          }
+          // Live session injection (Option B): the operator logged in mid-scan; apply the captured cookie to the LIVE
+          //   session — browser context + the raw http path — so subsequent screens are authenticated, no restart.
+          if (cmd.injectCookieFile) {
+            try {
+              const { header, browserCookies } = loadCookieFile(cmd.injectCookieFile, opts.targetUrl);
+              if (header) {
+                await session.driver.addCookies(browserCookies); // authenticate the browser context
+                session.currentCookie = header; // authenticate the raw http path (authHeaders reads currentCookie)
+                opts.onText?.("🔓 session injected (operator login) — continuing authenticated");
+                opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: "🔓 operator injected a login session — continuing authenticated" } });
+              } else {
+                opts.onText?.("⚠ injected session file was empty/unparseable");
+              }
+            } catch (e) {
+              opts.onText?.(`⚠ session injection failed: ${String(e instanceof Error ? e.message : e).slice(0, 120)}`);
+            }
           }
           if (cmd.note) opts.onText?.(`⚙ control note: ${cmd.note}`);
         }
@@ -1034,7 +1055,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       const diagnoseOne = async (sc: Screen): Promise<"continue" | "break"> => {
         // ── between-screens checkpoint ── apply any queued reconfigure, then honor an operator (WebUI) pause. This is the
         //    only safe apply point: the SDK agent is autonomous mid-query, so control lands strictly on the next screen.
-        applyPendingControls();
+        await applyPendingControls();
         // Operator pause: HOLD here (don't exit) until resumed via the WebUI toggle, keeping the live authed session warm so
         //   resume continues instantly with no re-login/re-survey. A stop (SIGTERM) kills the held process; the current screen
         //   is still queued (we haven't marked it scanning), so it stays resumable, and a --resume start clears paused (see above).
@@ -1048,7 +1069,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
           if (!session.done) {
             opts.onText?.("▶ resumed by operator");
             opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: "▶ resumed by operator" } });
-            applyPendingControls(); // apply anything reconfigured while paused
+            await applyPendingControls(); // apply anything reconfigured while paused
           }
         }
         const scUrl = warmTarget(sc.observedUrls?.[0]); // the authed page we're about to diagnose = a safe warm target

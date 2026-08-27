@@ -4,7 +4,7 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
-import { extname, join, normalize } from "node:path";
+import { extname, join, normalize, resolve, sep } from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
 
 import { AssessmentStore, buildReportModel, buildStateView, isInScope, parseTargetUrl, renderFindingsCsv, renderInventoryHtml, renderMarkdown, renderReportHtml, renderScreensCsv } from "@veritas/core";
@@ -478,6 +478,56 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
         if (scope !== state.scope) store.updateScope(id, scope); // persist the widening (live re-sync + resume both read it)
         store.appendTargetInjection(id, target.href);
       });
+    });
+    return;
+  }
+
+  // Live session injection (Option B): the operator logged in mid-scan (e.g. via the desktop's embedded browser),
+  // capturing a cookie file — inject it into the RUNNING pilot. body = { cookieFile }. Only the PATH is queued (as a
+  // control_command the pilot applies at its next checkpoint); the cookie stays in the local file. The path MUST be
+  // inside runsDir (the pilot reads it) — reject anything outside (no arbitrary file read). Operator-only (viewer 403'd above).
+  m = url.match(/^\/api\/assessments\/([^/]+)\/inject-session$/);
+  if (m) {
+    const id = decodeURIComponent(m[1] ?? "");
+    const store = openStore(id);
+    if (!store) return sendJson(res, 404, { error: "not found" });
+    let body = "";
+    let tooBig = false;
+    req.on("data", (c) => {
+      body += c;
+      if (body.length > 8 * 1024) {
+        tooBig = true;
+        req.destroy();
+      }
+    });
+    req.on("end", () => {
+      if (tooBig) return;
+      const closeQuietly = (): void => {
+        try {
+          store.close();
+        } catch {
+          /* noop */
+        }
+      };
+      let cookieFile: string;
+      try {
+        const j = JSON.parse(body) as { cookieFile?: unknown };
+        if (typeof j.cookieFile !== "string" || !j.cookieFile.trim()) throw new Error("cookieFile required");
+        cookieFile = resolve(j.cookieFile.trim());
+      } catch (e) {
+        closeQuietly();
+        return sendJson(res, 400, { error: `invalid body: ${String(e instanceof Error ? e.message : e).slice(0, 120)}` });
+      }
+      const runsAbs = resolve(opts.runsDir);
+      if (cookieFile !== runsAbs && !cookieFile.startsWith(runsAbs + sep)) {
+        closeQuietly();
+        return sendJson(res, 400, { error: "cookieFile must be inside the runs directory" });
+      }
+      if (!existsSync(cookieFile)) {
+        closeQuietly();
+        return sendJson(res, 400, { error: "cookieFile does not exist" });
+      }
+      mutateAndReply(id, store, () => store.appendControlCommand(id, { injectCookieFile: cookieFile, note: "operator injected a live session" }));
     });
     return;
   }

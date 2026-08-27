@@ -57,6 +57,10 @@ export interface ControlCommand {
   rateMs?: number;
   /** New cap on the number of screens to diagnose (drain bound). */
   maxScreens?: number;
+  /** Live session injection: PATH to a cookie file (raw Cookie header / storageState) the running pilot loads and
+   *  applies to its live session mid-scan (operator logged in during the run). Only the PATH travels in the event —
+   *  the cookie itself stays in the local (gitignored) file, never in the append-only log / WebUI projection. */
+  injectCookieFile?: string;
   /** Free-text note for the audit log / operator visibility. */
   note?: string;
 }
