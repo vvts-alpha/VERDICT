@@ -32,4 +32,10 @@ contextBridge.exposeInMainWorld("verdictDesktop", {
             return () => ipcRenderer.removeListener("attbrowser:navigated", h);
         },
     },
+
+    // In-app settings (LLM provider / Deep + Light models / browser path).
+    settings: {
+        get: () => ipcRenderer.invoke("settings:get"),
+        set: (s) => ipcRenderer.invoke("settings:set", s),
+    },
 });

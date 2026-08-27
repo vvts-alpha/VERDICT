@@ -10,8 +10,11 @@ const bridge = () => (typeof window !== "undefined" ? window.verdictDesktop?.bro
 export function AttendedBrowser({ initialUrl, onClose }: { initialUrl: string; onClose: () => void }) {
     const holderRef = useRef<HTMLDivElement>(null);
     const [urlField, setUrlField] = useState(initialUrl);
+    const [currentUrl, setCurrentUrl] = useState(initialUrl);
     const [nav, setNav] = useState({ canGoBack: false, canGoForward: false, loading: false });
     const [note, setNote] = useState<{ ok: boolean; text: string } | null>(null);
+    const [captured, setCaptured] = useState<{ path: string; host: string } | null>(null);
+    const [launching, setLaunching] = useState(false);
 
     // Keep the native view aligned with the placeholder region.
     useEffect(() => {
@@ -30,6 +33,7 @@ export function AttendedBrowser({ initialUrl, onClose }: { initialUrl: string; o
         void b.open(initialUrl);
         const off = b.onNavigated((s) => {
             setUrlField(s.url);
+            if (s.url && s.url !== "about:blank") setCurrentUrl(s.url);
             setNav({ canGoBack: s.canGoBack, canGoForward: s.canGoForward, loading: s.loading });
         });
         return () => {
@@ -49,7 +53,40 @@ export function AttendedBrowser({ initialUrl, onClose }: { initialUrl: string; o
     const capture = async (): Promise<void> => {
         const r = await bridge()?.capture();
         if (!r) return;
-        setNote(r.ok ? { ok: true, text: `captured ${r.count} cookie(s) for ${r.host} → ${r.path}` } : { ok: false, text: r.error ?? "capture failed" });
+        if (r.ok && r.path && r.host) {
+            setCaptured({ path: r.path, host: r.host });
+            setNote({ ok: true, text: `captured ${r.count} cookie(s) for ${r.host} — start an authenticated scan below` });
+        } else {
+            setCaptured(null);
+            setNote({ ok: false, text: r.error ?? "capture failed" });
+        }
+    };
+
+    // Attended → auto handoff: launch a headless authenticated scan of this target using the captured session cookie.
+    const scan = async (): Promise<void> => {
+        if (!captured) return;
+        setLaunching(true);
+        try {
+            const res = await fetch("/api/run", {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({
+                    command: "pilot",
+                    manifest: { target: currentUrl, auth: { roles: [{ name: "session", cookieFile: captured.path }] } },
+                    options: {},
+                }),
+            });
+            const j = (await res.json()) as { id?: string; error?: string };
+            if (res.ok && j.id) {
+                window.location.href = `/?id=${encodeURIComponent(j.id)}`; // navigate the app to the new run (unmounts + closes this browser)
+            } else {
+                setNote({ ok: false, text: j.error ?? `launch failed (${res.status})` });
+                setLaunching(false);
+            }
+        } catch (e) {
+            setNote({ ok: false, text: String(e) });
+            setLaunching(false);
+        }
     };
 
     return (
@@ -67,6 +104,11 @@ export function AttendedBrowser({ initialUrl, onClose }: { initialUrl: string; o
                     placeholder="https://target/login"
                 />
                 <button type="button" className="attb-capture" onClick={() => void capture()} title="Save the login session for the scan">Capture session</button>
+                {captured ? (
+                    <button type="button" className="attb-scan" disabled={launching} onClick={() => void scan()} title={`Start a headless authenticated scan of ${captured.host} with this session`}>
+                        {launching ? "Starting…" : "Scan with session →"}
+                    </button>
+                ) : null}
                 <button type="button" className="attb-close" onClick={onClose} title="Close">Close</button>
             </div>
             {note ? <div className={note.ok ? "attb-note ok" : "attb-note err"}>{note.text}</div> : null}

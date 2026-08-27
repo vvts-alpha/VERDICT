@@ -31,6 +31,18 @@ declare global {
         capture(assessmentId?: string): Promise<AttBrowserCapture>;
         onNavigated(cb: (s: AttBrowserNavState) => void): () => void;
     }
+    interface DesktopSettings {
+        provider: "claude-cli" | "openai";
+        baseURL?: string;
+        apiKey?: string;
+        deepModel?: string;
+        lightModel?: string;
+        browserPath?: string;
+    }
+    interface SettingsBridge {
+        get(): Promise<DesktopSettings>;
+        set(s: DesktopSettings): Promise<DesktopSettings>;
+    }
     interface VerdictDesktop {
         platform: string;
         minimize(): void;
@@ -39,6 +51,7 @@ declare global {
         isMaximized(): Promise<boolean>;
         onMaximizeChange(cb: (maximized: boolean) => void): () => void;
         browser: AttendedBrowserBridge;
+        settings: SettingsBridge;
     }
     interface Window {
         verdictDesktop?: VerdictDesktop;

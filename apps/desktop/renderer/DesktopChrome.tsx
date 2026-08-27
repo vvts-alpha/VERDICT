@@ -1,5 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { AttendedBrowser } from "./AttendedBrowser";
+import { Settings } from "./Settings";
 
 // Desktop app chrome: a custom (frameless-window) title bar with window controls, rendered ONLY when running
 // inside the Electron shell (window.verdictDesktop present). In a plain browser it is a pass-through — the
@@ -32,6 +33,8 @@ export function DesktopChrome({ children }: { children: ReactNode }) {
     // Debug: VERDICT_ATTB_URL (via ?attb=<url>) auto-opens the attended browser to a URL for screenshot verification.
     const attbDebug = typeof window !== "undefined" ? new URLSearchParams(window.location.search).get("attb") : null;
     const [browserOpen, setBrowserOpen] = useState(!!attbDebug);
+    const settingsDebug = typeof window !== "undefined" && new URLSearchParams(window.location.search).get("settings") === "1";
+    const [settingsOpen, setSettingsOpen] = useState(settingsDebug);
 
     useEffect(() => {
         if (!desktop) return;
@@ -57,6 +60,14 @@ export function DesktopChrome({ children }: { children: ReactNode }) {
                 >
                     Browser
                 </button>
+                <button
+                    type="button"
+                    className={`desk-tool${settingsOpen ? " active" : ""}`}
+                    onClick={() => setSettingsOpen(true)}
+                    title="Settings — AI provider, Deep / Light models, browser path"
+                >
+                    Settings
+                </button>
                 <div className="desk-winctl">
                     <button type="button" className="desk-wbtn" onClick={() => desktop.minimize()} aria-label="Minimize" title="Minimize">
                         <WinIcon kind="min" />
@@ -72,6 +83,7 @@ export function DesktopChrome({ children }: { children: ReactNode }) {
             <div className="desk-content">
                 {children}
                 {browserOpen ? <AttendedBrowser initialUrl={attbDebug ?? "about:blank"} onClose={() => setBrowserOpen(false)} /> : null}
+                {settingsOpen ? <Settings onClose={() => setSettingsOpen(false)} /> : null}
             </div>
         </div>
     );

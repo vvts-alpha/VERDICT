@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { existsSync, mkdirSync } from "node:fs";
 import { startServer, type RunningServer, type RunLauncherConfig } from "@veritas/server";
 import { setupAttendedBrowser } from "./attended-browser.js";
+import { setupSettingsIpc, loadSettings, settingsToEnv } from "./settings.js";
 
 /** App root (apps/desktop) — main.js lives in dist/, so one level up. Used to locate the preload. */
 const APP_ROOT = fileURLToPath(new URL("..", import.meta.url));
@@ -52,9 +53,9 @@ async function boot(): Promise<void> {
               cliPath,
               nodePath: process.execPath,
               // ELECTRON_RUN_AS_NODE makes `process.execPath` (the Electron binary) run as plain Node for the child
-              // (verified: it has node:sqlite + loads @veritas/core). Force the openai LLM provider since a packaged
-              // app has no `claude` binary on PATH; VERDICT_LLM_* / VERDICT_BROWSER_PATH pass through from the app env.
-              childEnv: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+              // (verified: it has node:sqlite + loads @veritas/core). A thunk so in-app Settings (LLM provider / Deep +
+              // Light models / browser path) apply to the NEXT run without an app restart. Settings win over the app env.
+              childEnv: () => ({ ...process.env, ELECTRON_RUN_AS_NODE: "1", ...settingsToEnv(loadSettings()) }),
               cwd: app.getPath("userData"),
               onLog: (m: string) => console.log("[run]", m),
           }
@@ -95,6 +96,9 @@ async function boot(): Promise<void> {
     win.on("maximize", () => win?.webContents.send("win:maximize-changed", true));
     win.on("unmaximize", () => win?.webContents.send("win:maximize-changed", false));
 
+    // In-app settings (LLM provider / Deep + Light models / browser path) — read by the childEnv thunk above.
+    setupSettingsIpc();
+
     // Attended embedded browser (human login / CAPTCHA inside the one window; session handoff to the auto pilot).
     const attb = setupAttendedBrowser(win, runsDir);
     // Open target/external links in the system browser, not inside the app window.
@@ -124,6 +128,7 @@ async function boot(): Promise<void> {
     // Debug/CI: VERDICT_SHOT=<path> captures the rendered window to a PNG (loadURL already resolved = loaded), then exits.
     const shotPath = process.env.VERDICT_SHOT;
     if (shotPath) {
+        if (process.env.VERDICT_SHOT_QUERY) await win.loadURL(server.url + process.env.VERDICT_SHOT_QUERY);
         await new Promise((r) => setTimeout(r, 2500)); // let the React app render + WS connect
         const img = await win.webContents.capturePage();
         const { writeFile } = await import("node:fs/promises");
