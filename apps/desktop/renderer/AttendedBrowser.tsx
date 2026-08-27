@@ -7,6 +7,28 @@ import { useEffect, useRef, useState } from "react";
 
 const bridge = () => (typeof window !== "undefined" ? window.verdictDesktop?.browser : undefined);
 
+// A start page shown when the attended browser opens with no target — makes "Browser" read as "start an attended scan".
+const START_PAGE =
+    "data:text/html;charset=utf-8," +
+    encodeURIComponent(
+        `<!doctype html><html><head><meta charset="utf-8"><style>
+        html,body{height:100%;margin:0}
+        body{background:#14161a;color:#8a93a0;font:14px ui-monospace,Menlo,Consolas,monospace;display:flex;align-items:center;justify-content:center}
+        .c{max-width:520px;padding:24px}
+        h1{color:#d7dbe0;font-size:16px;letter-spacing:1px;margin:0 0 14px}
+        ol{line-height:1.9;padding-left:20px;margin:0}
+        b{color:#6db0ff}
+        </style></head><body><div class="c">
+        <h1>Attended assessment</h1>
+        <ol>
+          <li>Type the target's login URL in the address bar above and press Enter.</li>
+          <li>Log in / clear any CAPTCHA by hand — this is a real browser, not automation.</li>
+          <li>Click <b>Capture session</b> to save the login.</li>
+          <li>Click <b>Scan with session →</b> to run an authenticated scan (headless, in this window).</li>
+        </ol>
+        </div></body></html>`,
+    );
+
 export function AttendedBrowser({ initialUrl, onClose }: { initialUrl: string; onClose: () => void }) {
     const holderRef = useRef<HTMLDivElement>(null);
     const [urlField, setUrlField] = useState(initialUrl);
@@ -30,10 +52,11 @@ export function AttendedBrowser({ initialUrl, onClose }: { initialUrl: string; o
         const ro = new ResizeObserver(report);
         if (holderRef.current) ro.observe(holderRef.current);
         window.addEventListener("resize", report);
-        void b.open(initialUrl);
+        void b.open(initialUrl && initialUrl !== "about:blank" ? initialUrl : START_PAGE);
         const off = b.onNavigated((s) => {
-            setUrlField(s.url);
-            if (s.url && s.url !== "about:blank") setCurrentUrl(s.url);
+            const real = s.url && s.url !== "about:blank" && !s.url.startsWith("data:");
+            setUrlField(real ? s.url : ""); // hide the internal start-page data: URL — show the placeholder instead
+            if (real) setCurrentUrl(s.url);
             setNav({ canGoBack: s.canGoBack, canGoForward: s.canGoForward, loading: s.loading });
         });
         return () => {

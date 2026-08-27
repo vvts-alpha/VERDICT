@@ -11,7 +11,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p renderer/tsconfig.json --noEmit",
     "start": "electron dist/main.js",
     "dev": "pnpm build && electron dist/main.js",
-    "spike": "electron src/spike.mjs"
+    "spike": "electron src/spike.mjs",
+    "dist": "electron-builder --config electron-builder.yml"
   },
   "devDependencies": {
     "@types/node": "^22.10.6",

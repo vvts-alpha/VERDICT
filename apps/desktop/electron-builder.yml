@@ -1,0 +1,40 @@
+# electron-builder config for the VERDICT desktop app → native installers (AppImage / nsis / dmg).
+#
+# Run against a MATERIALIZED bundle (pnpm's symlinked node_modules trips electron-builder), e.g.:
+#   pnpm -r build
+#   pnpm --filter @veritas/desktop deploy ./bundle        # self-contained (all @veritas/* + deps materialized)
+#   cd bundle && npx electron-builder --config electron-builder.yml
+# The deploy bundle already runs as-is with `electron .` (verified); this step wraps it into an installer.
+#
+# asar is OFF: the app spawns the CLI child (node_modules/@veritas/cli/dist/main.js) as a real process, and
+# child_process spawning + require.resolve of files inside an asar archive is unsupported — asar:false keeps the
+# backend spawnable/resolvable with zero asarUnpack bookkeeping (there are no native modules to hide, so the only
+# cost is a slightly larger install).
+appId: com.verdict.desktop
+productName: VERDICT
+asar: false
+directories:
+  output: dist-installer
+files:
+  - dist/**
+  - dist-renderer/**
+  - preload.cjs
+  - package.json
+  - node_modules/**
+# The automation browser (Playwright chromium) is NOT bundled here — it is large (~150MB) and per-platform.
+# The operator points at a chromium via Settings (VERDICT_BROWSER_PATH). To bundle one, drop it under
+# resources/chromium and add it to extraResources, then set the browser path to process.resourcesPath at runtime.
+# extraResources:
+#   - from: ../vendor/chromium-linux
+#     to: chromium
+linux:
+  target:
+    - AppImage
+    - dir
+  category: Development
+win:
+  target:
+    - nsis
+mac:
+  target:
+    - dmg
