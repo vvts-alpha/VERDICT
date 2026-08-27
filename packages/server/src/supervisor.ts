@@ -162,8 +162,9 @@ export class Supervisor {
       if (input.command === "pilot" && o.burpProxy) args.push("--burp-proxy");
       if (input.command === "pilot" && o.proxy) args.push("--proxy", o.proxy); // general upstream proxy (any proxy)
     }
-    // attended×LiveHands: the child reverse-connects to serve and screencasts role sessions (token auth).
-    if ((input.command === "pilot" || input.command === "redteam") && o.attended && this.relay && this.controlBase) {
+    // LiveHands reverse-connection (token auth): the child connects back to serve to screencast the browser. Used for
+    // attended login (operator control) AND — for any pilot run — a view-only live screencast of the auto scan browser.
+    if (this.relay && this.controlBase && (input.command === "pilot" || (input.command === "redteam" && o.attended))) {
       const token = randomBytes(16).toString("hex");
       this.relay.issueToken(id, token);
       args.push("--control-url", `${this.controlBase}/ws/agent?id=${id}&token=${token}`);
@@ -218,9 +219,10 @@ export class Supervisor {
     if (o.focus) args.push("--focus", o.focus);
     if (o.keepAliveMin != null) args.push("--keepalive-min", String(o.keepAliveMin));
     if (o.anchorUrl) args.push("--anchor-url", o.anchorUrl);
-    // attended issues a new control channel (token) to reopen the windows in the WebUI.
-    if (o.attended && this.relay && this.controlBase) {
-      args.push("--attended");
+    // LiveHands reverse-connection: attended re-opens the login windows; any pilot resume also gets a control-url for
+    // the view-only auto-scan screencast. (--attended only when the run is attended.)
+    if (this.relay && this.controlBase) {
+      if (o.attended) args.push("--attended");
       const token = randomBytes(16).toString("hex");
       this.relay.issueToken(id, token);
       args.push("--control-url", `${this.controlBase}/ws/agent?id=${id}&token=${token}`);

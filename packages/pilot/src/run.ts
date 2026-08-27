@@ -401,6 +401,16 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     primaryCookie = prim.cookie;
   } else {
     driver = await PlaywrightDriver.launch({ ...launchBase, userDataDir: opts.profileDir });
+    // View-only live screencast of the (headless) auto-scan browser — so the operator can watch it work in the WebUI's
+    // "Live" tab. Reuses the LiveHands reverse-WS; the screencast only streams while someone is watching (lazy start).
+    if (opts.controlUrl) {
+      try {
+        liveControl = new LiveControl(opts.controlUrl, opts.onText);
+        await liveControl.register("scan", driver);
+      } catch {
+        /* screencast is best-effort — never block the scan on it */
+      }
+    }
   }
 
   const http = new FetchHttpClient({

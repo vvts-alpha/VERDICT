@@ -14,9 +14,10 @@ import { Index } from "./components/Index";
 import { Sessions } from "./components/Sessions";
 import { Chat } from "./components/Chat";
 import { Control } from "./components/Control";
+import { LiveView } from "./components/LiveView";
 import { AsrView } from "./components/AsrView";
 
-type Tab = "screen" | "findings" | "scenarios" | "log" | "apis" | "js" | "sessions" | "ask" | "control";
+type Tab = "screen" | "findings" | "scenarios" | "log" | "apis" | "js" | "sessions" | "ask" | "control" | "live";
 
 // DESIGN §8 — left: SITE TREE (nav) + progress bar; right: tabs: Screen / Findings / Diagnostic log / APIs.
 export function App() {
@@ -128,6 +129,9 @@ export function App() {
             <button type="button" className={tab === "ask" ? "active" : ""} onClick={() => setTab("ask")}>
               💬 Ask
             </button>
+            <button type="button" className={tab === "live" ? "active" : ""} onClick={() => setTab("live")}>
+              Live
+            </button>
             <button type="button" className={tab === "control" ? "active" : ""} onClick={() => setTab("control")}>
               Control
             </button>
@@ -146,6 +150,7 @@ export function App() {
             {tab === "js" ? <JsAssets view={view} /> : null}
             {tab === "log" ? <Log events={view.events} /> : null}
             {tab === "sessions" ? <Sessions id={view.id} /> : null}
+            {tab === "live" ? <LiveView id={view.id} /> : null}
             {tab === "ask" ? <Chat id={view.id} /> : null}
             {tab === "control" ? <Control view={view} /> : null}
           </div>

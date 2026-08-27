@@ -31,8 +31,9 @@ export function Sessions({ id }: { id: string }) {
         .then((r) => r.json())
         .then((rs: RoleSession[]) => {
           if (!alive) return;
-          setRoles(rs);
-          setActive((a) => a ?? rs[0]?.role ?? null);
+          const login = rs.filter((r) => r.role !== "scan"); // "scan" is the view-only auto screencast (the Live tab), not an attended login
+          setRoles(login);
+          setActive((a) => a ?? login[0]?.role ?? null);
         })
         .catch(() => {});
     };

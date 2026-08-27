@@ -47,6 +47,17 @@ body { background: var(--bg); color: var(--fg); font-size: 13px; }
 .idxblank-title { color: var(--fg); font-size: 18px; letter-spacing: 0.5px; }
 .idxblank-sub { margin: 0; max-width: 440px; line-height: 1.6; color: var(--muted); }
 .idxblank-cta { margin-top: 8px; padding: 10px 22px; font-size: 13px; }
+
+/* Live view (view-only screencast of the auto-scan browser) */
+.liveview { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+.liveview-bar { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--line); }
+.liveview-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+.liveview-dot.live { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+.liveview-dot.waiting, .liveview-dot.connecting { background: var(--warn); }
+.liveview-dot.closed { background: var(--err); }
+.liveview-stage { flex: 1 1 auto; min-height: 0; display: flex; align-items: center; justify-content: center; background: #0d0f13; overflow: auto; padding: 10px; }
+.liveview-canvas { max-width: 100%; max-height: 100%; border: 1px solid var(--line); border-radius: 4px; }
+.liveview-empty { color: var(--muted); font-size: 13px; }
 .idxtable { width: 100%; border-collapse: collapse; margin-top: 10px; }
 .idxtable th { text-align: left; font-weight: 500; color: var(--muted); font-size: 11px; letter-spacing: 0.5px;
   text-transform: uppercase; padding: 6px 12px; border-bottom: 1px solid var(--line); }
