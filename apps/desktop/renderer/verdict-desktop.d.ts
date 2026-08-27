@@ -38,6 +38,7 @@ declare global {
         deepModel?: string;
         lightModel?: string;
         browserPath?: string;
+        proxy?: string;
     }
     interface SettingsBridge {
         get(): Promise<DesktopSettings>;

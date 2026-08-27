@@ -71,7 +71,11 @@ export function Settings({ onClose }: { onClose: () => void }) {
                     </div>
                 </div>
 
-                <div className="settings-sec">Automation browser</div>
+                <div className="settings-sec">Network</div>
+                <div className="settings-field">
+                    <span>Upstream proxy <em>routes all scan traffic (browser + http), e.g. Burp — blank = direct</em></span>
+                    <input value={s.proxy ?? ""} placeholder="http://127.0.0.1:8080" spellCheck={false} onChange={(e) => field("proxy", e.target.value)} />
+                </div>
                 <div className="settings-field">
                     <span>Chromium path <em>for the headless scan browser (leave blank to use the env / bundled)</em></span>
                     <input value={s.browserPath ?? ""} placeholder="/path/to/chrome" spellCheck={false} onChange={(e) => field("browserPath", e.target.value)} />

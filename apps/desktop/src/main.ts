@@ -56,6 +56,11 @@ async function boot(): Promise<void> {
               // (verified: it has node:sqlite + loads @veritas/core). A thunk so in-app Settings (LLM provider / Deep +
               // Light models / browser path) apply to the NEXT run without an app restart. Settings win over the app env.
               childEnv: () => ({ ...process.env, ELECTRON_RUN_AS_NODE: "1", ...settingsToEnv(loadSettings()) }),
+              // Activate the Settings proxy on pilot runs (env alone never activates it — the --proxy flag does).
+              childArgs: (command) => {
+                  const proxy = loadSettings().proxy;
+                  return proxy && command.startsWith("pilot") ? ["--proxy", proxy] : [];
+              },
               cwd: app.getPath("userData"),
               onLog: (m: string) => console.log("[run]", m),
           }

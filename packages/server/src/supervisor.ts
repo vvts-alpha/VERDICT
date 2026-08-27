@@ -21,6 +21,9 @@ export interface RunLauncherConfig {
   /** Working directory for child processes (default process.cwd()). The desktop app passes an absolute dir since
    *  its cwd is the read-only install dir, not the repo. */
   cwd?: string;
+  /** Extra CLI args appended to a child, chosen per command (evaluated per-spawn). The desktop uses it to pass
+   *  `--proxy <url>` from Settings to pilot runs. `command` is the spawnChild command label (e.g. "pilot", "pilot --resume"). */
+  childArgs?: (command: string) => string[];
   onLog?: (m: string) => void;
 }
 
@@ -284,7 +287,8 @@ export class Supervisor {
     // otherwise hit the child's stderr → run.log → the ASR Log tab (looks like a "SQLite read error"). args[0] is the
     // CLI script path, so the node flag must precede it.
     const childEnv = typeof this.cfg.childEnv === "function" ? this.cfg.childEnv() : (this.cfg.childEnv ?? process.env);
-    const child = spawn(this.cfg.nodePath, ["--disable-warning=ExperimentalWarning", ...args], { cwd: this.cfg.cwd ?? process.cwd(), env: childEnv, stdio: ["ignore", "pipe", "pipe"] });
+    const extraArgs = this.cfg.childArgs?.(command) ?? []; // e.g. desktop passes --proxy from Settings for pilot runs
+    const child = spawn(this.cfg.nodePath, ["--disable-warning=ExperimentalWarning", ...args, ...extraArgs], { cwd: this.cfg.cwd ?? process.cwd(), env: childEnv, stdio: ["ignore", "pipe", "pipe"] });
     const rec: RunProc = { id, command, child, startedAt: new Date().toISOString(), status: "running", exitCode: null };
     this.procs.set(id, rec);
     // Tee the child's stdout/stderr to runs/<id>/run.log, one timestamped line at a time (the WebUI ASR Log tab

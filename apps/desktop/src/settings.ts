@@ -19,6 +19,8 @@ export interface DesktopSettings {
     lightModel?: string;
     /** Chromium binary for automation (VERDICT_BROWSER_PATH). Blank = rely on the env / a bundled browser. */
     browserPath?: string;
+    /** Upstream proxy for ALL traffic (browser + raw http), e.g. http://127.0.0.1:8080. Passed to pilot runs as --proxy. */
+    proxy?: string;
 }
 
 const DEFAULTS: DesktopSettings = { provider: "claude-cli" };
@@ -37,7 +39,7 @@ export function loadSettings(): DesktopSettings {
 
 function saveSettings(s: DesktopSettings): DesktopSettings {
     const clean: DesktopSettings = { provider: s.provider === "openai" ? "openai" : "claude-cli" };
-    for (const k of ["baseURL", "apiKey", "deepModel", "lightModel", "browserPath"] as const) {
+    for (const k of ["baseURL", "apiKey", "deepModel", "lightModel", "browserPath", "proxy"] as const) {
         const v = s[k];
         if (typeof v === "string" && v.trim()) clean[k] = v.trim();
     }
@@ -55,6 +57,7 @@ export function settingsToEnv(s: DesktopSettings): Record<string, string> {
     if (s.deepModel) env.VERDICT_LLM_MODEL = s.deepModel;
     if (s.lightModel) env.VERDICT_LLM_FAST_MODEL = s.lightModel;
     if (s.browserPath) env.VERDICT_BROWSER_PATH = s.browserPath;
+    if (s.proxy) env.VERDICT_PROXY = s.proxy; // the value; activation is via the --proxy arg the desktop appends (env alone never activates)
     return env;
 }
 
