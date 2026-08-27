@@ -41,6 +41,9 @@ function fmt(iso: string): string {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
+/** Running inside the Electron desktop shell? (the title bar there already shows the VERDICT brand). */
+const isDesktop = typeof window !== "undefined" && !!(window as unknown as { verdictDesktop?: unknown }).verdictDesktop;
+
 export function Index() {
   const [rows, setRows] = useState<Row[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -86,7 +89,7 @@ export function Index() {
   return (
     <div className="idx">
       <header className="idxhead">
-        <img className="brand-logo" src="/verdict-title.png" alt="VERDICT" />
+        {isDesktop ? null : <img className="brand-logo" src="/verdict-title.png" alt="VERDICT" />}
         <span className="idxtitle">Projects</span>
         <span className="idxcount">{rows ? `${rows.length}` : ""}</span>
         {authEnabled ? (
@@ -107,9 +110,17 @@ export function Index() {
       </header>
       {err ? <p className="idxempty">{err}</p> : null}
       {rows && rows.length === 0 ? (
-        <p className="idxempty">
-          No assessments yet. Run <code>pilot</code> or <code>assess</code> and they show up here.
-        </p>
+        <div className="idxblank">
+          <div className="idxblank-title">No assessments yet</div>
+          <p className="idxblank-sub">Point VERDICT at a target and it maps the app, then hunts for vulnerabilities — autonomously.</p>
+          {canWrite ? (
+            <button type="button" className="idxnew idxblank-cta" onClick={() => setCreating(true)}>
+              + New assessment
+            </button>
+          ) : (
+            <p className="idxblank-sub">Ask an operator to start one.</p>
+          )}
+        </div>
       ) : null}
       {rows && rows.length > 0 ? (
         <table className="idxtable">

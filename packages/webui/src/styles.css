@@ -43,6 +43,10 @@ body { background: var(--bg); color: var(--fg); font-size: 13px; }
 .typepill.asr { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); background: color-mix(in srgb, var(--warn) 12%, transparent); }
 .idxempty { padding: 2rem 4px; color: var(--muted); }
 .idxempty code { background: #11141a; padding: 1px 6px; border-radius: 4px; }
+.idxblank { display: flex; flex-direction: column; align-items: center; text-align: center; gap: 12px; padding: 72px 20px; color: var(--muted); }
+.idxblank-title { color: var(--fg); font-size: 18px; letter-spacing: 0.5px; }
+.idxblank-sub { margin: 0; max-width: 440px; line-height: 1.6; color: var(--muted); }
+.idxblank-cta { margin-top: 8px; padding: 10px 22px; font-size: 13px; }
 .idxtable { width: 100%; border-collapse: collapse; margin-top: 10px; }
 .idxtable th { text-align: left; font-weight: 500; color: var(--muted); font-size: 11px; letter-spacing: 0.5px;
   text-transform: uppercase; padding: 6px 12px; border-bottom: 1px solid var(--line); }
