@@ -16,7 +16,7 @@ import { analyzeJsSinksFull } from "./jssinks.js";
 import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { join } from "node:path";
-import { readFileSync } from "node:fs";
+import { readFileSync, renameSync } from "node:fs";
 
 /** In attended (manual multi-session) mode, 1 role = 1 persistent context. Holds a live session. */
 export interface RoleSession {
@@ -48,6 +48,10 @@ export interface PilotSession {
   /** Role name → free-form privilege description (e.g. "full admin" / "regular user (read-only)"). Used for the high/low-privilege call in auth-diff. */
   roleDescriptions: Map<string, string>;
   loginLlm: LlmClient;
+  /** A fresh DOM-XSS proof screenshot captured by probe_dom_xss at the moment the payload EXECUTED (a visible banner
+   *  is injected on fire, so the shot actually shows the XSS). record_finding consumes it for the next xss finding
+   *  (moving it to findings/<fid>.png) instead of a generic current-page capture. rel = path under artifactsDir. */
+  xssProof?: { rel: string; at: number };
   currentCookie: string;
   /** Bearer JWT held by the SPA (localStorage etc.). So it reaches APIs that don't use cookie auth (Juice Shop etc.),
    *  http_request / probe_logic send it as `Authorization: Bearer`. login() updates it per role. */
@@ -2119,8 +2123,12 @@ export function buildTools(s: PilotSession) {
       { url: z.string(), param: z.string().optional() },
       async ({ url, param }) => {
         const tok = `domX${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`;
-        // On execution, set window.__verdict_xss=tok and also fire alert (either one is detected). img.onerror fires on innerHTML insertion.
-        const payload = `"><img src=x onerror="window.__verdict_xss='${tok}';alert('${tok}')">`;
+        s.xssProof = undefined; // reset any stale proof from a previous probe
+        // On execution (img.onerror fires when the SPA inserts this via innerHTML): (1) set window.__verdict_xss=tok,
+        // (2) inject a big fixed banner so the evidence SCREENSHOT visibly proves the XSS fired (not just a subtle
+        // rendered tag), (3) fire alert (an extra detection signal). All strings single-quoted (attribute is double-quoted).
+        const banner = `(function(){try{var d=document.createElement('div');d.id='verdict-xss';d.textContent='VERDICT · DOM-XSS EXECUTED · ${tok}';d.setAttribute('style','position:fixed;top:0;left:0;right:0;z-index:2147483647;background:#c0392b;color:#fff;font:700 20px/1.5 system-ui,-apple-system,sans-serif;padding:16px 20px;text-align:center;letter-spacing:.3px;box-shadow:0 3px 14px rgba(0,0,0,.6)');(document.body||document.documentElement).appendChild(d);}catch(e){}})()`;
+        const payload = `"><img src=x onerror="window.__verdict_xss='${tok}';${banner};alert('${tok}')">`;
         const benign = `verdict${tok}safe`;
         const buildUrl = (val: string): string | null => {
           try {
@@ -2171,6 +2179,16 @@ export function buildTools(s: PilotSession) {
           return txt(`ERROR: ${String(e).slice(0, 180)}`);
         }
         if (!ctrl || !p1 || !p2) return txt("ERROR: could not build injection URL — pass url with a {{XSS}} placeholder, or url + param.");
+        // Proof screenshot: p2 was the last run, so the browser is still on the XSS'd page with the injected banner
+        // visible. Capture it now → record_finding will use THIS (the execution moment) for the finding screenshot.
+        if (p2.executed || p1.executed) {
+          try {
+            const rel = `findings/_xssproof-${tok}.png`;
+            if (await s.driver.saveScreenshot(join(s.artifactsDir, rel))) s.xssProof = { rel, at: Date.now() };
+          } catch {
+            /* best-effort — the finding still records, just without the fire-time shot */
+          }
+        }
         const confirmed = !ctrl.executed && p1.executed && p2.executed;
         return txt(
           JSON.stringify({
@@ -3002,14 +3020,27 @@ export function buildTools(s: PilotSession) {
           }
           s.findCounter += 1;
           const fid = `f-${String(s.findCounter).padStart(3, "0")}`;
-          // Capture a browser screenshot of the current state as visual evidence (best-effort — a request/response
-          // alone is hard to read; the screenshot shows what the operator would see). Skipped silently if it fails.
+          // Screenshot evidence (best-effort — a request/response alone is hard to read). For an XSS finding, prefer
+          // the fire-time proof probe_dom_xss just captured (a visible "DOM-XSS EXECUTED" banner) over a generic
+          // current-page shot that wouldn't actually show the XSS. Otherwise capture the current page state.
           let shot: string | undefined;
-          try {
-            const rel = `findings/${fid}.png`;
-            if (await s.driver.saveScreenshot(join(s.artifactsDir, rel))) shot = rel;
-          } catch {
-            /* no browser page / capture failed — findings still record without it */
+          const rel = `findings/${fid}.png`;
+          const proof = s.xssProof;
+          if (proof && Date.now() - proof.at < 120000 && category.toLowerCase().includes("xss")) {
+            try {
+              renameSync(join(s.artifactsDir, proof.rel), join(s.artifactsDir, rel));
+              shot = rel;
+            } catch {
+              /* proof file moved/missing — fall through to a live capture */
+            }
+            s.xssProof = undefined; // consumed (or unusable) — don't reuse for a later finding
+          }
+          if (!shot) {
+            try {
+              if (await s.driver.saveScreenshot(join(s.artifactsDir, rel))) shot = rel;
+            } catch {
+              /* no browser page / capture failed — findings still record without it */
+            }
           }
           const f: Finding = {
             id: fid,
