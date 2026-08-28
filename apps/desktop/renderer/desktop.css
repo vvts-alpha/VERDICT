@@ -45,13 +45,13 @@
 }
 .attb-btn {
   width: 30px; height: 28px; border: 1px solid var(--line); border-radius: 6px;
-  background: #0d0f13; color: var(--fg); font-size: 15px; line-height: 1; cursor: default;
+  background: var(--inset); color: var(--fg); font-size: 15px; line-height: 1; cursor: default;
 }
 .attb-btn:disabled { opacity: 0.35; }
-.attb-btn:not(:disabled):hover { background: #1a1f27; }
+.attb-btn:not(:disabled):hover { background: var(--btn-hover); }
 .attb-url {
   flex: 1 1 auto; height: 28px; padding: 0 10px;
-  background: #0d0f13; color: var(--fg); border: 1px solid var(--line); border-radius: 6px; font: inherit; font-size: 12px;
+  background: var(--inset); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; font: inherit; font-family: var(--font-mono); font-size: 12px;
 }
 .attb-capture {
   height: 28px; padding: 0 12px; border-radius: 6px; font-weight: 700; font-size: 12px; cursor: default;
@@ -68,12 +68,12 @@
   height: 28px; padding: 0 12px; border-radius: 6px; font-size: 12px; cursor: default;
   background: transparent; border: 1px solid var(--line); color: var(--muted);
 }
-.attb-close:hover { color: var(--fg); background: #1a1f27; }
+.attb-close:hover { color: var(--fg); background: var(--btn-hover); }
 .attb-note { padding: 5px 12px; font-size: 12px; border-bottom: 1px solid var(--line); }
 .attb-note.ok { color: var(--accent); }
 .attb-note.err { color: var(--err); }
 /* placeholder the native Chromium view is drawn over — keep it empty (a subtle ground while it loads) */
-.attb-view { flex: 1 1 auto; min-height: 0; background: #0d0f13; }
+.attb-view { flex: 1 1 auto; min-height: 0; background: var(--inset); }
 
 /* ── settings overlay ── */
 .settings-overlay {
@@ -108,7 +108,7 @@
 .settings-field > span { color: var(--muted); font-size: 12px; }
 .settings-field > span em { font-style: normal; color: #5a6472; font-size: 11px; margin-left: 6px; }
 .settings-field input, .settings-field select {
-  background: #0d0f13; color: var(--fg); border: 1px solid var(--line); border-radius: 6px;
+  background: var(--inset); color: var(--fg); border: 1px solid var(--line); border-radius: 6px;
   padding: 8px 10px; font: inherit; font-size: 12px;
 }
 .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px; }

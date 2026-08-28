@@ -89,7 +89,7 @@ async function boot(): Promise<void> {
         minWidth: 900,
         minHeight: 600,
         title: "VERDICT",
-        backgroundColor: "#14161a", // matches the web UI --bg so there is no white flash before load
+        backgroundColor: "#0f1116", // matches the web UI --bg so there is no white flash before load
         frame: false, // custom in-app title bar (DesktopChrome) — the app frame, not a browser window
         webPreferences: {
             contextIsolation: true,
@@ -161,7 +161,7 @@ app.whenReady()
 
 app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0 && server) {
-        win = new BrowserWindow({ width: 1400, height: 900, title: "VERDICT", backgroundColor: "#0d0f13" });
+        win = new BrowserWindow({ width: 1400, height: 900, title: "VERDICT", backgroundColor: "#0f1116" });
         void win.loadURL(server.url);
     }
 });

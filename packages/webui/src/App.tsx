@@ -107,7 +107,7 @@ export function App() {
               Findings ({view.findings.length})
             </button>
             <button type="button" className={tab === "scenarios" ? "active" : ""} onClick={() => setTab("scenarios")}>
-              🧩 Scenarios
+              Scenarios
             </button>
             <button type="button" className={tab === "apis" ? "active" : ""} onClick={() => setTab("apis")}>
               APIs
@@ -124,10 +124,10 @@ export function App() {
               onClick={() => setTab("sessions")}
               title={awaitingSessions > 0 ? `${awaitingSessions} session(s) waiting for login` : undefined}
             >
-              🖥 Sessions{awaitingSessions > 0 ? ` 🔴 ${awaitingSessions}` : ""}
+              Sessions{awaitingSessions > 0 ? ` (${awaitingSessions})` : ""}
             </button>
             <button type="button" className={tab === "ask" ? "active" : ""} onClick={() => setTab("ask")}>
-              💬 Ask
+              Ask
             </button>
             <button type="button" className={tab === "live" ? "active" : ""} onClick={() => setTab("live")}>
               Live
