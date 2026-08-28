@@ -1,0 +1,49 @@
+name: Build Windows .exe
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/desktop-app
+
+jobs:
+  build:
+    name: Build on Windows runner
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@9.15.4 --activate
+        shell: bash
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        shell: bash
+
+      - name: Build packages
+        run: pnpm -r build
+        shell: bash
+
+      - name: Package Windows .exe (electron-builder if configured)
+        run: |
+          # Try to run electron-builder if it's used by the project.
+          if command -v npx >/dev/null 2>&1; then
+            npx electron-builder --win --x64 || true
+          fi
+        shell: bash
+
+      - name: Upload built .exe artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: '**/*.exe'
+
