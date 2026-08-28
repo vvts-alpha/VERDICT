@@ -39,6 +39,12 @@ declare global {
         lightModel?: string;
         browserPath?: string;
         proxy?: string;
+        burpScan?: boolean;
+        burpApi?: string;
+        burpApiKey?: string;
+        burpResourcePool?: string;
+        burpAuditApi?: string;
+        burpAuditToken?: string;
     }
     interface SettingsBridge {
         get(): Promise<DesktopSettings>;

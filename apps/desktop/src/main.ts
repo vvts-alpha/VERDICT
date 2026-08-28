@@ -56,10 +56,15 @@ async function boot(): Promise<void> {
               // (verified: it has node:sqlite + loads @veritas/core). A thunk so in-app Settings (LLM provider / Deep +
               // Light models / browser path) apply to the NEXT run without an app restart. Settings win over the app env.
               childEnv: () => ({ ...process.env, ELECTRON_RUN_AS_NODE: "1", ...settingsToEnv(loadSettings()) }),
-              // Activate the Settings proxy on pilot runs (env alone never activates it — the --proxy flag does).
+              // Per-run flags derived from Settings for pilot runs: --proxy (env alone never activates it) and
+              // --burp-scan (enable the post-diagnosis Burp active scan; the Burp connection comes from the env above).
               childArgs: (command) => {
-                  const proxy = loadSettings().proxy;
-                  return proxy && command.startsWith("pilot") ? ["--proxy", proxy] : [];
+                  if (!command.startsWith("pilot")) return [];
+                  const s = loadSettings();
+                  const args: string[] = [];
+                  if (s.proxy) args.push("--proxy", s.proxy);
+                  if (s.burpScan) args.push("--burp-scan");
+                  return args;
               },
               cwd: app.getPath("userData"),
               onLog: (m: string) => console.log("[run]", m),
