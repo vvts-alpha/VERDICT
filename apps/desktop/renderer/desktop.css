@@ -7,9 +7,13 @@
   -webkit-app-region: drag; user-select: none;
 }
 .desk-brand {
+  -webkit-app-region: no-drag; /* clickable "home" in the draggable title bar */
   display: flex; align-items: center; gap: 8px;
-  padding: 0 14px; font-size: 12px; font-weight: 700; letter-spacing: 2px; color: var(--fg);
+  padding: 0 14px; border: 0; background: transparent; font: inherit;
+  font-size: 12px; font-weight: 700; letter-spacing: 2px; color: var(--fg); cursor: default;
+  transition: color 0.12s;
 }
+.desk-brand:hover { color: #fff; }
 .desk-mark { width: 9px; height: 9px; border-radius: 2px; background: var(--accent); display: inline-block; }
 .desk-drag { flex: 1 1 auto; }
 .desk-winctl { display: flex; align-items: stretch; -webkit-app-region: no-drag; }

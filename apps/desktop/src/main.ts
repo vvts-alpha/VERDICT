@@ -102,6 +102,9 @@ async function boot(): Promise<void> {
     ipcMain.on("win:minimize", () => win?.minimize());
     ipcMain.on("win:toggle-maximize", () => (win?.isMaximized() ? win.unmaximize() : win?.maximize()));
     ipcMain.on("win:close", () => win?.close());
+    // Refocus the app's HTML contents (the attended-browser WebContentsView steals OS focus, which otherwise eats the
+    // first click on a title-bar button). The renderer calls this when the pointer enters the title bar.
+    ipcMain.on("win:focus-chrome", () => win?.webContents.focus());
     ipcMain.handle("win:is-maximized", () => !!win?.isMaximized());
     win.on("maximize", () => win?.webContents.send("win:maximize-changed", true));
     win.on("unmaximize", () => win?.webContents.send("win:maximize-changed", false));

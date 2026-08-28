@@ -55,6 +55,7 @@ declare global {
         minimize(): void;
         toggleMaximize(): void;
         close(): void;
+        focusChrome(): void;
         isMaximized(): Promise<boolean>;
         onMaximizeChange(cb: (maximized: boolean) => void): () => void;
         browser: AttendedBrowserBridge;

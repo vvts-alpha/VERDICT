@@ -8,6 +8,9 @@ contextBridge.exposeInMainWorld("verdictDesktop", {
     minimize: () => ipcRenderer.send("win:minimize"),
     toggleMaximize: () => ipcRenderer.send("win:toggle-maximize"),
     close: () => ipcRenderer.send("win:close"),
+    /** Focus the app's own web contents. The attended-browser native view steals OS focus; calling this when the
+     *  pointer enters the title bar pre-empts the "first click just refocuses" quirk so chrome buttons act on click 1. */
+    focusChrome: () => ipcRenderer.send("win:focus-chrome"),
     isMaximized: () => ipcRenderer.invoke("win:is-maximized"),
     /** Subscribe to maximize/unmaximize; returns an unsubscribe fn. */
     onMaximizeChange: (cb) => {

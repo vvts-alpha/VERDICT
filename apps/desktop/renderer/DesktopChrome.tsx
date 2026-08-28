@@ -44,14 +44,31 @@ export function DesktopChrome({ children }: { children: ReactNode }) {
 
     if (!desktop) return <>{children}</>; // plain browser → unchanged web UI
 
+    // Return to the main app view (project list / run) — closes any overlay in ONE click.
+    const goMain = (): void => {
+        setBrowserOpen(false);
+        setSettingsOpen(false);
+    };
+    const onMain = !browserOpen && !settingsOpen;
+
     return (
         <div className="desk-shell">
-            <div className="desk-titlebar">
-                <span className="desk-brand">
+            {/* onMouseEnter refocuses the HTML so a title-bar click acts on the first press even while the
+                attended-browser native view holds OS focus (otherwise the first click just steals focus back). */}
+            <div className="desk-titlebar" onMouseEnter={() => desktop.focusChrome?.()}>
+                <button type="button" className="desk-brand" onClick={goMain} title="Main — back to the assessments view">
                     <span className="desk-mark" aria-hidden="true" />
                     VERDICT
-                </span>
+                </button>
                 <div className="desk-drag" />
+                <button
+                    type="button"
+                    className={`desk-tool${onMain ? " active" : ""}`}
+                    onClick={goMain}
+                    title="Main — the assessments list / run view"
+                >
+                    Main
+                </button>
                 <button
                     type="button"
                     className={`desk-tool${browserOpen ? " active" : ""}`}
