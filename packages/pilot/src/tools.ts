@@ -12,7 +12,7 @@ import type { LlmClient } from "@veritas/llm";
 import type { BurpAuditConn, EvidenceStore, FetchHttpClient, HttpRequest, HttpResponse, TechComponent, TechSample } from "@veritas/scanner";
 import { oobPayload, oobPoll, fingerprintTech, formatTechInventory, lookupCves, formatCveResults, impactOracle, identityAppears } from "@veritas/scanner";
 import { placePayload, parseLocation, oobFilesToMultipart, filesHaveOobPlaceholder } from "./inject.js";
-import { analyzeJsSinks } from "./jssinks.js";
+import { analyzeJsSinksFull } from "./jssinks.js";
 import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { join } from "node:path";
@@ -1277,6 +1277,7 @@ export async function analyzePageJs(s: PilotSession, pageUrl: string): Promise<A
   let totalEnrolled = 0;
   let totalSecrets = 0;
   let totalSinks = 0;
+  let sinksTruncated = false;
   for (const burl of bundles) {
     let body = "";
     try {
@@ -1325,10 +1326,11 @@ export async function analyzePageJs(s: PilotSession, pageUrl: string): Promise<A
     // (4) DOM-XSS sink candidates — regex pre-filter + (when an LLM is present) an AI refinement pass over the slices.
     //     LEADS only: the agent confirms each at runtime with probe_dom_xss (evidence discipline). s.loginLlm is the
     //     session's fast LLM client (honours VERDICT_LLM_PROVIDER); undefined-safe = falls back to regex-only.
-    const sinksFound = await analyzeJsSinks(s.loginLlm, burl, body);
+    const { sinks: sinksFound, truncated } = await analyzeJsSinksFull(s.loginLlm, burl, body);
+    if (truncated) sinksTruncated = true;
     totalSinks += sinksFound.length;
     // Every DOM-XSS lead (all confidences) is worth a probe_dom_xss — static analysis of minified code is inherently
-    // low-certainty, and the runtime probe is cheap + decisive. Collected here, then sorted high→low and capped below.
+    // low-certainty, and the runtime probe is cheap + decisive. Collected here, then sorted high→low below.
     for (const k of sinksFound)
       sinkLeads.push({ bundle: burl, sink: k.sink, ...(k.source ? { source: k.source } : {}), confidence: k.confidence, ...(k.routeHint ? { routeHint: k.routeHint } : {}), snippet: k.snippet.slice(0, 120) });
     s.store.appendEvent(s.assessmentId, {
@@ -1348,11 +1350,14 @@ export async function analyzePageJs(s: PilotSession, pageUrl: string): Promise<A
   if (perBundle.length > 0)
     s.store.appendEvent(s.assessmentId, {
       type: "note",
-      payload: { message: `📜 analyze_js ${pageUrl}: ${perBundle.length} bundle(s) → ${totalEnrolled} new endpoint screen(s), ${totalSecrets} secret hit(s), ${totalSinks} DOM-XSS sink candidate(s)` },
+      payload: { message: `📜 analyze_js ${pageUrl}: ${perBundle.length} bundle(s) → ${totalEnrolled} new endpoint screen(s), ${totalSecrets} secret hit(s), ${totalSinks} DOM-XSS sink candidate(s)${sinksTruncated ? " (a bundle hit the sink ceiling — some tail sinks unanalyzed)" : ""}` },
     });
   const rank = { high: 0, medium: 1, low: 2 } as const;
   sinkLeads.sort((a, b) => (rank[a.confidence as keyof typeof rank] ?? 3) - (rank[b.confidence as keyof typeof rank] ?? 3));
-  return { page: pageUrl, analyzed: perBundle.length, endpointsEnrolled: totalEnrolled, secretsFound: totalSecrets, sinkCandidates: totalSinks, sinkLeads: sinkLeads.slice(0, 12), bundles: perBundle };
+  // Surface EVERY candidate, only sorted (highest-confidence first). A generous ceiling avoids flooding the agent's
+  // context on a pathological bundle; if it ever bites, the note above says the tail was left unanalyzed (never silent).
+  const leadsShown = 40;
+  return { page: pageUrl, analyzed: perBundle.length, endpointsEnrolled: totalEnrolled, secretsFound: totalSecrets, sinkCandidates: totalSinks, sinkLeads: sinkLeads.slice(0, leadsShown), bundles: perBundle };
 }
 
 export function buildTools(s: PilotSession) {

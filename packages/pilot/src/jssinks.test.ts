@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { FakeLlmClient } from "@veritas/llm";
-import { scanJsSinks, analyzeJsSinks, aiRefineSinks } from "./jssinks.js";
+import { scanJsSinks, analyzeJsSinks, analyzeJsSinksFull, aiRefineSinks } from "./jssinks.js";
 
 // A DOM-XSS: the search route reads location.hash and writes it into innerHTML unsanitized.
 const VULN = `function render(){var q=location.hash.split("q=")[1];document.getElementById("out").innerHTML="Results for "+q;}`;
@@ -17,9 +17,18 @@ test("scanJsSinks: innerHTML with a nearby location.hash source is a hit (nearSo
     assert.equal(h?.nearSource, "location.hash");
 });
 
-test("scanJsSinks: a source-less innerHTML (framework noise) is dropped", () => {
+test("scanJsSinks: a source-less innerHTML is KEPT (no dumb regex drop — the LLM decides), with no nearSource", () => {
     const hits = scanJsSinks(BENIGN);
-    assert.equal(hits.length, 0, "no candidate without a taint source near a noisy sink");
+    const h = hits.find((x) => x.sink === "innerHTML");
+    assert.ok(h, "kept, not silently pruned");
+    assert.equal(h?.nearSource, undefined, "no taint source proven near it (a priority signal, not a filter)");
+});
+
+test("analyzeJsSinksFull: reports scanned count + truncated flag, and assesses ALL hits (no LLM = all leads)", async () => {
+    const res = await analyzeJsSinksFull(undefined, "https://x/app.js", `${VULN}\n${BENIGN}\n${EVAL}`);
+    assert.equal(res.truncated, false);
+    assert.ok(res.scanned >= 2, "every hit is counted, not just source-backed ones");
+    assert.equal(res.sinks.length, res.scanned, "no-LLM path keeps every scanned hit as a lead");
 });
 
 test("scanJsSinks: eval is high-danger and surfaces even without a proven source", () => {

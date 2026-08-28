@@ -57,7 +57,8 @@ const SOURCES: { name: string; re: RegExp }[] = [
 
 const WINDOW = 160; // chars of context extracted around a sink for the snippet
 const SOURCE_RADIUS = 500; // how far around a sink a source still counts as "near"
-const MAX_HITS = 24; // cap slices handed to the LLM (bounds cost); prioritized by nearSource then danger
+const MAX_SCAN = 200; // safety ceiling on total slices from ONE bundle (priority-sorted; a truncation is surfaced, never silent)
+const AI_BATCH = 30; // slices per LLM refinement call — ALL slices are analyzed, in batches (no candidate is dropped un-assessed)
 
 /** One regex-located sink occurrence, with local context. */
 export interface RawSinkHit {
@@ -70,7 +71,12 @@ export interface RawSinkHit {
 
 const norm = (s: string): string => s.replace(/\s+/g, " ").trim();
 
-/** Regex pre-filter: return the prioritized candidate sink hits in a bundle body (no LLM). */
+/**
+ * Regex pre-filter: return the candidate sink hits in a bundle body (no LLM). We do NOT drop hits on a dumb heuristic
+ * (a source-less sink is kept — the LLM, not a regex, decides what is real); dedup of identical slices is the only
+ * removal. Prioritized (nearby source first, then high-danger) so that IF the safety ceiling truncates a pathological
+ * bundle, the most promising slices survive — and the truncation is surfaced to the caller, never silent.
+ */
 export function scanJsSinks(body: string): RawSinkHit[] {
   if (!body) return [];
   const hits: RawSinkHit[] = [];
@@ -82,7 +88,7 @@ export function scanJsSinks(body: string): RawSinkHit[] {
       const snippet = norm(body.slice(from, at + WINDOW));
       const dedup = `${s.name}:${snippet.slice(0, 90)}`;
       if (seen.has(dedup)) continue;
-      // is a taint source near this sink?
+      // is a taint source near this sink? (a PRIORITY signal, not a filter — source-less sinks are still kept)
       const ctx = body.slice(Math.max(0, at - SOURCE_RADIUS), at + SOURCE_RADIUS);
       let nearSource: string | undefined;
       for (const src of SOURCES)
@@ -90,16 +96,13 @@ export function scanJsSinks(body: string): RawSinkHit[] {
           nearSource = src.name;
           break;
         }
-      // noisy sinks (innerHTML/.html()/location) are only kept when a source is near; high-danger sinks always count.
-      if (!nearSource && s.danger !== "high") continue;
       seen.add(dedup);
       hits.push({ sink: s.name, danger: s.danger, snippet: snippet.slice(0, 220), ...(nearSource ? { nearSource } : {}) });
-      if (hits.length >= MAX_HITS * 3) break; // hard stop while scanning a huge bundle
     }
   }
-  // prioritize: has a nearby source first, then high-danger, then the rest; cap.
+  // prioritize: has a nearby source first, then high-danger, then the rest (matters only if the ceiling truncates).
   hits.sort((a, b) => Number(!!b.nearSource) - Number(!!a.nearSource) || (b.danger === "high" ? 1 : 0) - (a.danger === "high" ? 1 : 0));
-  return hits.slice(0, MAX_HITS);
+  return hits.slice(0, MAX_SCAN);
 }
 
 /** Convert a raw regex hit to a JsSink lead (the no-LLM fallback verdict). */
@@ -164,14 +167,30 @@ export async function aiRefineSinks(llm: LlmClient, bundleUrl: string, hits: Raw
   }
 }
 
+export interface JsSinkAnalysis {
+  sinks: JsSink[];
+  /** total sink slices the regex found (before the LLM cleared any) — so the caller can report true coverage */
+  scanned: number;
+  /** true if the bundle had more sinks than the safety ceiling (MAX_SCAN) and the tail was not analyzed */
+  truncated: boolean;
+}
+
 /**
- * Analyze one bundle body for DOM-XSS sink candidates. Regex pre-filter always runs; when an LLM is supplied it
- * refines the slices into precise candidates, otherwise the regex verdict is returned. Bounded + best-effort — any
- * error yields the regex leads (or []), never throws.
+ * Analyze one bundle body for DOM-XSS sink candidates. The regex pre-filter always runs; when an LLM is supplied,
+ * EVERY slice is refined (in batches — nothing is dropped un-assessed), otherwise the regex verdict is returned for
+ * all of them. Best-effort — a failed batch degrades to its regex leads, never throws.
  */
-export async function analyzeJsSinks(llm: LlmClient | undefined, bundleUrl: string, body: string): Promise<JsSink[]> {
+export async function analyzeJsSinksFull(llm: LlmClient | undefined, bundleUrl: string, body: string): Promise<JsSinkAnalysis> {
   const hits = scanJsSinks(body);
-  if (hits.length === 0) return [];
-  if (!llm) return hits.map(rawToSink);
-  return aiRefineSinks(llm, bundleUrl, hits);
+  const truncated = hits.length >= MAX_SCAN;
+  if (hits.length === 0) return { sinks: [], scanned: 0, truncated };
+  if (!llm) return { sinks: hits.map(rawToSink), scanned: hits.length, truncated };
+  const sinks: JsSink[] = [];
+  for (let i = 0; i < hits.length; i += AI_BATCH) sinks.push(...(await aiRefineSinks(llm, bundleUrl, hits.slice(i, i + AI_BATCH))));
+  return { sinks, scanned: hits.length, truncated };
+}
+
+/** Back-compat convenience: just the candidate list. */
+export async function analyzeJsSinks(llm: LlmClient | undefined, bundleUrl: string, body: string): Promise<JsSink[]> {
+  return (await analyzeJsSinksFull(llm, bundleUrl, body)).sinks;
 }
