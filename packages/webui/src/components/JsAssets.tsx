@@ -17,21 +17,32 @@ export function JsAssets({ view }: { view: StateView }) {
             <th>size</th>
             <th>endpoints</th>
             <th>secrets</th>
+            <th>DOM-XSS sinks</th>
             <th>map</th>
           </tr>
         </thead>
         <tbody>
-          {rows.map((r) => (
-            <tr key={r.url}>
-              <td className="mono">{r.url}</td>
-              <td className="muted">{(r.bytes / 1024).toFixed(1)} KB</td>
-              <td className="mono">{r.endpointsFound.length}</td>
-              <td className={r.secretsFound.length > 0 ? "mono" : "muted"} title={r.secretsFound.map((s) => s.detail).join("\n")}>
-                {r.secretsFound.length === 0 ? "—" : r.secretsFound.map((s) => s.kind).join(", ")}
-              </td>
-              <td className={r.sourceMap ? "mono" : "muted"}>{r.sourceMap ? "yes" : "—"}</td>
-            </tr>
-          ))}
+          {rows.map((r) => {
+            const sinks = r.sinksFound ?? [];
+            const hot = sinks.filter((k) => k.confidence !== "low");
+            return (
+              <tr key={r.url}>
+                <td className="mono">{r.url}</td>
+                <td className="muted">{(r.bytes / 1024).toFixed(1)} KB</td>
+                <td className="mono">{r.endpointsFound.length}</td>
+                <td className={r.secretsFound.length > 0 ? "mono" : "muted"} title={r.secretsFound.map((s) => s.detail).join("\n")}>
+                  {r.secretsFound.length === 0 ? "—" : r.secretsFound.map((s) => s.kind).join(", ")}
+                </td>
+                <td
+                  className={hot.length > 0 ? "mono hasf" : sinks.length > 0 ? "mono" : "muted"}
+                  title={sinks.map((k) => `${k.confidence.toUpperCase()} ${k.sink}${k.source ? ` ← ${k.source}` : ""}${k.routeHint ? `  (${k.routeHint})` : ""} — ${k.rationale}`).join("\n") || undefined}
+                >
+                  {sinks.length === 0 ? "—" : hot.length > 0 ? `${hot.length} candidate${hot.length > 1 ? "s" : ""}` : `${sinks.length} low`}
+                </td>
+                <td className={r.sourceMap ? "mono" : "muted"}>{r.sourceMap ? "yes" : "—"}</td>
+              </tr>
+            );
+          })}
         </tbody>
       </table>
     </section>

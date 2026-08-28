@@ -12,6 +12,7 @@ import type { LlmClient } from "@veritas/llm";
 import type { BurpAuditConn, EvidenceStore, FetchHttpClient, HttpRequest, HttpResponse, TechComponent, TechSample } from "@veritas/scanner";
 import { oobPayload, oobPoll, fingerprintTech, formatTechInventory, lookupCves, formatCveResults, impactOracle, identityAppears } from "@veritas/scanner";
 import { placePayload, parseLocation, oobFilesToMultipart, filesHaveOobPlaceholder } from "./inject.js";
+import { analyzeJsSinks } from "./jssinks.js";
 import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { join } from "node:path";
@@ -1226,6 +1227,10 @@ export interface AnalyzeJsResult {
   analyzed: number;
   endpointsEnrolled: number;
   secretsFound: number;
+  /** DOM-XSS sink candidates found across the bundles (leads → confirm with probe_dom_xss). */
+  sinkCandidates: number;
+  /** the actionable candidates (high/medium confidence), so the agent can drive probe_dom_xss at the route hints. */
+  sinkLeads: Array<{ bundle: string; sink: string; source?: string; confidence: string; routeHint?: string; snippet: string }>;
   bundles: Array<Record<string, unknown>>;
   note?: string;
 }
@@ -1237,7 +1242,7 @@ export interface AnalyzeJsResult {
  * post-survey pass. Returns a summary.
  */
 export async function analyzePageJs(s: PilotSession, pageUrl: string): Promise<AnalyzeJsResult> {
-  const empty: AnalyzeJsResult = { page: pageUrl, analyzed: 0, endpointsEnrolled: 0, secretsFound: 0, bundles: [] };
+  const empty: AnalyzeJsResult = { page: pageUrl, analyzed: 0, endpointsEnrolled: 0, secretsFound: 0, sinkCandidates: 0, sinkLeads: [], bundles: [] };
   if (!isInScope(pageUrl, s.scope)) return { ...empty, note: "out of scope" };
   let html = "";
   try {
@@ -1268,8 +1273,10 @@ export async function analyzePageJs(s: PilotSession, pageUrl: string): Promise<A
 
   const mask = (v: string): string => (v.length > 12 ? `${v.slice(0, 6)}…${v.slice(-4)}` : v);
   const perBundle: Array<Record<string, unknown>> = [];
+  const sinkLeads: AnalyzeJsResult["sinkLeads"] = [];
   let totalEnrolled = 0;
   let totalSecrets = 0;
+  let totalSinks = 0;
   for (const burl of bundles) {
     let body = "";
     try {
@@ -1315,6 +1322,15 @@ export async function analyzePageJs(s: PilotSession, pageUrl: string): Promise<A
         }
       }
     }
+    // (4) DOM-XSS sink candidates — regex pre-filter + (when an LLM is present) an AI refinement pass over the slices.
+    //     LEADS only: the agent confirms each at runtime with probe_dom_xss (evidence discipline). s.loginLlm is the
+    //     session's fast LLM client (honours VERDICT_LLM_PROVIDER); undefined-safe = falls back to regex-only.
+    const sinksFound = await analyzeJsSinks(s.loginLlm, burl, body);
+    totalSinks += sinksFound.length;
+    // Every DOM-XSS lead (all confidences) is worth a probe_dom_xss — static analysis of minified code is inherently
+    // low-certainty, and the runtime probe is cheap + decisive. Collected here, then sorted high→low and capped below.
+    for (const k of sinksFound)
+      sinkLeads.push({ bundle: burl, sink: k.sink, ...(k.source ? { source: k.source } : {}), confidence: k.confidence, ...(k.routeHint ? { routeHint: k.routeHint } : {}), snippet: k.snippet.slice(0, 120) });
     s.store.appendEvent(s.assessmentId, {
       type: "js_analyzed",
       payload: {
@@ -1322,18 +1338,21 @@ export async function analyzePageJs(s: PilotSession, pageUrl: string): Promise<A
         bytes: body.length,
         endpointsFound: refs.map((a) => `${a.method} ${a.urlTemplate}`),
         secretsFound,
+        sinksFound,
         sourceMap,
         analyzedAt: new Date().toISOString(),
       },
     });
-    perBundle.push({ url: burl, bytes: body.length, endpoints: refs.length, enrolled, secrets: secretsFound.length, sourceMap });
+    perBundle.push({ url: burl, bytes: body.length, endpoints: refs.length, enrolled, secrets: secretsFound.length, sinks: sinksFound.length, sourceMap });
   }
   if (perBundle.length > 0)
     s.store.appendEvent(s.assessmentId, {
       type: "note",
-      payload: { message: `📜 analyze_js ${pageUrl}: ${perBundle.length} bundle(s) → ${totalEnrolled} new endpoint screen(s), ${totalSecrets} secret hit(s)` },
+      payload: { message: `📜 analyze_js ${pageUrl}: ${perBundle.length} bundle(s) → ${totalEnrolled} new endpoint screen(s), ${totalSecrets} secret hit(s), ${totalSinks} DOM-XSS sink candidate(s)` },
     });
-  return { page: pageUrl, analyzed: perBundle.length, endpointsEnrolled: totalEnrolled, secretsFound: totalSecrets, bundles: perBundle };
+  const rank = { high: 0, medium: 1, low: 2 } as const;
+  sinkLeads.sort((a, b) => (rank[a.confidence as keyof typeof rank] ?? 3) - (rank[b.confidence as keyof typeof rank] ?? 3));
+  return { page: pageUrl, analyzed: perBundle.length, endpointsEnrolled: totalEnrolled, secretsFound: totalSecrets, sinkCandidates: totalSinks, sinkLeads: sinkLeads.slice(0, 12), bundles: perBundle };
 }
 
 export function buildTools(s: PilotSession) {
@@ -3197,7 +3216,7 @@ export function buildTools(s: PilotSession) {
     // ───────────────────────── first-party JS recon ─────────────────────────
     tool(
       "analyze_js",
-      "Statically analyze a page's FIRST-PARTY JavaScript: fetch its in-scope <script src> bundles and mine each for (1) hidden API endpoints (fetch/axios/XHR / `/api` literals) — new in-scope ones are ENROLLED as screens the diagnosis stage will probe; (2) hardcoded secrets (API keys / tokens / private keys); (3) an exposed source map. Hidden endpoints and keys live in the bundles, not just the pages link-following clicked — run this on the app root and any SPA/app page early. Deduped by URL (already-analyzed bundles are skipped). Pass the page url (defaults to the current page).",
+      "Statically analyze a page's FIRST-PARTY JavaScript: fetch its in-scope <script src> bundles and mine each for (1) hidden API endpoints (fetch/axios/XHR / `/api` literals) — new in-scope ones are ENROLLED as screens the diagnosis stage will probe; (2) hardcoded secrets (API keys / tokens / private keys); (3) an exposed source map; (4) DOM-XSS SINK CANDIDATES — dangerous sinks (innerHTML/outerHTML/insertAdjacentHTML/document.write/eval/Function/setTimeout-string/.html()/location/setAttribute) fed by a taint source (location.hash/search, document.referrer, window.name, postMessage, URL/route params). An LLM refines the regex hits into precise candidates with a routeHint. These are LEADS, not findings — each is returned in sinkLeads with a routeHint to confirm at runtime with probe_dom_xss (a DOM-XSS is confirmed only when the payload actually executes in the browser). Hidden endpoints, keys, and sinks live in the bundles, not just the pages link-following clicked — run this on the app root and any SPA/app page early. Deduped by URL (already-analyzed bundles are skipped). Pass the page url (defaults to the current page).",
       { url: z.string().optional() },
       async ({ url }) => {
         let pageUrl = url;
@@ -3215,7 +3234,7 @@ export function buildTools(s: PilotSession) {
             ...res,
             hint:
               res.analyzed > 0
-                ? `${res.endpointsEnrolled} NEW endpoint screen(s) enrolled from JS (they will be diagnosed). For any secret hit, verify it is live and record_finding(secret-exposure). An exposed source map is itself a finding (info/low).`
+                ? `${res.endpointsEnrolled} NEW endpoint screen(s) enrolled from JS (they will be diagnosed). For any secret hit, verify it is live and record_finding(secret-exposure). An exposed source map is itself a finding (info/low).${res.sinkCandidates > 0 ? ` ${res.sinkCandidates} DOM-XSS sink candidate(s) — see sinkLeads: for each, browser_navigate the routeHint (or the sink's page) and run probe_dom_xss(url, param) to confirm the payload EXECUTES; only then record_finding(xss). Do NOT record from the static hit alone.` : ""}`
                 : (res.note ?? "nothing new to analyze"),
           }),
         );

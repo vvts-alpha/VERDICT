@@ -51,6 +51,7 @@ export type {
   AssetInventory,
   JsAsset,
   JsSecret,
+  JsSink,
 } from "./types/index.js";
 
 // SQLite state store
