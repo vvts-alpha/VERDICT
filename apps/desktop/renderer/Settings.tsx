@@ -7,12 +7,12 @@ import { useEffect, useState, type ReactNode } from "react";
 const bridge = () => (typeof window !== "undefined" ? window.verdictDesktop?.settings : undefined);
 
 const EMPTY: DesktopSettings = { provider: "claude-cli" };
-const SECTIONS = ["AI provider", "Models", "Network", "Burp"] as const;
+const SECTIONS = ["Models", "Network", "Burp"] as const;
 type Section = (typeof SECTIONS)[number];
 
 export function Settings({ onClose }: { onClose: () => void }) {
     const [s, setS] = useState<DesktopSettings>(EMPTY);
-    const [section, setSection] = useState<Section>("AI provider");
+    const [section, setSection] = useState<Section>("Models");
     const [saved, setSaved] = useState(false);
 
     useEffect(() => {
@@ -65,7 +65,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
                     </nav>
 
                     <div className="settings-pane">
-                        {section === "AI provider" ? (
+                        {section === "Models" ? (
                             <>
                                 <Field label="Provider">
                                     <select value={s.provider} onChange={(e) => set("provider", e.target.value as DesktopSettings["provider"])}>
@@ -81,11 +81,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
                                 ) : (
                                     <p className="settings-note-inline">The Claude subscription CLI needs the `claude` binary on PATH. Switch to OpenAI-compatible to use OpenCodeGo / a local model.</p>
                                 )}
-                            </>
-                        ) : null}
-
-                        {section === "Models" ? (
-                            <>
+                                <div className="settings-sec">Model tiering</div>
                                 <Field label="Deep model" hint="high-value diagnosis / scenario"><Text k="deepModel" ph={openai ? "hy3" : "claude-opus-4-8"} /></Field>
                                 <Field label="Light model" hint="survey / methodology / low-value"><Text k="lightModel" ph={openai ? "hy3" : "claude-sonnet-5"} /></Field>
                             </>
