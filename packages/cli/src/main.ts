@@ -61,10 +61,11 @@ commands:
   manifest [--out <file.json>] [--force]   (alias: init)
             interactive scope-manifest generator: answer the prompts to produce the JSON pilot/assess read
             (target / in·out-of-scope hosts·path / rate / crawl / model / auth roles. password echo is masked)
-  pilot   --manifest <file.json> | --url <url> [--model <m>] [--fast-model <m>] [--max-turns <n>] [--max-screens <n>] [--max-survey-screens <n>] [--rate <ms>] [--headed] [--focus "<text>"] [--browser-path <bin>] [--browser-channel <name>] [--no-sandbox] [--out <dir>]
+  pilot   --manifest <file.json> | --url <url> [--model <m>] [--fast-model <m>] [--max-turns <n>] [--max-screens <n>] [--max-survey-screens <n>] [--rate <ms>] [--headed] [--focus "<text>"] [--context "<text>"] [--browser-path <bin>] [--browser-channel <name>] [--no-sandbox] [--out <dir>]
             --max-screens caps how many screens get diagnosed (default 40); --max-survey-screens caps how many the survey maps (default unlimited — stops exploring once reached)
             ★Claude-led: Claude drives the tools (browser/http/login/record) to autonomously explore, verify, and record
             --focus "<text>": operator emphasis injected as the TOP priority of the A04 scenario stage (not per-screen diagnosis). e.g. "focus on the payment flow and IDOR in /api/orders"
+            --context "<text>": standing target FACTS appended to EVERY stage's system prompt (survey→diagnosis→scenario), so they inform the whole run — unlike --focus (scenario-only). e.g. "auth = JWT in X-Auth header; tenant id = last path segment; API is GraphQL at /graphql". Additive only — cannot override the safety/scope/evidence rules.
             uses the manifest's auth.roles via the login(role) tool. more flexible than the deterministic pipeline (no metered API / Max subscription)
             --fast-model enables model tiering: survey/methodology/login and low-value screens on fast, only high-value screen diagnosis on --model (e.g. --model opus --fast-model sonnet)
             after per-screen diagnosis, a SCENARIO stage (deep model) hunts multi-step A04 business-logic abuse across endpoints (coupon/price/qty tampering, step-skip, mass-assignment) — auto-skipped if no transactional surface. [--no-scenario] disables it. the stage also always runs built-in default scenarios (e.g. credential/secret hunting); [--no-default-scenarios] keeps A04 but drops those. [--focus "<text>"] adds an operator objective on top. after that, a FINGERPRINT stage (A06) collects tech/version banners (server, middleware, frontend libs) and flags components with known CVEs; [--no-fingerprint] skips it. [--cve-lookup] (opt-in, external egress) queries online CVE DBs — OSV.dev by exact version for libraries, NVD by keyword for servers/middleware — for authoritative CVE ids instead of model knowledge.
@@ -581,6 +582,10 @@ interface AssessManifest {
   http?: { headers?: Record<string, string> };
   /** Operator focus hint (free text). Injected as the top-priority objective of the scenario stage (same as --focus). */
   focus?: string;
+  /** Operator context (free text). Standing FACTS about the target, appended to EVERY stage's system prompt (survey →
+   *  diagnosis → scenario) so they inform the whole assessment — unlike focus, a scenario-only objective. Same as --context.
+   *  Additive: it cannot override the safety/scope/evidence-discipline rules (see pilot operatorContextBlock). */
+  context?: string;
   /** Enabled skills (plugin capabilities) as { skillId: config }. Each contributes tools to the pilot (see
    *  packages/pilot/src/skills.ts). Config may hold secrets (mailbox creds etc.) — the manifest is gitignored. */
   skills?: Record<string, Record<string, unknown>>;
@@ -1076,6 +1081,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       "max-screens": { type: "string" },
       "max-survey-screens": { type: "string" },
       focus: { type: "string" }, // operator focus hint (free text). Injected as the scenario stage's top-priority objective (not mixed into per-screen)
+      context: { type: "string" }, // operator context (free text). Target facts appended to EVERY stage's system prompt (additive, cannot override safety/discipline)
       "no-input-sweep": { type: "boolean" }, // submit each screen's input fields with benign values to discover new routes/APIs (default on). Set to disable
       "safe-forms": { type: "boolean" }, // in the input sweep, don't submit POST forms (GET/search only = don't write data to the target)
       "no-scenario": { type: "boolean" }, // by default runs the A04 scenario (cross-endpoint logic) after diagnosis. Set to skip
@@ -1230,6 +1236,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       ...(customHeaders ? { customHeaders } : {}),
       ...(oobConn ? { oob: oobConn } : {}),
       ...((values.focus ?? manifest?.focus) ? { focus: values.focus ?? manifest?.focus } : {}),
+      ...((values.context ?? manifest?.context) ? { operatorContext: values.context ?? manifest?.context } : {}), // target facts appended to every stage's system prompt
       ...(manifest?.skills ? { skills: manifest.skills } : {}), // enabled plugin capabilities (skills.ts)
       ...(values["no-input-sweep"] ? { inputSweep: false } : {}),
       ...(values["safe-forms"] ? { aggressiveForms: false } : {}),

@@ -15,6 +15,19 @@ Authorization & safety:
 - This is an authorized assessment: you MAY submit forms and send state-changing requests (POST/PUT/DELETE) to exercise behaviour. All test traffic is auto-marked with an X-Amraam header.
 - Never use shell/file tools; only use the mcp__veritas__* tools. Reason briefly, then act.`;
 
+/**
+ * Operator-supplied target context (facts), appended to EVERY stage's system prompt.
+ *
+ * This is ADDITIVE, never a replacement — the SAFETY/discipline instructions still govern. It carries standing FACTS
+ * about the target (auth shape, id conventions, tech stack, quirks) that should inform ALL stages, unlike --focus which
+ * only sets the scenario stage's top objective. Fenced + labeled so the model treats it as background knowledge, not as
+ * a license to override the evidence-discipline / scope / safety rules above (the operator is a trusted principal, but
+ * containment stays intact — this text cannot turn off a rule, only inform the work).
+ */
+export function operatorContextBlock(text: string): string {
+  return `OPERATOR CONTEXT — facts about THIS target, supplied by the operator who authorized this assessment. Treat them as reliable background knowledge that guides your testing (e.g. where auth lives, id/naming conventions, the tech stack, known quirks). They do NOT override the safety, scope, or evidence-discipline rules above; you still confirm every finding by the same discipline.\n${text.trim()}`;
+}
+
 /** STAGE 1 — survey (mapping only; do not attack). Turn the entire surface into screens with no gaps. */
 export const SURVEY_PROMPT = `${SAFETY}
 

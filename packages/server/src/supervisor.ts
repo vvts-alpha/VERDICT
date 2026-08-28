@@ -48,6 +48,8 @@ export interface StartRunInput {
     maxSurveyScreens?: number;
     /** Operator's focus hint (free text). Injected as the top-priority objective of the scenario stage (--focus). */
     focus?: string;
+    /** Operator context (free text). Standing target facts appended to EVERY stage's system prompt (--context). */
+    context?: string;
     /** pilot only: keepalive interval in minutes (0 = off). For sites whose session dies on a cold `/` hit / full reload. */
     keepAliveMin?: number;
     /** pilot only: goto-safe authed hub (menu). Reach cold-nav-bouncing routes by clicking their link from here; also the keepalive target. */
@@ -156,6 +158,7 @@ export class Supervisor {
       if (o.maxScreens != null) args.push("--max-screens", String(o.maxScreens));
       if (o.maxSurveyScreens != null) args.push("--max-survey-screens", String(o.maxSurveyScreens));
       if (o.focus) args.push("--focus", o.focus);
+      if (o.context) args.push("--context", o.context);
       if (o.keepAliveMin != null) args.push("--keepalive-min", String(o.keepAliveMin));
       if (o.anchorUrl) args.push("--anchor-url", o.anchorUrl);
       if (input.command === "pilot" && o.burpScan) args.push("--burp-scan");

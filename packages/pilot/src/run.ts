@@ -21,7 +21,7 @@ import { buildTools, STAGE_TOOLS, dedupKey, isAuthWalled, loadCookieFile, mergeS
 import { resolveSkills, buildSkillTools, skillToolNamesForStage, type Stage } from "./skills.js";
 import type { PilotSession, RoleSession } from "./tools.js";
 import { LiveControl } from "./live-control.js";
-import { DEFAULT_SCENARIOS, DIAGNOSE_PROMPT, FINGERPRINT_PROMPT, METHODOLOGY_PROMPT, RECON_GUESS_PROMPT, SCENARIO_PROMPT, SURVEY_PROMPT } from "./system.js";
+import { DEFAULT_SCENARIOS, DIAGNOSE_PROMPT, FINGERPRINT_PROMPT, METHODOLOGY_PROMPT, operatorContextBlock, RECON_GUESS_PROMPT, SCENARIO_PROMPT, SURVEY_PROMPT } from "./system.js";
 
 export interface RunPilotOptions {
   store: AssessmentStore;
@@ -130,6 +130,11 @@ export interface RunPilotOptions {
   /** Operator emphasis hint (free text). Injected as the **top-priority objective of the scenario stage** (not mixed into per-screen diagnosis).
    *  e.g. "focus on the checkout flow and IDOR on /api/orders. Coupon/price tampering too." Emphasis, not exclusion. */
   focus?: string;
+  /** Operator context (free text) — standing FACTS about the target appended to EVERY stage's system prompt (survey →
+   *  diagnosis → scenario). Unlike focus (a scenario-stage objective), this informs the agent's work across all stages.
+   *  e.g. "auth is a JWT in the X-Auth header; tenant id is the last path segment; the API is GraphQL at /graphql."
+   *  Additive only — it cannot override the safety/scope/evidence-discipline rules (see operatorContextBlock). */
+  operatorContext?: string;
   /** Input sweep: on every browser_navigate, submit forms/searches with benign values to discover new routes/APIs (default on). */
   inputSweep?: boolean;
   /** In the input sweep, also submit POST forms (= writes data to the target). Default true. If false, GET/search only. */
@@ -621,6 +626,9 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     model?: string;
     shouldStop: () => boolean;
   }): Promise<number> => {
+    // Operator context (target facts) is appended to EVERY stage's system prompt — additive, never a replacement
+    // (the SAFETY/discipline text in p.system still governs; see operatorContextBlock). One choke point covers all stages.
+    const sys = opts.operatorContext?.trim() ? `${p.system}\n\n${operatorContextBlock(opts.operatorContext)}` : p.system;
     // OpenAI-compatible provider (OpenCodeGo etc.): drive the SAME veritas tools via a chat/completions tool-calling
     // loop instead of the Claude Agent SDK. The stage allowlist (p.allowed) is the locked toolbox — enforced by the loop.
     if (useOpenAi) {
@@ -628,7 +636,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         baseURL: llmCfg.baseURL!,
         ...(llmCfg.apiKey ? { apiKey: llmCfg.apiKey } : {}),
         model: p.model ?? deepModel ?? llmCfg.model!, // under openai llmCfg.model is guaranteed (checked at startup)
-        system: p.system,
+        system: sys,
         goal: p.goal,
         tools: toolDefs as unknown as PilotToolDef[],
         allowed: p.allowed,
@@ -672,7 +680,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         // allowlist that PreToolUse-denies everything other than veritas MCP tools (incl. Task/Agent/Monitor/Skill/ToolSearch/...).
         hooks: { PreToolUse: [{ hooks: [onlyVeritasToolsHook] }] },
         ...(p.model ? { model: p.model } : {}),
-        systemPrompt: { type: "preset", preset: "claude_code", append: p.system },
+        systemPrompt: { type: "preset", preset: "claude_code", append: sys },
         maxTurns: p.maxTurns,
       },
     });

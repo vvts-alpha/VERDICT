@@ -34,6 +34,7 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
   const [rate, setRate] = useState("250");
   const [maxTurns, setMaxTurns] = useState("");
   const [focus, setFocus] = useState(""); // operator's emphasis hint → top priority of the scenario stage
+  const [context, setContext] = useState(""); // operator's standing target facts → appended to every stage's system prompt
   const [headed, setHeaded] = useState(false);
   const [surveyOnly, setSurveyOnly] = useState(false);
   const [exhaustive, setExhaustive] = useState(false);
@@ -163,6 +164,7 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
     if (command === "pilot" && keepAliveMin.trim() !== "" && Number.isFinite(Number(keepAliveMin))) options.keepAliveMin = Number.parseInt(keepAliveMin, 10);
     if (command === "pilot" && anchorUrl.trim()) options.anchorUrl = anchorUrl.trim();
     if (command === "pilot" && focus.trim()) options.focus = focus.trim();
+    if (command === "pilot" && context.trim()) options.context = context.trim();
 
     try {
       const res = await fetch("/api/run", {
@@ -280,6 +282,17 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
             value={focus}
             onChange={(e) => setFocus(e.target.value)}
             placeholder="e.g. Focus on the checkout flow and IDOR in /api/orders. Also coupons / price tampering."
+            rows={2}
+          />
+        </label>
+      ) : null}
+      {command === "pilot" ? (
+        <label className="nf-field nf-wide" title="operator context — standing FACTS about the target, appended to EVERY stage's system prompt (survey → diagnosis → scenario) so they inform the whole run. additive only: it guides the agent, it does not override the safety / scope / evidence-discipline rules.">
+          <span>Operator context (target facts)</span>
+          <textarea
+            value={context}
+            onChange={(e) => setContext(e.target.value)}
+            placeholder="e.g. Auth is a JWT in the X-Auth header. Tenant id is the last path segment. The API is GraphQL at /graphql. Test accounts share org 42."
             rows={2}
           />
         </label>
