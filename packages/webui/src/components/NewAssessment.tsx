@@ -1,6 +1,6 @@
 // "+ New" full manifest editor → POST /api/run → navigate to the launched run.
 // Builds an AssessManifest JSON (target / scope / crawl / auth.roles) + run options.
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 type AuthMethod = "manual" | "credentials" | "cookie";
 interface Role {
@@ -29,8 +29,21 @@ function lines(s: string): string[] {
 export function NewAssessment({ onCancel }: { onCancel: () => void }) {
   const [command, setCommand] = useState<"pilot" | "assess">("pilot");
   const [target, setTarget] = useState("");
-  const [model, setModel] = useState("claude-opus-4-8"); // deep default = Opus: high-value screens/scenarios/fingerprint
-  const [fastModel, setFastModel] = useState("claude-sonnet-5"); // fast default = Sonnet: survey/methodology/low-value screens (= tiering ON by default; "none" = single model)
+  const [model, setModel] = useState("claude-opus-4-8"); // deep default = Opus
+  const [fastModel, setFastModel] = useState("claude-sonnet-5"); // fast default = Sonnet
+  const [useDesktopSettings, setUseDesktopSettings] = useState(false);
+  const desktopBridge = typeof window !== "undefined" ? (window as any).verdictDesktop : undefined;
+
+  // If running inside the desktop app, prefer its persisted settings (Deep / Light models)
+  useEffect(() => {
+    if (!desktopBridge?.settings) return;
+    void desktopBridge.settings.get().then((s: any) => {
+      if (!s) return;
+      if (s.deepModel) setModel(s.deepModel);
+      if (s.lightModel) setFastModel(s.lightModel);
+      setUseDesktopSettings(true);
+    });
+  }, [desktopBridge]);
   const [rate, setRate] = useState("250");
   const [maxTurns, setMaxTurns] = useState("");
   const [focus, setFocus] = useState(""); // operator's emphasis hint → top priority of the scenario stage
@@ -219,25 +232,34 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
       <div className="nf-grid">
         <label className="nf-field">
           <span>{command === "pilot" ? "Model (deep)" : "Model"}</span>
-          <select value={model} onChange={(e) => setModel(e.target.value)}>
-            {MODELS.map((m) => (
-              <option key={m.id} value={m.id}>
-                {m.label}
-              </option>
-            ))}
-          </select>
-        </label>
-        {command === "pilot" ? (
-          <label className="nf-field" title="model tiering: high-value screens use the deep model, survey/methodology/low-value screens use this fast model">
-            <span>Fast model</span>
-            <select value={fastModel} onChange={(e) => setFastModel(e.target.value)}>
-              <option value="">— none (single model)</option>
+          {useDesktopSettings ? (
+            // When running in the desktop app, the desktop Settings manage model choices; show a read-only hint.
+            <input readOnly value={model} />
+          ) : (
+            <select value={model} onChange={(e) => setModel(e.target.value)}>
               {MODELS.map((m) => (
                 <option key={m.id} value={m.id}>
                   {m.label}
                 </option>
               ))}
             </select>
+          )}
+        </label>
+        {command === "pilot" ? (
+          <label className="nf-field" title="model tiering: high-value screens use the deep model, survey/methodology/low-value screens use this fast model">
+            <span>Fast model</span>
+            {useDesktopSettings ? (
+              <input readOnly value={fastModel ?? ""} />
+            ) : (
+              <select value={fastModel} onChange={(e) => setFastModel(e.target.value)}>
+                <option value="">— none (single model)</option>
+                {MODELS.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.label}
+                  </option>
+                ))}
+              </select>
+            )}
           </label>
         ) : null}
         <label className="nf-field">

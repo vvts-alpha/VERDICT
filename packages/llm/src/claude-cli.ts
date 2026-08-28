@@ -7,7 +7,7 @@ import type { LlmClient, LlmRequest, LlmResponse } from "./types.js";
 export interface ClaudeCliOptions {
   /** Default "claude" (resolved via PATH) */
   binPath?: string;
-  /** Default "claude-sonnet-4-6" */
+  /** Default "claude-sonnet-5" */
   defaultModel?: string;
   /** Default 120000ms */
   defaultTimeoutMs?: number;
@@ -26,7 +26,7 @@ export class ClaudeCliClient implements LlmClient {
 
   complete(req: LlmRequest): Promise<LlmResponse> {
     const bin = this.opts.binPath ?? "claude";
-    const model = req.model ?? this.opts.defaultModel ?? "claude-sonnet-4-6";
+    const model = req.model ?? this.opts.defaultModel ?? "claude-sonnet-5";
     const timeout = req.timeoutMs ?? this.opts.defaultTimeoutMs ?? 120_000;
     const args = ["-p", "--output-format", "json", "--model", model];
     if (req.system) args.push("--system-prompt", req.system);

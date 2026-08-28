@@ -26,6 +26,12 @@ A Claude-led agent that maps your target, hunts vulns, and marks a finding **`co
 
 ---
 
+> 🖥️ Desktop-first: This repository now treats the `apps/desktop` Electron shell as the primary operator experience. Run the desktop app for a self-contained local UI + in-process server: see `apps/desktop/PACKAGING.md` and `apps/desktop/README` for packaging and platform notes.
+
+---
+
+---
+
 > ⚠️ **Authorized testing only.** Every network action passes a scope gate; out-of-scope is denied, not attempted.
 
 VERDICT runs a real browser and a scoped HTTP client through tools that **Claude operates** — survey → methodology → diagnosis → (multi-step logic) → (Burp) → report. It is **staged on purpose** so the model can't "skim and skip", and **evidence-disciplined** so a finding is `confirmed` only when it actually reproduces. Everything streams to a live WebUI.
