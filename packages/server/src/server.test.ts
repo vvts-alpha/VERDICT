@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { AssessmentStore, deriveScopeFromSingleUrl } from "@veritas/core";
 import type { Screen, StateView, WsMessage } from "@veritas/core";
 import { startServer } from "./index.js";
+import { isContainedPath } from "./server.js";
 
 function screen(id: string, urlTemplate: string): Screen {
   return {
@@ -37,6 +38,18 @@ function seed(runsDir: string, id: string): AssessmentStore {
   store.upsertScreen(id, screen("s-0001", "/products/{id}"));
   return store;
 }
+
+test("isContainedPath: Windows backslash descendants are inside (the packaged-desktop 403)", () => {
+  const root = "C:\\Users\\app\\dist-renderer";
+  const win = "\\";
+  assert.equal(isContainedPath(root, root, win), true);
+  assert.equal(isContainedPath(root, root + "\\index.html", win), true);
+  assert.equal(isContainedPath(root, root + "\\assets\\x.js", win), true);
+  assert.equal(isContainedPath(root, "C:\\Users\\app\\secret.txt", win), false);
+  assert.equal(isContainedPath(root, "C:\\Users\\app\\dist-renderer-evil\\x", win), false);
+  // the old check used "/" and rejected every Windows path
+  assert.equal(isContainedPath(root, root + "\\index.html", "/"), false);
+});
 
 test("HTTP API lists assessments and projects a StateView", async () => {
   const runsDir = mkdtempSync(join(tmpdir(), "veritas-srv-"));

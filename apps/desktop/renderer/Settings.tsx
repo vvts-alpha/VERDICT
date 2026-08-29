@@ -9,6 +9,34 @@ const bridge = () => (typeof window !== "undefined" ? window.verdictDesktop?.set
 const EMPTY: DesktopSettings = { provider: "claude-cli" };
 const SECTIONS = ["Models", "Network", "Burp"] as const;
 type Section = (typeof SECTIONS)[number];
+type StringKey = Exclude<keyof DesktopSettings, "provider" | "burpScan">;
+
+// Hoisted: defining these inside Settings remounted every <input> on each keystroke (focus lost after 1 char).
+function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
+    return (
+        <label className="settings-field">
+            <span>
+                {label}
+                {hint ? <em>{hint}</em> : null}
+            </span>
+            {children}
+        </label>
+    );
+}
+
+function Text({
+    value,
+    onChange,
+    ph,
+    type = "text",
+}: {
+    value: string;
+    onChange: (v: string) => void;
+    ph?: string;
+    type?: string;
+}) {
+    return <input type={type} value={value} placeholder={ph} spellCheck={false} onChange={(e) => onChange(e.target.value)} />;
+}
 
 export function Settings({ onClose }: { onClose: () => void }) {
     const [s, setS] = useState<DesktopSettings>(EMPTY);
@@ -23,6 +51,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
         setS((prev) => ({ ...prev, [k]: v }));
         setSaved(false);
     };
+    const setStr = (k: StringKey) => (v: string) => set(k, v);
 
     const save = async (): Promise<void> => {
         const v = await bridge()?.set(s);
@@ -31,19 +60,6 @@ export function Settings({ onClose }: { onClose: () => void }) {
             setSaved(true);
         }
     };
-
-    const Field = ({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) => (
-        <label className="settings-field">
-            <span>
-                {label}
-                {hint ? <em>{hint}</em> : null}
-            </span>
-            {children}
-        </label>
-    );
-    const Text = ({ k, ph, type = "text" }: { k: keyof DesktopSettings; ph?: string; type?: string }) => (
-        <input type={type} value={(s[k] as string) ?? ""} placeholder={ph} spellCheck={false} onChange={(e) => set(k, e.target.value)} />
-    );
 
     const openai = s.provider === "openai";
 
@@ -75,22 +91,22 @@ export function Settings({ onClose }: { onClose: () => void }) {
                                 </Field>
                                 {openai ? (
                                     <>
-                                        <Field label="Base URL"><Text k="baseURL" ph="https://opencode.ai/zen/go/v1" /></Field>
-                                        <Field label="API key"><Text k="apiKey" ph="sk-…" type="password" /></Field>
+                                        <Field label="Base URL"><Text value={s.baseURL ?? ""} onChange={setStr("baseURL")} ph="https://opencode.ai/zen/go/v1" /></Field>
+                                        <Field label="API key"><Text value={s.apiKey ?? ""} onChange={setStr("apiKey")} ph="sk-…" type="password" /></Field>
                                     </>
                                 ) : (
                                     <p className="settings-note-inline">The Claude subscription CLI needs the `claude` binary on PATH. Switch to OpenAI-compatible to use OpenCodeGo / a local model.</p>
                                 )}
                                 <div className="settings-sec">Model tiering</div>
-                                <Field label="Deep model" hint="high-value diagnosis / scenario"><Text k="deepModel" ph={openai ? "hy3" : "claude-opus-4-8"} /></Field>
-                                <Field label="Light model" hint="survey / methodology / low-value"><Text k="lightModel" ph={openai ? "hy3" : "claude-sonnet-5"} /></Field>
+                                <Field label="Deep model" hint="high-value diagnosis / scenario"><Text value={s.deepModel ?? ""} onChange={setStr("deepModel")} ph={openai ? "hy3" : "claude-opus-4-8"} /></Field>
+                                <Field label="Light model" hint="survey / methodology / low-value"><Text value={s.lightModel ?? ""} onChange={setStr("lightModel")} ph={openai ? "hy3" : "claude-sonnet-5"} /></Field>
                             </>
                         ) : null}
 
                         {section === "Network" ? (
                             <>
-                                <Field label="Upstream proxy" hint="all scan traffic (browser + http), e.g. Burp — blank = direct"><Text k="proxy" ph="http://127.0.0.1:8080" /></Field>
-                                <Field label="Chromium path" hint="the headless scan browser (blank = env / bundled)"><Text k="browserPath" ph="/path/to/chrome" /></Field>
+                                <Field label="Upstream proxy" hint="Browser tab + scan traffic (browser + http), e.g. Burp — blank = direct"><Text value={s.proxy ?? ""} onChange={setStr("proxy")} ph="http://127.0.0.1:8080" /></Field>
+                                <Field label="Chromium path" hint="headless scan browser — blank = installed Chrome/Edge"><Text value={s.browserPath ?? ""} onChange={setStr("browserPath")} ph="C:\Program Files\Google\Chrome\Application\chrome.exe" /></Field>
                             </>
                         ) : null}
 
@@ -101,12 +117,12 @@ export function Settings({ onClose }: { onClose: () => void }) {
                                     <span>Run a Burp active scan after diagnosis on each run <em>needs a REST or Audit endpoint below</em></span>
                                 </label>
                                 <div className="settings-sec">Audit REST <em>scans behind login (recommended)</em></div>
-                                <Field label="Audit REST URL" hint="the VERDICT Burp Audit extension, e.g. http://127.0.0.1:1338"><Text k="burpAuditApi" ph="http://127.0.0.1:1338" /></Field>
-                                <Field label="Audit token"><Text k="burpAuditToken" ph="token" type="password" /></Field>
+                                <Field label="Audit REST URL" hint="the VERDICT Burp Audit extension, e.g. http://127.0.0.1:1338"><Text value={s.burpAuditApi ?? ""} onChange={setStr("burpAuditApi")} ph="http://127.0.0.1:1338" /></Field>
+                                <Field label="Audit token"><Text value={s.burpAuditToken ?? ""} onChange={setStr("burpAuditToken")} ph="token" type="password" /></Field>
                                 <div className="settings-sec">Burp Pro REST <em>fallback</em></div>
-                                <Field label="REST API URL"><Text k="burpApi" ph="http://127.0.0.1:1337" /></Field>
-                                <Field label="API key"><Text k="burpApiKey" ph="key" type="password" /></Field>
-                                <Field label="Resource pool"><Text k="burpResourcePool" ph="default" /></Field>
+                                <Field label="REST API URL"><Text value={s.burpApi ?? ""} onChange={setStr("burpApi")} ph="http://127.0.0.1:1337" /></Field>
+                                <Field label="API key"><Text value={s.burpApiKey ?? ""} onChange={setStr("burpApiKey")} ph="key" type="password" /></Field>
+                                <Field label="Resource pool"><Text value={s.burpResourcePool ?? ""} onChange={setStr("burpResourcePool")} ph="default" /></Field>
                             </>
                         ) : null}
                     </div>

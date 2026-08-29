@@ -18,6 +18,7 @@ declare global {
         path?: string;
         count?: number;
         host?: string;
+        header?: string;
         error?: string;
     }
     interface AttendedBrowserBridge {

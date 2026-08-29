@@ -113,12 +113,18 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(payload);
 }
 
+/** True if `full` is `rootAbs` or a descendant. Uses `sep` so Windows `\\` paths are not 403'd
+ *  (a hard-coded "/" made every packaged-desktop static request return "forbidden"). */
+export function isContainedPath(rootAbs: string, full: string, separator = sep): boolean {
+  return full === rootAbs || full.startsWith(rootAbs + separator);
+}
+
 function serveStatic(res: ServerResponse, webRoot: string, urlPath: string): void {
   const rootAbs = normalize(webRoot);
   let rel = decodeURIComponent((urlPath.split("?")[0] ?? "/"));
   if (rel === "/" || rel === "") rel = "/index.html";
   const full = normalize(join(rootAbs, rel));
-  if (full !== rootAbs && !full.startsWith(rootAbs + "/")) {
+  if (!isContainedPath(rootAbs, full)) {
     res.writeHead(403);
     res.end("forbidden");
     return;

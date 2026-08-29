@@ -5,13 +5,13 @@
 // The store, WS projection, and evidence contracts are unchanged — this is the same server the `serve` command
 // runs, just hosted by Electron instead of a bare Node process (docs/DESKTOP_APP.md, "backend nearly unchanged").
 
-import { app, BrowserWindow, ipcMain, shell } from "electron";
+import { app, BrowserWindow, ipcMain, session, shell } from "electron";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import { existsSync, mkdirSync } from "node:fs";
 import { startServer, type RunningServer, type RunLauncherConfig } from "@veritas/server";
-import { setupAttendedBrowser } from "./attended-browser.js";
+import { applyAttendedProxy, setupAttendedBrowser } from "./attended-browser.js";
 import { setupSettingsIpc, loadSettings, settingsToEnv } from "./settings.js";
 
 /** App root (apps/desktop) — main.js lives in dist/, so one level up. Used to locate the preload. */
@@ -83,6 +83,13 @@ async function boot(): Promise<void> {
     });
     console.log(`[verdict] server on ${server.url} (runs: ${runsDir})`);
 
+    // The local UI must not go through the operator's HTTP_PROXY / Windows system proxy (Burp, corporate
+    // MITM, …). Chromium will otherwise fetch http://127.0.0.1:<port>/ via that proxy and boot with
+    // ERR_PROXY_CONNECTION_FAILED. The attended Browser tab uses partition persist:attended and is pointed
+    // at Settings' upstream proxy separately (applyAttendedProxy).
+    await session.defaultSession.setProxy({ mode: "direct" });
+    await applyAttendedProxy();
+
     win = new BrowserWindow({
         width: 1400,
         height: 900,
@@ -109,8 +116,11 @@ async function boot(): Promise<void> {
     win.on("maximize", () => win?.webContents.send("win:maximize-changed", true));
     win.on("unmaximize", () => win?.webContents.send("win:maximize-changed", false));
 
-    // In-app settings (LLM provider / Deep + Light models / browser path) — read by the childEnv thunk above.
-    setupSettingsIpc();
+    // In-app settings (LLM provider / Deep + Light models / browser path / proxy) — read by the childEnv thunk above.
+    // Saving proxy reapplies it to the attended Browser tab immediately (no app restart).
+    setupSettingsIpc(() => {
+        void applyAttendedProxy();
+    });
 
     // Attended embedded browser (human login / CAPTCHA inside the one window; session handoff to the auto pilot).
     const attb = setupAttendedBrowser(win, runsDir);
@@ -154,6 +164,16 @@ async function boot(): Promise<void> {
 
 app.setName("VERDICT"); // stable userData dir (~/.config/VERDICT) instead of the generic "Electron"
 app.disableHardwareAcceleration(); // headless/WSL friendliness; the UI is a plain document, not GPU-bound
+// Burp MITM: Chromium would otherwise blank the attended Browser tab (no cert interstitial in WebContentsView).
+app.commandLine.appendSwitch("ignore-certificate-errors");
+// Burp's HTTP/2 interception commonly yields a white page; the local UI is HTTP/1.1 so this is safe.
+app.commandLine.appendSwitch("disable-http2");
+
+app.on("certificate-error", (event, _wc, url, error, _certificate, callback) => {
+    event.preventDefault();
+    console.warn("[verdict] certificate-error ignored:", error, url);
+    callback(true);
+});
 
 app.whenReady()
     .then(boot)

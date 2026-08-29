@@ -5,6 +5,15 @@ import { useEffect, useRef, useState } from "react";
 // This React layer is just the chrome: a toolbar (nav + URL + capture) and a placeholder that reports its on-screen
 // bounds to main so the native view stays aligned. "Capture session" writes the login cookies to a file the pilot loads.
 
+async function copyText(text: string): Promise<boolean> {
+    try {
+        await navigator.clipboard.writeText(text);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
 const bridge = () => (typeof window !== "undefined" ? window.verdictDesktop?.browser : undefined);
 
 // A start page shown when the attended browser opens with no target — makes "Browser" read as "start an attended scan".
@@ -35,7 +44,7 @@ export function AttendedBrowser({ initialUrl, onClose }: { initialUrl: string; o
     const [currentUrl, setCurrentUrl] = useState(initialUrl);
     const [nav, setNav] = useState({ canGoBack: false, canGoForward: false, loading: false });
     const [note, setNote] = useState<{ ok: boolean; text: string } | null>(null);
-    const [captured, setCaptured] = useState<{ path: string; host: string } | null>(null);
+    const [captured, setCaptured] = useState<{ path: string; host: string; header?: string } | null>(null);
     const [launching, setLaunching] = useState(false);
 
     // Keep the native view aligned with the placeholder region.
@@ -73,11 +82,22 @@ export function AttendedBrowser({ initialUrl, onClose }: { initialUrl: string; o
         if (!/^https?:\/\//i.test(u)) u = `https://${u}`;
         void bridge()?.navigate(u);
     };
+    const copyUrl = async (): Promise<void> => {
+        const u = (urlField.trim() || currentUrl).trim();
+        if (!u || u.startsWith("data:")) return;
+        const ok = await copyText(u);
+        setNote({ ok, text: ok ? "copied URL" : "copy failed" });
+    };
+    const copyCookies = async (): Promise<void> => {
+        if (!captured?.header) return;
+        const ok = await copyText(captured.header);
+        setNote({ ok, text: ok ? "copied Cookie header" : "copy failed" });
+    };
     const capture = async (): Promise<void> => {
         const r = await bridge()?.capture();
         if (!r) return;
         if (r.ok && r.path && r.host) {
-            setCaptured({ path: r.path, host: r.host });
+            setCaptured({ path: r.path, host: r.host, header: r.header });
             setNote({ ok: true, text: `captured ${r.count} cookie(s) for ${r.host} — start an authenticated scan below` });
         } else {
             setCaptured(null);
@@ -151,7 +171,11 @@ export function AttendedBrowser({ initialUrl, onClose }: { initialUrl: string; o
                     onKeyDown={(e) => { if (e.key === "Enter") go(); }}
                     placeholder="https://target/login"
                 />
+                <button type="button" className="attb-copy" disabled={!urlField.trim() && !currentUrl} onClick={() => void copyUrl()} title="Copy URL" aria-label="Copy URL">Copy</button>
                 <button type="button" className="attb-capture" onClick={() => void capture()} title="Save the login session for the scan">Capture session</button>
+                {captured?.header ? (
+                    <button type="button" className="attb-copy" onClick={() => void copyCookies()} title="Copy the Cookie header to the clipboard (Repeater / curl)">Copy cookies</button>
+                ) : null}
                 {captured && currentRunId ? (
                     <button type="button" className="attb-scan" disabled={launching} onClick={() => void inject()} title="Inject this session into the scan you're viewing — it continues authenticated, no restart">
                         {launching ? "Injecting…" : "Inject into this run →"}

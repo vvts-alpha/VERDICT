@@ -73,6 +73,12 @@
   background: transparent; border: 1px solid var(--line); color: var(--muted);
 }
 .attb-close:hover { color: var(--fg); background: var(--btn-hover); }
+.attb-copy {
+  height: 28px; padding: 0 10px; border-radius: 6px; font-size: 12px; cursor: default; white-space: nowrap;
+  background: transparent; border: 1px solid var(--line); color: var(--fg);
+}
+.attb-copy:disabled { opacity: 0.35; }
+.attb-copy:not(:disabled):hover { background: var(--btn-hover); }
 .attb-note { padding: 5px 12px; font-size: 12px; border-bottom: 1px solid var(--line); }
 .attb-note.ok { color: var(--accent); }
 .attb-note.err { color: var(--err); }
@@ -84,6 +90,7 @@
   position: absolute; inset: 0; z-index: 30;
   display: flex; align-items: flex-start; justify-content: center;
   background: rgba(0, 0, 0, 0.5); padding: 40px 16px; overflow: auto;
+  -webkit-app-region: no-drag;
 }
 .settings-card {
   width: 100%; max-width: 720px; background: var(--panel); border: 1px solid var(--line);
