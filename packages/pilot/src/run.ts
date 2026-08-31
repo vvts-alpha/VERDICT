@@ -17,7 +17,7 @@ import { EvidenceStore, FetchHttpClient, fingerprintTech, stackAttackHints } fro
 import type { TechSample } from "@veritas/scanner";
 import type { BurpAuditConn } from "@veritas/scanner";
 import { join } from "node:path";
-import { buildTools, STAGE_TOOLS, dedupKey, isAuthWalled, loadCookieFile, mergeSetCookie, touchIsDead, stripHash, backfillParentPrefixes, availableRoles, analyzePageJs, enrolByNavigate } from "./tools.js";
+import { buildTools, STAGE_TOOLS, applyLoadedAuth, dedupKey, isAuthWalled, loadCookieFile, mergeSetCookie, touchIsDead, stripHash, backfillParentPrefixes, availableRoles, analyzePageJs, enrolByNavigate } from "./tools.js";
 import { resolveSkills, buildSkillTools, skillToolNamesForStage, type Stage } from "./skills.js";
 import type { PilotSession, RoleSession } from "./tools.js";
 import { LiveControl } from "./live-control.js";
@@ -350,11 +350,12 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       let deferred = false;
       if (cookieFile) {
         try {
-          const { browserCookies } = loadCookieFile(cookieFile, opts.targetUrl);
+          const loaded = loadCookieFile(cookieFile, opts.targetUrl);
           await d.clearSession();
-          await d.addCookies(browserCookies);
-          await d.gotoUrl(opts.targetUrl);
-          opts.onText?.(`🍪 role ${roleLabel(role, opts.roleDescriptions)}: injected ${browserCookies.length} pre-captured cookie(s) (no manual login needed)`);
+          const applied = await applyLoadedAuth(d, loaded, opts.targetUrl);
+          opts.onText?.(
+            `🍪 role ${roleLabel(role, opts.roleDescriptions)}: injected ${loaded.browserCookies.length} cookie(s)${applied.bearer ? " + bearer" : ""} (no manual login needed)`,
+          );
         } catch (e) {
           opts.onText?.(`⚠ role '${role}' cookie file error: ${String(e).slice(0, 120)}`);
         }
@@ -1012,10 +1013,11 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
           //   session — browser context + the raw http path — so subsequent screens are authenticated, no restart.
           if (cmd.injectCookieFile) {
             try {
-              const { header, browserCookies } = loadCookieFile(cmd.injectCookieFile, opts.targetUrl);
-              if (header) {
-                await session.driver.addCookies(browserCookies); // authenticate the browser context
-                session.currentCookie = header; // authenticate the raw http path (authHeaders reads currentCookie)
+              const loaded = loadCookieFile(cmd.injectCookieFile, opts.targetUrl);
+              if (loaded.header || loaded.bearer || loaded.origins.length > 0) {
+                const applied = await applyLoadedAuth(session.driver, loaded, opts.targetUrl);
+                session.currentCookie = applied.cookie;
+                session.currentBearer = applied.bearer;
                 opts.onText?.("🔓 session injected (operator login) — continuing authenticated");
                 opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: "🔓 operator injected a login session — continuing authenticated" } });
               } else {

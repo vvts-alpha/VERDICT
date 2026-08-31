@@ -1,7 +1,8 @@
 // Attended (human-phase) embedded browser. Uses Electron's OWN Chromium as a WebContentsView placed INSIDE the app
 // window — so the operator logs in / clears CAPTCHA in a REAL browser (no automation mode, no navigator.webdriver =
-// far harder to fingerprint than stealth Playwright), all in the one window. After login, the session is captured
-// (cookies → a raw `Cookie:` header file) and handed to the automation pilot (which loadCookieFile reads). This is the
+// far harder to fingerprint than stealth Playwright), all in the one window. After login, the session is captured as
+// Playwright storageState JSON (cookies + origin localStorage, including SPA Bearer tokens) and handed to the
+// automation pilot (loadCookieFile). This is the
 // 人間フェーズ side of the division-of-labour in docs/DESKTOP_APP.md; the auto phase stays on Playwright (headless).
 
 import { WebContentsView, ipcMain, session, type BrowserWindow } from "electron";
@@ -46,7 +47,15 @@ interface Bounds {
 export interface AttendedBrowserDebug {
     open(url: string): Promise<void>;
     captureViewPng(path: string): Promise<boolean>;
-    captureCookies(): Promise<{ ok: boolean; path?: string; count?: number; host?: string; header?: string; error?: string }>;
+    captureCookies(): Promise<{
+        ok: boolean;
+        path?: string;
+        count?: number;
+        localStorage?: number;
+        host?: string;
+        header?: string;
+        error?: string;
+    }>;
 }
 
 export function setupAttendedBrowser(win: BrowserWindow, runsDir: string): AttendedBrowserDebug {
@@ -121,21 +130,84 @@ export function setupAttendedBrowser(win: BrowserWindow, runsDir: string): Atten
     ipcMain.on("attbrowser:forward", () => view?.webContents.navigationHistory.goForward());
     ipcMain.on("attbrowser:reload", () => view?.webContents.reload());
 
-    // Capture the current session as a raw `Cookie:` header file the pilot can load (attended → automation handoff).
-    const captureCookies = async (assessmentId?: string): Promise<{ ok: boolean; path?: string; count?: number; host?: string; header?: string; error?: string }> => {
+    // Capture the current session as Playwright storageState (cookies + origin localStorage) so SPA Bearer
+    // tokens survive the attended → automation handoff. loadCookieFile reads this JSON.
+    const captureCookies = async (assessmentId?: string): Promise<{
+        ok: boolean;
+        path?: string;
+        count?: number;
+        localStorage?: number;
+        host?: string;
+        header?: string;
+        error?: string;
+    }> => {
         if (!view) return { ok: false, error: "no attended browser open" };
         const wc = view.webContents;
         const url = wc.getURL();
-        if (!url || url === "about:blank") return { ok: false, error: "navigate to the target and log in first" };
-        const cookies = await wc.session.cookies.get({ url }); // cookies that would be sent to this URL = the session
-        if (cookies.length === 0) return { ok: false, error: "no cookies for this page yet (log in first)" };
+        if (!url || url === "about:blank" || url.startsWith("data:")) return { ok: false, error: "navigate to the target and log in first" };
+        let origin = "";
+        let host = "";
+        try {
+            const u = new URL(url);
+            origin = u.origin;
+            host = u.host;
+        } catch {
+            return { ok: false, error: "navigate to the target and log in first" };
+        }
+        const cookies = await wc.session.cookies.get({ url });
+        let localStorage: Array<{ name: string; value: string }> = [];
+        try {
+            const dumped = (await wc.executeJavaScript(`(() => {
+                try {
+                    const out = [];
+                    for (let i = 0; i < localStorage.length; i++) {
+                        const name = localStorage.key(i);
+                        if (name) out.push({ name, value: localStorage.getItem(name) ?? "" });
+                    }
+                    return out;
+                } catch (e) { return []; }
+            })()`)) as unknown;
+            if (Array.isArray(dumped)) {
+                localStorage = dumped
+                    .map((item) => {
+                        if (!item || typeof item !== "object") return null;
+                        const it = item as { name?: unknown; value?: unknown };
+                        if (typeof it.name !== "string" || !it.name) return null;
+                        return { name: it.name, value: String(it.value ?? "") };
+                    })
+                    .filter((x): x is { name: string; value: string } => x !== null);
+            }
+        } catch {
+            localStorage = [];
+        }
+        if (cookies.length === 0 && localStorage.length === 0) {
+            return { ok: false, error: "no cookies or localStorage for this page yet (log in first)" };
+        }
         const header = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
-        const host = new URL(url).host;
+        const sameSite = (v: string | undefined): "Strict" | "Lax" | "None" => {
+            const s = (v ?? "").toLowerCase();
+            if (s === "strict") return "Strict";
+            if (s === "lax") return "Lax";
+            return "None";
+        };
+        const state = {
+            cookies: cookies.map((c) => ({
+                name: c.name,
+                value: c.value,
+                domain: (c.domain ?? host).replace(/^\./, ""),
+                path: c.path || "/",
+                expires: typeof c.expirationDate === "number" ? c.expirationDate : -1,
+                httpOnly: !!c.httpOnly,
+                secure: !!c.secure,
+                sameSite: sameSite(c.sameSite),
+            })),
+            origins: localStorage.length ? [{ origin, localStorage }] : [],
+        };
         const outDir = assessmentId ? join(runsDir, assessmentId) : join(runsDir, "_sessions");
         mkdirSync(outDir, { recursive: true });
-        const outPath = join(outDir, `attended_cookies_${host.replace(/[^a-zA-Z0-9._-]/g, "_")}.txt`);
-        writeFileSync(outPath, `${header}\n`);
-        return { ok: true, path: outPath, count: cookies.length, host, header };
+        const outPath = join(outDir, `attended_session_${host.replace(/[^a-zA-Z0-9._-]/g, "_")}.json`);
+        writeFileSync(outPath, `${JSON.stringify(state, null, 2)}\n`);
+        return { ok: true, path: outPath, count: cookies.length, localStorage: localStorage.length, host, header };
     };
     ipcMain.handle("attbrowser:capture", (_e, assessmentId?: string) => captureCookies(assessmentId));
 

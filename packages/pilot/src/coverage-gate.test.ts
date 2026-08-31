@@ -10,7 +10,7 @@ test("plannedClassesFor parses the classes=[...] prefix and canonicalizes", () =
     ["idor", "sqli", "xss-stored"].sort(),
   );
   // info-disclosure / headers / free-text other are exempt from coverage enforcement
-  assert.deepEqual(plannedClassesFor("classes=[info-disclosure,headers] ..."), []);
+  assert.deepEqual(plannedClassesFor("classes=[info-disclosure,headers,session] ..."), []);
   assert.deepEqual(plannedClassesFor("(no recorded plan — use judgement)"), []);
   assert.deepEqual(plannedClassesFor(undefined), []);
 });

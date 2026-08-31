@@ -829,6 +829,51 @@ export class PlaywrightDriver implements Driver {
     await this.context.addCookies(cookies as Parameters<BrowserContext["addCookies"]>[0]).catch(() => {});
   }
 
+  /** Restore Playwright storageState `origins` (SPA Bearer in localStorage). Init-script covers later navigations;
+   *  if the current page already matches an origin, set immediately too. */
+  async restoreLocalStorage(
+    origins: Array<{ origin: string; localStorage: Array<{ name: string; value: string }> }>,
+  ): Promise<void> {
+    if (origins.length === 0) return;
+    await this.context.addInitScript((entries: Array<{ origin: string; localStorage: Array<{ name: string; value: string }> }>) => {
+      const g = globalThis as any;
+      const origin = g.location?.origin;
+      if (!origin) return;
+      const match = entries.find((o) => o.origin === origin);
+      if (!match) return;
+      const st = g.localStorage;
+      if (!st) return;
+      for (const item of match.localStorage) {
+        try {
+          st.setItem(item.name, item.value);
+        } catch {
+          /* quota / private mode */
+        }
+      }
+    }, origins);
+    let currentOrigin = "";
+    try {
+      currentOrigin = new URL(this.page.url()).origin;
+    } catch {
+      /* about:blank */
+    }
+    const here = origins.find((o) => o.origin === currentOrigin);
+    if (!here) return;
+    await this.page
+      .evaluate((items: Array<{ name: string; value: string }>) => {
+        const st = (globalThis as any).localStorage;
+        if (!st) return;
+        for (const item of items) {
+          try {
+            st.setItem(item.name, item.value);
+          } catch {
+            /* quota / private mode */
+          }
+        }
+      }, here.localStorage)
+      .catch(() => {});
+  }
+
   /** The current page URL (the post-login landing point = start of the authenticated re-crawl). */
   currentUrl(): string {
     return this.page.url();

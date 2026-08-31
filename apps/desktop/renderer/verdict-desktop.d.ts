@@ -17,6 +17,7 @@ declare global {
         ok: boolean;
         path?: string;
         count?: number;
+        localStorage?: number;
         host?: string;
         header?: string;
         error?: string;

@@ -10,13 +10,22 @@ import type { LoginCreds, Observation, PlaywrightDriver } from "@veritas/crawler
 import { InventoryBuilder, normalizePath, smartLogin, guessParamType, extractApiRefs, apiCallToBuiltScreen } from "@veritas/crawler";
 import type { LlmClient } from "@veritas/llm";
 import type { BurpAuditConn, EvidenceStore, FetchHttpClient, HttpRequest, HttpResponse, TechComponent, TechSample } from "@veritas/scanner";
-import { oobPayload, oobPoll, fingerprintTech, formatTechInventory, lookupCves, formatCveResults, impactOracle, identityAppears } from "@veritas/scanner";
+import { oobPayload, oobPoll, fingerprintTech, formatTechInventory, lookupCves, formatCveResults, impactOracle, identityAppears, auditHeaders } from "@veritas/scanner";
 import { placePayload, parseLocation, oobFilesToMultipart, filesHaveOobPlaceholder } from "./inject.js";
 import { analyzeJsSinksFull } from "./jssinks.js";
+import { bumpJwtExp, jwtForgeCandidates } from "./jwt.js";
+import { placeUserIdentity, userEnumMarker } from "./user-enum.js";
+import { disclosureHit } from "./disclosure.js";
+import { formatRequestDump, glanceCookie, parseCookieHeader, peekJwt } from "./session-glance.js";
+import { bearerFromOrigins, normalizeOrigins, type StorageOrigin } from "./storage-state.js";
+import { SSRF_CONTROL, SSRF_PAYLOADS, placeSsrfTarget, ssrfHit } from "./ssrf.js";
+import { XXE_ENTITY_URLS, controlSvg, extractFetchUrls, xssSvg, xxeSvg } from "./upload.js";
 import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { join } from "node:path";
 import { readFileSync, renameSync } from "node:fs";
+
+export { forgeAlgNone } from "./jwt.js";
 
 /** In attended (manual multi-session) mode, 1 role = 1 persistent context. Holds a live session. */
 export interface RoleSession {
@@ -141,9 +150,9 @@ export const STAGE_TOOLS = {
   // recon extrapolation: after survey, read the mapped surface and forced-browse LLM-predicted unlinked endpoints.
   reconGuess: ["get_inventory", "probe_guesses", "browser_navigate", "guess_done"],
   methodology: ["get_inventory", "record_methodology", "methodology_done"],
-  diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_dom_xss", "probe_stored_xss", "probe_ssti", "probe_sqli", "probe_cmdi", "probe_traversal", "probe_redirect", "probe_jwt", "probe_csrf", "probe_oob", "probe_logic", "probe_race", "probe_reset_poison", "analyze_session", "verify_access", "probe_idor", "analyze_js", "browser_navigate", "browser_fill", "browser_click", "browser_upload", "record_finding", "screen_done", "skip_screen"],
+  diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_dom_xss", "probe_stored_xss", "probe_ssti", "probe_sqli", "probe_cmdi", "probe_traversal", "probe_redirect", "probe_jwt", "probe_csrf", "probe_oob", "probe_ssrf", "probe_upload", "probe_logic", "probe_race", "probe_reset_poison", "probe_user_enum", "probe_secrets", "probe_headers", "analyze_session", "verify_access", "probe_idor", "analyze_js", "browser_navigate", "browser_fill", "browser_click", "browser_upload", "record_finding", "screen_done", "skip_screen"],
   // scenario (A04 cross-cutting logic): overview the inventory + fire multi-step request chains via probe_scenario. Once, after per-screen diagnosis.
-  scenario: ["get_inventory", "login", "http_request", "browser_navigate", "browser_fill", "browser_click", "probe_scenario", "probe_race", "probe_reset_poison", "record_finding", "scenario_done"],
+  scenario: ["get_inventory", "login", "http_request", "browser_navigate", "browser_fill", "browser_click", "probe_scenario", "probe_race", "probe_reset_poison", "probe_user_enum", "probe_secrets", "record_finding", "scenario_done"],
   // fingerprint (A06 known-vulnerable components): fingerprint_scan to collect versions, evaluate known CVEs (cve_lookup opt-in) and record.
   fingerprint: ["fingerprint_scan", "cve_lookup", "http_request", "record_finding", "fingerprint_done"],
 } as const;
@@ -294,7 +303,7 @@ export const BUSINESS_LOGIC_CATEGORIES = new Set<string>(["price-tampering", "qt
 
 /** Categories of the "confirmed when a specific marker appears in the response" type (judged by marker presence, not length delta).
  *  Business logic (probe_logic/probe_scenario) + reflected XSS (unescaped reflection) + open-redirect (Location is the OOB). */
-export const MARKER_BASED_CATEGORIES = new Set<string>([...BUSINESS_LOGIC_CATEGORIES, "xss-reflected", "xss-stored", "open-redirect", "ssti", "secret-exposure", "user-enumeration", "race-condition", "account-takeover"]);
+export const MARKER_BASED_CATEGORIES = new Set<string>([...BUSINESS_LOGIC_CATEGORIES, "xss-reflected", "xss-stored", "open-redirect", "ssti", "secret-exposure", "user-enumeration", "race-condition", "account-takeover", "info-disclosure", "ssrf", "xxe"]);
 
 /** Categories that don't allow verdict:"suspected". Two reasons: (1) low-value hygiene classes that just add noise
  *  (rate-limit/headers/info-disclosure/misconfig — were being mass-produced as "suspected"); (2) XSS, where even the general
@@ -502,32 +511,6 @@ export function authHeaders(s: Pick<PilotSession, "currentCookie" | "currentBear
   };
 }
 
-function b64urlDecode(s: string): string {
-  const pad = s.length % 4 === 0 ? "" : "=".repeat(4 - (s.length % 4));
-  return Buffer.from(s.replace(/-/g, "+").replace(/_/g, "/") + pad, "base64").toString("utf8");
-}
-function b64urlEncode(s: string): string {
-  return Buffer.from(s, "utf8").toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-/** Re-encode a JWT with alg:none (empty signature). Accepted if the server isn't verifying the signature = fatal forgery.
- *  Sets header.alg to "none", keeps payload as-is (mutate can also alter claims). Returns null on failure. */
-export function forgeAlgNone(token: string, mutate?: (claims: Record<string, unknown>) => void): string | null {
-  const parts = token.split(".");
-  if (parts.length < 2 || !parts[0] || !parts[1]) return null;
-  let header: Record<string, unknown>;
-  let payload: Record<string, unknown>;
-  try {
-    header = JSON.parse(b64urlDecode(parts[0]));
-    payload = JSON.parse(b64urlDecode(parts[1]));
-  } catch {
-    return null;
-  }
-  header.alg = "none";
-  if (mutate) mutate(payload);
-  return `${b64urlEncode(JSON.stringify(header))}.${b64urlEncode(JSON.stringify(payload))}.`;
-}
-
 /** ignore_paths pattern matching. Treats `*` as a wildcard; patterns without a `*` are prefix matches.
  *  e.g. "/news/" matches everything under /news/, "/artikel/*" likewise, "/p" matches every path starting with /p. URL or relative, judged on the path. */
 export function pathIsIgnored(urlOrPath: string, patterns: ReadonlyArray<string>, base: string): boolean {
@@ -560,12 +543,18 @@ export function availableRoles(s: PilotSession): Array<{ name: string; descripti
   });
 }
 
+export interface LoadedAuth {
+  header: string;
+  browserCookies: Array<{ name: string; value: string; domain: string; path: string }>;
+  origins: StorageOrigin[];
+  /** Bearer JWT recovered from origin localStorage (SPA token-auth). Empty if none. */
+  bearer: string;
+}
+
 /** Read an operator-supplied Cookie file. Auto-detects a raw Cookie header ("a=1; b=2") / a Playwright storageState JSON
- *  ({cookies:[...]}) / a simple array ([{name,value}]) → an http header + cookies for browser injection. */
-export function loadCookieFile(
-  path: string,
-  targetUrl: string,
-): { header: string; browserCookies: Array<{ name: string; value: string; domain: string; path: string }> } {
+ *  ({cookies:[...], origins:[...]}) / a simple array ([{name,value}]) → an http header + cookies for browser injection
+ *  + origin localStorage (Bearer-in-localStorage SPAs). */
+export function loadCookieFile(path: string, targetUrl: string): LoadedAuth {
   const raw = readFileSync(path, "utf8").trim();
   let host = "";
   try {
@@ -573,18 +562,24 @@ export function loadCookieFile(
   } catch {
     host = "";
   }
-  // try JSON (storageState or array)
   try {
     const j = JSON.parse(raw) as unknown;
-    const arr = Array.isArray(j) ? j : ((j as { cookies?: unknown[] }).cookies ?? []);
-    const bc = (arr as Array<{ name?: string; value?: unknown; domain?: string; path?: string }>)
-      .filter((c) => c && c.name)
-      .map((c) => ({ name: c.name as string, value: String(c.value ?? ""), domain: c.domain || host, path: c.path || "/" }));
-    if (bc.length > 0) return { header: bc.map((c) => `${c.name}=${c.value}`).join("; "), browserCookies: bc };
+    const isArr = Array.isArray(j);
+    const isState = !isArr && !!j && typeof j === "object" && ("cookies" in (j as object) || "origins" in (j as object));
+    if (isArr || isState) {
+      const arr = isArr ? j : ((j as { cookies?: unknown[] }).cookies ?? []);
+      const bc = (arr as Array<{ name?: string; value?: unknown; domain?: string; path?: string }>)
+        .filter((c) => c && c.name)
+        .map((c) => ({ name: c.name as string, value: String(c.value ?? ""), domain: c.domain || host, path: c.path || "/" }));
+      const origins = isArr ? [] : normalizeOrigins((j as { origins?: unknown }).origins);
+      const bearer = bearerFromOrigins(origins);
+      if (bc.length > 0 || origins.length > 0) {
+        return { header: bc.map((c) => `${c.name}=${c.value}`).join("; "), browserCookies: bc, origins, bearer };
+      }
+    }
   } catch {
     /* not JSON → treat as a raw header */
   }
-  // raw Cookie header: "Cookie: a=1; b=2" or "a=1; b=2"
   const header = raw.replace(/^cookie:\s*/i, "").split(/\r?\n/)[0]?.trim() ?? "";
   const browserCookies = header
     .split(";")
@@ -595,7 +590,23 @@ export function loadCookieFile(
       return { name: kv.slice(0, i).trim(), value: kv.slice(i + 1).trim(), domain: host, path: "/" };
     })
     .filter((c) => c.name);
-  return { header, browserCookies };
+  return { header, browserCookies, origins: [], bearer: "" };
+}
+
+type AuthDriver = {
+  addCookies: (cookies: LoadedAuth["browserCookies"]) => Promise<void>;
+  restoreLocalStorage?: (origins: StorageOrigin[]) => Promise<void>;
+  gotoUrl?: (url: string) => Promise<void>;
+  bearerToken?: () => Promise<string | null>;
+};
+
+/** Inject a loaded cookie/storageState file into the live driver + return cookie/Bearer for the HTTP path. */
+export async function applyLoadedAuth(driver: AuthDriver, loaded: LoadedAuth, targetUrl: string): Promise<{ cookie: string; bearer: string }> {
+  if (loaded.browserCookies.length) await driver.addCookies(loaded.browserCookies);
+  if (loaded.origins.length && driver.restoreLocalStorage) await driver.restoreLocalStorage(loaded.origins);
+  if (driver.gotoUrl) await driver.gotoUrl(targetUrl).catch(() => undefined);
+  const live = driver.bearerToken ? ((await driver.bearerToken().catch(() => null)) ?? "") : "";
+  return { cookie: loaded.header, bearer: loaded.bearer || live };
 }
 
 // ── hybrid judgment for auth-bypass: the machine vetoes "auth is clearly enforced", only gray cases go to Claude ──
@@ -814,14 +825,14 @@ function bumpHttp(s: PilotSession, status: number): void {
 }
 
 /** Pull the planned attack classes out of a screen plan's `classes=[a,b,c]` prefix, canonicalized (for the coverage gate).
- *  "One-shot" classes like info-disclosure/headers/misconfig are exempt from coverage enforcement (they can surface even if not in the plan). */
+ *  "One-shot" classes like info-disclosure/headers/misconfig/session are exempt from coverage enforcement (they can surface even if not in the plan). */
 export function plannedClassesFor(plan: string | undefined): string[] {
   if (!plan) return [];
   const m = /^classes=\[([^\]]*)\]/.exec(plan);
   if (!m) return [];
   const raw = (m[1] ?? "").split(",").map((c) => c.trim()).filter(Boolean);
   // Classes found passively/opportunistically (not forced into active coverage even if written into the plan).
-  const EXCLUDED = new Set(["other", "headers", "info-disclosure", "misconfig"]);
+  const EXCLUDED = new Set(["other", "headers", "info-disclosure", "misconfig", "session"]);
   const out = new Set<string>();
   for (const c of raw) {
     const cc = coarseClass(c);
@@ -1785,14 +1796,21 @@ export function buildTools(s: PilotSession) {
         const cookieFile = s.roleCookieFiles.get(role);
         if (cookieFile) {
           try {
-            const { header, browserCookies } = loadCookieFile(cookieFile, s.targetUrl);
-            if (!header) return txt(`cookie file for '${role}' is empty/unparseable: ${cookieFile}`);
+            const loaded = loadCookieFile(cookieFile, s.targetUrl);
+            if (!loaded.header && !loaded.bearer && loaded.origins.length === 0) {
+              return txt(`cookie file for '${role}' is empty/unparseable: ${cookieFile}`);
+            }
             await s.driver.clearSession();
-            await s.driver.addCookies(browserCookies);
-            s.currentCookie = header;
-            s.currentBearer = (await s.driver.bearerToken().catch(() => null)) ?? "";
+            const applied = await applyLoadedAuth(s.driver, loaded, s.targetUrl);
+            s.currentCookie = applied.cookie;
+            s.currentBearer = applied.bearer;
             s.currentRole = role;
-            return txt(`role '${role}'${tag}: injected ${browserCookies.length} pre-captured cookie(s) from file (no login).`);
+            const bits = [
+              loaded.browserCookies.length ? `${loaded.browserCookies.length} cookie(s)` : "",
+              loaded.origins.length ? `${loaded.origins.reduce((n, o) => n + o.localStorage.length, 0)} localStorage key(s)` : "",
+              applied.bearer ? "bearer present" : "",
+            ].filter(Boolean);
+            return txt(`role '${role}'${tag}: injected ${bits.join(", ") || "session"} from file (no login).`);
           } catch (e) {
             return txt(`cookie file error for '${role}': ${String(e).slice(0, 150)}`);
           }
@@ -2457,13 +2475,17 @@ export function buildTools(s: PilotSession) {
     ),
     tool(
       "probe_jwt",
-      "Confirm a JWT signature-verification bypass (alg:none forgery). Requires the current session to hold a Bearer JWT (login first). Forges an alg:none token from it (empty signature) and replays it against an identity-returning authed `url`; sends a garbage token as the negative control (must be rejected) and the forged token twice (if accepted = the server does not verify the signature). Returns negativeControl + positiveReplays evidenceIds for record_finding(category session). Optionally mutate a claim via `claimKey`/`claimValue` to also prove privilege escalation.",
+      "Confirm a JWT forgery: (1) weak HMAC secret — cracks the live Bearer against a small default-secret wordlist (secret, jwt-secret, empty, …) and mints a new token; (2) alg:none / None / NONE (signature not verified). Requires login() so the session holds a Bearer JWT. Replays each candidate against an identity-returning authed `url`; garbage token is the negative control (must be rejected) and the forged token is sent twice (if accepted = the server took a token we minted). Returns negativeControl + positiveReplays evidenceIds → record_finding(category session). Optionally mutate a claim via `claimKey`/`claimValue` to also prove privilege escalation. Does not cover jku/x5u or kid injection.",
       { url: z.string(), claimKey: z.string().optional(), claimValue: z.string().optional() },
       async ({ url, claimKey, claimValue }) => {
         if (!s.currentBearer) return txt("no Bearer JWT in the current session — login(role) first (this probe forges from the live token).");
         if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} is out of scope`);
-        const forged = forgeAlgNone(s.currentBearer, claimKey ? (c) => { c[claimKey] = claimValue ?? "admin"; } : undefined);
-        if (!forged) return txt("could not parse the current Bearer token as a JWT (header.payload.signature).");
+        const mutate = (c: Record<string, unknown>): void => {
+          bumpJwtExp(c);
+          if (claimKey) c[claimKey] = claimValue ?? "admin";
+        };
+        const candidates = jwtForgeCandidates(s.currentBearer, mutate);
+        if (candidates.length === 0) return txt("could not parse the current Bearer token as a JWT (header.payload.signature).");
         const send = async (bearer: string, kind: "negative_control" | "positive_replay", tag: string) => {
           const req: HttpRequest = { method: "GET", url, headers: { ...authHeaders(s), authorization: `Bearer ${bearer}` }, body: null };
           const res = await s.http.send(req);
@@ -2478,28 +2500,218 @@ export function buildTools(s: PilotSession) {
           });
           return { evId: ev.id, status: res.status, len: res.body.length };
         };
-        let ctrl: Awaited<ReturnType<typeof send>>;
-        let p1: Awaited<ReturnType<typeof send>>;
-        let p2: Awaited<ReturnType<typeof send>>;
         try {
-          ctrl = await send("eyJhbGciOiJub25lIn0.eyJpbnZhbGlkIjp0cnVlfQ.", "negative_control", "garbage/invalid token"); // 明らかに無効 → 401 が期待
-          p1 = await send(forged, "positive_replay", "forged alg:none #1");
-          p2 = await send(forged, "positive_replay", "forged alg:none #2");
+          const ctrl = await send("eyJhbGciOiJub25lIn0.eyJpbnZhbGlkIjp0cnVlfQ.", "negative_control", "garbage/invalid token");
+          const tried: string[] = [];
+          for (const c of candidates) {
+            tried.push(c.technique);
+            const p1 = await send(c.token, "positive_replay", `${c.technique} #1`);
+            if (!(p1.status < 400 && ctrl.status >= 400)) continue;
+            const p2 = await send(c.token, "positive_replay", `${c.technique} #2`);
+            if (p2.status >= 400) continue;
+            const secretBit = c.secret !== undefined ? ` HMAC secret ${c.secret === "" ? "(empty string)" : JSON.stringify(c.secret)}.` : "";
+            return txt(
+              JSON.stringify({
+                technique: c.technique,
+                ...(c.secret !== undefined ? { secret: c.secret } : {}),
+                negativeControl: ctrl.evId,
+                positiveReplays: [p1.evId, p2.evId],
+                control: { status: ctrl.status },
+                forged: [{ status: p1.status }, { status: p2.status }],
+                verdict: `JWT FORGERY (${c.technique}) — minted token ACCEPTED while the garbage control was rejected.${secretBit} record_finding(session, severity high/critical) with these evidenceIds.`,
+              }),
+            );
+          }
+          const cracked = candidates.find((c) => c.secret !== undefined);
+          return txt(
+            JSON.stringify({
+              tried,
+              ...(cracked ? { hmacCracked: { technique: cracked.technique, secret: cracked.secret } } : {}),
+              control: { status: ctrl.status },
+              verdict: cracked
+                ? `not confirmed on this url: HMAC secret is ${JSON.stringify(cracked.secret)} but the minted token was not accepted (control ${ctrl.status}). Try another identity endpoint. alg:none variants also rejected.`
+                : `not confirmed: no candidate accepted (control ${ctrl.status}; tried ${tried.join(", ")}). Need forged<400 and control>=400.`,
+            }),
+          );
         } catch (e) {
           return txt(`ERROR: ${String(e).slice(0, 180)}`);
         }
-        const accepted = p1.status < 400 && p2.status < 400 && ctrl.status >= 400;
-        return txt(
-          JSON.stringify({
-            negativeControl: ctrl.evId,
-            positiveReplays: [p1.evId, p2.evId],
-            control: { status: ctrl.status },
-            forged: [{ status: p1.status }, { status: p2.status }],
-            verdict: accepted
-              ? "JWT FORGERY — the alg:none token was ACCEPTED while the garbage control was rejected; the server does not verify the signature. record_finding(session, severity high/critical) with these evidenceIds."
-              : `not confirmed: forged token status ${p1.status}/${p2.status}, control ${ctrl.status} (need forged<400 and control>=400)`,
-          }),
-        );
+      },
+    ),
+    tool(
+      "probe_user_enum",
+      "Confirm USER ENUMERATION on a login / forgot-password / register / verify-email endpoint: a KNOWN-valid username vs a NON-EXISTENT one produce a distinguishing marker (wrong-password vs user-not-found, exists:true, or a status flip). Confirmation is by that MARKER, not body length. Put {{USER}} in `url` or `body`, or pass `param` (query). `validUser` = an account that exists (defaults to the first configured role username). Sends unauthenticated on purpose (pre-auth surface). Returns negativeControl + positiveReplays + effectMarker → record_finding(category user-enumeration).",
+      {
+        url: z.string(),
+        validUser: z.string().optional(),
+        invalidUser: z.string().optional(),
+        param: z.string().optional(),
+        method: z.string().optional(),
+        body: z.string().nullable().optional(),
+      },
+      async ({ url, validUser, invalidUser, param, method, body }) => {
+        const valid = (validUser?.trim() || [...s.roleCreds.values()][0]?.username || "").trim();
+        if (!valid) return txt("ERROR: pass validUser (a username that exists) or configure a role with credentials so the probe has a known-valid account.");
+        const nobody = (invalidUser?.trim() || `nosuch_${Date.now().toString(36)}@verdict.invalid`).trim();
+        if (valid === nobody) return txt("ERROR: validUser and invalidUser must differ.");
+        const placed = (user: string) => placeUserIdentity(url, body ?? null, param, user);
+        if (!placed(valid) || !placed(nobody)) return txt("ERROR: put {{USER}} in url or body, or pass a query `param` to inject the username.");
+        const meth = (method ?? (body != null ? "POST" : "GET")).toUpperCase();
+        const fire = async (user: string, kind: "negative_control" | "positive_replay", tag: string) => {
+          const p = placed(user)!;
+          if (!isInScope(p.url, s.scope)) throw new Error(`out of scope: ${p.url}`);
+          // Pre-auth on purpose: do NOT attach the session cookie/Bearer (a logged-in login form is not an enum surface).
+          const hdr: Record<string, string> = {};
+          if (p.body != null) {
+            const t = p.body.trim();
+            hdr["content-type"] = t.startsWith("{") || t.startsWith("[") ? "application/json" : "application/x-www-form-urlencoded";
+          }
+          const req: HttpRequest = { method: meth, url: p.url, headers: hdr, body: p.body };
+          const res = await s.http.send(req);
+          bumpHttp(s, res.status);
+          const stamped = { ...res, body: `${res.body}\n[VERDICT-USER-ENUM] status:${res.status}` };
+          const ev = s.evidence.record({
+            screenId: s.currentScreenId ?? "pilot",
+            validator: "claude-pilot-user-enum",
+            kind,
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
+            response: stamped,
+            note: `user-enum ${tag} user=${user}`,
+          });
+          return { evId: ev.id, status: res.status, body: res.body };
+        };
+        try {
+          const ctrl = await fire(nobody, "negative_control", "invalid user");
+          const p1 = await fire(valid, "positive_replay", "valid user #1");
+          const p2 = await fire(valid, "positive_replay", "valid user #2");
+          const hit = userEnumMarker(ctrl, p1, p2, valid, nobody);
+          const stampedHas = (sample: { status: number; body: string }, marker: string): boolean =>
+            sample.body.includes(marker) || `status:${sample.status}` === marker;
+          const logic = hit
+            ? checkLogicEvidence(
+                { status: ctrl.status, hasMarker: stampedHas(ctrl, hit.marker) },
+                [p1, p2].map((p) => ({ status: p.status, hasMarker: stampedHas(p, hit.marker) })),
+                { requireSuccess: false },
+              )
+            : ({ ok: false, reason: "no distinguishing marker" } as const);
+          return txt(
+            JSON.stringify({
+              validUser: valid,
+              invalidUser: nobody,
+              negativeControl: ctrl.evId,
+              positiveReplays: [p1.evId, p2.evId],
+              ...(hit ? { effectMarker: hit.marker } : {}),
+              control: { status: ctrl.status },
+              valid: [{ status: p1.status }, { status: p2.status }],
+              verdict: hit && logic.ok
+                ? `USER ENUMERATION CONFIRMED — ${hit.reason}. record_finding(category user-enumeration) with these evidenceIds + effectMarker.`
+                : `not confirmed: ${!hit ? "valid and invalid usernames produced no stable distinguishing marker (generic error / username echo only)." : (logic as { reason: string }).reason}`,
+            }),
+          );
+        } catch (e) {
+          return txt(`ERROR: ${String(e).slice(0, 180)}`);
+        }
+      },
+    ),
+    tool(
+      "probe_secrets",
+      "Confirm a SECRET or INFO DISCLOSURE at `url` (a page, /.env, /actuator/env, a backup, a stack-trace error). GETs a non-existent control path (must be clean) then `url` twice. Hits the impact oracle (keys, private key, .env, passwd) → record_finding(secret-exposure); or phpinfo / directory listing / stack trace → record_finding(info-disclosure). Ambient copies already in the 404 control are ignored. Returns negativeControl + positiveReplays + effectMarker.",
+      { url: z.string() },
+      async ({ url }) => {
+        if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} is out of scope`);
+        let controlUrl: string;
+        try {
+          const u = new URL(url);
+          controlUrl = new URL(`/verdict-nonexistent-${Date.now().toString(36)}`, u.origin).href;
+        } catch {
+          return txt("ERROR: url is not absolute");
+        }
+        if (!isInScope(controlUrl, s.scope)) return txt(`BLOCKED: control path ${controlUrl} out of scope`);
+        const fire = async (u: string, kind: "negative_control" | "positive_replay", tag: string) => {
+          const req: HttpRequest = { method: "GET", url: u, headers: authHeaders(s), body: null };
+          const res = await s.http.send(req);
+          bumpHttp(s, res.status);
+          const ev = s.evidence.record({
+            screenId: s.currentScreenId ?? "pilot",
+            validator: "claude-pilot-secrets",
+            kind,
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
+            response: res,
+            note: `secrets ${tag}`,
+          });
+          return { evId: ev.id, status: res.status, body: res.body };
+        };
+        try {
+          const ctrl = await fire(controlUrl, "negative_control", "nonexistent path");
+          const p1 = await fire(url, "positive_replay", "target #1");
+          const p2 = await fire(url, "positive_replay", "target #2");
+          const hit = disclosureHit(p1.body, ctrl.body);
+          const stable = !!(hit && p2.body.includes(hit.marker));
+          const logic = hit && stable
+            ? checkLogicEvidence(
+                { status: ctrl.status, hasMarker: ctrl.body.includes(hit.marker) },
+                [p1, p2].map((p) => ({ status: p.status, hasMarker: p.body.includes(hit.marker) })),
+                { requireSuccess: false },
+              )
+            : ({ ok: false, reason: !hit ? "no secret / info-disclosure signature (and none the control lacked)" : "marker not stable on replay" } as const);
+          return txt(
+            JSON.stringify({
+              negativeControl: ctrl.evId,
+              positiveReplays: [p1.evId, p2.evId],
+              ...(hit ? { category: hit.category, effectMarker: hit.marker, detail: hit.detail } : {}),
+              control: { status: ctrl.status },
+              target: [{ status: p1.status }, { status: p2.status }],
+              verdict:
+                hit && logic.ok
+                  ? `${hit.category === "secret-exposure" ? "SECRET EXPOSURE" : "INFO DISCLOSURE"} CONFIRMED — ${hit.detail}. record_finding(category ${hit.category}) with these evidenceIds + effectMarker.`
+                  : `not confirmed: ${(logic as { reason: string }).reason}`,
+            }),
+          );
+        } catch (e) {
+          return txt(`ERROR: ${String(e).slice(0, 180)}`);
+        }
+      },
+    ),
+    tool(
+      "probe_headers",
+      "Confirm missing security headers on `url` (CSP, HSTS, X-Frame-Options / frame-ancestors, nosniff, Referrer-Policy, Permissions-Policy) — the same checklist as CLI header-audit. Two GETs; absence is deterministic (no negative-control differential). Returns missing[] + evidenceIds → record_finding(category headers, param=<rule key> e.g. csp). HSTS is skipped on non-TLS. Do not file this as suspected.",
+      { url: z.string() },
+      async ({ url }) => {
+        if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} is out of scope`);
+        const fire = async (kind: "negative_control" | "positive_replay", tag: string) => {
+          const req: HttpRequest = { method: "GET", url, headers: authHeaders(s), body: null };
+          const res = await s.http.send(req);
+          bumpHttp(s, res.status);
+          const ev = s.evidence.record({
+            screenId: s.currentScreenId ?? "pilot",
+            validator: "claude-pilot-headers",
+            kind,
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
+            response: res,
+            note: `headers ${tag}`,
+          });
+          return { evId: ev.id, status: res.status, headers: res.headers };
+        };
+        try {
+          const a = await fire("negative_control", "#1");
+          const b = await fire("positive_replay", "#2");
+          const lc: Record<string, string> = {};
+          for (const [k, v] of Object.entries(a.headers ?? {})) lc[k.toLowerCase()] = v;
+          const missing = auditHeaders(lc, url);
+          return txt(
+            JSON.stringify({
+              negativeControl: a.evId,
+              positiveReplays: [a.evId, b.evId],
+              missing: missing.map((r) => ({ key: r.key, header: r.header, severity: r.severity, title: r.title })),
+              verdict:
+                missing.length === 0
+                  ? "not confirmed: all checked security headers are present (or HSTS n/a on http)."
+                  : `MISSING HEADERS — ${missing.map((r) => r.header).join(", ")}. record_finding(category headers, param=<key>) for each, citing these evidenceIds (absence class: no control differential required).`,
+            }),
+          );
+        } catch (e) {
+          return txt(`ERROR: ${String(e).slice(0, 180)}`);
+        }
       },
     ),
     tool(
@@ -2803,6 +3015,222 @@ export function buildTools(s: PilotSession) {
       },
     ),
     tool(
+      "probe_ssrf",
+      "Confirm IN-BAND SSRF (no Collaborator): a URL/hostname sink where the SERVER fetches the value and the RESPONSE carries the fetched content (cloud metadata, /etc/passwd, internal admin). Put {{SSRF}} in `url` or `body`, or pass `param` (query). Sends a reserved .invalid control (must be clean) then cloud-IMDS / file:// / loopback payloads; confirms when a metadata/passwd marker appears only on the payload, twice. record_finding(category ssrf) with effectMarker. If the response is BLIND (no content differential), use probe_oob instead.",
+      {
+        url: z.string(),
+        param: z.string().optional(),
+        method: z.string().optional(),
+        body: z.string().nullable().optional(),
+      },
+      async ({ url, param, method, body }) => {
+        if (!placeSsrfTarget(url, body ?? null, param, SSRF_CONTROL)) {
+          return txt("ERROR: put {{SSRF}} in url or body, or pass a query `param` (the URL/host the server fetches).");
+        }
+        const meth = (method ?? (body != null ? "POST" : "GET")).toUpperCase();
+        const fire = async (val: string, kind: "negative_control" | "positive_replay", tag: string) => {
+          const p = placeSsrfTarget(url, body ?? null, param, val)!;
+          if (!isInScope(p.url, s.scope)) throw new Error(`out of scope: ${p.url}`);
+          const hdr: Record<string, string> = { ...authHeaders(s) };
+          if (p.body != null) {
+            const t = p.body.trim();
+            hdr["content-type"] = t.startsWith("{") || t.startsWith("[") ? "application/json" : "application/x-www-form-urlencoded";
+          }
+          const req: HttpRequest = { method: meth, url: p.url, headers: hdr, body: p.body };
+          const res = await s.http.send(req);
+          bumpHttp(s, res.status);
+          const ev = s.evidence.record({
+            screenId: s.currentScreenId ?? "pilot",
+            validator: "claude-pilot-ssrf",
+            kind,
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
+            response: res,
+            note: `ssrf ${tag}`,
+          });
+          return { evId: ev.id, status: res.status, body: res.body };
+        };
+        try {
+          const ctrl = await fire(SSRF_CONTROL, "negative_control", "control(.invalid host)");
+          const tried: string[] = [];
+          for (const payload of SSRF_PAYLOADS) {
+            tried.push(payload);
+            const p1 = await fire(payload, "positive_replay", `${payload} #1`);
+            const hit = ssrfHit(p1.body, ctrl.body, payload);
+            if (!hit) continue;
+            const p2 = await fire(payload, "positive_replay", `${payload} #2`);
+            if (!p2.body.includes(hit.marker)) continue;
+            const logic = checkLogicEvidence(
+              { status: ctrl.status, hasMarker: ctrl.body.includes(hit.marker) },
+              [p1, p2].map((p) => ({ status: p.status, hasMarker: p.body.includes(hit.marker) })),
+              { requireSuccess: false },
+            );
+            if (!logic.ok) continue;
+            return txt(
+              JSON.stringify({
+                technique: payload,
+                negativeControl: ctrl.evId,
+                positiveReplays: [p1.evId, p2.evId],
+                effectMarker: hit.marker,
+                detail: hit.detail,
+                control: { status: ctrl.status },
+                payload: [{ status: p1.status }, { status: p2.status }],
+                verdict: `IN-BAND SSRF CONFIRMED — ${hit.detail} (payload ${payload}). record_finding(category ssrf) with these evidenceIds + effectMarker.`,
+              }),
+            );
+          }
+          return txt(
+            JSON.stringify({
+              tried,
+              negativeControl: ctrl.evId,
+              control: { status: ctrl.status },
+              verdict: "not confirmed: no metadata / file / internal-content marker vs the .invalid control. If the sink is BLIND, use probe_oob.",
+            }),
+          );
+        } catch (e) {
+          return txt(`ERROR: ${String(e).slice(0, 180)}`);
+        }
+      },
+    ),
+    tool(
+      "probe_upload",
+      "Confirm a FILE UPLOAD vuln — an HTTP 200 accept is NOT a finding. Uploads a benign control SVG, then a unique-marker XSS SVG, then (if needed) an XXE SVG; extracts a fetch URL from the upload response (JSON url/path/href, Location, HTML href/src) and GETs it (in-scope only). Confirms when the fetched body (or the upload body) carries the XSS marker in a live HTML position, or /etc/passwd / win.ini from XXE, absent from the control. record_finding(xss-stored or xxe) with effectMarker. Webshell RCE is out of scope here.",
+      {
+        url: z.string(),
+        field: z.string().optional(),
+        method: z.string().optional(),
+        fields: z.record(z.string()).optional(),
+      },
+      async ({ url, field, method, fields }) => {
+        if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} is out of scope`);
+        const fileField = (field?.trim() || "file").trim();
+        const meth = (method ?? "POST").toUpperCase();
+        const tok = `vXss${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`;
+        type Up = { evId: string; status: number; body: string; headers: Record<string, string>; urls: string[] };
+        const upload = async (filename: string, content: string, kind: "negative_control" | "positive_replay", tag: string): Promise<Up> => {
+          const req: HttpRequest = {
+            method: meth,
+            url,
+            headers: authHeaders(s),
+            body: null,
+            multipart: {
+              ...(fields ? { fields } : {}),
+              files: [{ name: fileField, filename, contentType: "image/svg+xml", base64: Buffer.from(content, "utf8").toString("base64") }],
+            },
+          };
+          const res = await s.http.send(req);
+          bumpHttp(s, res.status);
+          const evBody = `[multipart] ${filename}\n${content.slice(0, 400)}`;
+          const ev = s.evidence.record({
+            screenId: s.currentScreenId ?? "pilot",
+            validator: "claude-pilot-upload",
+            kind,
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers), body: evBody },
+            response: res,
+            note: `upload ${tag}`,
+          });
+          return { evId: ev.id, status: res.status, body: res.body, headers: res.headers, urls: extractFetchUrls(res.body, res.headers, url) };
+        };
+        const fetchUrl = async (u: string, kind: "negative_control" | "positive_replay", tag: string) => {
+          if (!isInScope(u, s.scope)) throw new Error(`out of scope: ${u}`);
+          const req: HttpRequest = { method: "GET", url: u, headers: authHeaders(s), body: null };
+          const res = await s.http.send(req);
+          bumpHttp(s, res.status);
+          const ev = s.evidence.record({
+            screenId: s.currentScreenId ?? "pilot",
+            validator: "claude-pilot-upload",
+            kind,
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
+            response: res,
+            note: `upload-fetch ${tag}`,
+          });
+          return { evId: ev.id, status: res.status, body: res.body };
+        };
+        try {
+          const ctrlUp = await upload("verdict-ctrl.svg", controlSvg(), "negative_control", "control svg");
+          const xssUp = await upload(`verdict-xss-${tok}.svg`, xssSvg(tok), "positive_replay", "xss svg #1");
+          const ctrlFetchUrl = ctrlUp.urls.find((u) => isInScope(u, s.scope));
+          const xssFetchUrl = xssUp.urls.find((u) => isInScope(u, s.scope));
+          if (xssFetchUrl) {
+            const ctrlGet = ctrlFetchUrl
+              ? await fetchUrl(ctrlFetchUrl, "negative_control", "control file")
+              : { evId: ctrlUp.evId, status: ctrlUp.status, body: ctrlUp.body };
+            const g1 = await fetchUrl(xssFetchUrl, "positive_replay", "xss file #1");
+            const g2 = await fetchUrl(xssFetchUrl, "positive_replay", "xss file #2");
+            const live = reflectionIsLive(g1.body, tok) && reflectionIsLive(g2.body, tok) && !reflectionIsLive(ctrlGet.body, tok);
+            const logic = live
+              ? checkLogicEvidence(
+                  { status: ctrlGet.status, hasMarker: reflectionIsLive(ctrlGet.body, tok) },
+                  [g1, g2].map((p) => ({ status: p.status, hasMarker: reflectionIsLive(p.body, tok) })),
+                  { requireSuccess: false },
+                )
+              : ({ ok: false, reason: "marker not live in fetched SVG" } as const);
+            if (live && logic.ok) {
+              return txt(
+                JSON.stringify({
+                  category: "xss-stored",
+                  fetchUrl: xssFetchUrl,
+                  negativeControl: ctrlGet.evId,
+                  positiveReplays: [g1.evId, g2.evId],
+                  effectMarker: tok,
+                  verdict: `UPLOAD SVG XSS CONFIRMED — fetched ${xssFetchUrl} executes the marker in a live HTML position. record_finding(category xss-stored) with these evidenceIds + effectMarker. An accepted upload alone is not a finding.`,
+                }),
+              );
+            }
+          }
+          for (const entity of XXE_ENTITY_URLS) {
+            const xxeUp = await upload("verdict-xxe.svg", xxeSvg(entity), "positive_replay", `xxe ${entity}`);
+            const fetchU = xxeUp.urls.find((u) => isInScope(u, s.scope));
+            const samples = [{ evId: xxeUp.evId, status: xxeUp.status, body: xxeUp.body }];
+            if (fetchU) {
+              samples.push(await fetchUrl(fetchU, "positive_replay", "xxe file #1"));
+              samples.push(await fetchUrl(fetchU, "positive_replay", "xxe file #2"));
+            }
+            const hit = samples.map((p) => disclosureHit(p.body, ctrlUp.body)).find((h) => h && h.category === "secret-exposure") ?? null;
+            if (!hit) continue;
+            const withMarker = samples.filter((p) => p.body.includes(hit.marker));
+            if (withMarker.length < 1) continue;
+            const p1 = withMarker[0]!;
+            const p2 = withMarker[1] ?? p1;
+            // Need two positives: if only the upload body leaked, replay the XXE upload.
+            const replay = withMarker.length >= 2 ? p2 : await upload("verdict-xxe.svg", xxeSvg(entity), "positive_replay", `xxe ${entity} replay`);
+            const pos2 = withMarker.length >= 2 ? p2 : replay;
+            if (!pos2.body.includes(hit.marker)) continue;
+            const logic = checkLogicEvidence(
+              { status: ctrlUp.status, hasMarker: ctrlUp.body.includes(hit.marker) },
+              [{ status: p1.status, hasMarker: true }, { status: pos2.status, hasMarker: pos2.body.includes(hit.marker) }],
+              { requireSuccess: false },
+            );
+            if (!logic.ok) continue;
+            return txt(
+              JSON.stringify({
+                category: "xxe",
+                ...(fetchU ? { fetchUrl: fetchU } : {}),
+                negativeControl: ctrlUp.evId,
+                positiveReplays: [p1.evId, pos2.evId],
+                effectMarker: hit.marker,
+                detail: hit.detail,
+                verdict: `UPLOAD XXE CONFIRMED — ${hit.detail}. record_finding(category xxe) with these evidenceIds + effectMarker. An accepted upload alone is not a finding.`,
+              }),
+            );
+          }
+          const fetched = xssFetchUrl ?? ctrlFetchUrl;
+          return txt(
+            JSON.stringify({
+              uploaded: true,
+              ...(fetched ? { fetchUrl: fetched } : { fetchUrl: null }),
+              negativeControl: ctrlUp.evId,
+              positiveReplays: [xssUp.evId],
+              verdict: fetched
+                ? `not confirmed: uploaded and fetched ${fetched}, but no live XSS marker and no XXE file contents vs the control. Accepted ≠ vulnerability.`
+                : "not confirmed: file was accepted but no in-scope fetch URL in the response (and no in-band XXE leak). Do not record a finding from accept-alone; try another field name or browser_upload.",
+            }),
+          );
+        } catch (e) {
+          return txt(`ERROR: ${String(e).slice(0, 180)}`);
+        }
+      },
+    ),
+    tool(
       "probe_scenario",
       'Confirm a MULTI-STEP business-logic abuse that spans endpoints (coupon stacking/forging, negative quantity/price reaching checkout, skipping a payment/approval/ownership step, mass-assignment escalation, double-spend). You give an ordered `control` flow (legitimate) and an ordered `exploit` flow (manipulated). Each step: {method,url,headers?,body?,capture?}. `capture` maps varName→a JSON path (e.g. data.id, basket.0.id) OR regex applied to THAT step\'s response; later steps reference it as {{varName}} in url/body/headers (thread ids/tokens through the chain). The current session cookie+Bearer are attached automatically. `effectMarker` is a string that appears in a response ONLY when the manipulation is ACCEPTED (the injected total/price, an out-of-order step returning 200, a coupon applied twice). The control flow runs once (must NOT show the marker); the exploit flow runs twice (must show it, stably). Returns evidenceIds (control=negativeControl, exploit=positiveReplays) ready for record_finding with a price-tampering/qty-tampering/workflow-bypass/mass-assignment category.',
       {
@@ -3076,7 +3504,7 @@ export function buildTools(s: PilotSession) {
             return txt(
               isXssCat
                 ? `REJECTED: XSS is marker-provable, not a "suspected" class. Either a unique payload reflected UNESCAPED in a live HTML context (→ record verdict:"confirmed" with control + 2 replays + effectMarker via probe_xss / probe_stored_xss / probe_dom_xss) or you have NOT observed XSS. A field name that "looks like" a raw-HTML sink, an admin-rendered field, or a sibling you believe was confirmed is a HYPOTHESIS — drive probe_stored_xss(store, renderUrl) / probe_dom_xss to the actual render sink and confirm it, otherwise mark the class tested-clean / not-applicable(reason). Do NOT file it suspected.`
-                : `REJECTED: '${category}' is deterministically observable (you either saw it or you didn't), not a "suspected" class — if you saw it record verdict:"confirmed" (control + 2 replays), else skip. Reserve 'suspected' for serious exploitation classes you could not fully confirm this run (idor/idor-write/sqli/ssti/rce/path-traversal/ssrf/xxe/auth-bypass/mass-assignment/vulnerable-component/secret-exposure).`,
+                : `REJECTED: '${category}' is deterministically observable (you either saw it or you didn't), not a "suspected" class — if you saw it record verdict:"confirmed" (control + 2 replays), else skip. Reserve 'suspected' for serious exploitation classes you could not fully confirm this run (idor/idor-write/sqli/ssti/rce/path-traversal/ssrf/xxe/auth-bypass/mass-assignment/vulnerable-component/secret-exposure/session).`,
             );
           }
           // version-based CVE(未 exploit)は High/Critical(RCE/path-traversal/auth-bypass 級)だけ surface。
@@ -3098,9 +3526,11 @@ export function buildTools(s: PilotSession) {
           if (category !== "vulnerable-component") {
             const differs = observationDiffersFromControl(ctrlRec ? { status: ctrlRec.response.status, body: ctrlRec.response.body } : undefined, { status: obsRec.response.status, body: obsRec.response.body }, effectMarker);
             const carriesImpact = impactOracle(obsRec.response.body).length > 0;
-            if (!differs && !carriesImpact)
+            // Session glance: the anomaly lives in the REQUEST (Cookie / Authorization), not a response differential.
+            const sessionGlance = category === "session" && obsRec.validator === "claude-pilot-session";
+            if (!differs && !carriesImpact && !sessionGlance)
               return txt(
-                `REJECTED (no observed anomaly): observation ${observation} demonstrates nothing on its own — it neither DIFFERS from a cited 'negativeControl' (a clean baseline: a non-existent id / benign input) nor carries a concrete impact (leaked secret / cross-user data / command output) the oracle can see. A suspected lead needs an anomaly you OBSERVED, not the endpoint's shape (a client-controlled id, a field name, an admin-ish path). Cite a 'negativeControl' the observation visibly differs from (a status flip / >64B length delta / an 'effectMarker' present only in the observation), or an observation that carries a real impact — or confirm it outright (control + 2 replays). If the effect is genuinely out-of-band (nothing observable in-band), mark the class tested with that note instead of filing a suspected finding.`,
+                `REJECTED (no observed anomaly): observation ${observation} demonstrates nothing on its own — it neither DIFFERS from a cited 'negativeControl' (a clean baseline: a non-existent id / benign input) nor carries a concrete impact (leaked secret / cross-user data / command output) the oracle can see. A suspected lead needs an anomaly you OBSERVED, not the endpoint's shape (a client-controlled id, a field name, an admin-ish path). Cite a 'negativeControl' the observation visibly differs from (a status flip / >64B length delta / an 'effectMarker' present only in the observation), or an observation that carries a real impact — or confirm it outright (control + 2 replays). For a weak-looking cookie/Bearer, run analyze_session and cite THAT evidenceId (verdict suspected). If the effect is genuinely out-of-band (nothing observable in-band), mark the class tested with that note instead of filing a suspected finding.`,
               );
           }
           const suspectEv = ctrlRec ? [negativeControl!, observation] : [observation];
@@ -3128,11 +3558,12 @@ export function buildTools(s: PilotSession) {
           // マーカーベース: 長さ差分でなく「印(effectMarker)」の有無で確証する。
           //   business-logic → probe_logic/probe_scenario の effectMarker / xss → 未エスケープ反射 / redirect → OOB host。
           if (!effectMarker)
-            return txt(`REJECTED: ${category} requires effectMarker (the string that appears only when the issue fires — the unescaped payload for xss, the OOB host for open-redirect, the injected total for business-logic). Run probe_xss / probe_redirect / probe_logic / probe_scenario and cite its evidenceIds + the marker.`);
+            return txt(`REJECTED: ${category} requires effectMarker (the string that appears only when the issue fires — the unescaped payload for xss, the OOB host for open-redirect, the injected total for business-logic, the valid-account phrase for user-enumeration). Run the matching probe and cite its evidenceIds + the marker.`);
           // マーカーは body だけでなくヘッダも見る(open-redirect の印は Location ヘッダに出る)。
           // XSS は「live HTML 位置での反射」= 実行可能文脈のみ有効(<script>/flight-data JSON 内の反射は不活性 → refute)。
           const isXss = category === "xss-reflected" || category === "xss-stored";
           const isRedirect = category === "open-redirect";
+          const allowNon2xx = isXss || category === "user-enumeration" || category === "secret-exposure" || category === "info-disclosure" || category === "ssrf" || category === "xxe";
           const hasMarker = (r: { body: string; headers: Record<string, string>; finalUrl?: string }): boolean =>
             isXss
               ? reflectionIsLive(r.body, effectMarker)
@@ -3142,9 +3573,23 @@ export function buildTools(s: PilotSession) {
           const verdict = checkLogicEvidence(
             { status: negRec.response.status, hasMarker: hasMarker(negRec.response) },
             posRecs.map((r) => ({ status: r!.response.status, hasMarker: hasMarker(r!.response) })),
-            { requireSuccess: !isXss }, // reflected XSS confirms on a 4xx error page too — don't gate it on status<400
+            { requireSuccess: !allowNon2xx },
           );
           if (!verdict.ok) return txt(`REJECTED (logic evidence): ${verdict.reason}.`);
+        } else if (category === "headers") {
+          // Absence class: two stable GETs of the same URL. The issue is a missing header, so control and positives
+          // are allowed to be the same response (CLI header-audit works the same way). Still require the cited
+          // responses to actually miss the checked header (param = rule key, e.g. csp).
+          if (posRecs.length < 2) return txt("REJECTED: headers requires >=2 GET evidenceIds (probe_headers).");
+          const p0 = posRecs[0]!;
+          if (!posRecs.every((r) => r!.response.status === p0.response.status))
+            return txt("REJECTED: header-audit replays disagree (unstable).");
+          const hdrLc: Record<string, string> = {};
+          for (const [k, v] of Object.entries(p0.response.headers ?? {})) hdrLc[k.toLowerCase()] = v;
+          const missing = auditHeaders(hdrLc, p0.request.url);
+          if (missing.length === 0) return txt("REJECTED: cited responses already carry the checked security headers.");
+          if (param && !missing.some((r) => r.key === param || r.header === param.toLowerCase()))
+            return txt(`REJECTED: '${param}' is present (or not a checked rule). Missing: ${missing.map((r) => r.key).join(", ")}.`);
         } else if (category !== "auth-bypass") {
           const verdict = checkEvidenceDiscipline(
             { status: negRec.response.status, bodyLen: negRec.response.body.length },
@@ -3391,38 +3836,65 @@ export function buildTools(s: PilotSession) {
     // ───────────────────────── セッション解析(B) ─────────────────────────
     tool(
       "analyze_session",
-      "Inspect the current auth cookies — flags (HttpOnly/Secure/SameSite), structure (jwt/hex/base64/plain) and predictability (e.g. value equals the username). Returns guidance to CONFIRM forgeability by http_request with a crafted cookie header for another identity (negative control: a clearly-invalid forged value must NOT authenticate).",
-      {},
-      async () => {
-        let cookies;
-        try {
-          cookies = await s.driver.cookies();
-        } catch (e) {
-          return txt(`ERROR: ${String(e).slice(0, 150)}`);
+      "Dump ONE live authenticated request (Cookie + Authorization + Set-Cookie + cookie flags + JWT alg/claims) so YOU can judge whether the session LOOKS weak. Fires a GET at `url` (default: current page / target). Hints (username-as-cookie, alg:none, short plaintext) are leads, not confirmation. JWT Bearer → also probe_jwt. To CONFIRM forgeability, http_request as another identity (invalid forged value must fail). If you cannot swap identity, record_finding(verdict:suspected, category session) citing the returned evidenceId.",
+      { url: z.string().optional() },
+      async ({ url }) => {
+        let pageUrl = url?.trim() || "";
+        if (!pageUrl) {
+          try {
+            pageUrl = s.driver.currentUrl();
+          } catch {
+            /* no live page */
+          }
         }
-        const role = s.currentRole.toLowerCase();
-        const analysis = cookies.map((c) => {
-          const v = c.value;
-          const isJwt = v.split(".").length === 3 && v.length > 20;
-          const structure = isJwt ? "jwt" : /^[0-9a-f]{16,}$/i.test(v) ? "hex" : /^[A-Za-z0-9+/=_-]{16,}$/.test(v) ? "base64ish" : "plain";
-          const equalsRole = Boolean(role) && v.toLowerCase().includes(role);
-          const predictable = equalsRole || (!isJwt && structure === "plain" && v.length < 12);
-          return {
-            name: c.name,
-            value: v.length > 48 ? `${v.slice(0, 48)}…` : v,
-            httpOnly: c.httpOnly,
-            secure: c.secure,
-            sameSite: c.sameSite,
-            structure,
-            equalsCurrentRole: equalsRole,
-            predictable,
-          };
+        if (!pageUrl) pageUrl = s.targetUrl;
+        if (!isInScope(pageUrl, s.scope)) return txt(`BLOCKED: ${pageUrl} is out of scope`);
+        const cookieHeader = s.currentCookie || "";
+        const bearer = s.currentBearer || "";
+        const authorization = bearer ? `Bearer ${bearer}` : "";
+        if (!cookieHeader && !bearer) return txt("no session: login(role) first (no Cookie, no Bearer).");
+        let jar: Array<{ name: string; value: string; httpOnly?: boolean; secure?: boolean; sameSite?: string }> = [];
+        try {
+          jar = await s.driver.cookies();
+        } catch {
+          jar = parseCookieHeader(cookieHeader);
+        }
+        if (jar.length === 0 && cookieHeader) jar = parseCookieHeader(cookieHeader);
+        const identities = [s.currentRole, ...[...s.roleCreds.values()].map((c) => c.username)].filter((x): x is string => Boolean(x && x.trim()));
+        const cookies = jar.map((c) => glanceCookie(c, identities));
+        const req: HttpRequest = { method: "GET", url: pageUrl, headers: authHeaders(s), body: null };
+        let res: HttpResponse;
+        try {
+          res = await s.http.send(req);
+          bumpHttp(s, res.status);
+        } catch (e) {
+          return txt(`ERROR: ${String(e).slice(0, 180)}`);
+        }
+        const ev = s.evidence.record({
+          screenId: s.currentScreenId ?? "pilot",
+          validator: "claude-pilot-session",
+          kind: "positive_replay",
+          request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
+          response: res,
+          note: "session glance (live authed request for the model to judge)",
         });
+        const setCookie = res.headers["set-cookie"] ?? res.headers["Set-Cookie"] ?? "";
+        const bearerJwt = bearer ? peekJwt(bearer) : null;
+        const hints = [
+          ...cookies.flatMap((c) => c.hints.map((h) => `${c.name}: ${h}`)),
+          ...(bearerJwt?.unsigned ? [`Bearer JWT alg=${bearerJwt.alg} looks unsigned`] : []),
+        ];
         return txt(
           JSON.stringify({
+            evidenceId: ev.id,
             currentRole: s.currentRole || "unauth",
-            cookies: analysis,
-            hint: "If a cookie is predictable (equals/contains the username) or lacks HttpOnly, forge it for ANOTHER user via http_request headers.cookie and check you receive their data. Negative control: an invalid forged value must fail to authenticate.",
+            requestDump: formatRequestDump("GET", pageUrl, cookieHeader, authorization),
+            response: { status: res.status, setCookie: setCookie || undefined },
+            cookies,
+            ...(bearerJwt ? { bearerJwt } : {}),
+            hints,
+            judge:
+              "YOU judge this request. Weak-looking session material (username/userid as cookie, sequential id, alg:none / unsigned JWT, session value = the role) is a lead. Confirm forge with http_request as another identity (garbage cookie must fail) → record_finding(session, confirmed). Cannot swap identity this run → record_finding(verdict:suspected, category session, medium+) citing this evidenceId. Do not confirm from the dump alone. Missing HttpOnly on a locale/csrf cookie is not a session finding. JWT in Authorization → also probe_jwt.",
           }),
         );
       },

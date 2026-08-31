@@ -33,6 +33,8 @@ export function DesktopChrome({ children }: { children: ReactNode }) {
     // Debug: VERDICT_ATTB_URL (via ?attb=<url>) auto-opens the attended browser to a URL for screenshot verification.
     const attbDebug = typeof window !== "undefined" ? new URLSearchParams(window.location.search).get("attb") : null;
     const [browserOpen, setBrowserOpen] = useState(!!attbDebug);
+    const [browserSeed, setBrowserSeed] = useState(attbDebug ?? "about:blank");
+    const [browserHandoffId, setBrowserHandoffId] = useState<string | undefined>(undefined);
     const settingsDebug = typeof window !== "undefined" && new URLSearchParams(window.location.search).get("settings") === "1";
     const [settingsOpen, setSettingsOpen] = useState(settingsDebug);
 
@@ -40,6 +42,20 @@ export function DesktopChrome({ children }: { children: ReactNode }) {
         if (!desktop) return;
         void desktop.isMaximized().then(setMaximized).catch(() => {});
         return desktop.onMaximizeChange(setMaximized);
+    }, [desktop]);
+
+    useEffect(() => {
+        if (!desktop) return;
+        const onShow = (e: Event): void => {
+            const d = (e as CustomEvent<{ url?: string; handoffId?: string }>).detail;
+            const url = d?.url?.trim();
+            if (url) setBrowserSeed(url);
+            setBrowserHandoffId(d?.handoffId?.trim() || undefined);
+            setSettingsOpen(false);
+            setBrowserOpen(true);
+        };
+        window.addEventListener("verdict-show-browser", onShow);
+        return () => window.removeEventListener("verdict-show-browser", onShow);
     }, [desktop]);
 
     if (!desktop) return <>{children}</>; // plain browser → unchanged web UI
@@ -99,7 +115,14 @@ export function DesktopChrome({ children }: { children: ReactNode }) {
             </div>
             <div className="desk-content">
                 {children}
-                {browserOpen ? <AttendedBrowser initialUrl={attbDebug ?? "about:blank"} onClose={() => setBrowserOpen(false)} /> : null}
+                {browserOpen ? (
+                    <AttendedBrowser
+                        key={`${browserSeed}\0${browserHandoffId ?? ""}`}
+                        initialUrl={browserSeed}
+                        handoffId={browserHandoffId}
+                        onClose={() => setBrowserOpen(false)}
+                    />
+                ) : null}
                 {settingsOpen ? <Settings onClose={() => setSettingsOpen(false)} /> : null}
             </div>
         </div>

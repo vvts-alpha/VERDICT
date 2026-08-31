@@ -13,6 +13,7 @@
 appId: com.verdict.desktop
 productName: VERDICT
 asar: false
+electronVersion: "38.0.0"
 directories:
   output: dist-installer
 files:

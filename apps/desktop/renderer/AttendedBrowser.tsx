@@ -32,19 +32,28 @@ const START_PAGE =
         <ol>
           <li>Type the target's login URL in the address bar above and press Enter.</li>
           <li>Log in / clear any CAPTCHA by hand — this is a real browser, not automation.</li>
-          <li>Click <b>Capture session</b> to save the login.</li>
+          <li>Click <b>Capture session</b> to save cookies and localStorage (SPA tokens).</li>
           <li>Click <b>Scan with session →</b> to run an authenticated scan (headless, in this window).</li>
         </ol>
         </div></body></html>`,
     );
 
-export function AttendedBrowser({ initialUrl, onClose }: { initialUrl: string; onClose: () => void }) {
+export function AttendedBrowser({
+    initialUrl,
+    handoffId,
+    onClose,
+}: {
+    initialUrl: string;
+    /** When set, this panel was opened from a pending HumanHandoff (CAPTCHA / auth wall). */
+    handoffId?: string;
+    onClose: () => void;
+}) {
     const holderRef = useRef<HTMLDivElement>(null);
     const [urlField, setUrlField] = useState(initialUrl);
     const [currentUrl, setCurrentUrl] = useState(initialUrl);
     const [nav, setNav] = useState({ canGoBack: false, canGoForward: false, loading: false });
     const [note, setNote] = useState<{ ok: boolean; text: string } | null>(null);
-    const [captured, setCaptured] = useState<{ path: string; host: string; header?: string } | null>(null);
+    const [captured, setCaptured] = useState<{ path: string; host: string; header?: string; cookies?: number; localStorage?: number } | null>(null);
     const [launching, setLaunching] = useState(false);
 
     // Keep the native view aligned with the placeholder region.
@@ -97,8 +106,19 @@ export function AttendedBrowser({ initialUrl, onClose }: { initialUrl: string; o
         const r = await bridge()?.capture();
         if (!r) return;
         if (r.ok && r.path && r.host) {
-            setCaptured({ path: r.path, host: r.host, header: r.header });
-            setNote({ ok: true, text: `captured ${r.count} cookie(s) for ${r.host} — start an authenticated scan below` });
+            setCaptured({ path: r.path, host: r.host, header: r.header, cookies: r.count, localStorage: r.localStorage });
+            const cookieN = r.count ?? 0;
+            const lsN = r.localStorage ?? 0;
+            const what = [
+                cookieN ? `${cookieN} cookie(s)` : "",
+                lsN ? `${lsN} localStorage key(s)` : "",
+            ].filter(Boolean).join(" + ") || "session";
+            setNote({
+                ok: true,
+                text: handoffId
+                    ? `captured ${what} for ${r.host} — click Logged in → continue`
+                    : `captured ${what} for ${r.host} — start an authenticated scan below`,
+            });
         } else {
             setCaptured(null);
             setNote({ ok: false, text: r.error ?? "capture failed" });
@@ -108,8 +128,8 @@ export function AttendedBrowser({ initialUrl, onClose }: { initialUrl: string; o
     // Option B: inject the captured session into the run currently open (?id=) — it applies mid-scan at the pilot's
     // next between-screens checkpoint, so a running scan becomes authenticated without a restart.
     const currentRunId = typeof window !== "undefined" ? new URLSearchParams(window.location.search).get("id") : null;
-    const inject = async (): Promise<void> => {
-        if (!captured || !currentRunId) return;
+    const inject = async (): Promise<boolean> => {
+        if (!captured || !currentRunId) return false;
         setLaunching(true);
         try {
             const res = await fetch(`/api/assessments/${encodeURIComponent(currentRunId)}/inject-session`, {
@@ -119,13 +139,32 @@ export function AttendedBrowser({ initialUrl, onClose }: { initialUrl: string; o
             });
             if (res.ok) {
                 setNote({ ok: true, text: `session injected into the running scan — it continues authenticated at the next screen` });
-            } else {
-                const j = (await res.json().catch(() => ({}))) as { error?: string };
-                setNote({ ok: false, text: j.error ?? `inject failed (${res.status})` });
+                return true;
             }
+            const j = (await res.json().catch(() => ({}))) as { error?: string };
+            setNote({ ok: false, text: j.error ?? `inject failed (${res.status})` });
+            return false;
         } catch (e) {
             setNote({ ok: false, text: String(e) });
+            return false;
         } finally {
+            setLaunching(false);
+        }
+    };
+
+    // Mid-run CAPTCHA/auth: inject cookies into Playwright, mark the handoff resolved, return to Main.
+    const continueHandoff = async (): Promise<void> => {
+        if (!handoffId || !currentRunId || !captured) return;
+        const ok = await inject();
+        if (!ok) return;
+        setLaunching(true);
+        try {
+            await fetch(`/api/assessments/${encodeURIComponent(currentRunId)}/handoffs/${encodeURIComponent(handoffId)}/resolve`, {
+                method: "POST",
+            });
+            onClose();
+        } catch (e) {
+            setNote({ ok: false, text: String(e) });
             setLaunching(false);
         }
     };
@@ -172,22 +211,39 @@ export function AttendedBrowser({ initialUrl, onClose }: { initialUrl: string; o
                     placeholder="https://target/login"
                 />
                 <button type="button" className="attb-copy" disabled={!urlField.trim() && !currentUrl} onClick={() => void copyUrl()} title="Copy URL" aria-label="Copy URL">Copy</button>
-                <button type="button" className="attb-capture" onClick={() => void capture()} title="Save the login session for the scan">Capture session</button>
+                <button type="button" className="attb-capture" onClick={() => void capture()} title="Save cookies + localStorage (SPA Bearer) for the scan">Capture session</button>
                 {captured?.header ? (
                     <button type="button" className="attb-copy" onClick={() => void copyCookies()} title="Copy the Cookie header to the clipboard (Repeater / curl)">Copy cookies</button>
                 ) : null}
-                {captured && currentRunId ? (
+                {captured && currentRunId && !handoffId ? (
                     <button type="button" className="attb-scan" disabled={launching} onClick={() => void inject()} title="Inject this session into the scan you're viewing — it continues authenticated, no restart">
                         {launching ? "Injecting…" : "Inject into this run →"}
                     </button>
                 ) : null}
-                {captured ? (
+                {captured && !handoffId ? (
                     <button type="button" className="attb-scan" disabled={launching} onClick={() => void scan()} title={`Start a new headless authenticated scan of ${captured.host} with this session`}>
                         {launching ? "Starting…" : "Scan (new run) →"}
                     </button>
                 ) : null}
+                {handoffId && currentRunId ? (
+                    <button
+                        type="button"
+                        className="attb-scan"
+                        disabled={launching || !captured}
+                        onClick={() => void continueHandoff()}
+                        title="Inject the captured cookies into the scan, mark the handoff done, and return to Main"
+                    >
+                        {launching ? "Continuing…" : "Logged in → continue"}
+                    </button>
+                ) : null}
                 <button type="button" className="attb-close" onClick={onClose} title="Close">Close</button>
             </div>
+            {handoffId ? (
+                <div className="attb-handoff">
+                    Scan waiting on you — log in / clear CAPTCHA here (real browser). Then Capture session
+                    {currentRunId ? " and Logged in → continue (injects cookies into the scan)." : "."}
+                </div>
+            ) : null}
             {note ? <div className={note.ok ? "attb-note ok" : "attb-note err"}>{note.text}</div> : null}
             {/* The native WebContentsView is positioned by main over this region. */}
             <div className="attb-view" ref={holderRef} />

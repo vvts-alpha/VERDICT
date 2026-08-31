@@ -40,3 +40,27 @@ test("Playwright storageState JSON({cookies:[...]})", () => {
 test("plain array [{name,value}]", () => {
   assert.equal(loadCookieFile(w("arr.json", JSON.stringify([{ name: "a", value: "1" }])), target).header, "a=1");
 });
+
+test("storageState origins restore Bearer even with zero cookies", () => {
+  const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sigsigsigsigsigsig";
+  const p = w("spa.json", JSON.stringify({
+    cookies: [],
+    origins: [{ origin: "https://app.example.com", localStorage: [{ name: "token", value: jwt }] }],
+  }));
+  const loaded = loadCookieFile(p, target);
+  assert.equal(loaded.header, "");
+  assert.equal(loaded.browserCookies.length, 0);
+  assert.equal(loaded.bearer, jwt);
+  assert.equal(loaded.origins[0]?.localStorage[0]?.name, "token");
+});
+
+test("storageState with cookies + origins", () => {
+  const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIyIn0.sigsigsigsigsigsig";
+  const p = w("both.json", JSON.stringify({
+    cookies: [{ name: "sid", value: "s1", domain: "app.example.com", path: "/" }],
+    origins: [{ origin: "https://app.example.com", localStorage: [{ name: "token", value: jwt }] }],
+  }));
+  const loaded = loadCookieFile(p, target);
+  assert.equal(loaded.header, "sid=s1");
+  assert.equal(loaded.bearer, jwt);
+});

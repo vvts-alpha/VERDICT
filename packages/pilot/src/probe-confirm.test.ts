@@ -36,7 +36,11 @@ test("forgeAlgNone returns null for non-JWT input", () => {
 test("xss-reflected and open-redirect route through marker-based confirmation", () => {
   assert.ok(MARKER_BASED_CATEGORIES.has("xss-reflected"));
   assert.ok(MARKER_BASED_CATEGORIES.has("open-redirect"));
-  assert.ok(MARKER_BASED_CATEGORIES.has("price-tampering")); // includes business-logic too (superset)
+  assert.ok(MARKER_BASED_CATEGORIES.has("user-enumeration"));
+  assert.ok(MARKER_BASED_CATEGORIES.has("info-disclosure"));
+  assert.ok(MARKER_BASED_CATEGORIES.has("secret-exposure"));
+  assert.ok(MARKER_BASED_CATEGORIES.has("ssrf"));
+  assert.ok(MARKER_BASED_CATEGORIES.has("xxe"));
   // one-shot / body-length-diff classes are not marker-based (prevents mis-routing)
   assert.ok(!MARKER_BASED_CATEGORIES.has("idor"));
   assert.ok(!MARKER_BASED_CATEGORIES.has("sqli"));
@@ -67,7 +71,7 @@ test("suspected is scoped to serious classes — hygiene/deterministic classes a
   // XSS is marker-provable (reflectionIsLive) — confirm-or-skip, never a "suspected" hypothesis off a field name.
   for (const c of ["xss-reflected", "xss-stored"]) assert.ok(SUSPECT_EXCLUDED_CATEGORIES.has(c), `${c} should be excluded from suspected (marker-provable)`);
   // serious exploitation classes that are NOT marker-provable-in-one-request may be suspected.
-  for (const c of ["idor", "sqli", "ssti", "rce", "path-traversal", "ssrf", "mass-assignment", "vulnerable-component", "secret-exposure"])
+  for (const c of ["idor", "sqli", "ssti", "rce", "path-traversal", "ssrf", "mass-assignment", "vulnerable-component", "secret-exposure", "session"])
     assert.ok(!SUSPECT_EXCLUDED_CATEGORIES.has(c), `${c} should be allowed as suspected`);
 });
 

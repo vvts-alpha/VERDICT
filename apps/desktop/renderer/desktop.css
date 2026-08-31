@@ -82,6 +82,10 @@
 .attb-note { padding: 5px 12px; font-size: 12px; border-bottom: 1px solid var(--line); }
 .attb-note.ok { color: var(--accent); }
 .attb-note.err { color: var(--err); }
+.attb-handoff {
+  padding: 6px 12px; font-size: 12px; line-height: 1.45;
+  color: #f0d9a8; background: #3a2e1a; border-bottom: 1px solid var(--warn, #c9a227);
+}
 /* placeholder the native Chromium view is drawn over — keep it empty (a subtle ground while it loads) */
 .attb-view { flex: 1 1 auto; min-height: 0; background: var(--inset); }
 

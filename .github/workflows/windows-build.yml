@@ -1,4 +1,4 @@
-name: Build Windows .exe
+name: Build Windows installer
 
 on:
   workflow_dispatch:
@@ -17,7 +17,7 @@ jobs:
       - name: Setup Node.js 24
         uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          node-version: "24"
 
       - name: Enable pnpm
         run: |
@@ -33,17 +33,28 @@ jobs:
         run: pnpm -r build
         shell: bash
 
-      - name: Package Windows .exe (electron-builder if configured)
+      - name: Materialize self-contained desktop bundle
         run: |
-          # Try to run electron-builder if it's used by the project.
-          if command -v npx >/dev/null 2>&1; then
-            npx electron-builder --win --x64 || true
-          fi
+          pnpm --filter @veritas/desktop deploy ./bundle
+          # deploy copies package "files"; keep the builder config at the bundle root even if packing omits it
+          cp apps/desktop/electron-builder.yml bundle/electron-builder.yml
         shell: bash
 
-      - name: Upload built .exe artifacts
+      - name: Package Windows installer (electron-builder)
+        working-directory: bundle
+        run: npx --yes electron-builder --config electron-builder.yml --win --x64
+        shell: bash
+
+      - name: Upload VERDICT installer
         uses: actions/upload-artifact@v4
         with:
-          name: windows-exe
-          path: '**/*.exe'
+          name: verdict-windows-installer
+          path: bundle/dist-installer/*.exe
+          if-no-files-found: error
 
+      - name: Upload win-unpacked
+        uses: actions/upload-artifact@v4
+        with:
+          name: verdict-windows-unpacked
+          path: bundle/dist-installer/win-unpacked/
+          if-no-files-found: error

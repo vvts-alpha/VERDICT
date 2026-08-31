@@ -4,6 +4,12 @@
   "private": true,
   "type": "module",
   "main": "dist/main.js",
+  "files": [
+    "dist",
+    "dist-renderer",
+    "preload.cjs",
+    "electron-builder.yml"
+  ],
   "scripts": {
     "build:renderer": "vite build",
     "build:main": "tsc -p tsconfig.build.json",
