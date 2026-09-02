@@ -1,4 +1,5 @@
-// 💬 Ask — a read-only Q&A that asks Claude about this assessment (findings/screens/scope).
+// 💬 Ask — a read-only Q&A over this assessment (findings/screens/scope). Uses the configured LLM
+// (desktop Settings / VERDICT_LLM_*), not a hardcoded Claude CLI spawn.
 // POST the conversation to /api/assessments/:id/chat and show the answer. History is persisted server-side
 // (runs/<id>/chat.json) and loaded on mount, so past exchanges survive a reload.
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";

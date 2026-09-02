@@ -47,6 +47,9 @@ declare global {
         burpResourcePool?: string;
         burpAuditApi?: string;
         burpAuditToken?: string;
+        oobProvider?: "off" | "interactsh" | "burp";
+        interactshServer?: string;
+        interactshToken?: string;
     }
     interface SettingsBridge {
         get(): Promise<DesktopSettings>;

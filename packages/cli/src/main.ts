@@ -38,8 +38,8 @@ import {
 import { PlaywrightDriver, buildInventory, crawl, exploreScreen, htmlToPdf, labelInventory, normalizePath, parseOpenApiToScreens, smartLogin, writeScreenInventory } from "@veritas/crawler";
 import type { LoginCreds } from "@veritas/crawler";
 import { resolveLlmConfig, makeLlmClient } from "@veritas/llm";
-import { EvidenceStore, FetchHttpClient, SECURITY_HEADERS, auditHeaders, parseBurpReport, pickBurpConfigs, readEvidenceArtifact, scanInventory, startBurpScan, getBurpScan, dedupSeedUrls, submitAudit, getAuditStatusAll, getAuditIssues, resetAudit, buildRawRequest, mergeBurpIssues as scannerMergeBurpIssues, triageBurpInfo, formatBurpLeads } from "@veritas/scanner";
-import type { BurpAuditConn } from "@veritas/scanner";
+import { EvidenceStore, FetchHttpClient, SECURITY_HEADERS, auditHeaders, parseBurpReport, pickBurpConfigs, readEvidenceArtifact, scanInventory, startBurpScan, getBurpScan, dedupSeedUrls, submitAudit, getAuditStatusAll, getAuditIssues, resetAudit, buildRawRequest, mergeBurpIssues as scannerMergeBurpIssues, triageBurpInfo, formatBurpLeads, resolveOobProvider } from "@veritas/scanner";
+import type { BurpAuditConn, OobProvider } from "@veritas/scanner";
 import type { BurpIssue } from "@veritas/scanner";
 import { assessLogicInventory, assessScreenLogic, authDiffScreen } from "@veritas/agent";
 import type { RoleContext } from "@veritas/agent";
@@ -69,6 +69,7 @@ commands:
             uses the manifest's auth.roles via the login(role) tool. more flexible than the deterministic pipeline (no metered API / Max subscription)
             --fast-model enables model tiering: survey/methodology/login and low-value screens on fast, only high-value screen diagnosis on --model (e.g. --model opus --fast-model sonnet)
             after per-screen diagnosis, a SCENARIO stage (deep model) hunts multi-step A04 business-logic abuse across endpoints (coupon/price/qty tampering, step-skip, mass-assignment) — auto-skipped if no transactional surface. [--no-scenario] disables it. the stage also always runs built-in default scenarios (e.g. credential/secret hunting); [--no-default-scenarios] keeps A04 but drops those. [--focus "<text>"] adds an operator objective on top. after that, a FINGERPRINT stage (A06) collects tech/version banners (server, middleware, frontend libs) and flags components with known CVEs; [--no-fingerprint] skips it. [--cve-lookup] (opt-in, external egress) queries online CVE DBs — OSV.dev by exact version for libraries, NVD by keyword for servers/middleware — for authoritative CVE ids instead of model knowledge.
+            [--oob interactsh|burp|none] out-of-band confirmation for blind SSRF/XXE/SQLi. Default auto: INTERACTSH_SERVER → interactsh, else BURP_AUDIT_API → Collaborator, else off. Public Interactsh is opt-in third-party egress.
   pilot --survey-only --manifest <file.json> | --url <url> [...]
             survey only: maps screens + screenshots + API extraction only, no diagnosis/findings (cheap recon. diagnose later with --resume)
             ※ by default, during survey the model dynamically prunes low-value CMS content trees etc. via ignore_paths (curbs frontier explosion).
@@ -1088,6 +1089,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       "no-default-scenarios": { type: "boolean" }, // by default injects built-in scenarios (credential hunting, etc.). Set to disable just those (A04 stays)
       "no-fingerprint": { type: "boolean" }, // by default runs A06 fingerprinting (collect versions -> known-CVE assessment). Set to skip
       "cve-lookup": { type: "boolean" }, // in A06, query online CVE DBs (OSV/NVD) for detected versions (opt-in: third-party egress). Default off
+      oob: { type: "string" }, // interactsh | burp | none — wins over VERDICT_OOB. Public Interactsh is opt-in egress.
       "burp-scan": { type: "boolean" },
       "burp-api": { type: "string" },
       "no-burp-verify": { type: "boolean" }, // by default AI re-verifies Burp High+. Set to skip the verify phase
@@ -1222,9 +1224,16 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
     });
 
   try {
-    // Resolve the OOB (Burp Collaborator) connection so it's usable during diagnosis (probe_oob is enabled if BURP_AUDIT_API is set).
-    const oobConn = resolveBurpAudit();
-    if (oobConn) console.log(`  🛰 OOB ready via Collaborator (${oobConn.base}) — probe_oob enabled for blind SSRF/XXE/SQLi`);
+    // Resolve OOB (Interactsh or Burp Collaborator) so probe_oob is usable during diagnosis.
+    // Failures are non-fatal: the run continues, probe_oob reports NOT AVAILABLE.
+    let oob: OobProvider | null = null;
+    try {
+      oob = await resolveOobProvider(process.env, { ...(values.oob ? { mode: values.oob } : {}) });
+    } catch (e) {
+      console.log(`⚠ OOB unavailable: ${String(e instanceof Error ? e.message : e).slice(0, 160)}`);
+      oob = null;
+    }
+    if (oob) console.log(`  🛰 OOB ready via ${oob.kind} — probe_oob enabled for blind SSRF/XXE/SQLi`);
     const res = await runPilot({
       store,
       assessmentId: id,
@@ -1234,7 +1243,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       ...(lockToTargets ? { lockToSeeds: true } : {}),
       ...(httpBasic ? { httpBasic } : {}),
       ...(customHeaders ? { customHeaders } : {}),
-      ...(oobConn ? { oob: oobConn } : {}),
+      ...(oob ? { oob } : {}),
       ...((values.focus ?? manifest?.focus) ? { focus: values.focus ?? manifest?.focus } : {}),
       ...((values.context ?? manifest?.context) ? { operatorContext: values.context ?? manifest?.context } : {}), // target facts appended to every stage's system prompt
       ...(manifest?.skills ? { skills: manifest.skills } : {}), // enabled plugin capabilities (skills.ts)

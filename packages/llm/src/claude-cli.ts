@@ -38,6 +38,15 @@ export class ClaudeCliClient implements LlmClient {
         { timeout, maxBuffer: 32 * 1024 * 1024, cwd: this.opts.cwd },
         (err, stdout, stderr) => {
           if (err) {
+            const code = (err as NodeJS.ErrnoException).code;
+            if (code === "ENOENT") {
+              reject(
+                new Error(
+                  `claude CLI not found (spawn ${bin} ENOENT). Install the Claude Code CLI, or switch Settings → LLM to an OpenAI-compatible provider.`,
+                ),
+              );
+              return;
+            }
             reject(new Error(`claude CLI failed: ${err.message}${stderr ? ` | ${String(stderr).slice(0, 300)}` : ""}`));
             return;
           }

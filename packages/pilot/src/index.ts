@@ -6,4 +6,5 @@ export { buildTools, STAGE_TOOLS } from "./tools.js";
 export type { PilotSession } from "./tools.js";
 export { SURVEY_PROMPT, METHODOLOGY_PROMPT, DIAGNOSE_PROMPT } from "./system.js";
 export { verifyBurpFindings, triageAndDeepDiveBurp } from "./verify.js";
+export { triagePilotFindings, judgeConfirmedFinding } from "./findings-qa.js";
 export type { VerifyBurpDeps, VerifyBurpResult, TriageDeepDiveResult } from "./verify.js";

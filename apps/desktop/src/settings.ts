@@ -35,6 +35,12 @@ export interface DesktopSettings {
     burpAuditApi?: string;
     /** VERDICT Audit REST token (BURP_AUDIT_TOKEN). */
     burpAuditToken?: string;
+    /** OOB for blind SSRF/XXE: off | interactsh (free, opt-in public/self-host) | burp (Collaborator via Audit REST). */
+    oobProvider?: "off" | "interactsh" | "burp";
+    /** Interactsh server hostname or URL (INTERACTSH_SERVER). Blank + interactsh = oast.pro. */
+    interactshServer?: string;
+    /** Token for a protected Interactsh server (INTERACTSH_TOKEN). */
+    interactshToken?: string;
 }
 
 const DEFAULTS: DesktopSettings = { provider: "claude-cli" };
@@ -87,11 +93,12 @@ export function loadSettings(): DesktopSettings {
 
 function saveSettings(s: DesktopSettings): DesktopSettings {
     const clean: DesktopSettings = { provider: s.provider === "openai" ? "openai" : "claude-cli" };
-    for (const k of ["baseURL", "apiKey", "deepModel", "lightModel", "browserPath", "proxy", "burpApi", "burpApiKey", "burpResourcePool", "burpAuditApi", "burpAuditToken"] as const) {
+    for (const k of ["baseURL", "apiKey", "deepModel", "lightModel", "browserPath", "proxy", "burpApi", "burpApiKey", "burpResourcePool", "burpAuditApi", "burpAuditToken", "interactshServer", "interactshToken"] as const) {
         const v = s[k];
         if (typeof v === "string" && v.trim()) clean[k] = v.trim();
     }
     if (s.burpScan) clean.burpScan = true;
+    if (s.oobProvider === "interactsh" || s.oobProvider === "burp" || s.oobProvider === "off") clean.oobProvider = s.oobProvider;
     writeFileSync(file(), `${JSON.stringify(clean, null, 2)}\n`);
     return clean;
 }
@@ -121,7 +128,41 @@ export function settingsToEnv(s: DesktopSettings): Record<string, string> {
     if (s.burpResourcePool) env.BURP_RESOURCE_POOL = s.burpResourcePool;
     if (s.burpAuditApi) env.BURP_AUDIT_API = s.burpAuditApi;
     if (s.burpAuditToken) env.BURP_AUDIT_TOKEN = s.burpAuditToken;
+    if (s.oobProvider === "off") env.VERDICT_OOB = "none";
+    else if (s.oobProvider === "interactsh") {
+        env.VERDICT_OOB = "interactsh";
+        env.INTERACTSH_SERVER = s.interactshServer || "oast.pro";
+        if (s.interactshToken) env.INTERACTSH_TOKEN = s.interactshToken;
+    } else if (s.oobProvider === "burp") env.VERDICT_OOB = "burp";
+    else if (s.interactshServer) {
+        // Auto: a filled server is itself opt-in (resolveOobProvider then picks Interactsh).
+        env.INTERACTSH_SERVER = s.interactshServer;
+        if (s.interactshToken) env.INTERACTSH_TOKEN = s.interactshToken;
+    }
     return env;
+}
+
+/** Apply Settings onto process.env so the in-process server (Ask, PDF export) sees the same provider/browser
+ *  as scan children. childEnv only wraps spawned CLI processes — without this, Ask defaults to `claude` and
+ *  PDF looks for Playwright's unbundled chromium_headless_shell. */
+export function applyLlmSettingsToEnv(s: DesktopSettings = loadSettings(), env: NodeJS.ProcessEnv = process.env): void {
+    env.VERDICT_LLM_PROVIDER = s.provider;
+    if (s.baseURL) env.VERDICT_LLM_BASE_URL = s.baseURL;
+    else delete env.VERDICT_LLM_BASE_URL;
+    if (s.apiKey) env.VERDICT_LLM_API_KEY = s.apiKey;
+    else delete env.VERDICT_LLM_API_KEY;
+    if (s.deepModel) env.VERDICT_LLM_MODEL = s.deepModel;
+    else delete env.VERDICT_LLM_MODEL;
+    if (s.lightModel) env.VERDICT_LLM_FAST_MODEL = s.lightModel;
+    else delete env.VERDICT_LLM_FAST_MODEL;
+    const browser = s.browserPath?.trim() || detectSystemChromium();
+    if (browser) {
+        env.VERDICT_BROWSER_PATH = browser;
+        delete env.VERDICT_BROWSER_CHANNEL;
+    } else if (process.platform === "win32") {
+        delete env.VERDICT_BROWSER_PATH;
+        env.VERDICT_BROWSER_CHANNEL = "msedge";
+    }
 }
 
 /** Wire the get/set IPC the renderer's Settings panel uses. */

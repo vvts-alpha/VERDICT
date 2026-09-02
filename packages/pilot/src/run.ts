@@ -15,9 +15,10 @@ import { makeLlmClient, resolveLlmConfig } from "@veritas/llm";
 import { runOpenAiAgentLoop, type PilotToolDef } from "./agent-loop.js";
 import { EvidenceStore, FetchHttpClient, fingerprintTech, stackAttackHints } from "@veritas/scanner";
 import type { TechSample } from "@veritas/scanner";
-import type { BurpAuditConn } from "@veritas/scanner";
+import type { OobProvider } from "@veritas/scanner";
 import { join } from "node:path";
 import { buildTools, STAGE_TOOLS, applyLoadedAuth, dedupKey, isAuthWalled, loadCookieFile, mergeSetCookie, touchIsDead, stripHash, backfillParentPrefixes, availableRoles, analyzePageJs, enrolByNavigate } from "./tools.js";
+import { triagePilotFindings } from "./findings-qa.js";
 import { resolveSkills, buildSkillTools, skillToolNamesForStage, type Stage } from "./skills.js";
 import type { PilotSession, RoleSession } from "./tools.js";
 import { LiveControl } from "./live-control.js";
@@ -124,9 +125,9 @@ export interface RunPilotOptions {
    *  Only when set does it insert phase2_burpscan before report. Calling keepWarm() periodically keeps the authed session alive
    *  (so tokens/cookies don't go stale during a long Burp scan). The driver is still alive at this point. */
   onBurpScanPhase?: (ctx: { keepWarm: () => Promise<void>; cookie: string; bearer: string }) => Promise<void>;
-  /** OOB (Burp Collaborator) connection. When set, probe_oob is usable during diagnosis (confirming blind SSRF/XXE/SQLi).
-   *  The CLI resolves it from BURP_AUDIT_API/BURP_AUDIT_TOKEN and passes it. If unset, probe_oob is not-available. */
-  oob?: BurpAuditConn;
+  /** OOB provider (Interactsh or Burp Collaborator). When set, probe_oob is usable during diagnosis (blind SSRF/XXE/SQLi).
+   *  The CLI resolves it from VERDICT_OOB / INTERACTSH_SERVER / BURP_AUDIT_API. If unset, probe_oob is not-available. */
+  oob?: OobProvider;
   /** Operator emphasis hint (free text). Injected as the **top-priority objective of the scenario stage** (not mixed into per-screen diagnosis).
    *  e.g. "focus on the checkout flow and IDOR on /api/orders. Coupon/price tampering too." Emphasis, not exclusion. */
   focus?: string;
@@ -554,6 +555,75 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
 
   const toolDefs = [...buildTools(session), ...skillTools.map((e) => e.tool)]; // core + skill tools → SDK MCP server + OpenAI loop
   const server = createSdkMcpServer({ name: "veritas", version: "1.0.0", tools: toolDefs });
+
+  // Live operator controls (rate / scope-widen / max-screens / session inject). Applied on a 2s poll so survey
+  // (and mid-query diagnosis) can pick up a CAPTCHA login inject — not only between diagnosis screens.
+  let maxScan = opts.maxScreens ?? 40;
+  let lastControlSeq = 0;
+  if (opts.resume) {
+    const seen = opts.store.controlCommandsSince(opts.assessmentId, 0);
+    lastControlSeq = seen.length ? (seen[seen.length - 1]?.seq ?? 0) : 0;
+  }
+  const flushControls = async (): Promise<void> => {
+    for (const { seq, cmd } of opts.store.controlCommandsSince(opts.assessmentId, lastControlSeq)) {
+      lastControlSeq = seq;
+      let scopeChanged = false;
+      for (const raw of cmd.addHosts ?? []) {
+        const host = raw.trim().toLowerCase();
+        if (host && !opts.scope.inScopeHosts.includes(host)) {
+          opts.scope.inScopeHosts.push(host);
+          scopeChanged = true;
+        }
+      }
+      for (const p of cmd.addInScopePathPrefixes ?? []) {
+        if (p && !opts.scope.inScopePathPrefixes.includes(p)) {
+          opts.scope.inScopePathPrefixes.push(p);
+          scopeChanged = true;
+        }
+      }
+      if (typeof cmd.rateMs === "number" && cmd.rateMs >= 0) {
+        http.setRate(cmd.rateMs);
+        opts.onText?.(`⚙ rate → ${cmd.rateMs}ms (live)`);
+      }
+      if (typeof cmd.maxScreens === "number" && cmd.maxScreens > 0) {
+        maxScan = cmd.maxScreens;
+        opts.onText?.(`⚙ max-screens → ${cmd.maxScreens} (live)`);
+      }
+      if (scopeChanged) {
+        opts.store.updateScope(opts.assessmentId, opts.scope);
+        opts.onText?.(`⚙ scope widened → hosts=[${opts.scope.inScopeHosts.join(",")}] (live)`);
+      }
+      if (cmd.injectCookieFile) {
+        try {
+          const loaded = loadCookieFile(cmd.injectCookieFile, opts.targetUrl);
+          if (loaded.header || loaded.bearer || loaded.origins.length > 0) {
+            const applied = await applyLoadedAuth(session.driver, loaded, opts.targetUrl);
+            session.currentCookie = applied.cookie;
+            session.currentBearer = applied.bearer;
+            const live = session.roleSessions?.get(session.currentRole);
+            if (live) live.cookie = applied.cookie;
+            opts.onText?.("🔓 session injected (operator login) — continuing authenticated");
+            opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: "🔓 operator injected a login session — continuing authenticated" } });
+          } else {
+            opts.onText?.("⚠ injected session file was empty/unparseable");
+          }
+        } catch (e) {
+          opts.onText?.(`⚠ session injection failed: ${String(e instanceof Error ? e.message : e).slice(0, 120)}`);
+        }
+      }
+      if (cmd.note) opts.onText?.(`⚙ control note: ${cmd.note}`);
+    }
+  };
+  // Serialize: a 2s interval must not overlap a still-running inject (Playwright + sqlite). Chain, don't fire-and-forget.
+  let controlFlush: Promise<void> = Promise.resolve();
+  const applyPendingControls = (): Promise<void> => {
+    controlFlush = controlFlush.then(flushControls, flushControls);
+    return controlFlush;
+  };
+  const controlPoll = setInterval(() => {
+    void applyPendingControls().catch(() => {});
+  }, 2000);
+  controlPoll.unref();
   // rolesLine drives the survey's "log in EACH role before survey_done" gate (authClause below). It MUST list the same
   // roles login() can actually switch to — availableRoles(session): in attended mode the live-session keys (INCLUDING
   // pure-manual roles that carry no creds/cookie), otherwise the creds + cookie-file keys. Computing it from
@@ -968,68 +1038,8 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         lastTouch = Date.now();
       };
 
-      // ── live control channel ── operator reconfigure (rate / scope-widen / max-screens) applied between screens, plus
-      //    the WebUI pause finally honored by a running pilot. Only control_command events issued during THIS process apply
-      //    (seq > the max seen at start); scope changes are journaled via updateScope so a replay reconstructs the same gate.
-      let maxScan = opts.maxScreens ?? 40;
-      // Fresh run: apply EVERY control command (the run id didn't exist before launch, so all commands are new — incl.
-      // ones issued during survey/methodology, before diagnosis). Resume: skip commands already applied in the prior
-      // process (seq ≤ the current max), so a resumed run doesn't re-apply old reconfigures/injections.
-      let lastControlSeq = 0;
-      if (opts.resume) {
-        const seen = opts.store.controlCommandsSince(opts.assessmentId, 0);
-        lastControlSeq = seen.length ? (seen[seen.length - 1]?.seq ?? 0) : 0;
-      }
-      const applyPendingControls = async (): Promise<void> => {
-        for (const { seq, cmd } of opts.store.controlCommandsSince(opts.assessmentId, lastControlSeq)) {
-          lastControlSeq = seq;
-          let scopeChanged = false;
-          for (const raw of cmd.addHosts ?? []) {
-            const host = raw.trim().toLowerCase();
-            if (host && !opts.scope.inScopeHosts.includes(host)) {
-              opts.scope.inScopeHosts.push(host); // opts.scope === session.scope === the http allow-closure's scope (same ref)
-              scopeChanged = true;
-            }
-          }
-          for (const p of cmd.addInScopePathPrefixes ?? []) {
-            if (p && !opts.scope.inScopePathPrefixes.includes(p)) {
-              opts.scope.inScopePathPrefixes.push(p);
-              scopeChanged = true;
-            }
-          }
-          if (typeof cmd.rateMs === "number" && cmd.rateMs >= 0) {
-            http.setRate(cmd.rateMs);
-            opts.onText?.(`⚙ rate → ${cmd.rateMs}ms (live)`);
-          }
-          if (typeof cmd.maxScreens === "number" && cmd.maxScreens > 0) {
-            maxScan = cmd.maxScreens;
-            opts.onText?.(`⚙ max-screens → ${cmd.maxScreens} (live)`);
-          }
-          if (scopeChanged) {
-            opts.store.updateScope(opts.assessmentId, opts.scope); // journal (replayable); the live gate already sees it via the shared ref
-            opts.onText?.(`⚙ scope widened → hosts=[${opts.scope.inScopeHosts.join(",")}] (live)`);
-          }
-          // Live session injection (Option B): the operator logged in mid-scan; apply the captured cookie to the LIVE
-          //   session — browser context + the raw http path — so subsequent screens are authenticated, no restart.
-          if (cmd.injectCookieFile) {
-            try {
-              const loaded = loadCookieFile(cmd.injectCookieFile, opts.targetUrl);
-              if (loaded.header || loaded.bearer || loaded.origins.length > 0) {
-                const applied = await applyLoadedAuth(session.driver, loaded, opts.targetUrl);
-                session.currentCookie = applied.cookie;
-                session.currentBearer = applied.bearer;
-                opts.onText?.("🔓 session injected (operator login) — continuing authenticated");
-                opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: "🔓 operator injected a login session — continuing authenticated" } });
-              } else {
-                opts.onText?.("⚠ injected session file was empty/unparseable");
-              }
-            } catch (e) {
-              opts.onText?.(`⚠ session injection failed: ${String(e instanceof Error ? e.message : e).slice(0, 120)}`);
-            }
-          }
-          if (cmd.note) opts.onText?.(`⚙ control note: ${cmd.note}`);
-        }
-      };
+      // ── live control channel ── applyPendingControls is polled from the start of the run (survey included).
+      //    Between diagnosis screens we still flush it synchronously, then honor an operator pause.
 
       // ── operator-injected targets ── URLs added mid-run via the WebUI (target_injected events). enrolByNavigate is the
       //    one safe enroll path: it cold-GETs the URL, rejects catch-alls, and populates BOTH session.inv (so get_screen
@@ -1076,8 +1086,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
 
       // Diagnose one screen (shared body called from both the primary path and the drain). "break" stops the outer loop.
       const diagnoseOne = async (sc: Screen): Promise<"continue" | "break"> => {
-        // ── between-screens checkpoint ── apply any queued reconfigure, then honor an operator (WebUI) pause. This is the
-        //    only safe apply point: the SDK agent is autonomous mid-query, so control lands strictly on the next screen.
+        // ── between-screens checkpoint ── flush queued reconfigure/inject, then honor an operator (WebUI) pause.
         await applyPendingControls();
         // Operator pause: HOLD here (don't exit) until resumed via the WebUI toggle, keeping the live authed session warm so
         //   resume continues instantly with no re-login/re-survey. A stop (SIGTERM) kills the held process; the current screen
@@ -1237,7 +1246,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
           : "Assess each (component, version) against your own CVE/EOL knowledge (online CVE-DB lookup is off). ";
         turns += await runStage({
           system: FINGERPRINT_PROMPT,
-          goal: `Per-screen diagnosis and scenarios are done. Inventory the technology stack: call fingerprint_scan on ${opts.targetUrl} (plus a couple of representative in-scope URLs / the main JS bundle). ${cveClause}record_finding(category vulnerable-component) for every component with a real known issue — name the CVE, cite the version evidence (the banner/script that revealed it), set severity by the worst known issue, and state plainly it is version-based unless actively confirmed. Skip patched/current versions. Call fingerprint_done when every detected component has been assessed.`,
+          goal: `Per-screen diagnosis and scenarios are done. Inventory the technology stack: call fingerprint_scan on ${opts.targetUrl} (plus a couple of representative in-scope URLs / the main JS bundle). ${cveClause}record_finding(category vulnerable-component) only for a component WITH a concrete version and a High/Critical CVE that applies to THAT version — name the CVE, cite the version evidence, set severity by the worst known issue, and state it is version-based unless actively confirmed. Skip patched/current versions AND skip version-unknown product banners (BigIP/WAF/VPN family CVE lists are not findings). Call fingerprint_done when every detected component has been assessed.`,
           allowed: fpTools,
           maxTurns: Math.min(maxTurns, 25),
           model: deepModel, // mapping version <-> CVE is knowledge-intensive -> pinned deep
@@ -1250,6 +1259,33 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       //     found /admin_panel etc. -> it fell to report still queued and became "scanned 2/5".)
       await drainQueued();
       session.currentScreenId = null;
+    }
+
+    // ── Findings QA ── diagnosis records whatever probe_* CONFIRMED. That is not a second opinion (Valero HTML
+    //    search shipped as High SQLi). Mechanical oracles first, then a skeptical DEEP-model review over the raw
+    //    evidence (the FP-catcher — a length-delta "confirmed" is exactly where a second opinion pays off). Pinned to
+    //    the deep model on purpose: this is the highest-stakes judgment in the run, not a place to save tokens.
+    if (!opts.surveyOnly && !session.paused) {
+      try {
+        const qa = await triagePilotFindings({
+          store: opts.store,
+          assessmentId: opts.assessmentId,
+          evidence: session.evidence,
+          findings: session.findings,
+          llm: session.loginLlm,
+          model: deepModel ?? fastModel, // review on the DEEP model — the second opinion is only as good as the reviewer
+          onText: opts.onText,
+        });
+        if (qa.checked > 0) {
+          const line = `🔎 findings QA: ${qa.demoted} demoted / ${qa.kept} kept (${qa.checked} checked)`;
+          opts.onText?.(line);
+          opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: line } });
+        }
+      } catch (e) {
+        const m = String(e instanceof Error ? e.message : e).slice(0, 160);
+        opts.onText?.(`⚠ findings QA error: ${m}`);
+        opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: `⚠ findings QA error: ${m}` } });
+      }
     }
 
     // ── Burp scan phase ── after diagnosis/scenarios, before dropping to report, run it **while the session is alive**.
@@ -1303,6 +1339,8 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       });
     }
   } finally {
+    clearInterval(controlPoll);
+    await session.oob?.close?.().catch(() => {});
     liveControl?.close();
     if (roleSessions) {
       // attended closes each role's context (primary is included in roleSessions, so it isn't double-closed).

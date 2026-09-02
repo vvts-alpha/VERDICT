@@ -46,6 +46,7 @@ const VERSION_VALUE_HEADERS: { header: string; kind: TechKind; name: string }[] 
   { header: "x-aspnet-version", kind: "framework", name: "ASP.NET" },
   { header: "x-aspnetmvc-version", kind: "framework", name: "ASP.NET MVC" },
   { header: "x-generator", kind: "cms", name: "(generator)" },
+  { header: "microsoftsharepointteamservices", kind: "cms", name: "Microsoft SharePoint" },
 ];
 
 // Set-Cookie name → framework/language (no version, but reveals "what it's built with")
@@ -129,8 +130,61 @@ export function fingerprintTech(samples: ReadonlyArray<TechSample>): TechCompone
         });
       }
     }
+    // SharePoint hive paths (/_layouts/15/, corev15.css) identify the PRODUCT, not a patch version.
+    // 2016 / 2019 / Subscription / Online still serve the 15 hive for compatibility — not "SharePoint 2013".
+    if (
+      /\/_layouts\/\d+\//.test(s.body) ||
+      /corev\d+\.css/i.test(s.body) ||
+      /\/_catalogs\/masterpage\//i.test(s.body)
+    ) {
+      add({
+        kind: "cms",
+        name: "Microsoft SharePoint",
+        version: null,
+        source: "path",
+        evidence: "/_layouts/ or corevN.css (hive path is not a patch version)",
+      });
+    }
   }
   return [...byKey.values()];
+}
+
+function lowerHeaders(headers: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(headers)) out[k.toLowerCase()] = v;
+  return out;
+}
+
+function compsOf(headers: Record<string, string>, body: string): TechComponent[] {
+  return fingerprintTech([{ url: "https://local/", headers: lowerHeaders(headers), body: body ?? "" }]);
+}
+
+/** True when fingerprinting the response yields at least one component WITH a version (Apache/2.4.41, jquery-1.12.4).
+ *  `Server: BigIP` / a cookie name / a product family with no version is false. */
+export function hasVersionedComponent(headers: Record<string, string>, body: string): boolean {
+  return compsOf(headers, body).some((c) => Boolean(c.version));
+}
+
+/** Does the writeup cite this fingerprinted version (full string, or major.minor)? */
+function writeupCitesVersion(writeup: string, version: string): boolean {
+  if (!version) return false;
+  if (writeup.includes(version)) return true;
+  const mm = /^(\d+\.\d+)/.exec(version);
+  if (!mm) return false;
+  const esc = mm[1]!.replace(/\./g, "\\.");
+  return new RegExp(`(?<!\\d)${esc}(?!\\d)`).test(writeup);
+}
+
+/** Product-family CVE history with no version (F5 BIG-IP + CVE-2020-5902 "may apply") is not A06.
+ *  A hive path (/_layouts/15/) is not a version — the writeup must cite a version that fingerprinting actually extracted. */
+const VERSIONLESS_WRITEUP =
+  /undisclosed version|version\s+(?:is\s+|was\s+)?(?:not\s+|un)disclosed|no version (?:is |was )?(?:leaked|disclosed)|version remains unknown|\bunknown version\b|version unknown|product family has|patch level (?:could not|cannot|unverified)/i;
+
+export function isVersionlessComponentLead(writeup: string, headers: Record<string, string>, body: string): boolean {
+  if (VERSIONLESS_WRITEUP.test(writeup)) return true;
+  const versioned = compsOf(headers, body).filter((c) => c.version);
+  if (versioned.length === 0) return true;
+  return !versioned.some((c) => writeupCitesVersion(writeup, c.version!));
 }
 
 /** Format TechComponent[] into a human-readable table (for the LLM prompt / report). */

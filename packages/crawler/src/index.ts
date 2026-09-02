@@ -86,5 +86,5 @@ export { PlaywrightDriver } from "./drivers/playwright.js";
 export type { PlaywrightDriverOptions, AutoLoginOptions, CookieInfo } from "./drivers/playwright.js";
 
 // HTML → PDF (report PDF output; reuses playwright-core, no new dependency)
-export { htmlToPdf } from "./pdf.js";
-export type { HtmlToPdfOptions } from "./pdf.js";
+export { htmlToPdf, detectSystemChromium, resolvePlaywrightLaunch } from "./pdf.js";
+export type { HtmlToPdfOptions, PlaywrightLaunchChoice } from "./pdf.js";

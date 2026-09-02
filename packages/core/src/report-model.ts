@@ -107,12 +107,25 @@ export function buildReportModel(state: AssessmentState, now: Date = new Date(),
     reproSteps: f.reproSteps,
     evidence: f.evidenceIds.map((e): ReportEvidence => {
       const loaded = opts.loadEvidence?.(e) ?? null;
+      // A missing-header ("[headers] ...") finding is proven by the response HEADER block alone — the HTML body is
+      // irrelevant to it and was dominating the report (the same page body re-embedded once per header finding, so a
+      // 45-header run ballooned to 1.3MB / 23k lines). Keep only the status line + headers for these; real findings
+      // keep full bodies. Fixing it here in the shared model covers markdown, html, and pdf at once.
+      let response = loaded?.response ?? null;
+      let truncated = loaded?.truncated ?? false;
+      if (response && f.title.startsWith("[headers]")) {
+        const headerBlock = response.split(/\r?\n\r?\n/)[0] ?? response;
+        if (headerBlock.length < response.length) {
+          response = headerBlock;
+          truncated = true;
+        }
+      }
       return {
         evidenceId: e,
         path: `artifacts/${f.screenId ?? "_"}/${e}/`,
         request: loaded?.request ?? null,
-        response: loaded?.response ?? null,
-        truncated: loaded?.truncated ?? false,
+        response,
+        truncated,
       };
     }),
   }));

@@ -5,14 +5,14 @@
 // The store, WS projection, and evidence contracts are unchanged — this is the same server the `serve` command
 // runs, just hosted by Electron instead of a bare Node process (docs/DESKTOP_APP.md, "backend nearly unchanged").
 
-import { app, BrowserWindow, ipcMain, session, shell } from "electron";
+import { app, BrowserWindow, ipcMain, Menu, session, shell, type WebContents } from "electron";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import { existsSync, mkdirSync } from "node:fs";
 import { startServer, type RunningServer, type RunLauncherConfig } from "@veritas/server";
 import { applyAttendedProxy, setupAttendedBrowser } from "./attended-browser.js";
-import { setupSettingsIpc, loadSettings, settingsToEnv } from "./settings.js";
+import { setupSettingsIpc, loadSettings, settingsToEnv, applyLlmSettingsToEnv } from "./settings.js";
 
 /** App root (apps/desktop) — main.js lives in dist/, so one level up. Used to locate the preload. */
 const APP_ROOT = fileURLToPath(new URL("..", import.meta.url));
@@ -35,6 +35,32 @@ function resolveCliPath(): string | undefined {
 
 let server: RunningServer | null = null;
 let win: BrowserWindow | null = null;
+
+/** Drop File/Edit/View from a window. Report HTML/PDF opens via target=_blank as a child BrowserWindow;
+ *  without this, Windows/Linux show Electron's default application menu on that popup. */
+function stripAppMenu(created: BrowserWindow): void {
+    created.removeMenu();
+    created.setAutoHideMenuBar(true);
+    created.setMenuBarVisibility(false);
+}
+
+/** Same-origin popups (report HTML/PDF, inventory) stay in-app without a menu; everything else goes to the OS browser. */
+function attachPopupPolicy(contents: WebContents): void {
+    contents.setWindowOpenHandler(({ url }) => {
+        const origin = server?.url ?? "http://127.0.0.1";
+        if (!url.startsWith(origin)) {
+            void shell.openExternal(url);
+            return { action: "deny" };
+        }
+        return {
+            action: "allow",
+            overrideBrowserWindowOptions: {
+                title: "VERDICT",
+                autoHideMenuBar: true,
+            },
+        };
+    });
+}
 
 async function boot(): Promise<void> {
     // All writable state lives under userData (the install dir is read-only in a packaged app).
@@ -72,6 +98,10 @@ async function boot(): Promise<void> {
         : undefined;
     if (!runLauncher) console.warn("[verdict] @veritas/cli not resolvable — assessments cannot be launched from the UI yet");
 
+    // Ask + PDF run in this process via @veritas/server (not a CLI child), so Settings LLM/browser env
+    // must live on process.env (childEnv only wraps spawned scans).
+    applyLlmSettingsToEnv();
+
     server = await startServer({
         runsDir,
         host: "127.0.0.1", // single-user localhost — never bind 0.0.0.0 from the desktop app
@@ -89,6 +119,14 @@ async function boot(): Promise<void> {
     // at Settings' upstream proxy separately (applyAttendedProxy).
     await session.defaultSession.setProxy({ mode: "direct" });
     await applyAttendedProxy();
+
+    // Windows/Linux draw the application menu inside the window. The main chrome is frameless; popups
+    // (Export → HTML/PDF) must not grow File/Edit/View either. macOS keeps the screen-top app menu.
+    if (process.platform !== "darwin") Menu.setApplicationMenu(null);
+    app.on("browser-window-created", (_e, created) => {
+        stripAppMenu(created);
+        attachPopupPolicy(created.webContents);
+    });
 
     win = new BrowserWindow({
         width: 1400,
@@ -116,22 +154,16 @@ async function boot(): Promise<void> {
     win.on("maximize", () => win?.webContents.send("win:maximize-changed", true));
     win.on("unmaximize", () => win?.webContents.send("win:maximize-changed", false));
 
-    // In-app settings (LLM provider / Deep + Light models / browser path / proxy) — read by the childEnv thunk above.
-    // Saving proxy reapplies it to the attended Browser tab immediately (no app restart).
-    setupSettingsIpc(() => {
+    // In-app settings (LLM provider / Deep + Light models / browser path / proxy) — childEnv thunk (scans) +
+    // process.env (Ask + PDF). Saving proxy also reapplies it to the attended Browser tab (no app restart).
+    setupSettingsIpc((s) => {
+        applyLlmSettingsToEnv(s);
         void applyAttendedProxy();
     });
 
     // Attended embedded browser (human login / CAPTCHA inside the one window; session handoff to the auto pilot).
     const attb = setupAttendedBrowser(win, runsDir);
-    // Open target/external links in the system browser, not inside the app window.
-    win.webContents.setWindowOpenHandler(({ url }) => {
-        if (!url.startsWith(server?.url ?? "http://127.0.0.1")) {
-            void shell.openExternal(url);
-            return { action: "deny" };
-        }
-        return { action: "allow" };
-    });
+    attachPopupPolicy(win.webContents);
     win.webContents.on("did-fail-load", (_e, code, desc, url) => console.error(`[verdict] did-fail-load ${code} ${desc} ${url}`));
     await win.loadURL(server.url); // resolves after the page finishes loading
 

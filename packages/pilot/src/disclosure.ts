@@ -30,3 +30,19 @@ export function disclosureHit(body: string, baselineBody?: string): DisclosureHi
   }
   return null;
 }
+
+/** robots.txt is a public file. A Sitemap: line (even to production from staging) is not info-disclosure. */
+export function looksLikeRobotsTxt(body: string): boolean {
+  const t = body.replace(/^\uFEFF/, "").trimStart().slice(0, 4000);
+  return /user-agent\s*:/i.test(t) && /(?:sitemap|disallow|allow)\s*:/i.test(t);
+}
+
+/** sitemap.xml / sitemapindex — also a public file, not info-disclosure. */
+export function looksLikeSitemapXml(body: string): boolean {
+  const t = body.replace(/^\uFEFF/, "").trimStart().slice(0, 8000);
+  return /<(?:urlset|sitemapindex)\b/i.test(t);
+}
+
+export function looksLikePublicWebFile(body: string): boolean {
+  return looksLikeRobotsTxt(body) || looksLikeSitemapXml(body);
+}

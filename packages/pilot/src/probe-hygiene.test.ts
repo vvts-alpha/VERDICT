@@ -122,6 +122,17 @@ test("probe_user_enum does not attach the session cookie/Bearer (pre-auth surfac
   });
 });
 
+test("probe_secrets does NOT confirm a Maps JavaScript API key in the loader", async () => {
+  await withDir(async (dir) => {
+    const key = "AIzaSyAifmNrsDrUE-nYVrnETY1QAg8NeioXQh4";
+    const html = `<script src="https://maps.googleapis.com/maps/api/js?v=weekly&key=${key}"></script>`;
+    const send = async (req: HttpRequest) =>
+      req.url.includes("verdict-nonexistent") ? resp(404, "not found") : resp(200, html);
+    const out = await callTool(dir, "probe_secrets", { url: `${BASE}` }, send);
+    assert.match(String(out.verdict), /not confirmed/);
+  });
+});
+
 test("probe_secrets CONFIRMS a live AWS key vs a clean control", async () => {
   await withDir(async (dir) => {
     const key = "AKIA" + "ABCDEFGHIJKLMNOP";

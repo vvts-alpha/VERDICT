@@ -7,9 +7,9 @@ import { useEffect, useState, type ReactNode } from "react";
 const bridge = () => (typeof window !== "undefined" ? window.verdictDesktop?.settings : undefined);
 
 const EMPTY: DesktopSettings = { provider: "claude-cli" };
-const SECTIONS = ["Models", "Network", "Burp"] as const;
+const SECTIONS = ["Models", "Network", "OOB", "Burp"] as const;
 type Section = (typeof SECTIONS)[number];
-type StringKey = Exclude<keyof DesktopSettings, "provider" | "burpScan">;
+type StringKey = Exclude<keyof DesktopSettings, "provider" | "burpScan" | "oobProvider">;
 
 // Hoisted: defining these inside Settings remounted every <input> on each keystroke (focus lost after 1 char).
 function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
@@ -107,6 +107,41 @@ export function Settings({ onClose }: { onClose: () => void }) {
                             <>
                                 <Field label="Upstream proxy" hint="Browser tab + scan traffic (browser + http), e.g. Burp — blank = direct"><Text value={s.proxy ?? ""} onChange={setStr("proxy")} ph="http://127.0.0.1:8080" /></Field>
                                 <Field label="Chromium path" hint="headless scan browser — blank = installed Chrome/Edge"><Text value={s.browserPath ?? ""} onChange={setStr("browserPath")} ph="C:\Program Files\Google\Chrome\Application\chrome.exe" /></Field>
+                            </>
+                        ) : null}
+
+                        {section === "OOB" ? (
+                            <>
+                                <p className="settings-note-inline">
+                                    Blind SSRF/XXE/SQLi need an out-of-band callback host. Interactsh is free (public server is opt-in third-party egress). Burp Collaborator needs the Audit REST extension.
+                                </p>
+                                <Field label="Provider">
+                                    <select
+                                        value={s.oobProvider ?? ""}
+                                        onChange={(e) => {
+                                            const v = e.target.value;
+                                            set("oobProvider", v === "interactsh" || v === "burp" || v === "off" ? v : undefined);
+                                        }}
+                                    >
+                                        <option value="">Auto (Interactsh if a server is set, else Burp Audit REST, else off)</option>
+                                        <option value="off">Off</option>
+                                        <option value="interactsh">Interactsh (free)</option>
+                                        <option value="burp">Burp Collaborator (Audit REST)</option>
+                                    </select>
+                                </Field>
+                                {s.oobProvider === "interactsh" || !s.oobProvider ? (
+                                    <>
+                                        <Field label="Interactsh server" hint="hostname or URL — blank with Interactsh selected = oast.pro">
+                                            <Text value={s.interactshServer ?? ""} onChange={setStr("interactshServer")} ph="oast.pro" />
+                                        </Field>
+                                        <Field label="Interactsh token" hint="only for a protected / self-hosted server">
+                                            <Text value={s.interactshToken ?? ""} onChange={setStr("interactshToken")} ph="token" type="password" />
+                                        </Field>
+                                    </>
+                                ) : null}
+                                {s.oobProvider === "burp" ? (
+                                    <p className="settings-note-inline">Uses the Audit REST URL on the Burp tab (default http://127.0.0.1:1338). Collaborator must be enabled in the Burp project.</p>
+                                ) : null}
                             </>
                         ) : null}
 

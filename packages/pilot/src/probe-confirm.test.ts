@@ -41,6 +41,9 @@ test("xss-reflected and open-redirect route through marker-based confirmation", 
   assert.ok(MARKER_BASED_CATEGORIES.has("secret-exposure"));
   assert.ok(MARKER_BASED_CATEGORIES.has("ssrf"));
   assert.ok(MARKER_BASED_CATEGORIES.has("xxe"));
+  // path-traversal confirms on real file content (probe_traversal's effectMarker), NOT a body-length delta —
+  // a traversal that reads no file is not confirmed. This stops the "response is 64 bytes longer = confirmed" FP.
+  assert.ok(MARKER_BASED_CATEGORIES.has("path-traversal"));
   // one-shot / body-length-diff classes are not marker-based (prevents mis-routing)
   assert.ok(!MARKER_BASED_CATEGORIES.has("idor"));
   assert.ok(!MARKER_BASED_CATEGORIES.has("sqli"));

@@ -218,7 +218,8 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
     return sendJson(res, 200, { ok: true });
   }
 
-  // 💬 Ask: query Claude with this assessment's findings/screens/scope as context (read-only Q&A).
+  // 💬 Ask: read-only Q&A over this assessment (findings/screens/scope). Uses the configured LLM
+  // (VERDICT_LLM_PROVIDER — OpenAI-compatible or claude CLI), not a hardcoded Claude spawn.
   const chat = url.match(/^\/api\/assessments\/([^/]+)\/chat$/);
   if (chat) {
     const id = decodeURIComponent(chat[1] ?? "");
@@ -849,7 +850,7 @@ function buildChatContext(state: AssessmentState): string {
   return out.join("\n");
 }
 
-/** 💬 Ask body: pass the conversation history with state as context and let Claude answer (claude CLI subscription). */
+/** 💬 Ask body: conversation + assessment snapshot → configured LLM (Settings / VERDICT_LLM_*). Prefers the Light model. */
 async function serveChat(res: ServerResponse, runsDir: string, id: string, messages: Array<{ role: string; content: string }>): Promise<void> {
   if (!/^[a-z0-9_-]+$/i.test(id)) {
     sendJson(res, 400, { error: "bad id" });
@@ -869,7 +870,13 @@ async function serveChat(res: ServerResponse, runsDir: string, id: string, messa
   }
   const transcript = messages.map((m) => `${m.role === "assistant" ? "Assistant" : "User"}: ${m.content}`).join("\n\n");
   try {
-    const llm = makeLlmClient(resolveLlmConfig(process.env, { claudeDefaultModel: "claude-sonnet-5" }));
+    const llm = makeLlmClient(
+      resolveLlmConfig(process.env, {
+        claudeDefaultModel: "claude-sonnet-5",
+        // Ask is cheap Q&A — Light if set, else Deep / Claude default.
+        explicitModel: process.env.VERDICT_LLM_FAST_MODEL || undefined,
+      }),
+    );
     const r = await llm.complete({
       system: `${CHAT_SYSTEM}\n\n# Assessment data\n${buildChatContext(state)}`,
       prompt: `${transcript}\n\nAssistant:`,
@@ -968,7 +975,7 @@ async function serveReport(res: ServerResponse, runsDir: string, id: string, kin
       type = "text/csv; charset=utf-8";
       filename = "findings.csv";
     } else if (kind === "report" && fmt === "pdf") {
-      body = await htmlToPdf(renderReportHtml(model), { ...(process.env.VERITAS_BROWSER_PATH ? { executablePath: process.env.VERITAS_BROWSER_PATH } : {}), noSandbox: true });
+      body = await htmlToPdf(renderReportHtml(model), { noSandbox: true });
       type = "application/pdf";
       filename = "report.pdf";
       inline = true;
@@ -983,7 +990,7 @@ async function serveReport(res: ServerResponse, runsDir: string, id: string, kin
       inline = true;
     }
   } catch (e) {
-    sendJson(res, 500, { error: `render failed: ${String(e).slice(0, 200)}` });
+    sendJson(res, 500, { error: `render failed: ${String(e).split("\n")[0]!.slice(0, 300)}` });
     return;
   }
   res.writeHead(200, {
