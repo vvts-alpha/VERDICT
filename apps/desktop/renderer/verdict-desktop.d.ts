@@ -50,10 +50,17 @@ declare global {
         oobProvider?: "off" | "interactsh" | "burp";
         interactshServer?: string;
         interactshToken?: string;
+        operatorContext?: string;
     }
     interface SettingsBridge {
         get(): Promise<DesktopSettings>;
         set(s: DesktopSettings): Promise<DesktopSettings>;
+    }
+    interface AppInfo {
+        version: string;
+        electron: string;
+        node: string;
+        chrome: string;
     }
     interface VerdictDesktop {
         platform: string;
@@ -65,6 +72,7 @@ declare global {
         onMaximizeChange(cb: (maximized: boolean) => void): () => void;
         browser: AttendedBrowserBridge;
         settings: SettingsBridge;
+        app: { info(): Promise<AppInfo> };
     }
     interface Window {
         verdictDesktop?: VerdictDesktop;

@@ -41,4 +41,9 @@ contextBridge.exposeInMainWorld("verdictDesktop", {
         get: () => ipcRenderer.invoke("settings:get"),
         set: (s) => ipcRenderer.invoke("settings:set", s),
     },
+
+    // App info (version + runtime) for the About section — version is the single source of truth (package.json).
+    app: {
+        info: () => ipcRenderer.invoke("app:info"),
+    },
 });

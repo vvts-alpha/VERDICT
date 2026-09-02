@@ -41,6 +41,10 @@ export interface DesktopSettings {
     interactshServer?: string;
     /** Token for a protected Interactsh server (INTERACTSH_TOKEN). */
     interactshToken?: string;
+    /** Standing FACTS about your targets (auth shape, tenant model, where the API lives). Pre-fills the New form's
+     *  "Operator context" on new runs (the per-run value overrides), and is appended to every stage's system prompt as
+     *  --context. Additive only: it guides the agent, never overrides safety / scope / evidence-discipline. */
+    operatorContext?: string;
 }
 
 const DEFAULTS: DesktopSettings = { provider: "claude-cli" };
@@ -93,7 +97,7 @@ export function loadSettings(): DesktopSettings {
 
 function saveSettings(s: DesktopSettings): DesktopSettings {
     const clean: DesktopSettings = { provider: s.provider === "openai" ? "openai" : "claude-cli" };
-    for (const k of ["baseURL", "apiKey", "deepModel", "lightModel", "browserPath", "proxy", "burpApi", "burpApiKey", "burpResourcePool", "burpAuditApi", "burpAuditToken", "interactshServer", "interactshToken"] as const) {
+    for (const k of ["baseURL", "apiKey", "deepModel", "lightModel", "browserPath", "proxy", "burpApi", "burpApiKey", "burpResourcePool", "burpAuditApi", "burpAuditToken", "interactshServer", "interactshToken", "operatorContext"] as const) {
         const v = s[k];
         if (typeof v === "string" && v.trim()) clean[k] = v.trim();
     }

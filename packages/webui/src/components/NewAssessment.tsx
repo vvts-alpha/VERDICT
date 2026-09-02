@@ -41,6 +41,7 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
       if (!s) return;
       if (s.deepModel) setModel(s.deepModel);
       if (s.lightModel) setFastModel(s.lightModel);
+      if (s.operatorContext) setContext((prev) => prev || s.operatorContext); // pre-fill from the global Settings default (per-run edits win)
       setUseDesktopSettings(true);
     });
   }, [desktopBridge]);
@@ -210,7 +211,7 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
       <label className="nf-field">
         <span>Command</span>
         <select value={command} onChange={(e) => setCommand(e.target.value as "pilot" | "assess")}>
-          <option value="pilot">pilot (Claude-led)</option>
+          <option value="pilot">pilot (AI-led)</option>
           <option value="assess">assess (deterministic)</option>
         </select>
       </label>
@@ -309,8 +310,8 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
         </label>
       ) : null}
       {command === "pilot" ? (
-        <label className="nf-field nf-wide" title="operator context — standing FACTS about the target, appended to EVERY stage's system prompt (survey → diagnosis → scenario) so they inform the whole run. additive only: it guides the agent, it does not override the safety / scope / evidence-discipline rules.">
-          <span>Operator context (target facts)</span>
+        <label className="nf-field nf-wide" title="operator context — standing FACTS about the target (auth shape, tenant model, where the API lives), appended to EVERY stage's system prompt so they inform the whole run. Additive only: it guides the agent, it does not override the safety / scope / evidence-discipline rules. Unlike Focus (a one-run priority for the scenario stage), this is knowledge about the target. In the desktop app, set a reusable default in Settings → Agent.">
+          <span>Operator context (target facts — default in Settings → Agent)</span>
           <textarea
             value={context}
             onChange={(e) => setContext(e.target.value)}
@@ -321,15 +322,17 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
       ) : null}
 
       <div className="nf-checks">
-        <label>
-          <input type="checkbox" checked={headed} onChange={(e) => setHeaded(e.target.checked)} /> headed
-        </label>
+        {!useDesktopSettings ? (
+          <label title="show the automation browser window (headless off) — for debugging. In the desktop app, open the Live tab to watch the scan instead, so this is hidden.">
+            <input type="checkbox" checked={headed} onChange={(e) => setHeaded(e.target.checked)} /> headed
+          </label>
+        ) : null}
         {command === "pilot" ? (
           <>
-            <label>
+            <label title="map only (screens + APIs + screenshots) — no methodology / diagnosis / findings. Cheap recon; resume later to diagnose.">
               <input type="checkbox" checked={surveyOnly} onChange={(e) => setSurveyOnly(e.target.checked)} /> survey-only
             </label>
-            <label>
+            <label title="map EVERY screen — turns OFF the survey's auto-pruning of repetitive same-skeleton content pages (CMS article/news/category trees). Full coverage, but much slower/larger on content-heavy sites; leave off for a normal run.">
               <input type="checkbox" checked={exhaustive} onChange={(e) => setExhaustive(e.target.checked)} /> exhaustive
             </label>
             <label title="active Burp scan after diagnosis (uses env BURP_API)">

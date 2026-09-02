@@ -5,9 +5,10 @@ import { useEffect, useState, type ReactNode } from "react";
 // process to userData/settings.json and applied to the NEXT assessment run (no restart).
 
 const bridge = () => (typeof window !== "undefined" ? window.verdictDesktop?.settings : undefined);
+const appBridge = () => (typeof window !== "undefined" ? window.verdictDesktop?.app : undefined);
 
 const EMPTY: DesktopSettings = { provider: "claude-cli" };
-const SECTIONS = ["Models", "Network", "OOB", "Burp"] as const;
+const SECTIONS = ["Models", "Agent", "Network", "OOB", "Burp", "About"] as const;
 type Section = (typeof SECTIONS)[number];
 type StringKey = Exclude<keyof DesktopSettings, "provider" | "burpScan" | "oobProvider">;
 
@@ -38,13 +39,19 @@ function Text({
     return <input type={type} value={value} placeholder={ph} spellCheck={false} onChange={(e) => onChange(e.target.value)} />;
 }
 
+function TextArea({ value, onChange, ph, rows = 4 }: { value: string; onChange: (v: string) => void; ph?: string; rows?: number }) {
+    return <textarea value={value} placeholder={ph} spellCheck={false} rows={rows} onChange={(e) => onChange(e.target.value)} />;
+}
+
 export function Settings({ onClose }: { onClose: () => void }) {
     const [s, setS] = useState<DesktopSettings>(EMPTY);
     const [section, setSection] = useState<Section>("Models");
     const [saved, setSaved] = useState(false);
+    const [info, setInfo] = useState<AppInfo | null>(null);
 
     useEffect(() => {
         void bridge()?.get().then((v) => setS(v ?? EMPTY));
+        void appBridge()?.info().then(setInfo);
     }, []);
 
     const set = <K extends keyof DesktopSettings>(k: K, v: DesktopSettings[K]): void => {
@@ -103,6 +110,22 @@ export function Settings({ onClose }: { onClose: () => void }) {
                             </>
                         ) : null}
 
+                        {section === "Agent" ? (
+                            <>
+                                <p className="settings-note-inline">
+                                    <b>Operator context</b> is standing FACTS about your targets — auth shape, tenant model, where the API lives. It pre-fills the New form on every run and is appended to each stage's system prompt (<code>--context</code>). Additive only: it guides the agent, it never overrides the safety / scope / evidence-discipline rules. Leave blank if your targets differ each time (set it per run instead).
+                                </p>
+                                <Field label="Operator context" hint="target facts — pre-fills New; editable per run">
+                                    <TextArea
+                                        value={s.operatorContext ?? ""}
+                                        onChange={setStr("operatorContext")}
+                                        rows={6}
+                                        ph={"e.g. Auth is a JWT in the X-Auth header.\nTenant id is the last path segment.\nThe API is GraphQL at /graphql.\nTest accounts share org 42."}
+                                    />
+                                </Field>
+                            </>
+                        ) : null}
+
                         {section === "Network" ? (
                             <>
                                 <Field label="Upstream proxy" hint="Browser tab + scan traffic (browser + http), e.g. Burp — blank = direct"><Text value={s.proxy ?? ""} onChange={setStr("proxy")} ph="http://127.0.0.1:8080" /></Field>
@@ -158,6 +181,18 @@ export function Settings({ onClose }: { onClose: () => void }) {
                                 <Field label="REST API URL"><Text value={s.burpApi ?? ""} onChange={setStr("burpApi")} ph="http://127.0.0.1:1337" /></Field>
                                 <Field label="API key"><Text value={s.burpApiKey ?? ""} onChange={setStr("burpApiKey")} ph="key" type="password" /></Field>
                                 <Field label="Resource pool"><Text value={s.burpResourcePool ?? ""} onChange={setStr("burpResourcePool")} ph="default" /></Field>
+                            </>
+                        ) : null}
+
+                        {section === "About" ? (
+                            <>
+                                <p className="settings-note-inline"><b>VERDICT</b> — autonomous web / API pentest agent. AI drives · evidence proves · scans behind login.</p>
+                                <div className="settings-about">
+                                    <div className="settings-about-row"><span>Version</span><b>{info?.version ?? "…"}</b></div>
+                                    <div className="settings-about-row"><span>Electron</span><b>{info?.electron ?? "…"}</b></div>
+                                    <div className="settings-about-row"><span>Node</span><b>{info?.node ?? "…"}</b></div>
+                                    <div className="settings-about-row"><span>Chromium</span><b>{info?.chrome ?? "…"}</b></div>
+                                </div>
                             </>
                         ) : null}
                     </div>

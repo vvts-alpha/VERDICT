@@ -151,6 +151,7 @@ async function boot(): Promise<void> {
     // first click on a title-bar button). The renderer calls this when the pointer enters the title bar.
     ipcMain.on("win:focus-chrome", () => win?.webContents.focus());
     ipcMain.handle("win:is-maximized", () => !!win?.isMaximized());
+    ipcMain.handle("app:info", () => ({ version: app.getVersion(), electron: process.versions.electron, node: process.versions.node, chrome: process.versions.chrome }));
     win.on("maximize", () => win?.webContents.send("win:maximize-changed", true));
     win.on("unmaximize", () => win?.webContents.send("win:maximize-changed", false));
 

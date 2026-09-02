@@ -1,6 +1,6 @@
 {
   "name": "@veritas/desktop",
-  "version": "0.0.0",
+  "version": "2026.9.3",
   "private": true,
   "type": "module",
   "main": "dist/main.js",

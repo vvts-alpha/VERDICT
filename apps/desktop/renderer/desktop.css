@@ -115,6 +115,10 @@
 .settings-toggle input { margin-top: 3px; }
 .settings-toggle em { display: block; font-style: normal; color: #5a6472; font-size: 11px; }
 .settings-note-inline { color: var(--muted); font-size: 12px; line-height: 1.6; margin: 8px 0; }
+.settings-about { margin-top: 10px; }
+.settings-about-row { display: flex; justify-content: space-between; align-items: baseline; padding: 6px 0; border-bottom: 1px solid var(--border, #2a2f37); font-size: 13px; }
+.settings-about-row > span { color: var(--muted); }
+.settings-about-row > b { font-variant-numeric: tabular-nums; }
 .settings-head h2 { margin: 0; font-size: 16px; color: #fff; }
 .settings-x { background: transparent; border: 0; color: var(--muted); font-size: 20px; line-height: 1; cursor: default; }
 .settings-x:hover { color: var(--fg); }
