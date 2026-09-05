@@ -55,6 +55,7 @@ export function dedupSeedUrls(urls: ReadonlyArray<string>): string[] {
 }
 
 export interface BurpScanRequest {
+  signal?: AbortSignal;
   /** Burp REST base. e.g. http://127.0.0.1:1337 */
   base: string;
   /** API key (User options → Misc → REST API). Becomes the URL-path prefix. */
@@ -99,6 +100,7 @@ export async function startBurpScan(req: BurpScanRequest): Promise<string> {
   if (req.logins?.length) body.application_logins = req.logins;
   const res = await fetch(apiUrl(req.base, req.apiKey, "/v0.1/scan"), {
     method: "POST",
+    ...(req.signal ? { signal: req.signal } : {}),
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   });
@@ -136,8 +138,8 @@ interface BurpRestIssue {
 }
 
 /** Fetch the scan status + the issues found so far (cumulative). */
-export async function getBurpScan(base: string, apiKey: string | undefined, taskId: string): Promise<BurpScanStatus> {
-  const res = await fetch(apiUrl(base, apiKey, `/v0.1/scan/${taskId}`));
+export async function getBurpScan(base: string, apiKey: string | undefined, taskId: string, signal?: AbortSignal): Promise<BurpScanStatus> {
+  const res = await fetch(apiUrl(base, apiKey, `/v0.1/scan/${encodeURIComponent(taskId)}`), signal ? { signal } : {});
   if (!res.ok) throw new Error(`Burp REST status failed: ${res.status}`);
   const j = (await res.json()) as {
     scan_status?: string;

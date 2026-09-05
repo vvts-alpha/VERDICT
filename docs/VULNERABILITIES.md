@@ -37,6 +37,9 @@
 | `ssrf` | SSRF | in-band は `probe_ssrf`（IMDS / file:// / loopback の応答差）。blind は `probe_oob`（Interactsh または Collaborator） | medium–high |
 | `xxe` | XXE | `probe_upload`（in-band）または `probe_oob`（XML / アップロードに `{{OOB}}`） | high–critical |
 
+追加の専用プローブとして `probe_nosql`（NoSQL 演算子・時間差）、`probe_cors`（Origin 反射と資格情報許可）、
+`probe_proto`（注入後の応答マーカー）が実装されている。これらの存在は対象全体の網羅や実害の自動証明を意味しない。
+
 `probe_params` はリード生成。確認は上のプローブへ。
 
 ---
@@ -75,7 +78,7 @@ Cookie の予測可能性は `analyze_session` がライブの 1 リクエスト
 |---|---|
 | 公開 `.git/config` / `.git/HEAD` / `.env` | `exposed_file` |
 | 認証が必要なのに未認証で取れる | `auth_required` |
-| CORS 誤設定 | `cors_misconfig` |
+| CORS 誤設定 | `cors_misconfig`（pilot にも `probe_cors` あり） |
 | IDOR 仮説（隣 id） | `@veritas/agent` の verify |
 | ロール差分 | `authDiffScreen` |
 
@@ -98,7 +101,6 @@ Cookie の予測可能性は `analyze_session` がライブの 1 リクエスト
 - GraphQL 固有
 - HTTP リクエストスマグリング / キャッシュポイズニング
 - 本格デシリアライズ
-- プロトタイプ汚染（fingerprint の JS 注記のみ）
 - デフォルト認証情報の辞書ログイン
 
 残作業は [`CHECKLIST.md`](CHECKLIST.md)。

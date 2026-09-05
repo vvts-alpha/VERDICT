@@ -38,6 +38,9 @@ export { triageBurpInfo, formatBurpLeads, classifyBurpName } from "./burp-triage
 export type { BurpLead, LeadPriority, BurpLeadClass } from "./burp-triage.js";
 export { submitAudit, getAuditStatusAll, getAuditIssues, resetAudit, auditIssuesToBurpIssues, buildRawRequest } from "./burp-audit.js";
 export type { BurpAuditConn, AuditSubmit, AuditHostStatus } from "./burp-audit.js";
+export { submitSequentialAudit, getSequentialAudit } from "./burp-audit.js";
+export { runSequentialBurp, burpTaskSucceeded } from "./burp-sequential.js";
+export type { SequentialBurpResult, SequentialBurpStatus } from "./burp-sequential.js";
 export { oobStatus, oobPayload, oobPoll, BurpOobProvider } from "./burp-oob.js";
 export type { OobInteraction, OobPayload, OobPollOpts, OobProvider } from "./oob.js";
 export { FakeOobProvider } from "./oob.js";

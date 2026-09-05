@@ -49,23 +49,7 @@ export function NewLauncher({ onCancel }: { onCancel: () => void }) {
   const back = (): void => setMode(null);
 
   if (mode === "web") return <NewAssessment onCancel={back} />;
-  if (mode === "api") {
-    return (
-      <div className="newform">
-        <div className="nf-row nf-head">
-          <h2>API spec assessment</h2>
-          <button type="button" className="nf-cancel" onClick={back}>
-            ← Back
-          </button>
-        </div>
-        <p>Import an OpenAPI / Swagger spec to seed an API assessment. Available via the CLI for now:</p>
-        <pre className="mode-cli">
-          {"veritas spec-import --spec <openapi.json> --url <base-url>\nveritas scan --id <id>  &&  veritas logic --id <id>  &&  veritas report --id <id>"}
-        </pre>
-        <p className="mode-prompt">A WebUI form for this is next on the roadmap.</p>
-      </div>
-    );
-  }
+  if (mode === "api") return <NewAssessment onCancel={back} apiSpec />;
 
   return (
     <div className="newform">

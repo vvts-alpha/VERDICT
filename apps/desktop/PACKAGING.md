@@ -16,7 +16,7 @@ cd bundle && electron .                          # runs: window + in-process ser
 ```
 
 Verified end-to-end: the deployed app renders the UI and its spawned child resolves `playwright-core` + all
-`@veritas/*` from the bundle and runs a headless assessment. `node:sqlite` works (Electron 38 bundles Node 22.22).
+`@veritas/*` from the bundle and runs a headless assessment. `node:sqlite` works (the packaged Electron 38.0.0 runtime was checked with Node 22.18.0).
 
 The only external dependency is a **Chromium for automation** — set its path in the app's **Settings**
 (`VERDICT_BROWSER_PATH`). The LLM provider (OpenCodeGo / OpenAI / Claude) is also configured in Settings.

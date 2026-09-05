@@ -166,3 +166,12 @@ test("apiCallToBuiltScreen: JS-discovered endpoint → concrete, IDOR-typed synt
 test("apiCallToBuiltScreen: unparseable base URL → null", () => {
   assert.equal(apiCallToBuiltScreen({ method: "GET", urlTemplate: "/x", auth: "none", reqSchema: null, resSchema: null }, "not a url"), null);
 });
+
+test("API upload validation accepts supported operations and rejects wrong formats and empty documents", async () => {
+  const { validateOpenApiDocument } = await import("./openapi-ingest.js");
+  for (const doc of [null, {}, { openapi: "3.0.3", paths: {} }, { openapi: "4.0", paths: { "/": { get: {} } } }]) {
+    assert.throws(() => validateOpenApiDocument(doc));
+  }
+  validateOpenApiDocument({ openapi: "3.1.0", paths: { "/items": { post: {} } } });
+  validateOpenApiDocument({ swagger: "2.0", paths: { "/items": { get: {} } } });
+});

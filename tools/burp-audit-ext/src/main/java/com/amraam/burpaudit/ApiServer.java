@@ -69,7 +69,24 @@ public final class ApiServer {
 
         if (path.equals("/scan")) {
             if (!method.equals("POST")) { sendError(resp, 405, "POST only"); return; }
-            handleScan(req, resp);
+            handleScan(req, resp, false);
+        } else if (path.equals("/scan/serial")) {
+            if (!method.equals("POST")) { sendError(resp, 405, "POST only"); return; }
+            handleScan(req, resp, true);
+        } else if (path.startsWith("/scan/serial/")) {
+            if (!method.equals("GET")) { sendError(resp, 405, "GET only"); return; }
+            String id = urlDecode(path.substring("/scan/serial/".length()));
+            Audit audit = registry.getSerial(id);
+            if (audit == null) { sendError(resp, 404, "no sequential audit for " + id); return; }
+            JsonObject out = new JsonObject();
+            out.addProperty("id", id);
+            out.addProperty("status", audit.statusMessage());
+            out.addProperty("requests_made", audit.requestCount());
+            out.addProperty("errors", audit.errorCount());
+            JsonArray issues = new JsonArray();
+            for (AuditIssue issue : audit.issues()) issues.add(issueJson(new IssueStore.Entry(System.currentTimeMillis(), issue), true));
+            out.add("issues", issues);
+            sendJson(resp, 200, out);
         } else if (path.equals("/status")) {
             handleStatusAll(resp);
         } else if (path.startsWith("/status/")) {
@@ -103,7 +120,7 @@ public final class ApiServer {
     }
 
     // ── POST /scan ──
-    private void handleScan(MicroHttpServer.Request req, MicroHttpServer.Response resp) throws IOException {
+    private void handleScan(MicroHttpServer.Request req, MicroHttpServer.Response resp, boolean serial) throws IOException {
         JsonObject body;
         try {
             body = JsonParser.parseString(req.bodyString()).getAsJsonObject();
@@ -123,14 +140,17 @@ public final class ApiServer {
 
         String key;
         try {
-            key = registry.submit(h, p, secure, mode, raw);
+            key = serial ? registry.submitSerial(h, p, secure, mode, raw) : registry.submit(h, p, secure, mode, raw);
+        } catch (AuditRegistry.BusyException e) {
+            sendError(resp, 409, e.getMessage());
+            return;
         } catch (Exception e) {
             sendError(resp, 400, "could not submit request: " + e.getMessage());
             return;
         }
         JsonObject out = new JsonObject();
         out.addProperty("status", "queued");
-        out.addProperty("host", key);
+        out.addProperty(serial ? "id" : "host", key);
         out.addProperty("audit_mode", "passive".equalsIgnoreCase(mode) ? "passive" : "active");
         sendJson(resp, 200, out);
     }

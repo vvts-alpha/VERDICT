@@ -1,4 +1,5 @@
-import { useEffect, useState, type ReactNode } from "react";
+import type { ReadinessCheck } from "@veritas/core";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 
 // In-app settings, organized like a native app: a left category nav + a right pane (not one long form).
 // Configure the AI (provider/models), network (proxy + automation browser), and Burp — persisted by the main
@@ -47,6 +48,10 @@ export function Settings({ onClose }: { onClose: () => void }) {
     const [s, setS] = useState<DesktopSettings>(EMPTY);
     const [section, setSection] = useState<Section>("Models");
     const [saved, setSaved] = useState(false);
+    const [checking, setChecking] = useState(false);
+    const [checks, setChecks] = useState<ReadinessCheck[]>([]);
+    const [error, setError] = useState("");
+    const editVersion = useRef(0);
     const [info, setInfo] = useState<AppInfo | null>(null);
 
     useEffect(() => {
@@ -57,6 +62,8 @@ export function Settings({ onClose }: { onClose: () => void }) {
     const set = <K extends keyof DesktopSettings>(k: K, v: DesktopSettings[K]): void => {
         setS((prev) => ({ ...prev, [k]: v }));
         setSaved(false);
+        setChecks([]);
+        editVersion.current++;
     };
     const setStr = (k: StringKey) => (v: string) => set(k, v);
 
@@ -66,6 +73,14 @@ export function Settings({ onClose }: { onClose: () => void }) {
             setS(v);
             setSaved(true);
         }
+    };
+
+    const check = async (): Promise<void> => {
+        setChecking(true); setChecks([]); setError("");
+        const version = editVersion.current;
+        try { const result = await bridge()?.check(s) ?? []; if (version === editVersion.current) setChecks(result); }
+        catch { setError("Connection checks could not finish. Try again shortly."); }
+        finally { setChecking(false); }
     };
 
     const openai = s.provider === "openai";
@@ -198,8 +213,14 @@ export function Settings({ onClose }: { onClose: () => void }) {
                     </div>
                 </div>
 
+                <div className="settings-checks" aria-live="polite">
+                    {checks.map((c) => <p key={c.name} style={{ color: c.status === "error" ? "var(--err)" : c.status === "ok" ? "var(--ok)" : "var(--muted)" }}><b>{c.name}: {c.status}</b> — {c.message}</p>)}
+                    {error ? <p role="alert">{error}</p> : null}
+                </div>
                 <div className="settings-actions">
+                    <button type="button" className="settings-save" disabled={checking} onClick={() => void check()}>{checking ? "Checking…" : "Check connections"}</button>
                     <button type="button" className="settings-save" onClick={() => void save()}>Save</button>
+                    <small>Checks use the values above without saving. Model checks send short test requests and may use quota.</small>
                     {saved ? <span className="settings-saved">saved — applies to the next run</span> : null}
                 </div>
             </div>

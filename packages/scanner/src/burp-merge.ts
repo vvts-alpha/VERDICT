@@ -49,6 +49,14 @@ export function mergeBurpIssues(
     const ep = /(\/[A-Za-z0-9_{}/.-]+)/.exec(f.title)?.[1] ?? "/";
     existing.add(keyOf(coarseCategory(f.title), ep));
   }
+  const findingIds = new Set(state.findings.map((f) => f.id));
+  let sequence = 0;
+  const nextId = (): string => {
+    let candidate: string;
+    do { candidate = `${prefix}-${String(++sequence).padStart(3, "0")}`; } while (findingIds.has(candidate));
+    findingIds.add(candidate);
+    return candidate;
+  };
   let added = 0;
   let skipped = 0;
   let oos = 0;
@@ -107,7 +115,7 @@ export function mergeBurpIssues(
       note: first.issue.name,
     });
     store.upsertFinding(id, {
-      id: `${prefix}-${String(added).padStart(3, "0")}`,
+      id: nextId(),
       screenId: null,
       title: `[burp] ${first.issue.name}${urls.length > 1 ? ` (${urls.length} URLs)` : ""}`,
       severity,

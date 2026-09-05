@@ -56,7 +56,7 @@ export function renderMarkdown(m: ReportModel): string {
   out.push(`| Started | ${m.startedAt} |`);
   out.push(`| Generated | ${m.generatedAt} |`);
   out.push(`| Phase | ${m.phase} |`);
-  out.push(`| Screens | ${m.stats.screens.total} mapped · ${m.stats.screens.scanned} scanned · ${m.stats.screens.remaining} remaining |`);
+  out.push(`| Screens | ${m.stats.screens.total} mapped · ${m.stats.screens.scanned} tested · ${m.stats.screens.excluded} excluded · ${m.stats.screens.remaining} unfinished |`);
   out.push(`| Hypotheses | ${m.stats.hypotheses.total} (${m.stats.hypotheses.confirmed} confirmed) |`);
   out.push(`| Findings | ${m.stats.findings.total} |`);
   out.push(`| Tooling | ${m.brand} |`, "");

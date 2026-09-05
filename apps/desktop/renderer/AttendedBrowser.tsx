@@ -55,6 +55,8 @@ export function AttendedBrowser({
     const [note, setNote] = useState<{ ok: boolean; text: string } | null>(null);
     const [captured, setCaptured] = useState<{ path: string; host: string; header?: string; cookies?: number; localStorage?: number } | null>(null);
     const [launching, setLaunching] = useState(false);
+    const [sessionRoles, setSessionRoles] = useState<string[]>([]);
+    const [sessionRole, setSessionRole] = useState("");
 
     // Keep the native view aligned with the placeholder region.
     useEffect(() => {
@@ -132,17 +134,18 @@ export function AttendedBrowser({
         if (!captured || !currentRunId) return false;
         setLaunching(true);
         try {
-            const res = await fetch(`/api/assessments/${encodeURIComponent(currentRunId)}/inject-session`, {
+            const res = await fetch(`/api/assessments/${encodeURIComponent(currentRunId)}/continue-session`, {
                 method: "POST",
                 headers: { "content-type": "application/json" },
-                body: JSON.stringify({ cookieFile: captured.path }),
+                body: JSON.stringify({ cookieFile: captured.path, ...(handoffId ? { handoffId } : {}), ...(sessionRole ? { role: sessionRole } : {}) }),
             });
+            const j = await res.json();
             if (res.ok) {
-                setNote({ ok: true, text: `session injected into the running scan — it continues authenticated at the next screen` });
+                setNote({ ok: true, text: j.action === "restarted" ? "Diagnosis restarted with the captured session" : "Session queued; the running diagnosis will apply it shortly" });
                 return true;
             }
-            const j = (await res.json().catch(() => ({}))) as { error?: string };
-            setNote({ ok: false, text: j.error ?? `inject failed (${res.status})` });
+            if (Array.isArray(j.roles)) setSessionRoles(j.roles);
+            setNote({ ok: false, text: j.error ?? `continue failed (${res.status})` });
             return false;
         } catch (e) {
             setNote({ ok: false, text: String(e) });
@@ -157,16 +160,7 @@ export function AttendedBrowser({
         if (!handoffId || !currentRunId || !captured) return;
         const ok = await inject();
         if (!ok) return;
-        setLaunching(true);
-        try {
-            await fetch(`/api/assessments/${encodeURIComponent(currentRunId)}/handoffs/${encodeURIComponent(handoffId)}/resolve`, {
-                method: "POST",
-            });
-            onClose();
-        } catch (e) {
-            setNote({ ok: false, text: String(e) });
-            setLaunching(false);
-        }
+        onClose();
     };
 
     // Attended → auto handoff: launch a headless authenticated scan of this target using the captured session cookie.
@@ -174,6 +168,11 @@ export function AttendedBrowser({
         if (!captured) return;
         setLaunching(true);
         try {
+            const checks = await window.verdictDesktop?.settings.check();
+            if (checks?.some((c) => c.status === "error")) {
+                setNote({ ok: false, text: "Setup check failed. Open Settings → Check connections before starting." });
+                return;
+            }
             const res = await fetch("/api/run", {
                 method: "POST",
                 headers: { "content-type": "application/json" },
@@ -192,6 +191,8 @@ export function AttendedBrowser({
             }
         } catch (e) {
             setNote({ ok: false, text: String(e) });
+            setLaunching(false);
+        } finally {
             setLaunching(false);
         }
     };
@@ -215,9 +216,10 @@ export function AttendedBrowser({
                 {captured?.header ? (
                     <button type="button" className="attb-copy" onClick={() => void copyCookies()} title="Copy the Cookie header to the clipboard (Repeater / curl)">Copy cookies</button>
                 ) : null}
+                    {sessionRoles.length ? <label>Logged-in role <select value={sessionRole} onChange={(e) => setSessionRole(e.target.value)}><option value="">Choose role</option>{sessionRoles.map((role) => <option key={role} value={role}>{role}</option>)}</select></label> : null}
                 {captured && currentRunId && !handoffId ? (
-                    <button type="button" className="attb-scan" disabled={launching} onClick={() => void inject()} title="Inject this session into the scan you're viewing — it continues authenticated, no restart">
-                        {launching ? "Injecting…" : "Inject into this run →"}
+                    <button type="button" className="attb-scan" disabled={launching} onClick={() => void inject()} title="Apply the captured login and continue this diagnosis; restart it if stopped">
+                        {launching ? "Continuing…" : "Continue this run →"}
                     </button>
                 ) : null}
                 {captured && !handoffId ? (
@@ -231,7 +233,7 @@ export function AttendedBrowser({
                         className="attb-scan"
                         disabled={launching || !captured}
                         onClick={() => void continueHandoff()}
-                        title="Inject the captured cookies into the scan, mark the handoff done, and return to Main"
+                        title="Apply the captured login, restart the diagnosis if stopped, and return to Main"
                     >
                         {launching ? "Continuing…" : "Logged in → continue"}
                     </button>

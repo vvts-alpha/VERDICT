@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { seedSpecInventory } from "./spec-inventory.js";
 // @veritas/cli — DESIGN §11 / §12 M0.
 // Creates an assessment and writes runs/<id>/state.sqlite (+ observe via status / list).
 // The crawl/scan bodies are later milestones. This is a thin front over the state store.
@@ -38,7 +39,7 @@ import {
 import { PlaywrightDriver, buildInventory, crawl, exploreScreen, htmlToPdf, labelInventory, normalizePath, parseOpenApiToScreens, smartLogin, writeScreenInventory } from "@veritas/crawler";
 import type { LoginCreds } from "@veritas/crawler";
 import { resolveLlmConfig, makeLlmClient } from "@veritas/llm";
-import { EvidenceStore, FetchHttpClient, SECURITY_HEADERS, auditHeaders, parseBurpReport, pickBurpConfigs, readEvidenceArtifact, scanInventory, startBurpScan, getBurpScan, dedupSeedUrls, submitAudit, getAuditStatusAll, getAuditIssues, resetAudit, buildRawRequest, mergeBurpIssues as scannerMergeBurpIssues, triageBurpInfo, formatBurpLeads, resolveOobProvider } from "@veritas/scanner";
+import { EvidenceStore, FetchHttpClient, SECURITY_HEADERS, auditHeaders, parseBurpReport, pickBurpConfigs, readEvidenceArtifact, scanInventory, startBurpScan, getBurpScan, dedupSeedUrls, submitSequentialAudit, getSequentialAudit, runSequentialBurp, buildRawRequest, mergeBurpIssues as scannerMergeBurpIssues, triageBurpInfo, formatBurpLeads, resolveOobProvider } from "@veritas/scanner";
 import type { BurpAuditConn, OobProvider } from "@veritas/scanner";
 import type { BurpIssue } from "@veritas/scanner";
 import { assessLogicInventory, assessScreenLogic, authDiffScreen } from "@veritas/agent";
@@ -74,6 +75,8 @@ commands:
             survey only: maps screens + screenshots + API extraction only, no diagnosis/findings (cheap recon. diagnose later with --resume)
             ※ by default, during survey the model dynamically prunes low-value CMS content trees etc. via ignore_paths (curbs frontier explosion).
               add [--exhaustive] to disable pruning and extract every screen (= full survey mode).
+  pilot --spec <openapi.json> --url <base-url> [--manifest <file.json>] [--out <dir>]
+            seed the API inventory from a JSON specification, then plan and diagnose in the same run
   pilot --resume --id <id> [--manifest <file.json>] [--browser-path <bin>] [--no-sandbox] [--out <dir>]
   pilot --from-asr <asr-id|asset_inventory.json> [--from-asr-top <n>] [--from-asr-band critical|high|medium|low] [--from-asr-concurrency <n>] [--out <dir>]
             continue an existing run: skip survey/methodology, diagnose only undiagnosed (queued) screens (finish a crashed run)
@@ -1065,6 +1068,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       url: { type: "string" },
       id: { type: "string" },
       resume: { type: "boolean" },
+      spec: { type: "string" },
       "survey-only": { type: "boolean" },
       out: { type: "string" },
       model: { type: "string" },
@@ -1114,7 +1118,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
     });
     return;
   }
-  const resume = !!values.resume;
+  let resume = !!values.resume;
   // resume skips survey/methodology and resumes only diagnosis. Even without --manifest, it reads back the
   // runs/<id>/manifest.json persisted at start to restore the auth material (roleCreds/cookie/httpBasic/attended).
   // Note: without this, everything after resume becomes unauth and everything behind the auth wall returns 401, making diagnosis impossible.
@@ -1174,6 +1178,17 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       target: { kind: "single_url", url: seedUrl, followLinks: !lockToTargets, maxDepth: manifest?.crawl?.maxDepth ?? 10 }, // crawl default depth = 10
       scope,
     });
+  }
+
+  if (values.spec && !resume) {
+    try {
+      const doc: unknown = JSON.parse(readFileSync(values.spec, "utf8"));
+      seedSpecInventory(store, id, runsDir, doc, seedUrl, scope);
+      resume = true;
+    } catch (e) {
+      store.close();
+      fail(`Cannot import API specification: ${String(e instanceof Error ? e.message : e)}`);
+    }
   }
 
   const roleCreds = new Map<string, LoginCreds>();
@@ -2266,7 +2281,7 @@ async function runBurpScanOnRun(
     }
   }
   // 同一エンドポイント(パス + クエリ param 名)の値違いを1本に畳む(/login?next=… の大量スキャン生成を防ぐ)。
-  const urls = dedupSeedUrls(candidates).slice(0, 300);
+  const urls = dedupSeedUrls(candidates.filter((u) => isInScope(u, state.scope)));
   if (urls.length === 0) {
     console.log("⚠ burp-scan: no in-scope URLs, skipping (run survey/pilot first)");
     return 0;
@@ -2274,76 +2289,30 @@ async function runBurpScanOnRun(
   console.log(`▶ burp-scan ${id} → ${base}`);
   console.log(`  config: ${o.configs.join(" + ")}${o.configReason ? ` (${o.configReason})` : ""}${usePool ? ` | pool: ${resourcePool}` : " | pool: (Burp default)"} | seeds: ${urls.length}${o.logins.length ? ` | auth: ${o.logins.length}` : ""}`);
 
-  const startScan = (pool: string | undefined, customs: string[] | undefined): Promise<string> =>
-    startBurpScan({ base, ...(apiKey ? { apiKey } : {}), urls, configs: o.configs, ...(pool ? { resourcePool: pool } : {}), ...(o.logins.length ? { logins: o.logins } : {}), ...(customs && customs.length ? { customConfigs: customs } : {}) });
-
-  const pool0 = usePool ? resourcePool : undefined;
-  const customs0 = o.customConfigs && o.customConfigs.length ? o.customConfigs : undefined;
-  let taskId: string;
-  try {
-    taskId = await startScan(pool0, customs0);
-  } catch (e) {
-    const msg = String(e);
-    if (customs0) {
-      // operator の CustomConfiguration(scan policy / session 注入)が弾かれた可能性 → 無しで再試行(スキャン自体は走らせる)。
-      console.log(`⚠ scan start with your CustomConfiguration failed (${msg.slice(0, 120)}); retrying WITHOUT it (auto config / UNAUTHENTICATED). Check BURP_SCAN_CONFIG_FILE / BURP_SESSION_CONFIG_FILE against your Burp.`);
-      try {
-        taskId = await startScan(pool0, undefined);
-      } catch (e2) {
-        if (usePool && /resource pool/i.test(String(e2))) {
-          try {
-            taskId = await startScan(undefined, undefined);
-          } catch (e3) {
-            console.log(`⚠ burp-scan start failed: ${String(e3).slice(0, 160)} — skipping`);
-            return 0;
-          }
-        } else {
-          console.log(`⚠ burp-scan start failed: ${String(e2).slice(0, 160)} — skipping`);
-          return 0;
-        }
-      }
-    } else if (usePool && /resource pool/i.test(msg)) {
-      console.log(`⚠ resource pool "${resourcePool}" not found in Burp, continuing on the default pool (create a concurrency 1 / Delay 250ms pool to throttle).`);
-      try {
-        taskId = await startScan(undefined, undefined);
-      } catch (e2) {
-        console.log(`⚠ burp-scan start failed: ${String(e2).slice(0, 160)} — skipping`);
-        return 0;
-      }
-    } else {
-      console.log(`⚠ burp-scan start failed: ${msg.slice(0, 160)}\n  → Burp Pro REST enabled? base=${base} / key? — skipping`);
-      return 0;
-    }
-  }
-  console.log(`  scan task ${taskId} started; polling every ${o.pollSec}s (timeout ${o.maxMin}m)…`);
-
-  const deadline = Date.now() + o.maxMin * 60_000;
-  let last: Awaited<ReturnType<typeof getBurpScan>> | null = null;
-  while (Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, o.pollSec * 1000));
-    await o.onPoll?.(); // セッション維持(authed Burp スキャン中に Cookie/トークンを stale 化させない)
-    try {
-      last = await getBurpScan(base, apiKey, taskId);
-    } catch (e) {
-      console.log(`  ⚠ poll error: ${String(e).slice(0, 120)}`);
-      continue;
-    }
-    console.log(`  [${last.status}] progress ${last.progress}% · ${last.issueEvents} issue event(s)`);
-    if (last.status === "succeeded" || last.status === "failed") break;
-  }
-  if (!last) {
-    console.log("⚠ burp-scan: couldn't get scan status (timeout) — skipping");
-    return 0;
-  }
-  if (last.status !== "succeeded") {
-    // Non-succeeded on loop exit usually means the ${maxMin}m deadline hit mid-scan → issues below are PARTIAL.
-    const msg = `⚠ burp-scan ended status=${last.status} (likely the ${o.maxMin}m timeout) — imported issues may be PARTIAL. Let Burp finish, then import the rest: burp-import --id ${id} --report <burp.xml>.`;
-    console.log(msg);
-    store.appendEvent(id, { type: "note", payload: { message: msg } });
-  }
-
-  const { added, skipped, oos } = mergeBurpIssues(store, id, state, runsDir, last.issues, "bs");
-  console.log(`\nburp-scan ${id}: ${last.issues.length} issue(s) → +${added} net-new(dup ${skipped} / out-of-scope ${oos})`);
+  let added = 0;
+  const result = await runSequentialBurp({
+    items: urls,
+    start: (url, signal) => startBurpScan({
+      base, signal, ...(apiKey ? { apiKey } : {}), urls: [url], configs: o.configs,
+      ...(usePool ? { resourcePool } : {}),
+      ...(o.logins.length ? { logins: o.logins } : {}),
+      ...(o.customConfigs?.length ? { customConfigs: o.customConfigs } : {}),
+    }),
+    poll: (taskId, signal) => getBurpScan(base, apiKey, taskId, signal),
+    onStart: (index, taskId) => console.log(`  [${index + 1}/${urls.length}] scan task ${taskId} started (timeout ${o.maxMin}m per task)`),
+    onProgress: (snapshot) => console.log(`  [${snapshot.status}] progress ${snapshot.progress}%`),
+    onResult: async (snapshot) => {
+      const current = store.loadAssessment(id);
+      if (!current) throw new Error(`Assessment ${id} disappeared`);
+      added += mergeBurpIssues(store, id, current, runsDir, snapshot.issues, "bs").added;
+    },
+    ...(o.onPoll ? { onPoll: o.onPoll } : {}),
+    pollIntervalMs: o.pollSec * 1000,
+    taskTimeoutMs: o.maxMin * 60_000,
+  });
+  const message = `burp-scan: ${result.completed}/${result.total} tasks completed, ${result.submitted} submitted; +${added} findings${result.stoppedReason ? ` — PARTIAL: ${result.stoppedReason}. No further tasks submitted; any running Burp task is left in Burp. Export remaining results and use burp-import.` : ""}`;
+  console.log(message);
+  store.appendEvent(id, { type: "note", payload: { message } });
   if (added > 0) {
     if (o.verify !== false) await verifyImportedBurp(store, id, runsDir, { ...(o.verifyModel ? { model: o.verifyModel } : {}), httpBasic: o.httpBasic ?? null, ...(o.customHeaders ? { customHeaders: o.customHeaders } : {}) });
     const fs2 = store.loadAssessment(id);
@@ -2490,7 +2459,7 @@ function collectAuditRequests(state: AssessmentState): Array<{ method: string; u
       specs.push({ method: m, url: abs, ...(body ? { body, contentType: "application/json" } : {}) });
     }
   }
-  return specs.slice(0, 300);
+  return specs;
 }
 
 /** VERDICT Audit REST 経由でスキャン(submit→poll→issues→merge→verify→report)。非致命。 */
@@ -2506,82 +2475,43 @@ async function runBurpAuditOnRun(
   if (o.bearer) sessionHeaders.Authorization = `Bearer ${o.bearer}`;
   else if (o.httpBasic) sessionHeaders.Authorization = `Basic ${Buffer.from(`${o.httpBasic.user}:${o.httpBasic.pass}`, "utf8").toString("base64")}`;
 
-  const specs = collectAuditRequests(state);
-  if (specs.length === 0) {
+  const allSpecs = collectAuditRequests(state);
+  if (allSpecs.length === 0) {
     console.log("⚠ burp-audit: no in-scope endpoints (run survey/pilot first) — skipping");
     return 0;
   }
-  console.log(`▶ burp-audit ${id} → ${o.conn.base} | ${specs.length} authenticated request(s) (cookie ${o.cookie ? "✓" : "—"} / bearer ${o.bearer ? "✓" : "—"})`);
-
-  const startTs = Date.now();
-  await resetAudit(o.conn); // この拡張の蓄積をクリア(過去 run の issue を混ぜない)
-
-  const hostKeys = new Set<string>();
-  let submitted = 0;
-  for (const spec of specs) {
-    try {
+  const specs = allSpecs;
+  console.log(`▶ burp-audit ${id} → ${o.conn.base} | ${specs.length} authenticated request(s), sequential (timeout ${o.maxMin}m per task)`);
+  let added = 0;
+  const result = await runSequentialBurp({
+    items: specs,
+    start: async (spec, signal) => {
       const u = new URL(spec.url);
       const port = u.port ? Number(u.port) : u.protocol === "https:" ? 443 : 80;
       const raw = buildRawRequest({
-        method: spec.method,
-        pathWithQuery: u.pathname + u.search,
-        hostHeader: u.host,
+        method: spec.method, pathWithQuery: u.pathname + u.search, hostHeader: u.host,
         headers: sessionHeaders,
         ...(spec.body ? { body: spec.body, contentType: spec.contentType } : {}),
       });
-      const key = await submitAudit(o.conn, { host: u.hostname, port, secure: u.protocol === "https:", auditMode: "active", request: raw });
-      hostKeys.add(key);
-      submitted += 1;
-    } catch (e) {
-      console.log(`  ⚠ submit failed for ${spec.method} ${spec.url}: ${String(e).slice(0, 120)}`);
-    }
-  }
-  if (submitted === 0) {
-    console.log("⚠ burp-audit: nothing submitted — is the extension up? (BURP_AUDIT_API / token) — skipping");
-    return 0;
-  }
-  console.log(`  submitted ${submitted}; polling every ${o.pollSec}s (timeout ${o.maxMin}m)…`);
-
-  const deadline = Date.now() + o.maxMin * 60_000;
-  let finished = false;
-  while (Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, o.pollSec * 1000));
-    await o.onPoll?.();
-    let statuses;
-    try {
-      statuses = await getAuditStatusAll(o.conn);
-    } catch (e) {
-      console.log(`  ⚠ poll error: ${String(e).slice(0, 120)}`);
-      continue;
-    }
-    const mine = statuses.filter((s) => hostKeys.has(s.host));
-    const reqs = mine.reduce((n, s) => n + s.requestsMade, 0);
-    console.log(`  [${mine.map((s) => s.status).join(", ") || "?"}] ${reqs} requests`);
-    if (mine.length > 0 && mine.every((s) => /finished|succeeded|failed|paused/i.test(s.status))) {
-      finished = true;
-      break;
-    }
-  }
-  // Deadline hit while Burp was still auditing → the /issues snapshot below is PARTIAL, not Burp's full result.
-  // Surface it loudly (console + WebUI note) so the "N issue(s)" line isn't mistaken for completion: let Burp finish, then burp-import the XML.
-  if (!finished) {
-    const msg = `⚠ burp-audit timed out at ${o.maxMin}m while Burp was still scanning — imported issues are PARTIAL. Let Burp finish, then import the rest: burp-import --id ${id} --report <burp.xml> (or raise the audit timeout).`;
-    console.log(msg);
-    store.appendEvent(id, { type: "note", payload: { message: msg } });
-  }
-
-  let issues;
-  try {
-    issues = await getAuditIssues(o.conn, { since: startTs });
-  } catch (e) {
-    console.log(`⚠ burp-audit /issues failed: ${String(e).slice(0, 160)} — skipping import`);
-    return 0;
-  }
-  const { added, skipped, oos } = scannerMergeBurpIssues(store, id, state, join(runsDir, id, "artifacts"), issues, {
-    prefix: "ba",
-    pathTemplate: (p) => normalizePath(p).template,
+      return submitSequentialAudit(o.conn, { host: u.hostname, port, secure: u.protocol === "https:", auditMode: "active", request: raw }, signal);
+    },
+    poll: (taskId, signal) => getSequentialAudit(o.conn, taskId, signal),
+    onStart: (index, taskId) => console.log(`  [${index + 1}/${specs.length}] audit ${taskId} started`),
+    onProgress: (snapshot) => console.log(`  [${snapshot.status}] ${snapshot.requestsMade} requests`),
+    onResult: async (snapshot) => {
+      const current = store.loadAssessment(id);
+      if (!current) throw new Error(`Assessment ${id} disappeared`);
+      added += scannerMergeBurpIssues(store, id, current, join(runsDir, id, "artifacts"), snapshot.issues, {
+        prefix: "ba", pathTemplate: (p) => normalizePath(p).template,
+      }).added;
+    },
+    ...(o.onPoll ? { onPoll: o.onPoll } : {}),
+    pollIntervalMs: o.pollSec * 1000,
+    taskTimeoutMs: o.maxMin * 60_000,
   });
-  console.log(`\nburp-audit ${id}: ${issues.length} issue(s) → +${added} net-new(dup ${skipped} / out-of-scope ${oos})`);
+  const message = `burp-audit: ${result.completed}/${result.total} tasks completed, ${result.submitted} submitted; +${added} findings${result.stoppedReason ? ` — PARTIAL: ${result.stoppedReason}. No further tasks submitted; any running Burp task is left in Burp. Export remaining results and use burp-import.` : ""}`;
+  console.log(message);
+  store.appendEvent(id, { type: "note", payload: { message } });
   if (added > 0) {
     // Audit 経路は authed セッション(cookie/bearer)を持つので再検証にも渡す(/profile 等の認証下 finding を再現可能に)。
     if (o.verify !== false)

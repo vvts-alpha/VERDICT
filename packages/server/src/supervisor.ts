@@ -31,6 +31,8 @@ export interface StartRunInput {
   command: "pilot" | "assess" | "redteam" | "asr";
   /** JSON in AssessManifest format (saved verbatim to runs/<id>/manifest.json). */
   manifest: unknown;
+  /** Uploaded OpenAPI JSON; saved with the run and consumed by pilot. */
+  spec?: unknown;
   options?: {
     model?: string;
     fastModel?: string;
@@ -124,7 +126,9 @@ export class Supervisor {
       writeFileSync(join(dir, "asset_inventory.json"), `${JSON.stringify({ version: 1, generatedAt: "", apex, assets: [] }, null, 2)}\n`);
     }
 
+    if (input.spec) writeFileSync(join(dir, "openapi.json"), JSON.stringify(input.spec));
     const args = [this.cfg.cliPath, input.command, "--manifest", manifestPath, "--id", id, "--out", this.cfg.runsDir];
+    if (input.spec) args.push("--spec", join(dir, "openapi.json"));
     const o = input.options ?? {};
     if (o.headed) args.push("--headed"); // shared: pilot / assess / redteam all accept --headed
     if (input.command === "redteam") {

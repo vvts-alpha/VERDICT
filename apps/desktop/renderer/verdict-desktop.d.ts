@@ -54,6 +54,7 @@ declare global {
     }
     interface SettingsBridge {
         get(): Promise<DesktopSettings>;
+        check(s?: DesktopSettings): Promise<import("@veritas/core").ReadinessCheck[]>;
         set(s: DesktopSettings): Promise<DesktopSettings>;
     }
     interface AppInfo {

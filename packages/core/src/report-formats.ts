@@ -114,7 +114,7 @@ export function renderReportHtml(m: ReportModel): string {
   out.push(row("Started", esc(m.startedAt)));
   out.push(row("Generated", esc(m.generatedAt)));
   out.push(row("Phase", esc(m.phase)));
-  out.push(row("Screens", `${m.stats.screens.total} mapped · ${m.stats.screens.scanned} scanned · ${m.stats.screens.remaining} remaining`));
+  out.push(row("Screens", `${m.stats.screens.total} mapped · ${m.stats.screens.scanned} tested · ${m.stats.screens.excluded} excluded · ${m.stats.screens.remaining} unfinished`));
   out.push(row("Hypotheses", `${m.stats.hypotheses.total} (${m.stats.hypotheses.confirmed} confirmed)`));
   out.push(row("Findings", String(m.stats.findings.total)));
   out.push(row("Tooling", esc(m.brand)));

@@ -140,7 +140,9 @@ export function StatusBar({
         <>
           <span>phase: <b>{view.phase}</b></span>
           <span>screens: <b>{c.total}</b></span>
-          <span>scanned: <b>{c.terminal}/{c.total}</b></span>
+          <span title="Screens whose diagnosis finished; excludes omitted screens">tested: <b>{c.byStatus.clean + c.byStatus.finding + c.byStatus.suspected}/{c.total}</b></span>
+          <span title="Screens omitted from diagnosis">excluded: <b>{c.byStatus.excluded}</b></span>
+          <span title="Queued, in progress, blocked, or failed; diagnosis is not complete">unfinished: <b>{c.remaining}</b></span>
           <span>findings: <b>{view.findings.length}</b></span>
           <span>tokens: <b>{view.budget.tokensUsed >= 1000 ? `${(view.budget.tokensUsed / 1000).toFixed(1)}k` : view.budget.tokensUsed}</b></span>
           <span>handoffs: <b>{view.handoffs.filter((h) => h.status === "pending").length}</b></span>

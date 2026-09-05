@@ -248,3 +248,15 @@ export function apiCallToBuiltScreen(api: ApiCall, baseUrl: string): BuiltScreen
     },
   };
 }
+
+/** Reject unsupported uploads before creating a run. External references are never fetched. */
+export function validateOpenApiDocument(doc: unknown): void {
+  const root = asObj(doc);
+  if (!root || !(str(root.openapi)?.startsWith("3.") || root.swagger === "2.0")) {
+    throw new Error("Use an OpenAPI 3.x or Swagger 2.0 JSON document");
+  }
+  const paths = asObj(root.paths);
+  if (!paths || !Object.entries(paths).some(([path, value]) => path.startsWith("/") && METHODS.some((m) => asObj(asObj(value)?.[m])))) {
+    throw new Error("The specification contains no supported HTTP operations in paths");
+  }
+}

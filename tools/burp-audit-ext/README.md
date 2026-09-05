@@ -5,7 +5,7 @@ Burp Suite Professional の Montoya 拡張。**認証済みの生 HTTP リクエ
 
 Burp 標準 REST API(`1337`)は scan のリクエストにセッションを乗せる手段が無い。本拡張は
 **セッションをリクエスト内に内包**させることでこれを回避する — VERDICT は live な Cookie/Bearer を載せた
-生リクエストをそのまま `POST /scan` するだけでよい(注入も OpenAPI も不要、パラメータも生リクエストの
+生リクエストをそのまま `POST /scan/serial` するだけでよい(注入も OpenAPI も不要、パラメータも生リクエストの
 body/query がそのまま insertion point になる)。
 
 API 仕様は `API.md`(本ディレクトリ)。
@@ -53,21 +53,30 @@ gradle shadowJar           # → build/libs/verdict-burp-audit.jar (Gson 同梱�
 
 ```bash
 # 認証済みリクエストを投入
-curl -s localhost:1338/scan -H 'content-type: application/json' -d '{
+curl -s localhost:1338/scan/serial -H 'content-type: application/json' -d '{
   "host":"192.168.74.148","port":8000,"secure":false,"audit_mode":"active",
   "request":"GET /account HTTP/1.1\r\nHost: 192.168.74.148:8000\r\nCookie: session=abc\r\n\r\n"
 }'
-# 進捗
-curl -s localhost:1338/status/192.168.74.148:8000
-# 新規 issue(run 開始 ts 以降)
-curl -s 'localhost:1338/issues?since=1719230000000&evidence=true'
-# クリア
-curl -s -X POST localhost:1338/reset
+# 返された id の進捗と、その Audit の issue（証拠込み）
+curl -s localhost:1338/scan/serial/<id>
+# 完了を確認して結果を保存した後、次のリクエストを投入する
 ```
 
-## VERDICT 連携(次のステップ)
+## VERDICT 連携
 
-`@veritas/scanner` 側に本 API のクライアント(`burp-audit.ts`)+ 生リクエストビルダーを足し、
-burp フェーズで「inventory を dedup → 各エンドポイントの **live 認証ヘッダ込み生リクエスト**を `POST /scan`
-→ `GET /status` をポーリング → `GET /issues?since=` を `mergeBurpIssues` で取り込み」を回す。
-拡張(Java)はこのリポジトリの `tools/`、クライアント(TS)は packages 側、という分担。
+拡張 v0.2.0 と更新後の VERDICT は、**投入 → 完了確認 → 結果保存 → 次の1件**で動く。
+同じホストでも毎回新しい Audit を作る。実行中または完了不明の Audit が本拡張にあれば、追加投入は `409`。
+既存の `/scan` は互換用に残るが、VERDICT は使わない。旧 JAR の `404` 時も一括投入へ戻さず停止する。
+JAR を差し替えて Reload する前に、以前の Audit が終了していることを Burp で確認すること。
+
+既定のタイムアウトは **1件あたり30分**（CLI `burp-scan --max-min`）。失敗・一時停止・通信エラー・
+タイムアウト時は次を投入せず、取得済みの結果を保存して部分結果と表示する。Burp 側の実行中タスクは
+自動削除しない。残りの結果は XML をエクスポートして `burp-import` で取り込める。
+`/reset` は自動実行しないため、過去の結果や Collaborator の相関情報を消さない。
+
+タスク内の HTTP 並列数は Burp の設定に従う。順次投入だけで HTTP 同時接続数が1になるわけではない。
+この変更は投入負荷の対策であり、AWT のネイティブクラッシュ解消を保証するものではない。
+
+## 回帰テスト
+
+`gradle check` は Burp 本体やネットワーク対象を使わず、順次投入の排他制御・完了判定・新規 Audit の生成を検証する。

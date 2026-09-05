@@ -6,7 +6,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { AssessmentStore, buildReport, deriveScopeFromSingleUrl, evaluateStop, recordRequests } from "./index.js";
+import { AssessmentStore, buildReport, buildReportModel, renderReportHtml, deriveScopeFromSingleUrl, evaluateStop, recordRequests } from "./index.js";
 import type { Finding, Screen } from "./index.js";
 
 function screen(id: string, urlTemplate: string): Screen {
@@ -174,4 +174,21 @@ test("evaluateStop continues when screens remain and budget is ok", () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("excluded screens are not reported as tested in HTML or Markdown", () => {
+  const dir = mkdtempSync(join(tmpdir(), "report-excluded-"));
+  const store = AssessmentStore.open(join(dir, "state.sqlite"));
+  try {
+    store.createAssessment({ id: "coverage", target: { kind: "single_url", url: "https://shop.test", followLinks: true, maxDepth: 1 }, scope: deriveScopeFromSingleUrl("https://shop.test") });
+    for (const [index, status] of (["clean", "suspected", "excluded", "blocked"] as const).entries()) {
+      store.upsertScreen("coverage", screen(`s-${index}`, `/page${index}`));
+      store.setScreenScanStatus("coverage", `s-${index}`, status);
+    }
+    const state = store.loadAssessment("coverage")!;
+    const model = buildReportModel(state);
+    assert.deepEqual(model.stats.screens, { total: 4, scanned: 2, excluded: 1, remaining: 1 });
+    assert.match(buildReport(state), /2 tested · 1 excluded · 1 unfinished/);
+    assert.match(renderReportHtml(model), /2 tested · 1 excluded · 1 unfinished/);
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
 });

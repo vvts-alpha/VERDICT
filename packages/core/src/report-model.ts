@@ -65,7 +65,7 @@ export interface ReportModel {
   generatedAt: string; // ISO
   scope: ScopePolicy;
   stats: {
-    screens: { total: number; scanned: number; remaining: number };
+    screens: { total: number; scanned: number; excluded: number; remaining: number };
     hypotheses: { total: number; confirmed: number };
     findings: { total: number; bySeverity: Record<Severity, number>; suspected: number };
   };
@@ -153,7 +153,7 @@ export function buildReportModel(state: AssessmentState, now: Date = new Date(),
     generatedAt: now.toISOString(),
     scope: state.scope,
     stats: {
-      screens: { total: cov.total, scanned: cov.terminal, remaining: cov.remaining },
+      screens: { total: cov.total, scanned: cov.byStatus.clean + cov.byStatus.finding + cov.byStatus.suspected, excluded: cov.byStatus.excluded, remaining: cov.remaining },
       hypotheses: { total: state.hypotheses.length, confirmed: confirmedHypotheses },
       findings: { total: confirmedCount, bySeverity, suspected: suspectedCount },
     },

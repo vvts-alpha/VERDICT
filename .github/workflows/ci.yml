@@ -20,5 +20,7 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Build (workspace dep order)
         run: pnpm -r build
+      - name: Typecheck
+        run: pnpm -r typecheck
       - name: Test (node:test via tsx)
         run: pnpm -r test

@@ -10,6 +10,9 @@ import burp.api.montoya.scanner.audit.Audit;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
+import java.util.UUID;
+import java.util.function.Supplier;
+import java.util.function.Consumer;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -19,6 +22,8 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class AuditRegistry {
 
     private final MontoyaApi api;
+    private final Map<String, Audit> serialAudits = new ConcurrentHashMap<>();
+    private boolean uncertainStart;
     private final Map<String, Audit> audits = new ConcurrentHashMap<>();
     private final Map<String, String> modes = new ConcurrentHashMap<>();
 
@@ -28,6 +33,7 @@ public final class AuditRegistry {
 
     /** 生リクエストを host:port の Audit へ投入。Audit キー(host:port)を返す。 */
     public synchronized String submit(String host, int port, boolean secure, String mode, String rawRequest) {
+        requireSerialIdle();
         String key = host + ":" + port;
         Audit audit = audits.get(key);
         if (audit == null) {
@@ -44,6 +50,52 @@ public final class AuditRegistry {
         HttpRequest request = HttpRequest.httpRequest(service, ByteArray.byteArray(rawRequest.getBytes(StandardCharsets.ISO_8859_1)));
         audit.addRequest(request);
         return key;
+    }
+
+    public static final class BusyException extends IllegalStateException {
+        BusyException(String message) { super(message); }
+    }
+
+    private static boolean finished(Audit audit) {
+        String status = audit.statusMessage();
+        return status != null && status.trim().matches("(?i)^(?:audit )?(?:finished|completed|succeeded)(?: successfully)?\\.?$");
+    }
+
+    private void requireSerialIdle() {
+        if (uncertainStart) throw new BusyException("An audit start failed with uncertain state; inspect Burp before resetting the extension");
+        for (Audit a : serialAudits.values()) {
+            if (!finished(a)) throw new BusyException("A sequential audit is still running or its completion is unknown");
+        }
+    }
+
+    /** A fresh Audit per request. Completed tasks remain available for task-scoped results. */
+    public synchronized String submitSerial(String host, int port, boolean secure, String mode, String rawRequest) {
+        HttpRequest request = HttpRequest.httpRequest(HttpService.httpService(host, port, secure),
+            ByteArray.byteArray(rawRequest.getBytes(StandardCharsets.ISO_8859_1)));
+        BuiltInAuditConfiguration cfg = "passive".equalsIgnoreCase(mode)
+            ? BuiltInAuditConfiguration.LEGACY_PASSIVE_AUDIT_CHECKS
+            : BuiltInAuditConfiguration.LEGACY_ACTIVE_AUDIT_CHECKS;
+        return submitSerial(() -> api.scanner().startAudit(AuditConfiguration.auditConfiguration(cfg)),
+            audit -> audit.addRequest(request));
+    }
+
+    synchronized String submitSerial(Supplier<Audit> create, Consumer<Audit> addRequest) {
+        requireSerialIdle();
+        for (Audit a : audits.values()) {
+            if (!finished(a)) throw new BusyException("A legacy audit is still running or its completion is unknown");
+        }
+        String id = UUID.randomUUID().toString();
+        // If creation fails after reaching Burp, no later call may silently create an overlapping task.
+        uncertainStart = true;
+        Audit audit = create.get();
+        serialAudits.put(id, audit);
+        addRequest.accept(audit);
+        uncertainStart = false;
+        return id;
+    }
+
+    public Audit getSerial(String id) {
+        return serialAudits.get(id);
     }
 
     public Audit get(String hostKey) {
@@ -68,6 +120,11 @@ public final class AuditRegistry {
                 /* already gone */
             }
         }
+        for (Audit a : serialAudits.values()) {
+            try { a.delete(); } catch (Exception ignored) { /* already gone */ }
+        }
+        serialAudits.clear();
+        uncertainStart = false;
         audits.clear();
         modes.clear();
     }

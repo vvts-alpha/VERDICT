@@ -64,3 +64,15 @@ test("out-of-scope dropped; in-scope deduped against existing claude-pilot findi
   assert.equal(res.added, 0);
   assert.equal(findings.length, 0);
 });
+
+test("sequential imports preserve earlier findings instead of reusing their ids", () => {
+  const persisted = new Map<string, Finding>();
+  const store = { upsertFinding: (_: string, f: Finding) => { persisted.set(f.id, f); } };
+  const dir = mkdtempSync(join(tmpdir(), "burpmerge-serial-"));
+  for (const item of [issue("Cross-site scripting (reflected)", "/search"), issue("SQL injection", "/login")]) {
+    mergeBurpIssues(store, "a-1", { findings: [...persisted.values()], scope }, dir, [item], { prefix: "ba" });
+  }
+  assert.equal(persisted.size, 2);
+  assert.match(persisted.get("ba-001")!.title, /Cross-site scripting/);
+  assert.match(persisted.get("ba-002")!.title, /SQL injection/);
+});

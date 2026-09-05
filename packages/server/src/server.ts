@@ -9,13 +9,14 @@ import { WebSocket, WebSocketServer } from "ws";
 
 import { AssessmentStore, buildReportModel, buildStateView, isInScope, parseTargetUrl, renderFindingsCsv, renderInventoryHtml, renderMarkdown, renderReportHtml, renderScreensCsv } from "@veritas/core";
 import type { TargetInput, WsMessage, ControlCommand, ScopePolicy } from "@veritas/core";
-import { htmlToPdf } from "@veritas/crawler";
+import { htmlToPdf, validateOpenApiDocument } from "@veritas/crawler";
 import { resolveLlmConfig, makeLlmClient } from "@veritas/llm";
 import type { AssessmentState } from "@veritas/core";
 import { handleAuthSubmit, handleLogout, roleForReq, loginPageHtml } from "./auth.js";
 import type { AuthConfig, Role } from "./auth.js";
 import { Supervisor, type RunLauncherConfig, type StartRunInput } from "./supervisor.js";
 import { Relay } from "./relay.js";
+import { continueSession, SessionContinuationError } from "./continue-session.js";
 
 export interface ServerOptions {
   runsDir: string;
@@ -157,7 +158,7 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
     let tooBig = false;
     req.on("data", (c) => {
       body += c;
-      if (body.length > 256 * 1024) {
+      if (body.length > 3 * 1024 * 1024) {
         tooBig = true;
         req.destroy();
       }
@@ -172,6 +173,12 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
       }
       if (input.command !== "pilot" && input.command !== "assess" && input.command !== "redteam" && input.command !== "asr") {
         return sendJson(res, 400, { error: "command must be 'pilot', 'assess', 'redteam', or 'asr'" });
+      }
+      if (input.spec !== undefined) {
+        try {
+          if (input.command !== "pilot") throw new Error("API specifications use AI-led diagnosis");
+          validateOpenApiDocument(input.spec);
+        } catch (e) { return sendJson(res, 400, { error: String(e instanceof Error ? e.message : e) }); }
       }
       const manifestTarget = (input.manifest as { target?: unknown } | null)?.target;
       if (!input.manifest || typeof input.manifest !== "object" || !manifestTarget) {
@@ -493,6 +500,27 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
   // capturing a cookie file — inject it into the RUNNING pilot. body = { cookieFile }. Only the PATH is queued (as a
   // control_command the pilot applies at its next checkpoint); the cookie stays in the local file. The path MUST be
   // inside runsDir (the pilot reads it) — reject anything outside (no arbitrary file read). Operator-only (viewer 403'd above).
+  m = url.match(/^\/api\/assessments\/([^/]+)\/continue-session$/);
+  if (m) {
+    if (!supervisor) return sendJson(res, 400, { error: "run launcher disabled" });
+    const id = decodeURIComponent(m[1] ?? "");
+    if (!/^[a-zA-Z0-9_-]+$/.test(id)) return sendJson(res, 400, { error: "invalid assessment id" });
+    let body = "";
+    req.on("data", (chunk) => { body += chunk; if (body.length > 8192) req.destroy(); });
+    req.on("end", () => {
+      const store = openStore(id);
+      if (!store) return sendJson(res, 404, { error: "assessment not found" });
+      try {
+        const input = JSON.parse(body) as { cookieFile: string; handoffId?: string; role?: string };
+        if (typeof input.cookieFile !== "string") throw new Error("cookieFile required");
+        sendJson(res, 200, continueSession(opts.runsDir, id, input, store, supervisor));
+      } catch (e) {
+        sendJson(res, 400, { error: e instanceof SessionContinuationError ? e.message : "Could not continue; check the captured session and saved run", ...(e instanceof SessionContinuationError && e.roles ? { roles: e.roles } : {}) });
+      } finally { store.close(); }
+    });
+    return;
+  }
+
   m = url.match(/^\/api\/assessments\/([^/]+)\/inject-session$/);
   if (m) {
     const id = decodeURIComponent(m[1] ?? "");

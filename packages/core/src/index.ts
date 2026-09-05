@@ -92,3 +92,4 @@ export type { ReportModel, ReportFindingRow, ReportScreenRow, ReportEvidence, Ev
 export { renderReportHtml, renderFindingsCsv, renderScreensCsv, renderInventoryHtml } from "./report-formats.js";
 export { buildOpenApi, jsonShapeToSchema, schemaToJsonShape } from "./openapi.js";
 export type { BuildOpenApiOptions } from "./openapi.js";
+export type { ReadinessCheck } from "./types/readiness.js";

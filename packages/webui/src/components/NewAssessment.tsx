@@ -1,5 +1,6 @@
 // "+ New" full manifest editor → POST /api/run → navigate to the launched run.
 // Builds an AssessManifest JSON (target / scope / crawl / auth.roles) + run options.
+import type { ReadinessCheck } from "@veritas/core";
 import { useEffect, useState } from "react";
 
 type AuthMethod = "manual" | "credentials" | "cookie";
@@ -26,9 +27,11 @@ function lines(s: string): string[] {
     .filter((x) => x.length > 0);
 }
 
-export function NewAssessment({ onCancel }: { onCancel: () => void }) {
+export function NewAssessment({ onCancel, apiSpec = false }: { onCancel: () => void; apiSpec?: boolean }) {
   const [command, setCommand] = useState<"pilot" | "assess">("pilot");
   const [target, setTarget] = useState("");
+  const [specText, setSpecText] = useState("");
+  const [specName, setSpecName] = useState("");
   const [model, setModel] = useState("claude-opus-4-8"); // deep default = Opus
   const [fastModel, setFastModel] = useState("claude-sonnet-5"); // fast default = Sonnet
   const [useDesktopSettings, setUseDesktopSettings] = useState(false);
@@ -81,6 +84,8 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
   const [anchorUrl, setAnchorUrl] = useState(""); // goto-safe authed hub (menu) — reach cold-nav-bouncing routes by clicking from here (blank = off)
 
   const [busy, setBusy] = useState(false);
+  const [checking, setChecking] = useState(false);
+  const [checks, setChecks] = useState<ReadinessCheck[]>([]);
   const [err, setErr] = useState<string | null>(null);
 
   const setHeader = (i: number, patch: Partial<{ name: string; value: string }>): void =>
@@ -109,6 +114,21 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
   const addRole = (): void => setRoles((rs) => [...rs, { name: "", method: "manual", password: "", description: "", cookieFile: "", loginUrl: "" }]);
   const rmRole = (i: number): void => setRoles((rs) => rs.filter((_, j) => j !== i));
 
+  const checkSetup = async (): Promise<boolean> => {
+    if (!desktopBridge?.settings?.check) return true;
+    setChecking(true); setChecks([]);
+    try {
+      const saved = await desktopBridge.settings.get();
+      const result: ReadinessCheck[] = await desktopBridge.settings.check({ ...saved,
+        ...(model ? { deepModel: model } : {}), ...(fastModel ? { lightModel: fastModel } : {}),
+        burpScan: burpScan || saved.burpScan,
+      });
+      setChecks(result);
+      return result.length > 0 && result.every((c) => c.status !== "error");
+    } catch { setErr("Could not check setup. Open Settings and check connections."); return false; }
+    finally { setChecking(false); }
+  };
+
   const submit = async (): Promise<void> => {
     if (!target.trim()) {
       setErr("Target URL is required");
@@ -122,6 +142,13 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
     } catch {
       setErr(`Target must start with http:// or https:// (e.g. https://${target.trim()})`);
       return;
+    }
+    let spec: unknown;
+    if (apiSpec) {
+      try {
+        spec = JSON.parse(specText);
+        if (!spec || typeof spec !== "object") throw new Error();
+      } catch { setErr("Choose a valid OpenAPI / Swagger JSON file first"); return; }
     }
     setErr(null);
     setBusy(true);
@@ -181,10 +208,11 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
     if (command === "pilot" && context.trim()) options.context = context.trim();
 
     try {
+      if (!(await checkSetup())) { setErr("Fix the failed setup checks in Settings before starting."); setBusy(false); return; }
       const res = await fetch("/api/run", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ command, manifest, options }),
+        body: JSON.stringify({ command, manifest, options, ...(apiSpec ? { spec } : {}) }),
       });
       const data = (await res.json()) as { id?: string; error?: string };
       if (!res.ok || !data.id) {
@@ -202,19 +230,31 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
   return (
     <div className="newform">
       <div className="nf-row nf-head">
-        <h2>New assessment</h2>
+        <h2>{apiSpec ? "API specification assessment" : "New assessment"}</h2>
         <button type="button" className="nf-cancel" onClick={onCancel}>
           ← Cancel
         </button>
       </div>
 
-      <label className="nf-field">
+      {!apiSpec ? <label className="nf-field">
         <span>Command</span>
         <select value={command} onChange={(e) => setCommand(e.target.value as "pilot" | "assess")}>
           <option value="pilot">pilot (AI-led)</option>
           <option value="assess">assess (deterministic)</option>
         </select>
-      </label>
+      </label> : (
+        <label className="nf-field nf-wide">
+          <span>OpenAPI 3.x / Swagger 2.0 JSON file *</span>
+          <input type="file" accept=".json,application/json" onChange={(e) => {
+            const file = e.target.files?.[0];
+            setSpecText(""); setSpecName("");
+            if (!file) return;
+            if (file.size > 2 * 1024 * 1024) { setErr("Specification must be 2 MB or smaller"); return; }
+            void file.text().then((text) => { setSpecText(text); setSpecName(file.name); setErr(null); }).catch(() => setErr("Could not read the specification"));
+          }} />
+          <small>{specName || "Select a JSON file. YAML and external references are not supported."} The target URL overrides the specification server; scope and authentication below still apply. Diagnosis starts from the imported endpoints.</small>
+        </label>
+      )}
 
       <label className="nf-field">
         <span>Target URL *</span>
@@ -279,7 +319,7 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
             <input value={maxScreens} onChange={(e) => setMaxScreens(e.target.value)} placeholder="40" inputMode="numeric" />
           </label>
         ) : null}
-        {command === "pilot" ? (
+        {command === "pilot" && !apiSpec ? (
           <label className="nf-field" title="cap how many screens the survey maps (empty = unlimited). bounds exploration on large sites.">
             <span>Max survey screens</span>
             <input value={maxSurveyScreens} onChange={(e) => setMaxSurveyScreens(e.target.value)} placeholder="(unlimited)" inputMode="numeric" />
@@ -329,12 +369,14 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
         ) : null}
         {command === "pilot" ? (
           <>
+            {!apiSpec ? <>
             <label title="map only (screens + APIs + screenshots) — no methodology / diagnosis / findings. Cheap recon; resume later to diagnose.">
-              <input type="checkbox" checked={surveyOnly} onChange={(e) => setSurveyOnly(e.target.checked)} /> survey-only
+              <input type="checkbox" disabled={apiSpec} checked={surveyOnly} onChange={(e) => setSurveyOnly(e.target.checked)} /> survey-only
             </label>
             <label title="map EVERY screen — turns OFF the survey's auto-pruning of repetitive same-skeleton content pages (CMS article/news/category trees). Full coverage, but much slower/larger on content-heavy sites; leave off for a normal run.">
-              <input type="checkbox" checked={exhaustive} onChange={(e) => setExhaustive(e.target.checked)} /> exhaustive
+              <input type="checkbox" disabled={apiSpec} checked={exhaustive} onChange={(e) => setExhaustive(e.target.checked)} /> exhaustive
             </label>
+            </> : null}
             <label title="active Burp scan after diagnosis (uses env BURP_API)">
               <input type="checkbox" checked={burpScan} onChange={(e) => setBurpScan(e.target.checked)} /> burp-scan
             </label>
@@ -347,7 +389,7 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
 
       <details className="nf-section">
         <summary>Scope (optional — blank derives from target + scope mode)</summary>
-        <label className="nf-field">
+        {!apiSpec ? <label className="nf-field">
           <span>
             Target URLs — extra seeds, one per line (URL-list diagnosis){" "}
             <label className="nf-import" title="load a URL list from a file (CSV: first column, or one URL per line)">
@@ -369,8 +411,8 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
             onChange={(e) => setTargetUrls(e.target.value)}
             placeholder={"https://app.example.com/a\nhttps://api.example.com/v1/x"}
           />
-        </label>
-        {command === "pilot" ? (
+        </label> : null}
+        {command === "pilot" && !apiSpec ? (
           <div className="nf-checks">
             <label title="survey maps only the target + these URLs (no link-following); diagnosis is limited to the list + the APIs each screen calls">
               <input type="checkbox" checked={lockToTargets} onChange={(e) => setLockToTargets(e.target.checked)} /> 🔒 lock to target URLs (no crawl — diagnose only the list + their APIs)
@@ -397,6 +439,7 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
         </div>
       </details>
 
+      {!apiSpec ? (
       <details className="nf-section">
         <summary>Crawl</summary>
         <div className="nf-checks">
@@ -409,6 +452,7 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
           </label>
         </div>
       </details>
+      ) : null}
 
       <details className="nf-section">
         <summary>HTTP Basic auth (site-wide — the browser 401 dialog, before the app login)</summary>
@@ -474,8 +518,13 @@ export function NewAssessment({ onCancel }: { onCancel: () => void }) {
 
       {err ? <p className="nf-err">{err}</p> : null}
       <div className="nf-row nf-actions">
-        <button type="button" className="nf-launch" disabled={busy} onClick={() => void submit()}>
-          {busy ? "Launching…" : `▶ Launch ${command}`}
+        {desktopBridge?.settings?.check ? <div className="nf-wide">
+          <button type="button" disabled={busy || checking} onClick={() => void checkSetup()}>Check setup</button>
+          <p className="muted">Launch checks the selected models, automation browser, and enabled Burp connection. Short model test requests may use quota.</p>
+          <div aria-live="polite">{checks.map((c) => <p key={c.name}><b>{c.name}: {c.status}</b> — {c.message}</p>)}</div>
+        </div> : null}
+        <button type="button" className="nf-launch" disabled={busy || checking} onClick={() => void submit()}>
+          {checking ? "Checking setup…" : busy ? "Launching…" : `▶ Launch ${command}`}
         </button>
       </div>
     </div>

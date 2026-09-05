@@ -424,6 +424,22 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     }
   }
 
+  // Resume must load the newly saved primary session before any plan or diagnostic request.
+  // Old queued injection commands are intentionally skipped on resume.
+  if (opts.resume && !opts.attended) {
+    const role = [...opts.roleCreds.keys()][0] ?? [...(opts.roleCookieFiles?.keys() ?? [])][0];
+    const file = role ? opts.roleCookieFiles?.get(role) : undefined;
+    if (file) {
+      try {
+        const loaded = loadCookieFile(file, opts.targetUrl);
+        await driver.clearSession();
+        const applied = await applyLoadedAuth(driver, loaded, opts.targetUrl);
+        primaryCookie = applied.cookie;
+        primaryRole = role!;
+      } catch (e) { await driver.close(); throw e; }
+    }
+  }
+
   const http = new FetchHttpClient({
     allow: (u) => isInScope(u, opts.scope),
     minDelayMs: opts.rateMs ?? 250,
@@ -643,7 +659,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     session.inv.seed(prev.screens); // continue screenId numbering + dedup
     session.currentCookie = await driver.sessionCookieHeader(); // reuse the run's auth session (browser-profile)
     session.currentBearer = (await driver.bearerToken().catch(() => null)) ?? ""; // reuse the SPA's Bearer JWT too
-    session.currentRole = [...opts.roleCreds.keys()][0] ?? "";
+    session.currentRole = [...opts.roleCreds.keys()][0] ?? [...(opts.roleCookieFiles?.keys() ?? [])][0] ?? "";
     // Restore methodology plans from the event log (📋 PLAN <id>: ...)
     for (const e of prev.events) {
       if (e.type === "note") {

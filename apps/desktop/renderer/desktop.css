@@ -138,3 +138,7 @@
 }
 .settings-save:hover { background: #244a63; }
 .settings-saved { color: var(--ok); font-size: 12px; }
+
+.settings-checks { max-height: 180px; overflow-y: auto; font-size: 12px; line-height: 1.5; }
+.settings-actions { flex-wrap: wrap; }
+.settings-actions small { flex-basis: 100%; color: var(--muted); }

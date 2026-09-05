@@ -1,13 +1,14 @@
 import type { StateView } from "@veritas/core";
 import { eventLine } from "./Log";
 
-const ORDER = ["finding", "scanning", "queued", "clean", "excluded", "blocked", "error"] as const;
+const ORDER = ["finding", "suspected", "scanning", "queued", "clean", "excluded", "blocked", "error"] as const;
 const COLOR: Record<string, string> = {
   finding: "var(--warn)",
+  suspected: "var(--warn)",
   scanning: "var(--accent)",
-  queued: "#3a4250",
+  queued: "var(--line)",
   clean: "var(--ok)",
-  excluded: "#555",
+  excluded: "var(--muted)",
   blocked: "var(--err)",
   error: "var(--err)",
 };
@@ -38,6 +39,11 @@ export function Progress({ view }: { view: StateView }) {
             />
           );
         })}
+      </div>
+      <div className="pmeta muted" aria-label="Diagnosis breakdown">
+        {ORDER.filter((status) => (counts[status] ?? 0) > 0).map((status) => (
+          <span key={status}>{status === "clean" ? "tested, no findings" : status === "finding" ? "tested, findings" : status === "suspected" ? "tested, unconfirmed leads" : status}: {counts[status]} · </span>
+        ))}
       </div>
       <div className="pmeta muted">
         {scanning ? (

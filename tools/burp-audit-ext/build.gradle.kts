@@ -5,13 +5,14 @@ plugins {
 }
 
 group = "com.amraam"
-version = "0.1.0"
+version = "0.2.0"
 
 repositories { mavenCentral() }
 
 dependencies {
     // Montoya API は Burp が実行時に供給する → compileOnly。2026.4 でコンパイル検証済み(古い Burp なら下げる)。
     compileOnly("net.portswigger.burp.extensions:montoya-api:2026.4")
+    testImplementation("net.portswigger.burp.extensions:montoya-api:2026.4")
     // JSON は jar に同梱(Burp は供給しない)。
     implementation("com.google.code.gson:gson:2.11.0")
 }
@@ -29,3 +30,10 @@ tasks.shadowJar {
 }
 
 tasks.named("build") { dependsOn("shadowJar") }
+
+val sequentialAuditTest by tasks.registering(JavaExec::class) {
+    dependsOn(tasks.testClasses)
+    classpath = sourceSets.test.get().runtimeClasspath
+    mainClass.set("com.amraam.burpaudit.SequentialAuditTest")
+}
+tasks.named("check") { dependsOn(sequentialAuditTest) }

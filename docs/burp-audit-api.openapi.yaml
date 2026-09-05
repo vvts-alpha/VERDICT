@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: VERDICT Audit REST — Burp 拡張 API
-  version: 0.1.0
+  version: 0.2.0
   description: >
     Burp Suite Professional の Montoya 拡張が立てる REST API。認証済みの生 HTTP リクエストを
     1 件ずつ Scanner の Audit に投入する(GUI の「Audit selected items」相当)。セッションは
@@ -85,6 +85,58 @@ components:
               request_b64: { type: string }
               response_b64: { type: string }
 paths:
+  /scan/serial:
+    post:
+      summary: 新規 Audit に1件投入（順次 API）
+      description: 本拡張の既存 Audit が実行中または完了不明なら追加投入を拒否。結果不明時は再試行しない。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ScanRequest' }
+      responses:
+        '200':
+          description: 投入受理
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, status]
+                properties:
+                  id: { type: string, format: uuid }
+                  status: { type: string, example: queued }
+                  audit_mode: { type: string, enum: [active, passive] }
+        '400': { description: 不正リクエストまたは投入失敗 }
+        '401': { description: トークン不正 }
+        '409': { description: 既存 Audit が実行中または完了不明 }
+        '405': { description: POST 以外 }
+  /scan/serial/{id}:
+    get:
+      summary: 個別 Audit の進捗と証拠付き Issue
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: 完了を確認し、結果を保存してから次を投入する
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, status, requests_made, errors, issues]
+                properties:
+                  id: { type: string, format: uuid }
+                  status: { type: string, example: finished }
+                  requests_made: { type: integer }
+                  errors: { type: integer }
+                  issues:
+                    type: array
+                    items: { $ref: '#/components/schemas/Issue' }
+        '401': { description: トークン不正 }
+        '404': { description: 該当 Audit なし }
+        '405': { description: GET 以外 }
   /scan:
     post:
       summary: 認証済み生リクエストを Audit に投入
@@ -182,7 +234,7 @@ paths:
   /reset:
     post:
       summary: 捕捉済み Issue の蓄積をクリア
-      description: 本拡張の蓄積のみをクリア(Burp の SiteMap や進行中 Audit は消さない)。
+      description: 本拡張の Issue・Audit・Collaborator 相関情報をクリア。実行中の評価では使わない。
       responses:
         '200':
           description: クリア完了

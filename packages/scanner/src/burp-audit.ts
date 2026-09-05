@@ -4,6 +4,7 @@
 
 import type { BurpIssue } from "./burp.js";
 import { DEFAULT_BROWSER_UA } from "@veritas/core";
+import type { SequentialBurpStatus } from "./burp-sequential.js";
 
 export interface BurpAuditConn {
   /** e.g. http://172.29.176.1:1338 */
@@ -27,6 +28,31 @@ function url(conn: BurpAuditConn, path: string): string {
 }
 function headers(conn: BurpAuditConn, extra: Record<string, string> = {}): Record<string, string> {
   return { ...(conn.token ? { "X-Scan-Token": conn.token } : {}), ...extra };
+}
+
+/** Dedicated endpoint: an old extension returns 404 before submitting any scan. No legacy fallback. */
+export async function submitSequentialAudit(conn: BurpAuditConn, s: AuditSubmit, signal: AbortSignal): Promise<string> {
+  const res = await fetch(url(conn, "/scan/serial"), {
+    method: "POST", signal,
+    headers: headers(conn, { "content-type": "application/json" }),
+    body: JSON.stringify({ host: s.host, port: s.port, secure: s.secure, audit_mode: s.auditMode, request: s.request }),
+  });
+  if (res.status === 404) throw new Error("Sequential audit API unavailable: update and reload verdict-burp-audit.jar; bulk submission is disabled");
+  if (!res.ok) throw new Error(`serial audit /scan failed: ${res.status} ${(await res.text()).slice(0, 200)}`);
+  const j = await res.json() as { id?: unknown };
+  if (typeof j.id !== "string" || !j.id) throw new Error("Sequential audit API returned no task id");
+  return j.id;
+}
+
+/** Issues belong to this individual Audit; do not reset or import another assessment's global issue store. */
+export async function getSequentialAudit(conn: BurpAuditConn, id: string, signal: AbortSignal): Promise<SequentialBurpStatus> {
+  const res = await fetch(url(conn, `/scan/serial/${encodeURIComponent(id)}`), { headers: headers(conn), signal });
+  if (!res.ok) throw new Error(`serial audit /status failed: ${res.status}`);
+  const j = await res.json() as { id?: string; status?: string; errors?: number; requests_made?: number; issues?: AuditRestIssue[] };
+  if (j.id !== id || typeof j.status !== "string" || !Array.isArray(j.issues) || !Number.isFinite(j.errors) || !Number.isFinite(j.requests_made)) {
+    throw new Error("Invalid sequential audit status response");
+  }
+  return { status: j.status, errors: j.errors!, requestsMade: j.requests_made!, issues: auditIssuesToBurpIssues(j.issues) };
 }
 
 /** Submit one raw request to Audit. Returns the Audit key (host:port). */

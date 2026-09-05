@@ -39,6 +39,7 @@ contextBridge.exposeInMainWorld("verdictDesktop", {
     // In-app settings (LLM provider / Deep + Light models / browser path).
     settings: {
         get: () => ipcRenderer.invoke("settings:get"),
+        check: (s) => ipcRenderer.invoke("settings:check", s),
         set: (s) => ipcRenderer.invoke("settings:set", s),
     },
 

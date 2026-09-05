@@ -2,6 +2,7 @@
 // automation browser path, so switching the AI is easy and no env juggling is needed (BYOK, self-contained). Persisted
 // to userData/settings.json; mapped to the VERDICT_LLM_* / VERDICT_BROWSER_PATH env the child assessment processes read.
 
+import { checkReadiness } from "@veritas/server";
 import { app, ipcMain } from "electron";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -172,6 +173,19 @@ export function applyLlmSettingsToEnv(s: DesktopSettings = loadSettings(), env: 
 /** Wire the get/set IPC the renderer's Settings panel uses. */
 export function setupSettingsIpc(onSaved?: (s: DesktopSettings) => void): void {
     ipcMain.handle("settings:get", () => loadSettings());
+    let checking = false;
+    ipcMain.handle("settings:check", async (_e, draft?: DesktopSettings) => {
+        if (checking) throw new Error("A connection check is already running");
+        checking = true;
+        try {
+            const selected = draft ?? loadSettings();
+            const env = { ...process.env };
+            // Draft blanks must clear previously applied model settings, just as Save does.
+            applyLlmSettingsToEnv(selected, env);
+            Object.assign(env, settingsToEnv(selected));
+            return await checkReadiness(env, !!selected.burpScan);
+        } finally { checking = false; }
+    });
     ipcMain.handle("settings:set", (_e, s: DesktopSettings) => {
         const clean = saveSettings(s);
         onSaved?.(clean);

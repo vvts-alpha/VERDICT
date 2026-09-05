@@ -11,8 +11,25 @@
 
 - **エラー形式**：すべて `{ "error": "<理由>" }` を JSON で返す。
 - **raw リクエスト**：`POST /scan` の `request` は CRLF（`\r\n`）区切りの生 HTTP リクエスト。Cookie・ヘッダー・body を含めた完成品をそのまま渡す（＝セッションはリクエスト内に内包）。
-- **ホストキー**：監査は接続先 `host:port` 単位で束ねられる。進捗・キー指定はこの単位。
+- **識別子**：順次 API はリクエストごとの UUID。旧 `/scan` のみ `host:port` 単位で束ねる。
 - **Issue の捕捉**：拡張は起動時に `Scanner.registerAuditIssueHandler` を登録し、検出された Issue を発生時刻 (`found_at`) と req/resp つきで蓄積する。`/issues`・`/report` はこの蓄積から返す（プロジェクト全体の SiteMap ではなく、本拡張が捕捉した分）。run またぎの差分取得・リセット・証拠取得が可能。
+
+## 順次投入 API（v0.2.0、VERDICT が使用）
+
+`POST /scan/serial` は下記 `/scan` と同じ body を受け取り、新しい Audit に1件だけ投入する。
+成功時 `200`: `{ "id": "<uuid>", "status": "queued", "audit_mode": "active" }`。
+この拡張の Audit が実行中・一時停止・完了不明なら `409`（旧 `/scan` の Audit も対象）。
+投入結果が不明な通信障害では POST を再試行しない。
+
+`GET /scan/serial/{id}` は該当 Audit のみの結果を返す（存在しなければ `404`）。
+
+```json
+{ "id": "<uuid>", "status": "finished", "requests_made": 142, "errors": 0, "issues": [] }
+```
+
+`issues` の形は `/issues` と同じで、常に evidence を含む。完了状態かつ `errors=0` を確認して
+結果を保存してから次を投入する。paused/failed/unknown を成功扱いしない。
+旧 JAR が `/scan/serial` に `404` を返す場合、JAR 更新を案内して停止する。旧 API へはフォールバックしない。
 
 ## 1. `POST /scan`
 
@@ -82,21 +99,19 @@
 
 ## 6. `POST /reset`
 
-捕捉済み Issue の蓄積をクリア（`{ "status": "cleared" }`）。Burp の SiteMap や進行中 Audit は消さない。
+捕捉済み Issue の蓄積をクリア（`{ "status": "cleared" }`）。本拡張で作った Audit を削除し、Collaborator の相関情報もクリアする。実行中の評価では使わない。
 
 ## 想定フロー（VERDICT 連携）
 
 ```
-0. (任意) POST /reset            run 前にクリア。または開始時刻を since= に使う
-1. POST /scan                    各画面の認証済み raw リクエストを投入
-2. GET /status/{host}            succeeded までポーリング
-3. GET /issues?since=<開始ts>    この run の新規 Issue を mergeBurpIssues へ
-   GET /report?format=xml&host=… ネイティブ XML が要ればこちら
+1. POST /scan/serial             認証済み raw リクエストを1件投入
+2. GET /scan/serial/{id}         完了までポーリング（issues も取得）
+3. 結果を保存してから 1. へ      失敗・一時停止・通信障害・時間切れなら停止
 ```
 
 ## 制約（Montoya API 由来）
 
 - `audit_mode` は active/passive のみ。scan configuration ファイルは渡せない（scope 等は起動時 `--config-file`）。
 - resource pool はデフォルト固定（スロットリングは起動時 config）。
-- Issue → 投入リクエスト/ロールの相関は自動では付かない（Issue にタグが無い）。各 Issue の evidence(request) に
-  Cookie/Bearer 値が含まれるので、VERDICT 側は自分が投入した raw と突き合わせて識別する。
+- 順次 API の Issue は個別 Audit に紐づく。旧 `/issues` は全体の蓄積であり、run やロールを識別しない。
+- 拡張が管理するタスク間の排他制御。Burp GUI や標準 REST から起動した別タスクの並列実行は防がない。
