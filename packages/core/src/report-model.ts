@@ -78,7 +78,7 @@ export interface ReportModel {
 export function buildReportModel(state: AssessmentState, now: Date = new Date(), opts: BuildReportOptions = {}): ReportModel {
   const cov = coverage(state);
   // confirmed first, ordered by ascending severity within; suspected go to a separate later section.
-  const sorted = [...state.findings].sort(
+  const sorted = state.findings.filter((f) => !f.duplicateOf).sort(
     (a, b) => VERDICT_ORDER[findingVerdict(a)] - VERDICT_ORDER[findingVerdict(b)] || SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity],
   );
   const target = state.target.kind === "single_url" ? state.target.url : `scope_manifest ${state.target.path}`;

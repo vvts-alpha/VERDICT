@@ -6,13 +6,14 @@ import { checkReadiness } from "@veritas/server";
 import { app, ipcMain } from "electron";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { MODEL_PROVIDERS, normalizeModelProvider, modelConnectionEnv, type ModelProvider } from "./model-providers.js";
 
 export interface DesktopSettings {
-    /** "claude-cli" (Max subscription; needs the `claude` binary) or "openai" (any OpenAI-compatible endpoint incl. OpenCodeGo). */
-    provider: "claude-cli" | "openai";
+    /** Named service selection; non-Claude services use the OpenAI-compatible transport. */
+    provider: ModelProvider;
     /** openai: base URL, e.g. https://opencode.ai/zen/go/v1 */
     baseURL?: string;
-    /** openai: API key (stored locally in userData; never leaves the machine). */
+    /** API key, stored locally and sent to the configured provider for authentication. */
     apiKey?: string;
     /** Deep model — high-value diagnosis / scenario / deterministic path (VERDICT_LLM_MODEL). */
     deepModel?: string;
@@ -90,18 +91,20 @@ export function detectSystemChromium(): string | undefined {
 
 export function loadSettings(): DesktopSettings {
     try {
-        return { ...DEFAULTS, ...(JSON.parse(readFileSync(file(), "utf8")) as Partial<DesktopSettings>) };
+        const s = { ...DEFAULTS, ...(JSON.parse(readFileSync(file(), "utf8")) as Partial<DesktopSettings>) };
+        return { ...s, provider: normalizeModelProvider(s.provider, s.baseURL) };
     } catch {
         return { ...DEFAULTS };
     }
 }
 
 function saveSettings(s: DesktopSettings): DesktopSettings {
-    const clean: DesktopSettings = { provider: s.provider === "openai" ? "openai" : "claude-cli" };
+    const clean: DesktopSettings = { provider: normalizeModelProvider(s.provider, s.baseURL) };
     for (const k of ["baseURL", "apiKey", "deepModel", "lightModel", "browserPath", "proxy", "burpApi", "burpApiKey", "burpResourcePool", "burpAuditApi", "burpAuditToken", "interactshServer", "interactshToken", "operatorContext"] as const) {
         const v = s[k];
         if (typeof v === "string" && v.trim()) clean[k] = v.trim();
     }
+    if (!clean.baseURL && MODEL_PROVIDERS[clean.provider].baseURL) clean.baseURL = MODEL_PROVIDERS[clean.provider].baseURL;
     if (s.burpScan) clean.burpScan = true;
     if (s.oobProvider === "interactsh" || s.oobProvider === "burp" || s.oobProvider === "off") clean.oobProvider = s.oobProvider;
     writeFileSync(file(), `${JSON.stringify(clean, null, 2)}\n`);
@@ -112,11 +115,7 @@ function saveSettings(s: DesktopSettings): DesktopSettings {
  *  falls back to the app's own env / built-in defaults rather than clobbering it with "" ). */
 export function settingsToEnv(s: DesktopSettings): Record<string, string> {
     const env: Record<string, string> = {};
-    env.VERDICT_LLM_PROVIDER = s.provider;
-    if (s.baseURL) env.VERDICT_LLM_BASE_URL = s.baseURL;
-    if (s.apiKey) env.VERDICT_LLM_API_KEY = s.apiKey;
-    if (s.deepModel) env.VERDICT_LLM_MODEL = s.deepModel;
-    if (s.lightModel) env.VERDICT_LLM_FAST_MODEL = s.lightModel;
+    Object.assign(env, modelConnectionEnv(s));
     const browser = s.browserPath?.trim() || detectSystemChromium();
     if (browser) {
         env.VERDICT_BROWSER_PATH = browser;
@@ -151,15 +150,8 @@ export function settingsToEnv(s: DesktopSettings): Record<string, string> {
  *  as scan children. childEnv only wraps spawned CLI processes — without this, Ask defaults to `claude` and
  *  PDF looks for Playwright's unbundled chromium_headless_shell. */
 export function applyLlmSettingsToEnv(s: DesktopSettings = loadSettings(), env: NodeJS.ProcessEnv = process.env): void {
-    env.VERDICT_LLM_PROVIDER = s.provider;
-    if (s.baseURL) env.VERDICT_LLM_BASE_URL = s.baseURL;
-    else delete env.VERDICT_LLM_BASE_URL;
-    if (s.apiKey) env.VERDICT_LLM_API_KEY = s.apiKey;
-    else delete env.VERDICT_LLM_API_KEY;
-    if (s.deepModel) env.VERDICT_LLM_MODEL = s.deepModel;
-    else delete env.VERDICT_LLM_MODEL;
-    if (s.lightModel) env.VERDICT_LLM_FAST_MODEL = s.lightModel;
-    else delete env.VERDICT_LLM_FAST_MODEL;
+    for (const key of ["VERDICT_LLM_PROVIDER", "VERDICT_LLM_BASE_URL", "VERDICT_LLM_API_KEY", "VERDICT_LLM_MODEL", "VERDICT_LLM_FAST_MODEL"]) delete env[key];
+    Object.assign(env, modelConnectionEnv(s));
     const browser = s.browserPath?.trim() || detectSystemChromium();
     if (browser) {
         env.VERDICT_BROWSER_PATH = browser;

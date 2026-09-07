@@ -430,3 +430,28 @@ test("judgeConfirmedFinding: JSON auth-bypass with a plain-text 401 control is k
     assert.equal(judgeConfirmedFinding(f, evidence).demote, false);
     store.close();
   }));
+
+test("final QA retains duplicate audit rows while exports and reloads count one canonical finding", async () => {
+  await withDir(async (dir) => {
+    const { store, evidence } = setup(dir);
+    const c = ev(evidence, "negative_control", '{"rows":[]}');
+    const p1 = ev(evidence, "positive_replay", '{"rows":[{"id":1}]}');
+    const p2 = ev(evidence, "positive_replay", '{"rows":[{"id":1}]}');
+    for (const r of [p1,p2]) r.request.url = BASE + "search?q=' OR 1=1--";
+    const a = finding({ id: "f-001", title: "[sqli] Query injection", evidenceIds: [c.id,p1.id,p2.id], dedupKey: "sqli::/search::q" });
+    const b = finding({ id: "f-009", title: "[sqli] Same query on another screen", evidenceIds: [c.id,p1.id,p2.id] });
+    store.upsertFinding("a-1", a);
+    store.upsertFinding("a-1", b);
+    const result = await triagePilotFindings({ store, assessmentId: "a-1", evidence });
+    assert.equal(result.merged, 1);
+    assert.equal(store.loadAssessment("a-1")!.findings.length, 1);
+    const audit = store.loadAssessment("a-1", { includeDuplicates: true })!;
+    assert.equal(audit.findings.length, 2);
+    assert.equal(audit.findings[1]!.duplicateOf, "f-001");
+    assert.equal(audit.findings[0]!.dedupKey, "sqli::/search::q");
+    const { buildReportModel } = await import("@veritas/core");
+    assert.equal(buildReportModel(audit).stats.findings.total, 1);
+    assert.equal((await triagePilotFindings({ store, assessmentId: "a-1", evidence })).merged, 0);
+    store.close();
+  });
+});

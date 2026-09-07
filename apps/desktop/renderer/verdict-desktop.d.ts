@@ -34,7 +34,7 @@ declare global {
         onNavigated(cb: (s: AttBrowserNavState) => void): () => void;
     }
     interface DesktopSettings {
-        provider: "claude-cli" | "openai";
+        provider: import("../src/model-providers").ModelProvider;
         baseURL?: string;
         apiKey?: string;
         deepModel?: string;

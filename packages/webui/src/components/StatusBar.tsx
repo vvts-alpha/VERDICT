@@ -45,14 +45,14 @@ function BurpImport({ id }: { id: string }) {
 // The Report section of an Export menu — the assessment report in every format (HTML/PDF/Markdown/Findings CSV),
 // generated on the fly from the store's findings by `/report`. SHARED so every viewer's Export offers the identical
 // Report block: the web/API viewer (DownloadMenu, below) and the ASR viewer (AsrView's AsrExport) both render this,
-// so "Report" never drifts per view. GET endpoints → cookies sent automatically; html/pdf preview inline, md/csv download.
+// so "Report" never drifts per view. GET endpoints send cookies automatically; every report format downloads.
 export function ReportLinks({ id }: { id: string }) {
   const rep = (f: string): string => `/api/assessments/${encodeURIComponent(id)}/report?format=${f}`;
   return (
     <>
       <span className="dl-h">Report</span>
-      <a href={rep("html")} target="_blank" rel="noreferrer">HTML</a>
-      <a href={rep("pdf")} target="_blank" rel="noreferrer">PDF</a>
+      <a href={rep("html")} download={`${id}-report.html`}>HTML</a>
+      <a href={rep("pdf")} download={`${id}-report.pdf`}>PDF</a>
       <a href={rep("md")}>Markdown</a>
       <a href={rep("csv")}>Findings CSV</a>
     </>
@@ -60,7 +60,7 @@ export function ReportLinks({ id }: { id: string }) {
 }
 
 // Download the report / screen inventory. These are GET endpoints, so cookies are sent automatically.
-// html/pdf preview in a new tab (inline); md/csv download as attachments (the server sets Content-Disposition).
+// Reports download as attachments; the inventory HTML keeps its separate preview.
 function DownloadMenu({ id, canWrite }: { id: string; canWrite: boolean }) {
   const inv = (f: string): string => `/api/assessments/${encodeURIComponent(id)}/inventory?format=${f}`;
   return (

@@ -546,7 +546,7 @@ export class AssessmentStore {
 
   // ───────────────────────── reads ─────────────────────────
 
-  loadAssessment(id: string): AssessmentState | null {
+  loadAssessment(id: string, opts: { includeDuplicates?: boolean } = {}): AssessmentState | null {
     const row = this.db.prepare("SELECT * FROM assessments WHERE id = ?").get(id) as
       | AssessmentRow
       | undefined;
@@ -560,7 +560,7 @@ export class AssessmentStore {
       screens: this.readScreens(id),
       screenScans: this.readScreenScans(id),
       hypotheses: this.readHypotheses(id),
-      findings: this.readFindings(id),
+      findings: this.readFindings(id).filter((f) => opts.includeDuplicates || !f.duplicateOf),
       handoffs: this.readHandoffs(id),
       events: this.readEvents(id),
     };

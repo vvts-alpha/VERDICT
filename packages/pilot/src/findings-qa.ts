@@ -20,6 +20,7 @@ import type { EvidenceRecord, EvidenceStore } from "@veritas/scanner";
 import { classifyCrossUserBody, impactOracle, isPublicByDesignClientCredential, isVersionlessComponentLead } from "@veritas/scanner";
 import { looksBlocked, sqliHtmlLengthOnlyFp } from "./tools.js";
 import { looksLikePublicWebFile } from "./disclosure.js";
+import { consolidateFindings, qualifyFinding } from "./finding-review.js";
 
 export interface FindingsQaDeps {
   store: AssessmentStore;
@@ -36,6 +37,8 @@ export interface FindingsQaResult {
   checked: number;
   demoted: number;
   kept: number;
+  merged: number;
+  qualified: number;
 }
 
 export type QaJudgment = { demote: false } | { demote: true; reason: string };
@@ -69,7 +72,7 @@ function bodiesOf(evidence: EvidenceStore, ids: string[]): { control: string; po
   }
   const control = recs.find((r) => r.kind === "negative_control") ?? recs[0];
   if (!control) return null;
-  const positives = recs.filter((r) => r !== control);
+  const positives = recs.filter((r) => r.kind === "positive_replay" && r !== control);
   if (positives.length === 0) return null;
   return { control: control.response.body, positives: positives.map((r) => r.response.body), controlStatus: control.response.status, positiveStatuses: positives.map((r) => r.response.status), recs };
 }
@@ -129,6 +132,9 @@ const TRIAGE_SYSTEM =
   "- A tenant people-picker card (displayName + work email + photo + tenant) is NOT IDOR. false_positive.\n" +
   "- A public store/location/dealer locator (og:type place, Find a Station, sequential store ids, gas-station address and coordinates) is NOT IDOR. false_positive.\n" +
   "- A Google Maps JavaScript API key, Firebase web apiKey, or reCAPTCHA site key in client HTML/JS is public by design. NOT secret-exposure. false_positive.\n" +
+  "- Endpoint names containing admin do not establish an authorization requirement. Check whether the returned configuration is intentionally consumed by the public frontend; a sibling route returning 401 does not prove this route must require admin.\n" +
+  "- An accepted upload or script bytes served as an image do not prove browser execution. Negative deposits do not prove external payout. A token containing role=admin does not prove access to an admin-only operation without a valid low-privilege denial control.\n" +
+  "- Ten failed logins only establish no throttling within that sample, not unlimited attempts. Hash disclosure is distinct from recovered plaintext or account takeover.\n" +
   "- robots.txt / sitemap.xml is a public file. NOT info-disclosure. false_positive.\n" +
   "- A product-family banner (Server: BigIP, VPN/WAF/APM) with no version is NOT a vulnerable-component. false_positive.\n" +
   "- A SharePoint hive path (/_layouts/15/, corev15.css) is NOT SharePoint Server 2013 and does not prove CVE-2019-0604. false_positive. Keep only if a build header (MicrosoftSharePointTeamServices: 15.0.0.xxxx) is in the evidence.\n" +
@@ -180,7 +186,7 @@ function buildEvidencePrompt(f: Finding, evidence: EvidenceStore): string | null
   const got = bodiesOf(evidence, f.evidenceIds);
   if (!got) return null;
   const ctrl = got.recs.find((r) => r.kind === "negative_control") ?? got.recs[0]!;
-  const pos = got.recs.filter((r) => r !== ctrl);
+  const pos = got.recs.filter((r) => r.kind === "positive_replay" && r !== ctrl);
   const posLine = (r: EvidenceRecord, i: number): string => {
     // Re-run the impact oracle vs the control body so the window centers on the ACTUAL leaked marker (not the head),
     // and tell the reviewer what an automated oracle flagged — its job is to judge whether that is a real exploited
@@ -251,11 +257,27 @@ function demote(store: AssessmentStore, assessmentId: string, f: Finding, reason
 export async function triagePilotFindings(deps: FindingsQaDeps): Promise<FindingsQaResult> {
   const state = deps.store.loadAssessment(deps.assessmentId);
   const list = deps.findings ?? state?.findings ?? [];
+  let qualified = 0;
+  for (const f of list) {
+    if (f.duplicateOf) continue;
+    const reason = qualifyFinding(f, deps.evidence);
+    if (reason) {
+      qualified++;
+      deps.store.upsertFinding(deps.assessmentId, f);
+      deps.store.appendEvent(deps.assessmentId, { type: "note", payload: { message: `Findings review ${f.id}: ${reason}` } });
+    }
+  }
+  const merged = consolidateFindings(list, deps.evidence);
+  if (merged) {
+    // Persist merged evidence before hiding any superseded row, including when the canonical row came later.
+    for (const f of list.filter(f => !f.duplicateOf)) deps.store.upsertFinding(deps.assessmentId, f);
+    for (const f of list.filter(f => f.duplicateOf)) deps.store.upsertFinding(deps.assessmentId, f);
+  }
   let checked = 0;
   let demoted = 0;
   const leftover: Finding[] = [];
   for (const f of list) {
-    if (isBurp(f) || alreadyQad(f) || SKIP_CATEGORIES.has(categoryOfFinding(f))) continue;
+    if (f.duplicateOf || isBurp(f) || alreadyQad(f) || SKIP_CATEGORIES.has(categoryOfFinding(f))) continue;
     const v = findingVerdict(f);
     const a06suspect = v === "suspected" && categoryOfFinding(f) === "vulnerable-component";
     if (v !== "confirmed" && !a06suspect) continue;
@@ -278,5 +300,5 @@ export async function triagePilotFindings(deps: FindingsQaDeps): Promise<Finding
       }
     }
   }
-  return { checked, demoted, kept: checked - demoted };
+  return { checked, demoted, kept: checked - demoted, merged, qualified };
 }

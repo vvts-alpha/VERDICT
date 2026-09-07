@@ -983,7 +983,7 @@ async function serveReport(res: ServerResponse, runsDir: string, id: string, kin
   const artifactsDir = join(runsDir, id, "artifacts");
   const model = buildReportModel(state, new Date(), { loadEvidence: (evId) => loadEvidenceArtifact(artifactsDir, evId) });
 
-  // {body, type, filename, inline}. inline = in-browser preview (html/pdf), otherwise attachment download.
+  // Reports are attachments in every format; inventory HTML retains its preview.
   let body: string | Buffer;
   let type: string;
   let filename: string;
@@ -997,7 +997,6 @@ async function serveReport(res: ServerResponse, runsDir: string, id: string, kin
       body = renderReportHtml(model);
       type = "text/html; charset=utf-8";
       filename = "report.html";
-      inline = true;
     } else if (kind === "report" && fmt === "csv") {
       body = renderFindingsCsv(model);
       type = "text/csv; charset=utf-8";
@@ -1006,7 +1005,6 @@ async function serveReport(res: ServerResponse, runsDir: string, id: string, kin
       body = await htmlToPdf(renderReportHtml(model), { noSandbox: true });
       type = "application/pdf";
       filename = "report.pdf";
-      inline = true;
     } else if (kind === "inventory" && fmt === "csv") {
       body = renderScreensCsv(model);
       type = "text/csv; charset=utf-8";

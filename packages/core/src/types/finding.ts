@@ -13,6 +13,10 @@ export type FindingSource =
 
 export interface Finding {
   id: string;
+  /** Stable recording key, retained across resume instead of guessing from the title. */
+  dedupKey?: string;
+  /** Superseded record retained for audit; evidence is linked from the canonical finding. */
+  duplicateOf?: string;
   /** Originating screen. null if cross-screen */
   screenId: string | null;
   title: string;

@@ -36,15 +36,14 @@ function resolveCliPath(): string | undefined {
 let server: RunningServer | null = null;
 let win: BrowserWindow | null = null;
 
-/** Drop File/Edit/View from a window. Report HTML/PDF opens via target=_blank as a child BrowserWindow;
- *  without this, Windows/Linux show Electron's default application menu on that popup. */
+/** Drop File/Edit/View from windows, including inventory previews. */
 function stripAppMenu(created: BrowserWindow): void {
     created.removeMenu();
     created.setAutoHideMenuBar(true);
     created.setMenuBarVisibility(false);
 }
 
-/** Same-origin popups (report HTML/PDF, inventory) stay in-app without a menu; everything else goes to the OS browser. */
+/** Same-origin preview popups stay in-app without a menu; everything else goes to the OS browser. */
 function attachPopupPolicy(contents: WebContents): void {
     contents.setWindowOpenHandler(({ url }) => {
         const origin = server?.url ?? "http://127.0.0.1";
@@ -118,10 +117,23 @@ async function boot(): Promise<void> {
     // ERR_PROXY_CONNECTION_FAILED. The attended Browser tab uses partition persist:attended and is pointed
     // at Settings' upstream proxy separately (applyAttendedProxy).
     await session.defaultSession.setProxy({ mode: "direct" });
+    // Do not setSavePath: Electron must ask for a destination on every report export.
+    session.defaultSession.on("will-download", (_event, item) => {
+        if (!server) return;
+        const url = new URL(item.getURL());
+        if (url.origin !== new URL(server.url).origin || !/^\/api\/assessments\/[^/]+\/report$/.test(url.pathname)) return;
+        const format = url.searchParams.get("format");
+        if (format !== "html" && format !== "pdf") return;
+        item.setSaveDialogOptions({
+            title: `Save ${format.toUpperCase()} report`,
+            defaultPath: join(app.getPath("downloads"), item.getFilename()),
+            filters: [{ name: `${format.toUpperCase()} report`, extensions: [format] }],
+        });
+    });
     await applyAttendedProxy();
 
     // Windows/Linux draw the application menu inside the window. The main chrome is frameless; popups
-    // (Export → HTML/PDF) must not grow File/Edit/View either. macOS keeps the screen-top app menu.
+    // (inventory previews) must not grow File/Edit/View either. macOS keeps the screen-top app menu.
     if (process.platform !== "darwin") Menu.setApplicationMenu(null);
     app.on("browser-window-created", (_e, created) => {
         stripAppMenu(created);

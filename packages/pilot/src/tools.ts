@@ -3768,6 +3768,7 @@ export function buildTools(s: PilotSession) {
           }
           const f: Finding = {
             id: fid,
+            dedupKey: key,
             screenId: s.currentScreenId,
             title: `[${category}] ${title}`,
             severity: normSev,

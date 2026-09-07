@@ -1,4 +1,5 @@
 import type { ReadinessCheck } from "@veritas/core";
+import { MODEL_PROVIDERS, type ModelProvider } from "../src/model-providers";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 
 // In-app settings, organized like a native app: a left category nav + a right pane (not one long form).
@@ -46,6 +47,7 @@ function TextArea({ value, onChange, ph, rows = 4 }: { value: string; onChange: 
 
 export function Settings({ onClose }: { onClose: () => void }) {
     const [s, setS] = useState<DesktopSettings>(EMPTY);
+    const modelDrafts = useRef<Partial<Record<ModelProvider, Pick<DesktopSettings, "baseURL" | "apiKey" | "deepModel" | "lightModel">>>>({});
     const [section, setSection] = useState<Section>("Models");
     const [saved, setSaved] = useState(false);
     const [checking, setChecking] = useState(false);
@@ -67,6 +69,18 @@ export function Settings({ onClose }: { onClose: () => void }) {
     };
     const setStr = (k: StringKey) => (v: string) => set(k, v);
 
+    const selectProvider = (provider: ModelProvider): void => {
+        if (provider === s.provider) return;
+        const { baseURL, apiKey, deepModel, lightModel } = s;
+        modelDrafts.current[s.provider] = { baseURL, apiKey, deepModel, lightModel };
+        const draft = modelDrafts.current[provider] ?? { baseURL: MODEL_PROVIDERS[provider].baseURL };
+        setS({ ...s, provider, baseURL: draft.baseURL, apiKey: draft.apiKey, deepModel: draft.deepModel, lightModel: draft.lightModel });
+        setSaved(false);
+        setChecks([]);
+        setError("");
+        editVersion.current++;
+    };
+
     const save = async (): Promise<void> => {
         const v = await bridge()?.set(s);
         if (v) {
@@ -83,7 +97,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
         finally { setChecking(false); }
     };
 
-    const openai = s.provider === "openai";
+    const openai = s.provider !== "claude-cli";
 
     return (
         <div className="settings-overlay" onClick={onClose}>
@@ -106,22 +120,22 @@ export function Settings({ onClose }: { onClose: () => void }) {
                         {section === "Models" ? (
                             <>
                                 <Field label="Provider">
-                                    <select value={s.provider} onChange={(e) => set("provider", e.target.value as DesktopSettings["provider"])}>
-                                        <option value="claude-cli">Claude (subscription CLI)</option>
-                                        <option value="openai">OpenAI-compatible (OpenCodeGo / OpenAI / local)</option>
+                                    <select value={s.provider} onChange={(e) => selectProvider(e.target.value as ModelProvider)}>
+                                        {Object.entries(MODEL_PROVIDERS).map(([value, preset]) => <option key={value} value={value}>{preset.label}</option>)}
                                     </select>
                                 </Field>
                                 {openai ? (
                                     <>
-                                        <Field label="Base URL"><Text value={s.baseURL ?? ""} onChange={setStr("baseURL")} ph="https://opencode.ai/zen/go/v1" /></Field>
+                                        {s.provider === "other" ? <p className="settings-note-inline">Use an OpenAI-compatible API endpoint, including a local model server.</p> : null}
+                                        <Field label="Base URL"><Text value={s.baseURL ?? ""} onChange={setStr("baseURL")} ph={MODEL_PROVIDERS[s.provider].baseURL || "https://your-provider.example/v1"} /></Field>
                                         <Field label="API key"><Text value={s.apiKey ?? ""} onChange={setStr("apiKey")} ph="sk-…" type="password" /></Field>
                                     </>
                                 ) : (
-                                    <p className="settings-note-inline">The Claude subscription CLI needs the `claude` binary on PATH. Switch to OpenAI-compatible to use OpenCodeGo / a local model.</p>
+                                    <p className="settings-note-inline">The Claude subscription CLI needs the `claude` binary on PATH. Choose OpenCodeGo, OrcaRouter, or Other to use an API provider.</p>
                                 )}
                                 <div className="settings-sec">Model tiering</div>
-                                <Field label="Deep model" hint="high-value diagnosis / scenario"><Text value={s.deepModel ?? ""} onChange={setStr("deepModel")} ph={openai ? "hy3" : "claude-opus-4-8"} /></Field>
-                                <Field label="Light model" hint="survey / methodology / low-value"><Text value={s.lightModel ?? ""} onChange={setStr("lightModel")} ph={openai ? "hy3" : "claude-sonnet-5"} /></Field>
+                                <Field label="Deep model" hint="high-value diagnosis / scenario"><Text value={s.deepModel ?? ""} onChange={setStr("deepModel")} ph={openai ? "Model ID from your provider" : "Claude model name"} /></Field>
+                                <Field label="Light model" hint="survey / methodology / low-value"><Text value={s.lightModel ?? ""} onChange={setStr("lightModel")} ph={openai ? "Model ID from your provider" : "Claude model name"} /></Field>
                             </>
                         ) : null}
 

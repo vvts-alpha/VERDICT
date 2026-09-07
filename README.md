@@ -24,9 +24,9 @@ Use VERDICT only on systems you own or are explicitly authorized to test. Automa
 
 ### 1. Install the Windows app
 
-**Version note:** this guide describes the desktop app on `main`. The published **v2026.9.3** installer predates setup checks, API-spec assessment, automatic login continuation, revised coverage counts, and sequential Burp submission. Use a build from `main` for those features until a newer installer is released.
+**Version note:** this guide describes **v2026.9.7**, including setup checks, API-spec assessments, login continuation, sequential Burp submission, findings review improvements, and save dialogs for HTML/PDF reports. Upgrade from v2026.9.3 to use these features.
 
-Download the **Windows x64 installer** from [GitHub Releases](https://github.com/vvts-alpha/VERDICT/releases/latest). The first desktop release is [2026.9.3](https://github.com/vvts-alpha/VERDICT/releases/tag/v2026.9.3), with an `.exe`, `SHA256SUMS.txt`, and `WINDOWS-QUICKSTART.md` attached.
+Download the **Windows x64 installer** from [GitHub Releases](https://github.com/vvts-alpha/VERDICT/releases/latest). The [2026.9.7 release](https://github.com/vvts-alpha/VERDICT/releases/tag/v2026.9.7) includes the `.exe`, `SHA256SUMS.txt`, and `WINDOWS-QUICKSTART.md`.
 
 The installer includes the application runtime. You do not need Node.js, pnpm, or a separately started server to use it.
 
@@ -44,7 +44,7 @@ Open **Settings** in the app's title bar, fill in the relevant sections, and sel
 
 | Section | What to configure |
 | --- | --- |
-| **Models** | Choose **Claude (subscription CLI)** or **OpenAI-compatible**. For an endpoint, enter Base URL, API key, and Deep/Light model identifiers. Claude CLI mode requires an authenticated `claude` command on Windows PATH. |
+| **Models** | Choose **Claude**, **OpenCodeGo**, **OrcaRouter**, or **Other**. OpenCodeGo and OrcaRouter prefill their Base URL; Other accepts a custom OpenAI-compatible endpoint. Enter the API key and Deep/Light model identifiers for the selected API provider. Claude CLI mode requires an authenticated `claude` command on Windows PATH. |
 | **Agent** | Optional **Operator context**: standing facts about your targets, such as authentication or tenant structure. This pre-fills the New form and remains editable per assessment. |
 | **Network** | Leave **Chromium path** blank to detect installed Chrome/Edge, or enter the executable path. Set **Upstream proxy** only when routing traffic through Burp or another proxy. |
 | **OOB** | Optional callbacks for blind vulnerabilities: Interactsh or Burp Collaborator. |
@@ -58,7 +58,7 @@ Provider accounts, model access, and any API charges are separate from VERDICT. 
 1. Select **Main → New → Web / API app**.
 2. Enter the target URL, review its scope, and supply any authentication roles or target context.
 3. Launch the assessment. Follow the site tree, discovered screens/APIs, findings, and live log in the same window.
-4. Review each finding's evidence. The header displays tested, excluded, and unfinished screen counts separately; tested does not mean every vulnerability class was covered. Use **Export / Import** to download HTML, Markdown, PDF, or CSV reports. PDF export also uses the automation browser.
+4. Review each finding's evidence. The header displays tested, excluded, and unfinished screen counts separately; tested does not mean every vulnerability class was covered. Use **Export / Import** to download HTML, Markdown, PDF, or CSV reports. HTML and PDF open a save dialog in the desktop app. PDF export also uses the automation browser.
 
 For login through SSO, MFA, or CAPTCHA, open **Browser**, navigate to the target, and log in by hand. Select **Capture session**, then **Scan (new run) →** to start with the captured cookies and localStorage. This launches directly from the current browser URL; use the New form when you need explicit scope and role configuration.
 
@@ -97,6 +97,8 @@ These are recorded assessment-engine results with linked reports, not a new benc
 | [PortSwigger Web Security Academy](benchmarks/web-security-academy/README.md) | Target vulnerability detected in 16/20 labs: 12 confirmed, 4 suspected | Vulnerability detection; not the lab's “solved” status |
 
 See the [cross-benchmark analysis](benchmarks/README.md) for methodology, reports, and limitations.
+
+A newer [desktop Juice Shop assessment](benchmarks/juice-shop/desktop-2026-09.md) covered 154 mapped screens using OpenCodeGo / `omen-alpha`, with an operator-reported actual charge of **US$9.92**. The review documents duplicate findings and evidence limitations; its raw finding count is not a count of unique validated vulnerabilities.
 
 ## Local data and external services
 

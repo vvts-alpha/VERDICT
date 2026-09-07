@@ -653,7 +653,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
   const maxTurns = opts.maxTurns ?? 80; // matches the CLI default (main.ts is also 80). WebUI blank -> CLI default lands on 80.
 
   // ── resume: reseed from an existing run (skip survey/methodology, diagnose only un-diagnosed screens) ──
-  const prev = opts.resume ? opts.store.loadAssessment(opts.assessmentId) : null;
+  const prev = opts.resume ? opts.store.loadAssessment(opts.assessmentId, { includeDuplicates: true }) : null;
   const resumeStatus = prev ? new Map(prev.screenScans.map((s) => [s.screenId, s.status] as const)) : null;
   if (prev) {
     session.inv.seed(prev.screens); // continue screenId numbering + dedup
@@ -669,12 +669,13 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     }
     // Carry over existing findings (continue id numbering + best-effort dedup key to suppress double-reporting)
     for (const f of prev.findings) {
-      session.findings.push(f);
       const num = Number.parseInt(f.id.replace(/^f-/, ""), 10);
       if (Number.isFinite(num)) session.findCounter = Math.max(session.findCounter, num);
+      if (f.duplicateOf) continue;
+      session.findings.push(f);
       const cat = /^\[([a-z0-9-]+)\]/.exec(f.title)?.[1] ?? "other";
       const ep = /(\/[A-Za-z0-9_{}/.-]+)/.exec(f.title)?.[1] ?? "";
-      session.findingsByKey.set(dedupKey(cat, ep, undefined, opts.targetUrl), f);
+      session.findingsByKey.set(f.dedupKey ?? dedupKey(cat, ep, undefined, opts.targetUrl), f);
       session.recordCalls += 1;
     }
     opts.store.appendEvent(opts.assessmentId, {
@@ -1292,8 +1293,16 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
           model: deepModel ?? fastModel, // review on the DEEP model — the second opinion is only as good as the reviewer
           onText: opts.onText,
         });
-        if (qa.checked > 0) {
-          const line = `🔎 findings QA: ${qa.demoted} demoted / ${qa.kept} kept (${qa.checked} checked)`;
+        // Keep live recording aliases on canonical rows after reconciliation.
+        for (const [key, f] of session.findingsByKey) {
+          if (f.duplicateOf) {
+            const canonical = session.findings.find(x => x.id === f.duplicateOf);
+            if (canonical) session.findingsByKey.set(key, canonical);
+          }
+        }
+        session.findings = session.findings.filter(f => !f.duplicateOf);
+        if (qa.checked > 0 || qa.merged > 0 || qa.qualified > 0) {
+          const line = `🔎 findings QA: ${qa.demoted} demoted / ${qa.kept} kept (${qa.checked} checked), ${qa.merged} duplicates merged, ${qa.qualified} claims qualified`;
           opts.onText?.(line);
           opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: line } });
         }
