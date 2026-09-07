@@ -94,12 +94,19 @@ For out-of-band callbacks, configure **OOB → Burp** for Collaborator through t
 
 A local **OWASP Juice Shop 20.2.0** assessment used one administrator and two customer accounts with **OpenCodeGo / `omen-alpha`**.
 
+**Sample report:** [Read Markdown](benchmarks/juice-shop/desktop-2026-09/report.md) · [Download PDF](benchmarks/juice-shop/desktop-2026-09/report.pdf) · [Download HTML](https://github.com/vvts-alpha/VERDICT/raw/refs/heads/main/benchmarks/juice-shop/desktop-2026-09/report.html). The public copy retains findings and reproduction steps, with credentials redacted and raw traffic/artifacts omitted.
+
 | Measure | Recorded result |
 | --- | --- |
 | Surface inventory | **154 mapped screens marked scanned**, none remaining |
 | Actual charge | **US$9.92**, reported by the operator |
+| Usage screenshot | **US$8.51** for `omen-alpha (go)` on September 6; daily cost, not token count or run total |
 | Original report | 59 confirmed-category entries, 6 suspected leads, 1 low-signal note |
 | After review corrections | **54 confirmed-category entries**, 5 suspected leads, 1 low-signal note |
+
+<p align="center"><img src="assets/juice-shop-model-cost.png" alt="OpenCodeGo usage dashboard showing September 6 daily cost of US$8.51 for omen-alpha (go)" width="1000" /></p>
+
+*Operator-supplied daily cost view. All models / All Keys are selected; this image does not independently establish the reported US$9.92 assessment total.*
 
 Representative evidence includes a login SQLi control returning 401 while two attack replays obtain an administrator session; DOM XSS execution in the browser; and a cross-user address write followed by an ownership change.
 
