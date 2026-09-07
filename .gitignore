@@ -21,8 +21,8 @@ scope_manifest.*.json
 !scope_manifest.example.json
 *.manifest.json
 
-# プレゼン deck の成果物(decks/generate_*_deck.py から再生成可能。バイナリは追跡しない)
-decks/*.pptx
+# Private presentation materials must not be committed
+/decks/
 vault.json
 .env
 
