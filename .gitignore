@@ -57,3 +57,18 @@ dist-renderer/
 /dist-windows/
 /VERDICT-Setup-*.exe
 /windows-exe-*.zip
+
+# Benchmark publications are maintained in vvts-alpha/verdict-pub
+/benchmarks/
+/scripts/bench-*
+/scripts/build-juice-shop.mjs
+/scripts/build-xbow-bench.mjs
+/scripts/export-static-ui.mjs
+/assets/juice-shop-model-cost.png
+
+# Publish only maintained documentation; keep internal notes local
+/docs/*
+!/docs/USAGE.md
+!/docs/VULNERABILITIES.md
+!/docs/WEBUI_CONVENTIONS.md
+!/docs/burp-audit-api.openapi.yaml

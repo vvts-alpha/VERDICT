@@ -4,10 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-NewAgent is a **ground-up TypeScript rewrite** of the **VERDICT** (formerly AMRAAM, originally VERITAS) autonomous web/API pentest agent. It shares only *principles* with the older `CrowSong/` + `HungrySong/` pipeline documented in the parent `/home/sophos/BugBounty/CLAUDE.md` — **no code is reused**. When working under `NewAgent/`, this file governs; the parent file describes a different (Python) codebase.
+VERDICT is a TypeScript/pnpm monorepo for web/API security assessments. The primary interface is the Electron desktop app.
 
-- **Design source of truth:** `DESIGN.md` (Japanese). `README.md` is the operator guide (commands, pilot modes, WebUI, Burp/header-audit workflows). The richest running log of decisions is in memory (`newagent_claude_pilot_2026_06_09`).
-- **Picking up work / cross-machine handoff:** read `docs/NEXT_STEPS.md` first — it carries the current TODOs (attended manual-auth mode, diagnosis parallelization), the agreed design defaults, and new-box setup. (CLI sessions/memory are machine-local; that doc is the portable channel.)
+- **Contributor guidance:** follow `AGENTS.md`; see `DESIGN.md` for architecture and `docs/WEBUI_CONVENTIONS.md` for UI rules.
+- **Public documentation:** `README.md` is the desktop quickstart; `docs/USAGE.md` covers CLI/operator workflows. Internal plans, handoff notes, and private run artifacts stay local and must not be committed.
+- **Benchmark publications:** reports and benchmark tooling belong in https://github.com/vvts-alpha/verdict-pub, not this source repository.
 - **Authorized targets only.** Every network action passes the scope gate (`isInScope`); out-of-scope is denied. `--url` derives scope as same-origin + path-prefix; a manifest gives explicit scope.
 
 ## Setup & requirements

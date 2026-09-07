@@ -1,6 +1,6 @@
 /**
  * OWASP LLM Top 10 (2025) attack classes for the red-team mode, `llm-`-prefixed to disambiguate from
- * web-app finding categories in a shared report. See docs/llm-redteam-design.md §New code / taxonomy.
+ * web-app finding categories in a shared report.
  */
 export const LLM_CATEGORIES = [
   "llm-prompt-injection-direct",

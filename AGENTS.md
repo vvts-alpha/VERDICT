@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-VERDICT is a TypeScript/pnpm monorepo for web/API security assessments. `packages/*/src/` contains shared contracts and SQLite state (`core`), assessment logic (`crawler`, `scanner`, `agent`, `pilot`, `asr`, `llm-attacks`), LLM providers (`llm`), and interfaces (`cli`, `server`, React `webui`). `apps/desktop/` is the primary Electron interface. Tests live beside source as `*.test.ts`. `assets/` holds screenshots and branding; `templates/` contains example manifests; `tools/burp-audit-ext/` contains the Java extension. Consult `DESIGN.md`, `docs/NEXT_STEPS.md`, and `docs/WEBUI_CONVENTIONS.md` for architecture, priorities, and UI rules.
+VERDICT is a TypeScript/pnpm monorepo for web/API security assessments. `packages/*/src/` contains shared contracts and SQLite state (`core`), assessment logic (`crawler`, `scanner`, `agent`, `pilot`, `asr`, `llm-attacks`), LLM providers (`llm`), and interfaces (`cli`, `server`, React `webui`). `apps/desktop/` is the primary Electron interface. Tests live beside source as `*.test.ts`. `assets/` holds screenshots and branding; `templates/` contains example manifests; `tools/burp-audit-ext/` contains the Java extension. Consult `DESIGN.md` and `docs/WEBUI_CONVENTIONS.md` for architecture and UI rules. Benchmark reports and tooling belong in https://github.com/vvts-alpha/verdict-pub. Keep internal plans and handoff notes local; do not commit them.
 
 ## Build, Test, and Development Commands
 

@@ -1,4 +1,4 @@
-// Cross-process relay hub for attended×LiveHands. docs/LIVE_TAKEOVER.md.
+// Cross-process relay hub for attended×LiveHands.
 // The child (pilot) **reverse-connects** to /ws/agent?id=&token= and pushes a screencast per role,
 // and the operator's WebUI connects to /ws/session?id=&role=. serve relays both sides as a hub.
 //   child → serve : {t:"sessions",roles:[{role,url}]} / {t:"frame",role,data,meta} / {t:"url",role,url} / {t:"copied",role,text}

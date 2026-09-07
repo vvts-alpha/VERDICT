@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "ASR — Attack Surface Recon: wildcard -> discover assets -> map surface -> score attack targets -> hand off to pilot (see docs/ASR.md)",
+  "description": "ASR — Attack Surface Recon: wildcard -> discover assets -> map surface -> score attack targets -> hand off to pilot",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {

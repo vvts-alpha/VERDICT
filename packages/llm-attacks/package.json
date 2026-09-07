@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "LLM / AI-assistant red-team mode: canary/OOB oracle + adaptive conversation loop (docs/llm-redteam-design.md)",
+  "description": "LLM / AI-assistant red-team mode: canary/OOB oracle + adaptive conversation loop",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {

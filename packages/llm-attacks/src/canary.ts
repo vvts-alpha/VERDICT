@@ -13,7 +13,7 @@ export const CANARY_PATTERN = /VERDICT-CANARY-[0-9a-f]{32}/i;
 /**
  * Generate an unguessable canary: `VERDICT-CANARY-<128-bit hex>`.
  * Entropy is the whole point — a lookalike collision is astronomically unlikely, so canary-presence
- * needs zero fuzzy judgment (docs/llm-redteam-design.md §Core low-FP mechanism).
+ * needs zero fuzzy judgment.
  */
 export function generateCanary(): string {
   return CANARY_PREFIX + randomBytes(16).toString("hex");

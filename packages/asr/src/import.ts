@@ -55,7 +55,7 @@ export function parseHttpxJsonl(text: string): HostCandidate[] {
         const server = typeof o["webserver"] === "string" ? (o["webserver"] as string) : undefined;
         const tech = Array.isArray(o["tech"]) ? (o["tech"] as unknown[]).filter((x): x is string => typeof x === "string") : undefined;
         // httpx only emits hosts that RESPONDED, so any status = alive (a 401/403 wall or a 500 error page is a live,
-        // interesting target). Matches probeHost's "any status = alive" (docs/ASR.md 1.2) — a <400 cutoff wrongly
+        // interesting target). Matches probeHost's "any status = alive" — a <400 cutoff wrongly
         // dropped 4xx/5xx hosts as dead under --import-trust-liveness.
         const alive = status != null ? status > 0 : undefined;
         const hint: HostCandidate["hint"] = {

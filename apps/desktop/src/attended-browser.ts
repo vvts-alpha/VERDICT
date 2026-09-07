@@ -3,7 +3,7 @@
 // far harder to fingerprint than stealth Playwright), all in the one window. After login, the session is captured as
 // Playwright storageState JSON (cookies + origin localStorage, including SPA Bearer tokens) and handed to the
 // automation pilot (loadCookieFile). This is the
-// 人間フェーズ side of the division-of-labour in docs/DESKTOP_APP.md; the auto phase stays on Playwright (headless).
+// Handles the human browser phase; automation stays on headless Playwright.
 
 import { WebContentsView, ipcMain, session, type BrowserWindow } from "electron";
 import { writeFileSync, mkdirSync } from "node:fs";

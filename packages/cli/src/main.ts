@@ -1613,7 +1613,7 @@ async function cmdShots(args: string[]): Promise<void> {
   console.log(`\n${n}/${state.screens.length} screenshots captured → reload the WebUI (serve)`);
 }
 
-// ASR — Attack Surface Recon (Phase-0, docs/ASR.md). A wildcard/apex → crt.sh passive discovery → dns resolve +
+// ASR — Attack Surface Recon. A wildcard/apex → crt.sh passive discovery → dns resolve +
 // HTTP liveness → (optional) per-host screenshot → runs/<id>/asset_inventory.json. Wide-shallow triage feeding pilot.
 // P0: passive discovery + liveness + screenshots + inventory. Active DNS brute, scoring and AI triage are later slices.
 async function cmdAsr(args: string[]): Promise<void> {

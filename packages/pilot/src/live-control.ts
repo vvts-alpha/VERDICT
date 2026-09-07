@@ -1,6 +1,6 @@
 // The child (pilot) side of attended×LiveHands. Connects **back** to serve (the Node 24 global WebSocket client),
 // streams a per-role CDP screencast up, and relays operator input down. Manual-login completion is resolved by the
-// operator's "Done" (= replacing the old terminal Enter gate). docs/LIVE_TAKEOVER.md.
+// operator's "Done" (= replacing the old terminal Enter gate).
 import type { PlaywrightDriver } from "@veritas/crawler";
 
 type Cdp = Awaited<ReturnType<PlaywrightDriver["cdpSession"]>>;

@@ -8,7 +8,7 @@
 
 Map the application. Test across account roles. Review the requests, responses, and browser behavior behind each finding.
 
-[**Download Windows v2026.9.7**](https://github.com/vvts-alpha/VERDICT/releases/download/v2026.9.7/VERDICT.Setup.2026.9.7.exe) · [Get started](#get-started) · [Desktop evaluation](#desktop-evaluation-juice-shop) · [Development](#development)
+[**Download Windows v2026.9.7**](https://github.com/vvts-alpha/VERDICT/releases/download/v2026.9.7/VERDICT.Setup.2026.9.7.exe) · [Get started](#get-started) · [Benchmarks](https://github.com/vvts-alpha/verdict-pub) · [Development](#development)
 
 [![Release](https://img.shields.io/github/v/release/vvts-alpha/VERDICT)](https://github.com/vvts-alpha/VERDICT/releases/latest)
 [![CI](https://github.com/vvts-alpha/VERDICT/actions/workflows/ci.yml/badge.svg)](https://github.com/vvts-alpha/VERDICT/actions/workflows/ci.yml)
@@ -90,37 +90,9 @@ Use the updated **v0.2.0 serial API extension**. VERDICT submits one request, wa
 
 For out-of-band callbacks, configure **OOB → Burp** for Collaborator through the extension, or use Interactsh independently.
 
-## Desktop evaluation: Juice Shop
+## Benchmarks
 
-A local **OWASP Juice Shop 20.2.0** assessment used one administrator and two customer accounts with **OpenCodeGo / `omen-alpha`**.
-
-**Sample report:** [Read Markdown](benchmarks/juice-shop/desktop-2026-09/report.md) · [Download PDF](benchmarks/juice-shop/desktop-2026-09/report.pdf) · [Download HTML](https://github.com/vvts-alpha/VERDICT/raw/refs/heads/main/benchmarks/juice-shop/desktop-2026-09/report.html). The public copy retains findings and reproduction steps, with credentials redacted and raw traffic/artifacts omitted.
-
-| Measure | Recorded result |
-| --- | --- |
-| Surface inventory | **154 mapped screens marked scanned**, none remaining |
-| Actual charge | **US$9.92**, reported by the operator |
-| Usage screenshot | **US$8.51** for `omen-alpha (go)` on September 6; daily cost, not token count or run total |
-| Original report | 59 confirmed-category entries, 6 suspected leads, 1 low-signal note |
-| After review corrections | **54 confirmed-category entries**, 5 suspected leads, 1 low-signal note |
-
-<p align="center"><img src="assets/juice-shop-model-cost.png" alt="OpenCodeGo usage dashboard showing September 6 daily cost of US$8.51 for omen-alpha (go)" width="1000" /></p>
-
-*Operator-supplied daily cost view. All models / All Keys are selected; this image does not independently establish the reported US$9.92 assessment total.*
-
-Representative evidence includes a login SQLi control returning 401 while two attack replays obtain an administrator session; DOM XSS execution in the browser; and a cross-user address write followed by an ownership change.
-
-The review consolidated six duplicate entries, moved an upload-only XSS claim to suspected, and narrowed the impact and severity of negative wallet deposits. The corrected counts come from existing evidence, without another target scan or model call. They are **report counts, not independent validation of every remaining finding**. Scanning every mapped screen also does not mean every vulnerability class was tested everywhere. See the [evaluation and review notes](benchmarks/juice-shop/desktop-2026-09.md).
-
-### Earlier engine benchmarks
-
-| Benchmark | Recorded result |
-| --- | --- |
-| [XBOW-Bench](benchmarks/xbow-bench/README.md) | 100/109 successful runs across 104 benchmarks, including retries |
-| [Juice Shop — earlier run](benchmarks/juice-shop/README.md) | 38 confirmed findings across 16 classes |
-| [PortSwigger Web Security Academy](benchmarks/web-security-academy/README.md) | Target vulnerability detected in 16/20 labs: 12 confirmed, 4 suspected |
-
-These earlier results measure the assessment engine and use different evaluation criteria. They are not directly comparable to the desktop report counts. [Methodology and reports](benchmarks/README.md).
+Benchmark results, methodology, sample reports, and model-cost notes are maintained in [verdict-pub](https://github.com/vvts-alpha/verdict-pub). See the [September desktop evaluation](https://github.com/vvts-alpha/verdict-pub/blob/main/benchmarks/juice-shop/desktop-2026-09.md) for the reviewed Juice Shop report and its limitations.
 
 ## Evidence and local data
 
@@ -162,6 +134,5 @@ node packages/cli/dist/main.js serve  # http://127.0.0.1:4317
 - [Windows release and quickstart](https://github.com/vvts-alpha/VERDICT/releases/tag/v2026.9.7)
 - [CLI/operator guide](docs/USAGE.md): manifests, authentication, reports, and advanced workflows.
 - [Desktop packaging](apps/desktop/PACKAGING.md) and [Windows build workflow](.github/workflows/windows-build.yml).
-- [Detection coverage](docs/VULNERABILITIES.md) and [implementation checklist](docs/CHECKLIST.md).
-- [Attack-surface recon](docs/ASR.md) and [LLM red-team design](docs/llm-redteam-design.md).
+- [Detection coverage](docs/VULNERABILITIES.md).
 - [Architecture](DESIGN.md), [UI conventions](docs/WEBUI_CONVENTIONS.md), and [contributor guidelines](AGENTS.md).

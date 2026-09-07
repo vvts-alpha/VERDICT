@@ -1,6 +1,6 @@
 // Process supervisor for starting/stopping/resuming runs from the WebUI.
 // The server does not import the CLI; it **spawns it as a child process** (CLI = execution engine / server = control plane).
-// The child writes runs/<id>/state.sqlite → the existing WS projection live-streams progress as-is. The Phase-1 control plane in docs/LIVE_TAKEOVER.md.
+// The child writes runs/<id>/state.sqlite → the existing WS projection live-streams progress as-is.
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { createWriteStream, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";

@@ -3,7 +3,7 @@
 // pointed at the local server. Assessments still run as isolated child processes (wired via runLauncher below).
 //
 // The store, WS projection, and evidence contracts are unchanged — this is the same server the `serve` command
-// runs, just hosted by Electron instead of a bare Node process (docs/DESKTOP_APP.md, "backend nearly unchanged").
+// runs, just hosted by Electron instead of a bare Node process with the same backend.
 
 import { app, BrowserWindow, ipcMain, Menu, session, shell, type WebContents } from "electron";
 import { createRequire } from "node:module";

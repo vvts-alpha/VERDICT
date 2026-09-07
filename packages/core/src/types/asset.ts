@@ -2,7 +2,7 @@
 //
 // This is a shared contract type (the WebUI reads it, types-only), so it lives in core like Screen/Finding.
 // P0 populates the discovery + liveness subset; `score` (P0.5 deterministic rubric) and `ai` (P1 triage) are
-// optional and filled by later slices — see docs/ASR.md.
+// optional and filled by later slices.
 
 export type AssetSource = "crt.sh" | "import" | "active" | "seed";
 
