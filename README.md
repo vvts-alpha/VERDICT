@@ -4,11 +4,11 @@
 
 # VERDICT
 
-**Autonomous web and API security assessments, in one desktop app.**
+**Web and API security assessments, from login to evidence, in one desktop app.**
 
-Map a target, test its authenticated surface, and review findings alongside the requests and responses that support them.
+Map the application. Test across account roles. Review the requests, responses, and browser behavior behind each finding.
 
-[**Download for Windows**](https://github.com/vvts-alpha/VERDICT/releases/latest) · [Get started](#get-started) · [Evidence](#evidence-and-coverage) · [Benchmarks](#benchmarks) · [Develop](#development) · [Documentation](#documentation)
+[**Download Windows v2026.9.7**](https://github.com/vvts-alpha/VERDICT/releases/download/v2026.9.7/VERDICT.Setup.2026.9.7.exe) · [Get started](#get-started) · [Desktop evaluation](#desktop-evaluation-juice-shop) · [Development](#development)
 
 [![Release](https://img.shields.io/github/v/release/vvts-alpha/VERDICT)](https://github.com/vvts-alpha/VERDICT/releases/latest)
 [![CI](https://github.com/vvts-alpha/VERDICT/actions/workflows/ci.yml/badge.svg)](https://github.com/vvts-alpha/VERDICT/actions/workflows/ci.yml)
@@ -16,99 +16,116 @@ Map a target, test its authenticated surface, and review findings alongside the 
 
 </div>
 
-VERDICT brings assessment creation, manual login, live progress, evidence review, and report export into an Electron desktop application. It runs the assessment service locally and launches scans as separate processes. Choose Claude CLI or an OpenAI-compatible provider in Settings; the assessment engine combines model-guided investigation with deterministic verification.
+VERDICT combines model-guided investigation with deterministic probes and evidence review. The Windows app includes the runtime and runs the assessment service locally; no Node.js installation or separate server setup is required.
 
-Use VERDICT only on systems you own or are explicitly authorized to test. Automated probes enforce the configured scope. See [SECURITY.md](SECURITY.md).
+<p align="center"><img src="assets/desktop-assessment.png" alt="VERDICT desktop displaying the reviewed Juice Shop assessment, site tree, progress, and findings" width="1200" /></p>
+
+*Desktop assessment view displaying a reviewed copy of the September Juice Shop run. Findings include confirmed entries and leads; the report separates their counts.*
+
+Use VERDICT on systems you own or are explicitly authorized to test. Automated probes enforce the configured scope. See [SECURITY.md](SECURITY.md).
+
+## What you can do
+
+| Workflow | In the desktop app |
+| --- | --- |
+| **Assess a web application** | Start from a URL, define scope and account roles, and follow the discovered pages and APIs. |
+| **Assess an API specification** | Import OpenAPI 3.x or Swagger 2.0 JSON and diagnose the in-scope endpoint inventory. |
+| **Handle manual login** | Use the embedded Browser for SSO, MFA, or CAPTCHA; capture the session and continue the diagnosis. |
+| **Choose your models** | Select Claude, OpenCodeGo, OrcaRouter, or Other; configure Deep and Light models and check connections. |
+| **Review evidence** | Inspect findings alongside requests, responses, and captured browser evidence. Tested, excluded, and unfinished surfaces are counted separately. |
+| **Export a report** | Save HTML, PDF, Markdown, or Findings CSV. HTML and PDF open a save dialog and keep the assessment window in place. |
+| **Add Burp scanning** | Optionally submit active scans one task at a time, saving results before moving to the next task. |
+
+The engine covers injection, access control, sessions, business logic, secret exposure, and blind callbacks. See [detection coverage and gaps](docs/VULNERABILITIES.md) for the implemented checks and their limits.
 
 ## Get started
 
-### 1. Install the Windows app
+### 1. Install
 
-**Version note:** this guide describes **v2026.9.7**, including setup checks, API-spec assessments, login continuation, sequential Burp submission, findings review improvements, and save dialogs for HTML/PDF reports. Upgrade from v2026.9.3 to use these features.
+Download [VERDICT.Setup.2026.9.7.exe](https://github.com/vvts-alpha/VERDICT/releases/download/v2026.9.7/VERDICT.Setup.2026.9.7.exe) and run it on **Windows x64**. Close VERDICT before upgrading. The [release](https://github.com/vvts-alpha/VERDICT/releases/tag/v2026.9.7) also includes checksums, a Windows quickstart, and the optional Burp extension.
 
-Download the **Windows x64 installer** from [GitHub Releases](https://github.com/vvts-alpha/VERDICT/releases/latest). The [2026.9.7 release](https://github.com/vvts-alpha/VERDICT/releases/tag/v2026.9.7) includes the `.exe`, `SHA256SUMS.txt`, and `WINDOWS-QUICKSTART.md`.
+You need **Chrome or Edge** for automated browsing and PDF generation, plus your own LLM credentials or an authenticated Windows `claude` command. The embedded browser for manual login is included.
 
-The installer includes the application runtime. You do not need Node.js, pnpm, or a separately started server to use it.
+The installer is unsigned; Windows may display an unknown-publisher or SmartScreen warning. Automatic updates are not included. Windows x64 is the distributed installer; Linux/macOS packaging configuration remains available to source developers.
 
-You do need:
+### 2. Set up a model
 
-- **Chrome or Edge** installed for automated browsing. The embedded Browser tab is included; the automation browser is separate.
-- **An LLM provider**: an authenticated Windows `claude` command, or an OpenAI-compatible endpoint and its credentials/model identifiers.
-- **Burp Suite Professional**, only if you want its optional active scanner or Collaborator integration.
+Open **Settings → Models**.
 
-The current installer is unsigned, so Windows may show an unknown-publisher or SmartScreen warning. Automatic updates and a first-run setup wizard are not included. Linux and macOS installer targets exist in the build configuration; this release distributes Windows x64.
-
-### 2. Configure Settings
-
-Open **Settings** in the app's title bar, fill in the relevant sections, and select **Save**.
-
-| Section | What to configure |
+| Provider | Setup |
 | --- | --- |
-| **Models** | Choose **Claude**, **OpenCodeGo**, **OrcaRouter**, or **Other**. OpenCodeGo and OrcaRouter prefill their Base URL; Other accepts a custom OpenAI-compatible endpoint. Enter the API key and Deep/Light model identifiers for the selected API provider. Claude CLI mode requires an authenticated `claude` command on Windows PATH. |
-| **Agent** | Optional **Operator context**: standing facts about your targets, such as authentication or tenant structure. This pre-fills the New form and remains editable per assessment. |
-| **Network** | Leave **Chromium path** blank to detect installed Chrome/Edge, or enter the executable path. Set **Upstream proxy** only when routing traffic through Burp or another proxy. |
-| **OOB** | Optional callbacks for blind vulnerabilities: Interactsh or Burp Collaborator. |
-| **Burp** | Optional Audit REST/REST connection and post-diagnosis active scan. |
-| **About** | Installed application and runtime versions. |
+| **Claude** | Install and authenticate the `claude` CLI on Windows PATH. Enter the desired Claude model names. |
+| **OpenCodeGo** | Base URL is prefilled. Enter your API key and the model IDs available to your account. |
+| **OrcaRouter** | Base URL is prefilled. Enter your API key and model IDs. |
+| **Other** | Enter a custom OpenAI-compatible Base URL, API key if required, and model IDs; local model servers are supported through this interface. |
 
-Provider accounts, model access, and any API charges are separate from VERDICT. Settings changes apply to subsequent scans. **Check connections** tests the draft settings without saving: each distinct selected model receives a short test request, the automation browser launches and closes, and enabled Burp scanning is checked through read-only APIs. Model tests may use quota. New desktop assessments run these checks before launching.
+<p align="center"><img src="assets/desktop-model-settings.png" alt="Model Settings with OpenCodeGo selected, its API URL prefilled, and omen-alpha entered for Deep and Light models" width="1000" /></p>
 
-### 3. Run an assessment
+*Example configuration for the model used in the Juice Shop evaluation; enter your own API key.*
 
-1. Select **Main → New → Web / API app**.
-2. Enter the target URL, review its scope, and supply any authentication roles or target context.
-3. Launch the assessment. Follow the site tree, discovered screens/APIs, findings, and live log in the same window.
-4. Review each finding's evidence. The header displays tested, excluded, and unfinished screen counts separately; tested does not mean every vulnerability class was covered. Use **Export / Import** to download HTML, Markdown, PDF, or CSV reports. HTML and PDF open a save dialog in the desktop app. PDF export also uses the automation browser.
+**Deep** handles diagnosis and other investigation stages; **Light** handles survey and methodology work. Both can use the same model. **Check connections** tests the current fields without saving: model requests, automation-browser launch, and the read-only API connection when Burp scanning is enabled. Model checks may use quota. Select **Save** when ready; new assessments also run setup checks before launching.
 
-For login through SSO, MFA, or CAPTCHA, open **Browser**, navigate to the target, and log in by hand. Select **Capture session**, then **Scan (new run) →** to start with the captured cookies and localStorage. This launches directly from the current browser URL; use the New form when you need explicit scope and role configuration.
+OpenCodeGo / `omen-alpha` has been used in the desktop evaluation below. OrcaRouter's selection, saving, and transport mapping have been tested; a live OrcaRouter assessment has not been run.
 
-During an existing assessment, select **Continue this run →**, or **Logged in → continue** when the Browser tab was opened for a pending handoff. A running diagnosis receives the session; a stopped diagnosis restarts with the captured session. For stopped runs with multiple account roles, select the role used for the login; other roles and scope remain unchanged. Manual login does not guarantee that later automated requests will pass every challenge.
+Under **Network**, leave Chromium path blank to detect Chrome/Edge. Configure an upstream proxy only when needed. **Agent → Operator context** stores target facts that prefill new assessments.
 
-### 4. Assess an API specification
+### 3. Start and follow an assessment
 
-Select **Main → New → API spec**, choose an **OpenAPI 3.x / Swagger 2.0 JSON file** (up to 2 MB), and enter the target base URL. Configure scope, authentication, and models in the shared assessment form, then launch.
+1. Choose **Main → New → Web / API app**.
+2. Enter the target URL, review scope, and supply any account roles and target context.
+3. Launch and follow the site tree, progress, findings, and live log.
+4. Inspect each finding's evidence, then use **Export / Import** to save a report.
 
-The target URL overrides the specification's server URL. VERDICT imports the in-scope endpoints and starts planning and diagnosis from that inventory. YAML and external references are not supported.
+For API-first testing, choose **New → API spec** and upload an **OpenAPI 3.x / Swagger 2.0 JSON file**, up to 2 MB. The target base URL overrides the specification's server URL. In-scope endpoints seed planning and diagnosis; YAML and external references are not supported.
 
-### Optional: add Burp
+For SSO, MFA, or CAPTCHA, open **Browser**, navigate to the target, log in, and select **Capture session**. **Scan (new run) →** launches from the browser's current URL with the captured cookies and localStorage. Use the New form for explicit scope and role configuration.
 
-Start Burp's proxy listener and set its URL under **Settings → Network → Upstream proxy**. The embedded Browser tab and scan traffic use that proxy; the app's own local interface connects directly.
+For an existing assessment, use **Continue this run →** or the handoff's **Logged in → continue**. A running diagnosis receives the session; a stopped diagnosis restarts with it. For stopped runs with multiple roles, select the role used for the login. Subsequent automated requests may still encounter authentication challenges.
 
-For authenticated active scans, load the [VERDICT Audit REST extension](tools/burp-audit-ext/README.md), enter its URL/token under **Settings → Burp**, and enable the post-diagnosis scan. With the matching app and extension (serial API, v0.2.0), VERDICT submits one request, waits for that audit to finish, saves its findings, then submits the next. The updated app refuses older extensions. Each task has a 30-minute default timeout. Pauses, failures, network errors, and timeouts stop further submissions and mark the run’s scan results as partial. Standard REST scans likewise use one seed URL per task. Configure **OOB → Burp** to use Collaborator through the extension, or choose Interactsh independently.
+### Optional: connect Burp
 
-## Evidence and coverage
+Active scanning and Collaborator require **Burp Suite Professional**. Set Burp's proxy listener under **Settings → Network → Upstream proxy**. For active scanning, load the [attached Audit REST extension](https://github.com/vvts-alpha/VERDICT/releases/download/v2026.9.7/verdict-burp-audit.jar), configure its URL/token under **Settings → Burp**, and enable the post-diagnosis scan. See the [extension guide](tools/burp-audit-ext/README.md).
 
-The engine surveys the application, plans checks per screen, diagnoses the selected surface, investigates cross-screen scenarios and component versions, and reviews findings before reporting. Deep/Light model settings divide work between models. Available checks include injection, access control, session handling, business logic, secret exposure, and blind callbacks; see the [detection coverage and gaps](docs/VULNERABILITIES.md).
+Use the updated **v0.2.0 serial API extension**. VERDICT submits one request, waits for its audit, saves the findings, then submits the next. Older extensions are refused. Pauses, failures, connection errors, and the default 30-minute task timeout stop further submissions and leave partial results. Standard REST scans also use one seed URL per task.
 
-For replay-based vulnerability checks, confirmation requires a failing negative control and at least two successful positive replays. Findings retain supporting evidence, and the findings QA pass can demote weak results. Reconnaissance leads and unverified hypotheses remain distinct from confirmed findings.
+For out-of-band callbacks, configure **OOB → Burp** for Collaborator through the extension, or use Interactsh independently.
 
-<p align="center"><img src="assets/webui-evidence.png" alt="Published Juice Shop benchmark: request and response evidence in the browser-based findings viewer" width="1000" /></p>
+## Desktop evaluation: Juice Shop
 
-*Evidence example from the published Juice Shop benchmark, shown in the browser UI. The desktop app reuses the assessment views.*
+A local **OWASP Juice Shop 20.2.0** assessment used one administrator and two customer accounts with **OpenCodeGo / `omen-alpha`**.
 
-## Benchmarks
+| Measure | Recorded result |
+| --- | --- |
+| Surface inventory | **154 mapped screens marked scanned**, none remaining |
+| Actual charge | **US$9.92**, reported by the operator |
+| Original report | 59 confirmed-category entries, 6 suspected leads, 1 low-signal note |
+| After review corrections | **54 confirmed-category entries**, 5 suspected leads, 1 low-signal note |
 
-These are recorded assessment-engine results with linked reports, not a new benchmark run of the Windows installer.
+Representative evidence includes a login SQLi control returning 401 while two attack replays obtain an administrator session; DOM XSS execution in the browser; and a cross-user address write followed by an ownership change.
 
-| Benchmark | Recorded result | What was measured |
-| --- | --- | --- |
-| [XBOW-Bench](benchmarks/xbow-bench/README.md) | 100/109 successful runs (92%) across 104 benchmarks, including retries | Confirmation of the intended vulnerabilities |
-| [OWASP Juice Shop](benchmarks/juice-shop/README.md) | 38 confirmed findings across 16 classes in one run | Exploration and diagnosis from one starting URL |
-| [PortSwigger Web Security Academy](benchmarks/web-security-academy/README.md) | Target vulnerability detected in 16/20 labs: 12 confirmed, 4 suspected | Vulnerability detection; not the lab's “solved” status |
+The review consolidated six duplicate entries, moved an upload-only XSS claim to suspected, and narrowed the impact and severity of negative wallet deposits. The corrected counts come from existing evidence, without another target scan or model call. They are **report counts, not independent validation of every remaining finding**. Scanning every mapped screen also does not mean every vulnerability class was tested everywhere. See the [evaluation and review notes](benchmarks/juice-shop/desktop-2026-09.md).
 
-See the [cross-benchmark analysis](benchmarks/README.md) for methodology, reports, and limitations.
+### Earlier engine benchmarks
 
-A newer [desktop Juice Shop assessment](benchmarks/juice-shop/desktop-2026-09.md) covered 154 mapped screens using OpenCodeGo / `omen-alpha`, with an operator-reported actual charge of **US$9.92**. The review documents duplicate findings and evidence limitations; its raw finding count is not a count of unique validated vulnerabilities.
+| Benchmark | Recorded result |
+| --- | --- |
+| [XBOW-Bench](benchmarks/xbow-bench/README.md) | 100/109 successful runs across 104 benchmarks, including retries |
+| [Juice Shop — earlier run](benchmarks/juice-shop/README.md) | 38 confirmed findings across 16 classes |
+| [PortSwigger Web Security Academy](benchmarks/web-security-academy/README.md) | Target vulnerability detected in 16/20 labs: 12 confirmed, 4 suspected |
 
-## Local data and external services
+These earlier results measure the assessment engine and use different evaluation criteria. They are not directly comparable to the desktop report counts. [Methodology and reports](benchmarks/README.md).
 
-On Windows, desktop settings and assessment data live under `%APPDATA%\VERDICT`: `settings.json`, `runs/`, and captured sessions. The local service binds to `127.0.0.1` on an available port. CLI runs use `runs/` relative to the working directory unless `--out` selects another location.
+## Evidence and local data
 
-Settings, session captures, browser profiles, and evidence can contain credentials or sensitive target data. Keep them out of Git and review exports before sharing. Model requests send target context and evidence to your configured provider; optional proxy/OOB services also receive their relevant traffic. Local storage does not make an assessment offline.
+Replay-based confirmation requires a failing negative control and at least two successful positive replays. Final review can demote weak findings, qualify unsupported impact claims, and consolidate supported duplicates while retaining their original records and evidence. Unverified leads remain separate from confirmed report entries.
+
+Windows settings and runs live under **`%APPDATA%\VERDICT`**. The service binds to `127.0.0.1` on an available port; assessments run in separate CLI processes. Settings, captured sessions, and evidence can contain sensitive target data. Review exports before sharing and keep private artifacts out of Git.
+
+Assessment context and evidence are sent to the selected model provider; optional proxy and callback services receive their relevant traffic. Model access and charges are separate from VERDICT.
 
 ## Development
 
-Source development requires **Node.js 24+** and **pnpm 9.15.4**. Build workspace dependencies before running the desktop app or tests.
+Use **Node.js 24+** and **pnpm 9.15.4**. Build workspace dependencies before starting the app or tests.
 
 ```bash
 git clone https://github.com/vvts-alpha/VERDICT.git
@@ -124,48 +141,20 @@ pnpm -r typecheck
 pnpm -r test
 ```
 
-Tests use `node:test` through `tsx`, with fake browser/HTTP/LLM clients and local test servers. They do not require a live target or LLM account. See [desktop packaging](apps/desktop/PACKAGING.md) for bundle creation and [Windows CI](.github/workflows/windows-build.yml) for installer builds.
+`apps/desktop` owns the window, settings, and embedded browser. It hosts `packages/server` locally, uses the shared React views in `packages/webui`, and launches `packages/cli` for assessments. The engine packages share contracts and SQLite state through `packages/core`.
 
-### CLI and standalone browser UI
-
-The CLI remains available for automation and workflows that do not yet have desktop forms. After building from source:
+The CLI remains available for automation, standalone WebUI, attack-surface recon, and LLM red teaming:
 
 ```bash
-# Optional standalone browser interface: http://127.0.0.1:4317
-node packages/cli/dist/main.js serve
-
-# Create an explicit scope/auth manifest, then run an assessment
-node packages/cli/dist/main.js init --out scope_manifest.json
-node packages/cli/dist/main.js pilot --manifest scope_manifest.json
-
-# Inspect all commands
 node packages/cli/dist/main.js --help
+node packages/cli/dist/main.js serve  # http://127.0.0.1:4317
 ```
-
-API-spec import is also available through `spec-import` or `pilot --spec`; attack-surface recon (`asr`) and LLM-assistant red teaming (`redteam`) retain their CLI workflows. See the [CLI/operator guide](docs/USAGE.md) for detailed commands, manifests, environment variables, and authentication workflows; its separate `serve` setup is for CLI use.
-
-## Architecture
-
-```mermaid
-flowchart TD
-    UI[Electron window: shared React views] -->|local API / WebSocket| Server[Local assessment service]
-    UI -->|IPC| Browser[Embedded browser: manual login]
-    Browser -->|captured session| CLI[Assessment CLI child process]
-    Server -->|launch / stop| CLI
-    CLI --> Automation[Playwright: installed Chrome / Edge]
-    CLI --> HTTP[Scoped HTTP probes]
-    CLI --> LLM[Configured LLM provider]
-    CLI --> Store[SQLite state and evidence files]
-    Server --> Store
-```
-
-`apps/desktop` owns the window, settings, and manual browser. `packages/server` hosts the local API and supervises assessment processes; `packages/webui` supplies the shared views. The assessment packages (`pilot`, `crawler`, `scanner`, `agent`, `asr`, `llm-attacks`, `llm`) share contracts and state through `packages/core`. Desktop and CLI use the same engine and evidence store.
 
 ## Documentation
 
-- [CLI/operator guide](docs/USAGE.md): manifests, advanced authentication, API assessments, and reports.
-- [Desktop packaging](apps/desktop/PACKAGING.md): source bundles and native installers.
-- [Detection coverage](docs/VULNERABILITIES.md) and [current checklist](docs/CHECKLIST.md): implemented checks and remaining work.
-- [Attack-surface recon](docs/ASR.md) and [LLM red-team design](docs/llm-redteam-design.md): additional CLI workflows.
-- [Architecture design](DESIGN.md) and [UI conventions](docs/WEBUI_CONVENTIONS.md): contributor reference.
-- [Security policy](SECURITY.md): authorized use and reporting vulnerabilities in VERDICT.
+- [Windows release and quickstart](https://github.com/vvts-alpha/VERDICT/releases/tag/v2026.9.7)
+- [CLI/operator guide](docs/USAGE.md): manifests, authentication, reports, and advanced workflows.
+- [Desktop packaging](apps/desktop/PACKAGING.md) and [Windows build workflow](.github/workflows/windows-build.yml).
+- [Detection coverage](docs/VULNERABILITIES.md) and [implementation checklist](docs/CHECKLIST.md).
+- [Attack-surface recon](docs/ASR.md) and [LLM red-team design](docs/llm-redteam-design.md).
+- [Architecture](DESIGN.md), [UI conventions](docs/WEBUI_CONVENTIONS.md), and [contributor guidelines](AGENTS.md).
