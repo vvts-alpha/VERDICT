@@ -15,7 +15,6 @@ import { Sessions } from "./components/Sessions";
 import { Chat } from "./components/Chat";
 import { Control } from "./components/Control";
 import { LiveView } from "./components/LiveView";
-import { AsrView } from "./components/AsrView";
 
 type Tab = "screen" | "findings" | "scenarios" | "log" | "apis" | "js" | "sessions" | "ask" | "control" | "live";
 
@@ -47,30 +46,8 @@ export function App() {
     };
   }, [id]);
 
-  // An ASR (Attack Surface Recon) run has its OWN asset view — not the web-assessment tabbed layout. Detect it
-  // (its asset_inventory has assets) and render a standalone page; the web-assessment viewer below stays untouched.
-  const [isAsr, setIsAsr] = useState<boolean | null>(null);
-  useEffect(() => {
-    if (!id) return;
-    let alive = true;
-    fetch(`/api/assessments/${encodeURIComponent(id)}/assets`)
-      .then((r) => {
-        if (alive) setIsAsr(r.ok); // 200 = an asset_inventory exists = an ASR run (even mid-scan); 404 = web/API run
-      })
-      .catch(() => {
-        if (alive) setIsAsr(false);
-      });
-    return () => {
-      alive = false;
-    };
-  }, [id]);
-
   if (!id) {
     return <Index />;
-  }
-  if (isAsr) {
-    // ASR is its own assessment type → its own viewer (Assets tree + a Log tab), never the web-viewer tab layout.
-    return <AsrView id={id} />;
   }
   if (!view) {
     return <div className="empty">Connecting to {id} … ({conn})</div>;

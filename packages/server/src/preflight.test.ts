@@ -47,3 +47,15 @@ test("old extension fails readiness without submitting or resetting audits", asy
   });
   assert.equal(result.at(-1)?.status, "error");
 });
+
+test("same-model failures are checked once and report the actual safe category", async () => {
+  let calls = 0;
+  const result = await checkReadiness({ ...env, VERDICT_LLM_FAST_MODEL: "deep", BURP_AUDIT_API: "http://burp.test" }, true, {
+    model: async () => { calls++; throw new Error("HTTP 400 missing x-opencode-session secret-value"); }, browser: async () => {}, fetch: async () => new Response("secret-value", { status: 401 }),
+  });
+  assert.equal(calls, 1);
+  assert.deepEqual(result.slice(0, 2).map((r) => r.status), ["error", "error"]);
+  assert.match(result[0]!.message, /session metadata/);
+  assert.match(result.at(-1)!.message, /X-Scan-Token/);
+  assert.ok(!JSON.stringify(result).includes("secret-value"));
+});

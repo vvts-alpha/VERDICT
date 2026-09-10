@@ -38,6 +38,17 @@ node packages/cli/dist/main.js pilot --url https://example.com/ --survey-only   
 Every command below is `node packages/cli/dist/main.js <cmd>`. During development, skip the build with
 `pnpm --filter @veritas/cli dev <cmd>` (resolves `src` directly).
 
+For an API-compatible model, set its total context capacity (input plus output) in **Settings → Models → Deep / Light max context**, or use these environment variables for CLI runs:
+
+```bash
+VERDICT_LLM_CONTEXT_TOKENS=256000        # Deep model
+VERDICT_LLM_FAST_CONTEXT_TOKENS=128000   # Light model
+```
+
+Use token counts, not `256k`/`1M` suffixes. Unset limits default to 256,000; Light inherits Deep when the Light model is unset or identical to Deep. These settings apply to the API-compatible pilot loop; Claude manages its context internally. Pilot reserves up to 16,384 tokens (10% for smaller windows) for each response and summarizes older history at 80% of the remaining input budget. Log entries labelled `[context]` show estimated input and remaining space; they are separate from cumulative usage. Estimates include tool schemas and are adjusted upward from provider `prompt_tokens` when available.
+
+Summaries use the current stage's model, preserve the original instructions and goal, and retain recent complete tool exchanges when they fit. Summary calls also count toward token usage. Inventory and evidence stay in the assessment store. If a summary fails or the instructions alone cannot fit, the run pauses with unfinished screens still queued; correct the limit or provider issue and resume.
+
 ---
 
 ## 1. The shape of a run
@@ -66,6 +77,12 @@ Keep the WebUI (`serve`) open in a second terminal the whole time — progress, 
 diagnostic log stream in live. You do not have to watch the terminal.
 
 ---
+
+OpenCodeGo requests identify VERDICT and include a stable `x-opencode-session` for each conversation, including tool turns, retries, and context summaries. Update older desktop builds if a correct Go model/key is rejected for missing session metadata. Connection checks report safe failure categories without displaying credentials; Audit API HTTP 401/403 requires the extension's X-Scan-Token (separate from Burp's REST API key).
+
+Incomplete model stages pause instead of declaring screens clean. This includes provider authentication/quota failures, transport errors, exhausted turn limits, and replies that omit the required completion tool. Fix the reported cause and resume; unfinished screens stay queued and existing findings remain saved. Plans are persisted in full, and resume also restores attack classes from older PLAN logs. Interrupted planning resumes until every screen has a plan.
+
+The desktop authenticates its local HTTP API and WebSockets with a fresh credential on each launch. The main UI receives it through Electron's trusted session; target browser sessions remain separate. HTTP/WS reject requests from other origins, including other localhost ports. Standalone `serve` continues to support direct CLI clients and operator/viewer password login. Use the UI at the server's own URL; cross-origin browser clients are not supported.
 
 ## 2. Scope a target (the manifest)
 
@@ -101,6 +118,8 @@ Or hand-write it:
 | `same-origin` | exactly the target origin | single SPA/host, don't wander |
 | `etld` | the registrable domain (all subdomains) | app + `api.` + `auth.` on one eTLD+1 |
 | `unrestricted` | anything (still deny-listed) | multi-domain engagement — **only with explicit authorization** |
+
+eTLD+1 derivation uses the Public Suffix List including private hosting boundaries: `alice.github.io` permits `*.alice.github.io`, not other `github.io` tenants. Unknown suffixes and suffix-only seeds use the exact host and port. The new-assessment form previews allowed hosts. This affects newly derived scopes; existing saved scopes and explicit manifest overrides remain operator choices, so review them before resuming an older assessment.
 
 Always list logout/signout under `outOfScopePathPrefixes` (or rely on the built-in guard) — the agent must never
 hit them, they destroy the session. The scope gate is deny-first on **every** network action; out-of-scope returns

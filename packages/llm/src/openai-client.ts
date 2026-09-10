@@ -3,6 +3,7 @@
 // Implements the SAME one-shot LlmClient contract as ClaudeCliClient: complete({prompt, system?, model?}) -> {text, model}.
 // Structured output stays a downstream concern (extractJson + zod at the call sites), identical to the Claude path.
 
+import { createProviderHeaders } from "./provider-headers.js";
 import type { LlmClient, LlmRequest, LlmResponse } from "./types.js";
 
 /** Injectable fetch (tests / custom dispatchers). Global fetch satisfies this. */
@@ -36,7 +37,11 @@ export function chatCompletionsUrl(baseURL: string): string {
 }
 
 export class OpenAiClient implements LlmClient {
-    constructor(private readonly opts: OpenAiClientOptions) {}
+    private readonly providerHeaders: Record<string, string>;
+
+    constructor(private readonly opts: OpenAiClientOptions) {
+        this.providerHeaders = createProviderHeaders(opts.baseURL);
+    }
 
     async complete(req: LlmRequest): Promise<LlmResponse> {
         const model = req.model ?? this.opts.defaultModel;
@@ -54,6 +59,7 @@ export class OpenAiClient implements LlmClient {
             const res = await doFetch(url, {
                 method: "POST",
                 headers: {
+                    ...this.providerHeaders,
                     "content-type": "application/json",
                     ...(this.opts.apiKey ? { authorization: `Bearer ${this.opts.apiKey}` } : {}),
                     ...(this.opts.headers ?? {}),

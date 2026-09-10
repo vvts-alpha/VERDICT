@@ -75,3 +75,27 @@ test("deriveScopeFromSingleUrl stays same-origin (backward compatible)", () => {
   assert.deepEqual(scope.inScopeHosts, ["app.example.com:8443"]); // host includes port
   assert.deepEqual(scope.inScopePathPrefixes, ["/"]);
 });
+
+for (const tenant of ["alice.github.io", "tenant.pages.dev", "app.blogspot.com", "bucket.s3.amazonaws.com"]) {
+  test(`etld isolates the private hosting tenant ${tenant}`, () => {
+    const scope = deriveScopeFromUrls([`https://${tenant}/`], "etld");
+    assert.deepEqual(scope.inScopeHosts, [`*.${tenant}`]);
+    assert.ok(isInScope(`https://${tenant}/`, scope));
+    assert.ok(isInScope(`https://sub.${tenant}/`, scope));
+    assert.ok(!isInScope(`https://unrelated.${tenant.split(".").slice(1).join(".")}/`, scope));
+  });
+}
+
+for (const host of ["app.unknown-suffix", "app.internal", "github.io", "co.uk", "[::1]"]) {
+  test(`etld fails closed for ${host}`, () => {
+    const scope = deriveScopeFromUrls([`http://${host}:8080/`], "etld");
+    assert.deepEqual(scope.inScopeHosts, [`${host}:8080`]);
+    assert.ok(isInScope(`http://${host}:8080/`, scope));
+    assert.ok(!isInScope(`http://${host}:8081/`, scope));
+  });
+}
+
+test("etld honors PSL wildcard exceptions and international domain names", () => {
+  assert.deepEqual(deriveScopeFromUrls(["https://www.city.kawasaki.jp/"], "etld").inScopeHosts, ["*.city.kawasaki.jp"]);
+  assert.deepEqual(deriveScopeFromUrls(["https://shop.bücher.de/"], "etld").inScopeHosts, ["*.xn--bcher-kva.de"]);
+});

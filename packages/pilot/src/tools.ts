@@ -1757,6 +1757,7 @@ export function buildTools(s: PilotSession) {
           const sample = s.inv.screens().slice(0, 6).map((x) => x.screenId).join(", ");
           return txt(`REJECTED: '${screenId}' is not a mapped screenId. Use the EXACT screenId from get_inventory (e.g. ${sample || "s-0001"}). screen IDs look like s-0001, s-0002 — not paths. Call get_inventory (paginated) to read them.`);
         }
+        s.store.appendEvent(s.assessmentId, { type: "methodology_recorded", payload: { screenId, vulnClasses, plan } });
         s.plans.set(screenId, `classes=[${vulnClasses.join(",")}] ${plan}`);
         s.store.appendEvent(s.assessmentId, {
           type: "note",
@@ -1770,6 +1771,9 @@ export function buildTools(s: PilotSession) {
       "Finish the METHODOLOGY stage once every screen has a recorded plan.",
       { summary: z.string() },
       async ({ summary }) => {
+        const missing = s.inv.screens().filter((screen) => !s.plans.has(screen.screenId));
+        if (missing.length) return txt(`REJECTED: record_methodology is still required for ${missing.map((screen) => screen.screenId).join(", ")}`);
+        s.store.appendEvent(s.assessmentId, { type: "methodology_completed", payload: { screenIds: s.inv.screens().map((screen) => screen.screenId), summary } });
         s.methodologyDone = true;
         s.store.appendEvent(s.assessmentId, { type: "note", payload: { message: `📋 METHODOLOGY done: ${summary.slice(0, 300)}` } });
         return txt(`methodology complete — ${s.plans.size} plans`);

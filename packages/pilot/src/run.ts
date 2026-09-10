@@ -1,3 +1,4 @@
+import { restoreMethodologyPlans } from "./methodology.js";
 // Claude-led 3-stage orchestrator.
 //
 // If everything is thrown at once the AI elides work, so we segment into survey -> methodology -> diagnosis,
@@ -9,6 +10,7 @@ import { createSdkMcpServer, query } from "@anthropic-ai/claude-agent-sdk";
 import type { HookCallback } from "@anthropic-ai/claude-agent-sdk";
 import type { AssessmentStore, Screen, ScopePolicy } from "@veritas/core";
 import { isInScope, isScannable, recordTokens } from "@veritas/core";
+import { modelContextWindows } from "@veritas/core/llm-context";
 import type { LoginCreds } from "@veritas/crawler";
 import { InventoryBuilder, PlaywrightDriver, smartLogin } from "@veritas/crawler";
 import { makeLlmClient, resolveLlmConfig } from "@veritas/llm";
@@ -196,22 +198,20 @@ function screenIsHighValue(sc: Screen): boolean {
   return false;
 }
 
-/** Pure function that decides how far survey / methodology got in the previous run (for resume).
- *  The survey_done marker may not appear because the model didn't call it (the stage ended on maxTurns), so we
- *  also OR in the phase (past recon = phase1_label or later) and methodology's 📋 PLAN events. */
+/** A recorded plan is progress, not completion. Resume only skips planning when every saved screen has a plan. */
 export function resumeStageState(
-  prev: { phase: string; events: ReadonlyArray<{ type: string; payload: unknown }> } | null,
+  prev: { phase: string; screens?: ReadonlyArray<{ screenId: string }>; events: ReadonlyArray<{ type: string; payload: unknown }> } | null,
 ): { surveyDone: boolean; methodologyDone: boolean } {
   if (!prev) return { surveyDone: false, methodologyDone: false };
-  const notes = prev.events
-    .filter((e) => e.type === "note")
-    .map((e) => {
-      const m = (e.payload as { message?: unknown }).message;
-      return typeof m === "string" ? m : "";
-    });
-  const methodologyDone = notes.some((m) => /📋 PLAN s-\d+/.test(m));
-  const DONE_PHASES = new Set(["phase1_label", "phase2_scan", "report", "done"]);
-  const surveyDone = DONE_PHASES.has(prev.phase) || methodologyDone || notes.some((m) => m.includes("SURVEY done"));
+  const notes = prev.events.filter((e) => e.type === "note").map((e) => {
+    const m = (e.payload as { message?: unknown } | null)?.message;
+    return typeof m === "string" ? m : "";
+  });
+  const plans = restoreMethodologyPlans(prev.events);
+  const completed = prev.events.some((e) => e.type === "methodology_completed") || notes.some((m) => m.startsWith("📋 METHODOLOGY done:"));
+  const methodologyDone = completed && !!prev.screens && prev.screens.every((s) => plans.has(s.screenId));
+  const surveyDone = new Set(["phase1_label", "phase2_scan", "report", "done"]).has(prev.phase) ||
+    plans.size > 0 || notes.some((m) => m.includes("SURVEY done"));
   return { surveyDone, methodologyDone };
 }
 
@@ -299,6 +299,8 @@ export function roleLabel(role: string, descriptions?: Map<string, string>): str
 }
 
 export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
+  const llmCfg = resolveLlmConfig(process.env);
+  const contextWindows = modelContextWindows(llmCfg.provider === "openai" ? process.env : {});
   const launchBase = {
     headless: opts.headless ?? true,
     // The x-verdict marker is added driver-side "same-origin only" (never cross-origin = doesn't break third parties).
@@ -454,7 +456,6 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
 
   // LLM provider: default is the Claude Agent SDK (query()); VERDICT_LLM_PROVIDER=openai drives the pilot's agentic loop
   // through an OpenAI-compatible endpoint (OpenCodeGo etc.) instead — no `claude` subprocess. See ./agent-loop.ts.
-  const llmCfg = resolveLlmConfig(process.env);
   const useOpenAi = llmCfg.provider === "openai";
   // Tool transport for the openai loop: auto (default) = native function-calling with a text-protocol fallback for
   // models/endpoints without native tool support; force with VERDICT_LLM_TOOL_MODE=native|text.
@@ -660,13 +661,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     session.currentCookie = await driver.sessionCookieHeader(); // reuse the run's auth session (browser-profile)
     session.currentBearer = (await driver.bearerToken().catch(() => null)) ?? ""; // reuse the SPA's Bearer JWT too
     session.currentRole = [...opts.roleCreds.keys()][0] ?? [...(opts.roleCookieFiles?.keys() ?? [])][0] ?? "";
-    // Restore methodology plans from the event log (📋 PLAN <id>: ...)
-    for (const e of prev.events) {
-      if (e.type === "note") {
-        const m = /📋 PLAN (s-\d+): (.+)/.exec(e.payload.message);
-        if (m && m[1] && m[2]) session.plans.set(m[1], m[2]);
-      }
-    }
+    for (const [screenId, plan] of restoreMethodologyPlans(prev.events)) session.plans.set(screenId, plan);
     // Carry over existing findings (continue id numbering + best-effort dedup key to suppress double-reporting)
     for (const f of prev.findings) {
       const num = Number.parseInt(f.id.replace(/^f-/, ""), 10);
@@ -692,26 +687,30 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
   // If a stage dies from token/usage-limit exhaustion, pause the run rather than skipping to the next screen.
   //   done=true stops all subsequent stages/screens; paused=true keeps the final step from dropping to report (resumable).
   //   Once the quota recovers, `pilot --resume --id <id>` (the WebUI's ▶ resume) continues from the un-diagnosed queued screens.
-  const pauseRun = (detail: string): void => {
+  const pauseRun = (detail: string, cause: "usage" | "context" | "incomplete" | "auth" = "usage"): void => {
     if (session.paused) return; // don't double-count
     session.done = true;
     session.paused = true;
-    session.doneSummary = `⏸ paused — Claude usage/token limit reached. Resume when it resets: pilot --resume --id ${opts.assessmentId}`;
+    const reason = cause === "context" ? "Model context could not be summarized" : cause === "usage" ? "Model usage/token limit reached" : cause === "auth" ? "Target authentication is required" : "Model stage did not complete";
+    session.doneSummary = cause === "context"
+      ? `⏸ paused — ${reason}. Check Max context and model availability, then resume: pilot --resume --id ${opts.assessmentId}`
+      : `⏸ paused — ${reason}. ${cause === "auth" ? "Check target authentication" : "Check model availability and stage limits"}, then resume: pilot --resume --id ${opts.assessmentId}`;
     opts.onText?.(`${session.doneSummary}${detail ? ` (${detail})` : ""}`);
     opts.store.appendEvent(opts.assessmentId, {
       type: "note",
       payload: { message: `${session.doneSummary}${detail ? ` — ${detail}` : ""}` },
     });
-    opts.store.setPaused(opts.assessmentId, true, "Claude usage/token limit reached");
+    opts.store.setPaused(opts.assessmentId, true, reason);
   };
 
-  // One stage = one query(). Exit when the stage's done flag is set or Claude stops on its own.
+  // A stage may stop early, but only its accepted completion tool makes it complete.
   const runStage = async (p: {
     system: string;
     goal: string;
     allowed: readonly string[];
     maxTurns: number;
     model?: string;
+    contextWindowTokens: number;
     shouldStop: () => boolean;
   }): Promise<number> => {
     // Operator context (target facts) is appended to EVERY stage's system prompt — additive, never a replacement
@@ -720,6 +719,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     // OpenAI-compatible provider (OpenCodeGo etc.): drive the SAME veritas tools via a chat/completions tool-calling
     // loop instead of the Claude Agent SDK. The stage allowlist (p.allowed) is the locked toolbox — enforced by the loop.
     if (useOpenAi) {
+      let lastContextBand = -1;
       const res = await runOpenAiAgentLoop({
         baseURL: llmCfg.baseURL!,
         ...(llmCfg.apiKey ? { apiKey: llmCfg.apiKey } : {}),
@@ -729,6 +729,27 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         tools: toolDefs as unknown as PilotToolDef[],
         allowed: p.allowed,
         maxTurns: p.maxTurns,
+        contextWindowTokens: p.contextWindowTokens,
+        contextCheckpoint: () => JSON.stringify({
+          currentScreenId: session.currentScreenId,
+          currentRole: session.currentRole,
+          authenticated: !!(session.currentCookie || session.currentBearer),
+          mappedScreens: session.inv.screens().length,
+          visitedCount: session.visited.size,
+          pendingUrlCount: session.frontier.size,
+          nextUrls: [...session.frontier].slice(0, 20),
+          unplannedScreenIds: session.inv.screens().filter((sc) => !session.plans.has(sc.screenId)).slice(0, 40).map((sc) => sc.screenId),
+          findings: session.findings.length,
+          recentEvidenceIds: session.evidence.records.slice(-20).map((record) => record.id),
+        }),
+        onContext: ({ inputTokens, windowTokens, reservedTokens, remainingTokens }) => {
+          const band = Math.floor(inputTokens / windowTokens * 10);
+          if (band === lastContextBand) return;
+          lastContextBand = band;
+          const message = `[context] ${p.model ?? deepModel}: estimated input ${inputTokens}/${windowTokens} tokens; ${remainingTokens} available for input, ${reservedTokens} reserved for response.`;
+          opts.onText?.(message);
+          opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message } });
+        },
         mode: llmToolMode,
         onText: (t) => {
           opts.onText?.(t);
@@ -747,7 +768,9 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       if (res.stopped === "error") {
         opts.onText?.(`⚠ stage ended early: ${res.error}`);
         opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: `⚠ stage ended early: ${res.error}` } });
+        if (res.contextFailure) pauseRun(res.error ?? "Context recovery failed", "context");
       }
+      if (!p.shouldStop() && !session.paused) pauseRun(res.error ?? `Stage stopped: ${res.stopped}`, "incomplete");
       return res.turns;
     }
     let turns = 0;
@@ -758,21 +781,22 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     let assistantTokens = 0;
     let resultTokens = 0;
     let sawResult = false;
-    const q = query({
-      prompt: p.goal,
-      options: {
-        mcpServers: { veritas: server },
-        allowedTools: p.allowed.map((n) => `mcp__veritas__${n}`),
-        disallowedTools: DISALLOWED,
-        permissionMode: "bypassPermissions",
-        // allowlist that PreToolUse-denies everything other than veritas MCP tools (incl. Task/Agent/Monitor/Skill/ToolSearch/...).
-        hooks: { PreToolUse: [{ hooks: [onlyVeritasToolsHook] }] },
-        ...(p.model ? { model: p.model } : {}),
-        systemPrompt: { type: "preset", preset: "claude_code", append: sys },
-        maxTurns: p.maxTurns,
-      },
-    });
+    let q: ReturnType<typeof query> | undefined;
     try {
+      q = query({
+        prompt: p.goal,
+        options: {
+          mcpServers: { veritas: server },
+          allowedTools: p.allowed.map((n) => `mcp__veritas__${n}`),
+          disallowedTools: DISALLOWED,
+          permissionMode: "bypassPermissions",
+          // allowlist that PreToolUse-denies everything other than veritas MCP tools (incl. Task/Agent/Monitor/Skill/ToolSearch/...).
+          hooks: { PreToolUse: [{ hooks: [onlyVeritasToolsHook] }] },
+          ...(p.model ? { model: p.model } : {}),
+          systemPrompt: { type: "preset", preset: "claude_code", append: sys },
+          maxTurns: p.maxTurns,
+        },
+      });
       for await (const msg of q) {
         // Use structured fields as the primary signal (rate_limit_event / assistant.error / api_error_status 429).
         // On detection pauseRun sets done=true, and the `session.done` check below exits this stage.
@@ -804,8 +828,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         if (p.shouldStop() || session.done) break;
       }
     } catch (err) {
-      // When a stage dies with a throw. If it's token/usage-limit exhaustion, **pause instead of skipping** (resumable).
-      // Otherwise (maxTurns / transient SDK error) proceed best-effort to the next screen/stage as before.
+      // Preserve recorded evidence and pause unfinished stages, including non-quota SDK errors.
       // Tools already fired by this point (record_finding etc.) are already reflected in the store, so no finding is lost.
       const m = String(err instanceof Error ? err.message : err).slice(0, 160);
       if (isClaudeUsageLimit(m)) {
@@ -816,7 +839,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       }
     }
     try {
-      await q.return?.(undefined as never);
+      await q?.return?.(undefined as never);
     } catch {
       /* generator already done */
     }
@@ -830,6 +853,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         opts.store.updateBudget(opts.assessmentId, budget); // live-reflect to WebUI/status
       }
     }
+    if (!p.shouldStop() && !session.paused) pauseRun("Stage ended without its completion tool", "incomplete");
     return turns;
   };
 
@@ -869,7 +893,8 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         allowed: allowedFor("survey"),
         maxTurns,
         model: fastModel, // survey is mechanical -> fast
-        shouldStop: () => session.surveyDone || session.done,
+        contextWindowTokens: contextWindows.light,
+        shouldStop: () => session.surveyDone,
       });
     }
 
@@ -924,7 +949,8 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         allowed: allowedFor("reconGuess"),
         maxTurns: Math.min(maxTurns, 12),
         model: fastModel, // guessing is mechanical -> fast
-        shouldStop: () => session.reconGuessDone || session.done,
+        contextWindowTokens: contextWindows.light,
+        shouldStop: () => session.reconGuessDone,
       });
     }
 
@@ -979,7 +1005,8 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         allowed: allowedFor("methodology"),
         maxTurns: Math.min(maxTurns, 30),
         model: fastModel, // methodology is fast too (structured plan authoring)
-        shouldStop: () => session.methodologyDone || session.done,
+        contextWindowTokens: contextWindows.light,
+        shouldStop: () => session.methodologyDone,
       });
     }
 
@@ -1126,7 +1153,8 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         if (scUrl && !opts.anchorUrl) lastWarmUrl = scUrl; // else remember it for attended/Burp keepalive (no per-screen context)
         session.currentScreenId = sc.screenId;
         session.screenDone = false;
-        session.screenVerdict = null;
+        const existing = session.findings.filter((f) => f.screenId === sc.screenId);
+        session.screenVerdict = existing.some((f) => (f.verdict ?? "confirmed") === "confirmed") ? "finding" : existing.length ? "suspected" : null;
         session.screenSkipReason = null;
         session.screenProbes = 0; // reset per screen for the coverage-gate cross-check
         opts.store.setScreenScanStatus(opts.assessmentId, sc.screenId, "scanning");
@@ -1136,11 +1164,13 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
           allowed: allowedFor("diagnose"),
           maxTurns: perScreen,
           model: screenIsHighValue(sc) ? deepModel : fastModel, // only high-value screens go deep (opus)
-          shouldStop: () => session.screenDone || session.done,
+          contextWindowTokens: screenIsHighValue(sc) ? contextWindows.deep : contextWindows.light,
+          shouldStop: () => session.screenDone,
         });
         // If interrupted by token/usage-limit exhaustion: return this screen to queued **still un-diagnosed** (not clean),
         // pause, and exit. On resume it continues from the queued screens (this one and the untouched rest).
-        if (session.paused) {
+        if (session.paused || !session.screenDone) {
+          if (!session.paused) pauseRun("Diagnosis ended without screen_done", "incomplete");
           opts.store.setScreenScanStatus(opts.assessmentId, sc.screenId, "queued");
           return "break";
         }
@@ -1154,7 +1184,6 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
             : session.screenVerdict === "suspected"
               ? "suspected"
               : "clean";
-        opts.store.setScreenScanStatus(opts.assessmentId, sc.screenId, status);
 
         // ── Auth-wall circuit breaker ── if every probe returns 401 and nothing gets through (zero 2xx, zero findings),
         //    running more screens is pointless. Stop and prompt the operator to set auth (httpBasic/creds/cookie).
@@ -1171,10 +1200,11 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
             createdAt: new Date().toISOString(),
             resolvedAt: null,
           });
-          session.done = true;
-          session.doneSummary = msg;
+          opts.store.setScreenScanStatus(opts.assessmentId, sc.screenId, "queued");
+          pauseRun(msg, "auth");
           return "break";
         }
+        opts.store.setScreenScanStatus(opts.assessmentId, sc.screenId, status);
         return "continue";
       };
 
@@ -1245,7 +1275,8 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
           allowed: allowedFor("scenario"),
           maxTurns: Math.min(maxTurns, 40),
           model: deepModel, // discovering and building workflows is the hardest reasoning -> pinned deep
-          shouldStop: () => session.scenarioDone || session.done,
+          contextWindowTokens: contextWindows.deep,
+          shouldStop: () => session.scenarioDone,
         });
       }
 
@@ -1267,7 +1298,8 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
           allowed: fpTools,
           maxTurns: Math.min(maxTurns, 25),
           model: deepModel, // mapping version <-> CVE is knowledge-intensive -> pinned deep
-          shouldStop: () => session.fingerprintDone || session.done,
+          contextWindowTokens: contextWindows.deep,
+          shouldStop: () => session.fingerprintDone,
         });
       }
 
@@ -1352,7 +1384,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       // so queued screens can be continued on resume. The WebUI shows "⏸ paused" via control_changed.
       opts.store.appendEvent(opts.assessmentId, {
         type: "note",
-        payload: { message: `⏸ run paused (token/usage limit) — ${session.inv.screens().length} screens mapped; resume to finish diagnosis` },
+        payload: { message: `⏸ run paused — ${session.inv.screens().length} screens mapped; resume to finish diagnosis` },
       });
     } else if (!opts.surveyOnly) {
       opts.store.setPhase(opts.assessmentId, "report");
@@ -1375,7 +1407,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     }
   }
 
-  const summary = opts.surveyOnly
+  const summary = opts.surveyOnly && !session.paused
     ? `survey only: ${session.inv.screens().length} screen(s) mapped (not diagnosed; resume to diagnose).`
     : session.doneSummary ||
       `${session.findings.length} finding(s) across ${session.inv.screens().length} screen(s).`;

@@ -124,3 +124,29 @@ test("OpenAiClient throws when no model is resolvable", async () => {
     const client = new OpenAiClient({ baseURL: "http://x/v1", fetchImpl: fakeFetch({ json: {} }).fetchImpl });
     await assert.rejects(client.complete({ prompt: "p" }), /no model/);
 });
+
+test("OpenCode requests carry a stable session per client and an identifying user agent", async () => {
+    const ids: string[] = [];
+    const fetchImpl: FetchLike = async (_url, init) => {
+        const headers = new Headers(init.headers);
+        assert.match(headers.get("user-agent")!, /^VERDICT\//);
+        assert.match(headers.get("x-opencode-session")!, /^[a-f0-9-]{36}$/);
+        ids.push(headers.get("x-opencode-session")!);
+        return Response.json({ choices: [{ message: { content: "OK" } }] });
+    };
+    const options = { baseURL: "https://opencode.ai/zen/go/v1", defaultModel: "deepseek-v4-flash", fetchImpl };
+    const client = new OpenAiClient(options);
+    await client.complete({ prompt: "first turn" });
+    await client.complete({ prompt: "second turn" });
+    await new OpenAiClient(options).complete({ prompt: "another conversation" });
+    assert.equal(ids[0], ids[1]);
+    assert.notEqual(ids[1], ids[2]);
+});
+
+test("provider session metadata is not sent to other compatible endpoints", async () => {
+    const client = new OpenAiClient({ baseURL: "https://other.test/v1", defaultModel: "m", fetchImpl: async (_url, init) => {
+        assert.equal(new Headers(init.headers).get("x-opencode-session"), null);
+        return Response.json({ choices: [{ message: { content: "OK" } }] });
+    } });
+    await client.complete({ prompt: "hello" });
+});

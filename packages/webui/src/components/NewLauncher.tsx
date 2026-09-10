@@ -5,7 +5,7 @@
 import { useState, type ReactNode } from "react";
 import { NewAssessment } from "./NewAssessment";
 
-type Mode = "web" | "api";
+type Mode = "web";
 
 // Lucide-style single-color outline icons — stroke = currentColor, sized/colored via CSS (.mode-ic).
 const svg = {
@@ -34,9 +34,9 @@ function BracesIcon() {
     </svg>
   );
 }
-function Card({ icon, title, desc, onClick }: { icon: ReactNode; title: string; desc: string; onClick: () => void }) {
+function Card({ icon, title, desc, onClick, disabled = false }: { icon: ReactNode; title: string; desc: string; onClick?: () => void; disabled?: boolean }) {
   return (
-    <button type="button" className="mode-card" onClick={onClick}>
+    <button type="button" className="mode-card" onClick={onClick} disabled={disabled}>
       <span className="mode-ic">{icon}</span>
       <span className="mode-t">{title}</span>
       <span className="mode-d">{desc}</span>
@@ -49,7 +49,6 @@ export function NewLauncher({ onCancel }: { onCancel: () => void }) {
   const back = (): void => setMode(null);
 
   if (mode === "web") return <NewAssessment onCancel={back} />;
-  if (mode === "api") return <NewAssessment onCancel={back} apiSpec />;
 
   return (
     <div className="newform">
@@ -70,8 +69,8 @@ export function NewLauncher({ onCancel }: { onCancel: () => void }) {
         <Card
           icon={<BracesIcon />}
           title="API spec"
-          desc="Import an OpenAPI / Swagger spec to drive an API assessment."
-          onClick={() => setMode("api")}
+          desc="Coming Soon"
+          disabled
         />
       </div>
     </div>

@@ -2,7 +2,7 @@
 
 import type { BudgetState } from "./types/budget.js";
 import type { ScopeMode, ScopePolicy } from "./types/scope.js";
-import { registrableDomain } from "./etld.js";
+import { knownRegistrableDomain } from "./etld.js";
 import { parseTargetUrl } from "./scope-check.js";
 
 /** A realistic desktop-Chrome User-Agent shared by the browser driver AND the raw-HTTP client, so a target/WAF sees a
@@ -50,9 +50,9 @@ export function deriveScopeFromUrls(rawUrls: string[], mode: ScopeMode = "same-o
     const u = parseTargetUrl(raw); // reject schemeless/non-http(s) with a clear error (vs an opaque throw or a silently empty scope)
     if (mode === "unrestricted") hosts.add(UNRESTRICTED_HOST);
     else if (mode === "etld") {
-      const reg = registrableDomain(u.hostname);
-      // IP / localhost etc. (no notion of subdomains): don't add `*.`; fall back to the exact host (port included).
-      hosts.add(reg.includes(".") && !/^[0-9.]+$/.test(reg) ? `*.${reg}` : u.host);
+      const reg = knownRegistrableDomain(u.hostname);
+      // Private suffixes isolate tenants; unknown suffixes / IPs / suffix-only seeds stay exact (including port).
+      hosts.add(reg ? `*.${reg}` : u.host);
     } else hosts.add(u.host);
   }
   return {

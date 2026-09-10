@@ -29,7 +29,7 @@ Use VERDICT on systems you own or are explicitly authorized to test. Automated p
 | Workflow | In the desktop app |
 | --- | --- |
 | **Assess a web application** | Start from a URL, define scope and account roles, and follow the discovered pages and APIs. |
-| **Assess an API specification** | Import OpenAPI 3.x or Swagger 2.0 JSON and diagnose the in-scope endpoint inventory. |
+| **Assess an API specification** | Coming Soon |
 | **Handle manual login** | Use the embedded Browser for SSO, MFA, or CAPTCHA; capture the session and continue the diagnosis. |
 | **Choose your models** | Select Claude, OpenCodeGo, OrcaRouter, or Other; configure Deep and Light models and check connections. |
 | **Review evidence** | Inspect findings alongside requests, responses, and captured browser evidence. Tested, excluded, and unfinished surfaces are counted separately. |
@@ -69,6 +69,8 @@ OpenCodeGo / `omen-alpha` has been used in the desktop evaluation below. OrcaRou
 
 Under **Network**, leave Chromium path blank to detect Chrome/Edge. Configure an upstream proxy only when needed. **Agent → Operator context** stores target facts that prefill new assessments.
 
+For API providers, **Models → Deep / Light max context** sets each model's total context capacity in tokens (for example, `128000`, `256000`, or `1000000`). Use the limit supported by your endpoint. Blank defaults to 256,000; Light inherits Deep when both use the same model. Pilot reserves response space, reports estimated context usage in the run log, and automatically summarizes older history before the window fills. A failed summary pauses unfinished work for resume. Claude uses its own context management.
+
 ### 3. Start and follow an assessment
 
 1. Choose **Main → New → Web / API app**.
@@ -76,7 +78,7 @@ Under **Network**, leave Chromium path blank to detect Chrome/Edge. Configure an
 3. Launch and follow the site tree, progress, findings, and live log.
 4. Inspect each finding's evidence, then use **Export / Import** to save a report.
 
-For API-first testing, choose **New → API spec** and upload an **OpenAPI 3.x / Swagger 2.0 JSON file**, up to 2 MB. The target base URL overrides the specification's server URL. In-scope endpoints seed planning and diagnosis; YAML and external references are not supported.
+**API spec** in the new-assessment screen is **Coming Soon**.
 
 For SSO, MFA, or CAPTCHA, open **Browser**, navigate to the target, log in, and select **Capture session**. **Scan (new run) →** launches from the browser's current URL with the captured cookies and localStorage. Use the New form for explicit scope and role configuration.
 
@@ -122,7 +124,7 @@ pnpm -r test
 
 `apps/desktop` owns the window, settings, and embedded browser. It hosts `packages/server` locally, uses the shared React views in `packages/webui`, and launches `packages/cli` for assessments. The engine packages share contracts and SQLite state through `packages/core`.
 
-The CLI remains available for automation, standalone WebUI, attack-surface recon, and LLM red teaming:
+The CLI remains available for automation, standalone WebUI, and LLM red teaming:
 
 ```bash
 node packages/cli/dist/main.js --help

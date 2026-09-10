@@ -1,3 +1,5 @@
+import { parseContextTokens, type ModelContextSettings } from "@veritas/core/llm-context";
+
 /** Desktop service names map onto the two supported runtime transports. */
 export type ModelProvider = "claude-cli" | "opencode-go" | "orcarouter" | "other";
 
@@ -22,7 +24,7 @@ export function normalizeModelProvider(provider: unknown, baseURL?: string): Mod
     return "claude-cli";
 }
 
-export function modelConnectionEnv(s: { provider: ModelProvider; baseURL?: string; apiKey?: string; deepModel?: string; lightModel?: string }): Record<string, string> {
+export function modelConnectionEnv(s: ModelContextSettings & { provider: ModelProvider; baseURL?: string; apiKey?: string; deepModel?: string; lightModel?: string }): Record<string, string> {
     const provider = normalizeModelProvider(s.provider, s.baseURL);
     const env: Record<string, string> = { VERDICT_LLM_PROVIDER: provider === "claude-cli" ? "claude-cli" : "openai" };
     const baseURL = s.baseURL?.trim() || MODEL_PROVIDERS[provider].baseURL;
@@ -30,5 +32,11 @@ export function modelConnectionEnv(s: { provider: ModelProvider; baseURL?: strin
     if (s.apiKey) env.VERDICT_LLM_API_KEY = s.apiKey;
     if (s.deepModel) env.VERDICT_LLM_MODEL = s.deepModel;
     if (s.lightModel) env.VERDICT_LLM_FAST_MODEL = s.lightModel;
+    if (provider !== "claude-cli") {
+        const deep = parseContextTokens(s.deepContextTokens);
+        const light = parseContextTokens(s.lightContextTokens);
+        if (deep !== undefined) env.VERDICT_LLM_CONTEXT_TOKENS = String(deep);
+        if (light !== undefined) env.VERDICT_LLM_FAST_CONTEXT_TOKENS = String(light);
+    }
     return env;
 }

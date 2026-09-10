@@ -3,12 +3,13 @@
 // to userData/settings.json; mapped to the VERDICT_LLM_* / VERDICT_BROWSER_PATH env the child assessment processes read.
 
 import { checkReadiness } from "@veritas/server";
+import { parseContextTokens, type ModelContextSettings } from "@veritas/core/llm-context";
 import { app, ipcMain } from "electron";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { MODEL_PROVIDERS, normalizeModelProvider, modelConnectionEnv, type ModelProvider } from "./model-providers.js";
 
-export interface DesktopSettings {
+export interface DesktopSettings extends ModelContextSettings {
     /** Named service selection; non-Claude services use the OpenAI-compatible transport. */
     provider: ModelProvider;
     /** openai: base URL, e.g. https://opencode.ai/zen/go/v1 */
@@ -104,6 +105,10 @@ function saveSettings(s: DesktopSettings): DesktopSettings {
         const v = s[k];
         if (typeof v === "string" && v.trim()) clean[k] = v.trim();
     }
+    for (const k of ["deepContextTokens", "lightContextTokens"] as const) {
+        const value = parseContextTokens(s[k]);
+        if (value !== undefined) clean[k] = value;
+    }
     if (!clean.baseURL && MODEL_PROVIDERS[clean.provider].baseURL) clean.baseURL = MODEL_PROVIDERS[clean.provider].baseURL;
     if (s.burpScan) clean.burpScan = true;
     if (s.oobProvider === "interactsh" || s.oobProvider === "burp" || s.oobProvider === "off") clean.oobProvider = s.oobProvider;
@@ -150,7 +155,7 @@ export function settingsToEnv(s: DesktopSettings): Record<string, string> {
  *  as scan children. childEnv only wraps spawned CLI processes — without this, Ask defaults to `claude` and
  *  PDF looks for Playwright's unbundled chromium_headless_shell. */
 export function applyLlmSettingsToEnv(s: DesktopSettings = loadSettings(), env: NodeJS.ProcessEnv = process.env): void {
-    for (const key of ["VERDICT_LLM_PROVIDER", "VERDICT_LLM_BASE_URL", "VERDICT_LLM_API_KEY", "VERDICT_LLM_MODEL", "VERDICT_LLM_FAST_MODEL"]) delete env[key];
+    for (const key of ["VERDICT_LLM_PROVIDER", "VERDICT_LLM_BASE_URL", "VERDICT_LLM_API_KEY", "VERDICT_LLM_MODEL", "VERDICT_LLM_FAST_MODEL", "VERDICT_LLM_CONTEXT_TOKENS", "VERDICT_LLM_FAST_CONTEXT_TOKENS"]) delete env[key];
     Object.assign(env, modelConnectionEnv(s));
     const browser = s.browserPath?.trim() || detectSystemChromium();
     if (browser) {

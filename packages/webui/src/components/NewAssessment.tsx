@@ -67,6 +67,24 @@ export function NewAssessment({ onCancel, apiSpec = false }: { onCancel: () => v
   const [outHosts, setOutHosts] = useState("");
   const [inPaths, setInPaths] = useState("");
   const [outPaths, setOutPaths] = useState("");
+  const [scopePreview, setScopePreview] = useState<string[]>([]);
+  useEffect(() => {
+    setScopePreview([]);
+    if (inHosts.trim()) { setScopePreview(lines(inHosts)); return; }
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => {
+      const urls = [...new Set([target.trim(), ...lines(targetUrls)].filter(Boolean))];
+      if (!urls.length) return;
+      const query = new URLSearchParams({ mode: scopeMode });
+      for (const url of urls) query.append("url", url);
+      void fetch(`/api/scope-preview?${query}`, { signal: controller.signal }).then(async (res) => {
+        if (!res.ok) return;
+        const data = await res.json() as { hosts: string[] };
+        if (!controller.signal.aborted) setScopePreview(data.hosts);
+      }).catch(() => {});
+    }, 250);
+    return () => { window.clearTimeout(timer); controller.abort(); };
+  }, [target, targetUrls, scopeMode, inHosts]);
   // crawl
   const [followLinks, setFollowLinks] = useState(true);
   const [maxDepth, setMaxDepth] = useState("10"); // crawl default depth = 10
@@ -264,10 +282,11 @@ export function NewAssessment({ onCancel, apiSpec = false }: { onCancel: () => v
       <label className="nf-field">
         <span>Scope mode</span>
         <select value={scopeMode} onChange={(e) => setScopeMode(e.target.value as "same-origin" | "etld" | "unrestricted")}>
-          <option value="etld">eTLD+1 — seed domain + subdomains (incl. its APIs)</option>
+          <option value="etld">eTLD+1 — seed domain + subdomains (private hosting boundaries respected)</option>
           <option value="same-origin">same-origin — exact host only (APIs on other subdomains blocked)</option>
           <option value="unrestricted">unrestricted — any host (⚠ may leave the program)</option>
         </select>
+        <small>Allowed hosts: {scopePreview.length ? scopePreview.join(", ") : "Enter target URLs to preview"}. Exclusions below still apply.</small>
       </label>
 
       <div className="nf-grid">

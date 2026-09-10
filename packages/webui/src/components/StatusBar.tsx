@@ -44,7 +44,7 @@ function BurpImport({ id }: { id: string }) {
 
 // The Report section of an Export menu — the assessment report in every format (HTML/PDF/Markdown/Findings CSV),
 // generated on the fly from the store's findings by `/report`. SHARED so every viewer's Export offers the identical
-// Report block: the web/API viewer (DownloadMenu, below) and the ASR viewer (AsrView's AsrExport) both render this,
+// Shared report block for assessment export menus,
 // so "Report" never drifts per view. GET endpoints send cookies automatically; every report format downloads.
 export function ReportLinks({ id }: { id: string }) {
   const rep = (f: string): string => `/api/assessments/${encodeURIComponent(id)}/report?format=${f}`;
@@ -79,7 +79,7 @@ function DownloadMenu({ id, canWrite }: { id: string; canWrite: boolean }) {
 
 /**
  * The shared status-bar chrome — brand · role badge · sign-out · `● {conn}` dot — with slots for the middle metrics,
- * optional actions (pause), and an export menu. BOTH the web viewer (StatusBar, below) and the ASR viewer (AsrView)
+ * optional actions (pause), and an export menu. Assessment views
  * render through this, so the header is byte-identical across target types: same role badge, same sign-out link, same
  * connection indicator. Add anything header-common here, never re-implement it per view.
  */
@@ -107,7 +107,7 @@ export function StatusBarShell({
       ) : null}
       {metrics}
       {/* single spacer owns the right-alignment for the trailing controls group (pause · export · sign out · conn),
-          so it right-aligns identically whether or not a view supplies a pause button (ASR has none). */}
+          so it right-aligns identically whether or not a view supplies a pause button. */}
       <span className="sb-spacer" />
       {actions}
       {exportMenu}

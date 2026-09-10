@@ -1,3 +1,4 @@
+import { hasLocalToken, isTrustedRequest, validateRequestPath } from "./request-security.js";
 // DESIGN §8.1 / §8.4 — state API + WebSocket.
 // Project AssessmentState into StateView and push. Poll the state.sqlite that a separate process
 // (crawler/labeler) writes, via events.seq, and push new events as diffs (since there are no in-process events).
@@ -7,19 +8,21 @@ import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "
 import { extname, join, normalize, resolve, sep } from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
 
-import { AssessmentStore, buildReportModel, buildStateView, isInScope, parseTargetUrl, renderFindingsCsv, renderInventoryHtml, renderMarkdown, renderReportHtml, renderScreensCsv } from "@veritas/core";
+import { AssessmentStore, deriveScopeFromUrls, buildReportModel, buildStateView, isInScope, parseTargetUrl, renderFindingsCsv, renderInventoryHtml, renderMarkdown, renderReportHtml, renderScreensCsv } from "@veritas/core";
 import type { TargetInput, WsMessage, ControlCommand, ScopePolicy } from "@veritas/core";
 import { htmlToPdf, validateOpenApiDocument } from "@veritas/crawler";
 import { resolveLlmConfig, makeLlmClient } from "@veritas/llm";
 import type { AssessmentState } from "@veritas/core";
 import { handleAuthSubmit, handleLogout, roleForReq, loginPageHtml } from "./auth.js";
 import type { AuthConfig, Role } from "./auth.js";
-import { Supervisor, type RunLauncherConfig, type StartRunInput } from "./supervisor.js";
+import { Supervisor, isRunCommand, isSupportedRun, type RunLauncherConfig, type StartRunInput } from "./supervisor.js";
 import { Relay } from "./relay.js";
 import { continueSession, SessionContinuationError } from "./continue-session.js";
 
 export interface ServerOptions {
   runsDir: string;
+  /** Per-launch desktop credential; supplied by the trusted Electron session, never placed in URLs. */
+  localAuthToken?: string;
   port?: number;
   host?: string;
   /** Built webui (served statically). If unset, API/WS only */
@@ -60,7 +63,7 @@ const MIME: Record<string, string> = {
 interface AssessmentSummaryRow {
   id: string;
   phase: string;
-  type: "web" | "api" | "asr";
+  type: "web" | "api";
   screens: number;
   findings: number;
   target: TargetInput;
@@ -72,7 +75,7 @@ function listAssessments(runsDir: string): AssessmentSummaryRow[] {
   if (!existsSync(runsDir)) return [];
   const rows: AssessmentSummaryRow[] = [];
   for (const ent of readdirSync(runsDir, { withFileTypes: true })) {
-    if (!ent.isDirectory()) continue;
+    if (!ent.isDirectory() || !isSupportedRun(runsDir, ent.name)) continue;
     const dbPath = join(runsDir, ent.name, "state.sqlite");
     if (!existsSync(dbPath)) continue;
     try {
@@ -82,12 +85,10 @@ function listAssessments(runsDir: string): AssessmentSummaryRow[] {
       store.close();
       if (state) {
         const dir = join(runsDir, ent.name);
-        // asr = has an asset inventory · api = spec-seeded (no browser profile + API-only screens) · web = everything else
-        const type: "web" | "api" | "asr" = existsSync(join(dir, "asset_inventory.json"))
-          ? "asr"
-          : !existsSync(join(dir, "browser-profile")) && state.screens.length > 0 && state.screens.every((s) => s.apis.length > 0 && !s.screenshot)
-            ? "api"
-            : "web";
+        // Spec-seeded inventories with no browser profile are API assessments.
+        const type: "web" | "api" = !existsSync(join(dir, "browser-profile")) && state.screens.length > 0 && state.screens.every((s) => s.apis.length > 0 && !s.screenshot)
+          ? "api"
+          : "web";
         rows.push({
           id: state.id,
           phase: state.phase,
@@ -110,8 +111,21 @@ function listAssessments(runsDir: string): AssessmentSummaryRow[] {
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body);
-  res.writeHead(status, { "content-type": "application/json; charset=utf-8", "access-control-allow-origin": "*" });
+  res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
   res.end(payload);
+}
+
+/** Contain failures in both route dispatch and delayed body/report handlers. */
+function requestFailure(res: ServerResponse, error: unknown): void {
+  if (res.destroyed || res.writableEnded) return;
+  if (res.headersSent) { res.destroy(); return; }
+  sendJson(res, error instanceof URIError ? 400 : 500, { error: error instanceof URIError ? "invalid request path" : "request failed" });
+}
+
+function onBodyEnd(req: IncomingMessage, res: ServerResponse, handler: () => void): void {
+  req.on("end", () => {
+    try { handler(); } catch (error) { requestFailure(res, error); }
+  });
 }
 
 /** True if `full` is `rootAbs` or a descendant. Uses `sep` so Windows `\\` paths are not 403'd
@@ -163,7 +177,7 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
         req.destroy();
       }
     });
-    req.on("end", () => {
+    onBodyEnd(req, res, () => {
       if (tooBig) return;
       let input: StartRunInput;
       try {
@@ -171,8 +185,8 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
       } catch {
         return sendJson(res, 400, { error: "invalid JSON body" });
       }
-      if (input.command !== "pilot" && input.command !== "assess" && input.command !== "redteam" && input.command !== "asr") {
-        return sendJson(res, 400, { error: "command must be 'pilot', 'assess', 'redteam', or 'asr'" });
+      if (!isRunCommand(input?.command)) {
+        return sendJson(res, 400, { error: "command must be 'pilot', 'assess', or 'redteam'" });
       }
       if (input.spec !== undefined) {
         try {
@@ -209,6 +223,7 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
       return sendJson(res, ok ? 200 : 409, ok ? { ok: true } : { error: "not running" });
     }
     if (supervisor.isRunning(id)) return sendJson(res, 409, { error: "already running" });
+    if (!isSupportedRun(opts.runsDir, id)) return sendJson(res, 400, { error: "This saved assessment type is no longer supported" });
     supervisor.resume(id);
     return sendJson(res, 200, { ok: true });
   }
@@ -239,7 +254,7 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
         req.destroy();
       }
     });
-    req.on("end", () => {
+    onBodyEnd(req, res, () => {
       if (tooBig) return sendJson(res, 413, { error: "too large" });
       let parsed: { messages?: Array<{ role?: string; content?: string }> };
       try {
@@ -247,9 +262,10 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
       } catch {
         return sendJson(res, 400, { error: "invalid JSON body" });
       }
-      const messages = (parsed.messages ?? []).filter((m) => typeof m.content === "string" && m.content.trim());
+      if (!parsed || !Array.isArray(parsed.messages)) return sendJson(res, 400, { error: "messages must be an array" });
+      const messages = parsed.messages.filter((m) => m && typeof m.content === "string" && m.content.trim());
       if (!messages.length) return sendJson(res, 400, { error: "messages required" });
-      void serveChat(res, opts.runsDir, id, messages as Array<{ role: string; content: string }>);
+      void serveChat(res, opts.runsDir, id, messages as Array<{ role: string; content: string }>).catch((error) => requestFailure(res, error));
     });
     return;
   }
@@ -275,7 +291,7 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
       }
       chunks.push(c);
     });
-    req.on("end", () => {
+    onBodyEnd(req, res, () => {
       if (tooBig) return sendJson(res, 413, { error: "report too large (>128MB)" });
       const reportPath = join(opts.runsDir, id, "burp-upload.xml");
       try {
@@ -359,7 +375,7 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
         req.destroy();
       }
     });
-    req.on("end", () => {
+    onBodyEnd(req, res, () => {
       if (tooBig) return;
       let ids: string[] = [];
       try {
@@ -396,7 +412,7 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
         req.destroy();
       }
     });
-    req.on("end", () => {
+    onBodyEnd(req, res, () => {
       if (tooBig) return;
       let cmd: ControlCommand;
       try {
@@ -450,7 +466,7 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
         req.destroy();
       }
     });
-    req.on("end", () => {
+    onBodyEnd(req, res, () => {
       if (tooBig) return;
       const closeQuietly = (): void => {
         try {
@@ -507,7 +523,7 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
     if (!/^[a-zA-Z0-9_-]+$/.test(id)) return sendJson(res, 400, { error: "invalid assessment id" });
     let body = "";
     req.on("data", (chunk) => { body += chunk; if (body.length > 8192) req.destroy(); });
-    req.on("end", () => {
+    onBodyEnd(req, res, () => {
       const store = openStore(id);
       if (!store) return sendJson(res, 404, { error: "assessment not found" });
       try {
@@ -535,7 +551,7 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
         req.destroy();
       }
     });
-    req.on("end", () => {
+    onBodyEnd(req, res, () => {
       if (tooBig) return;
       const closeQuietly = (): void => {
         try {
@@ -637,6 +653,16 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptio
     handleControl(req, res, opts, supervisor);
     return;
   }
+  if (req.method === "GET" && url.startsWith("/api/scope-preview?")) {
+    const params = new URL(url, "http://localhost").searchParams;
+    const mode = params.get("mode") ?? "same-origin";
+    if (mode !== "same-origin" && mode !== "etld" && mode !== "unrestricted") return sendJson(res, 400, { error: "invalid scope mode" });
+    try {
+      const urls = params.getAll("url");
+      if (!urls.length) return sendJson(res, 400, { error: "target URL required" });
+      return sendJson(res, 200, { hosts: deriveScopeFromUrls(urls, mode).inScopeHosts });
+    } catch { return sendJson(res, 400, { error: "enter valid HTTP(S) target URLs" }); }
+  }
   if (url === "/api/assessments") {
     const rows = listAssessments(opts.runsDir).map((r) => ({ ...r, running: supervisor?.isRunning(r.id) ?? false }));
     sendJson(res, 200, rows);
@@ -675,7 +701,7 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptio
     }
     const file = join(opts.runsDir, sid, "artifacts", "screens", `${scr}.png`);
     if (existsSync(file) && statSync(file).isFile()) {
-      res.writeHead(200, { "content-type": "image/png", "cache-control": "no-cache", "access-control-allow-origin": "*" });
+      res.writeHead(200, { "content-type": "image/png", "cache-control": "no-cache" });
       res.end(readFileSync(file));
     } else {
       res.writeHead(404);
@@ -695,7 +721,7 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptio
     }
     const file = join(opts.runsDir, sid, "artifacts", "findings", `${fid}.png`);
     if (existsSync(file) && statSync(file).isFile()) {
-      res.writeHead(200, { "content-type": "image/png", "cache-control": "no-cache", "access-control-allow-origin": "*" });
+      res.writeHead(200, { "content-type": "image/png", "cache-control": "no-cache" });
       res.end(readFileSync(file));
     } else {
       res.writeHead(404);
@@ -763,69 +789,16 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptio
   const rep = url.match(/^\/api\/assessments\/([^/?]+)\/(report|inventory)(?:\?|$)/);
   if (rep) {
     const fmt = new URL(url, "http://localhost").searchParams.get("format");
-    void serveReport(res, opts.runsDir, decodeURIComponent(rep[1] ?? ""), rep[2] as "report" | "inventory", fmt);
+    void serveReport(res, opts.runsDir, decodeURIComponent(rep[1] ?? ""), rep[2] as "report" | "inventory", fmt).catch((error) => requestFailure(res, error));
     return;
   }
-  // ASR asset inventory (runs/<id>/asset_inventory.json) — read by the WebUI Assets tab. Missing → empty inventory.
-  const assetsM = url.match(/^\/api\/assessments\/([^/?]+)\/assets(?:\?|$)/);
-  if (assetsM) {
-    const aid = decodeURIComponent(assetsM[1] ?? "");
-    if (!/^[a-z0-9_-]+$/i.test(aid)) {
-      res.writeHead(400);
-      res.end("bad id");
-      return;
-    }
-    const invFile = join(opts.runsDir, aid, "asset_inventory.json");
-    if (!existsSync(invFile) || !statSync(invFile).isFile()) {
-      sendJson(res, 404, { error: "not an ASR run" }); // no inventory → the WebUI treats this as a web/API run
-      return;
-    }
-    try {
-      sendJson(res, 200, JSON.parse(readFileSync(invFile, "utf8")));
-    } catch {
-      sendJson(res, 200, { version: 1, generatedAt: "", apex: "", assets: [] }); // exists but mid-write
-    }
-    return;
-  }
-  // ASR host screenshot: runs/<id>/artifacts/hosts/<host>.png. Hostnames contain dots, so the id check allows
-  // [a-z0-9.-] (and rejects "..") rather than the screen route's stricter alnum set — traversal is impossible (no slash).
-  const hostShot = url.match(/^\/api\/assessments\/([^/]+)\/hosts\/([^/?]+)\/screenshot/);
-  if (hostShot) {
-    const aid = decodeURIComponent(hostShot[1] ?? "");
-    const host = decodeURIComponent(hostShot[2] ?? "");
-    if (!/^[a-z0-9_-]+$/i.test(aid) || !/^[a-z0-9.-]+$/i.test(host) || host.includes("..")) {
-      res.writeHead(400);
-      res.end("bad id");
-      return;
-    }
-    const file = join(opts.runsDir, aid, "artifacts", "hosts", `${host}.png`);
-    if (existsSync(file) && statSync(file).isFile()) {
-      res.writeHead(200, { "content-type": "image/png", "cache-control": "no-cache", "access-control-allow-origin": "*" });
-      res.end(readFileSync(file));
-    } else {
-      res.writeHead(404);
-      res.end("no screenshot");
-    }
-    return;
-  }
-  // Run log (the spawned child's stdout/stderr) — for the ASR Log tab. Empty 200 while nothing's been written yet.
-  const runLog = url.match(/^\/api\/assessments\/([^/?]+)\/run-log(?:\?|$)/);
-  if (runLog) {
-    const aid = decodeURIComponent(runLog[1] ?? "");
-    if (!/^[a-z0-9_-]+$/i.test(aid)) {
-      res.writeHead(400);
-      res.end("bad id");
-      return;
-    }
-    const file = join(opts.runsDir, aid, "run.log");
-    const body = existsSync(file) && statSync(file).isFile() ? readFileSync(file) : "";
-    res.writeHead(200, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-cache" });
-    res.end(body);
-    return;
-  }
-  const m = url.match(/^\/api\/assessments\/([^/?]+)/);
+  const m = url.match(/^\/api\/assessments\/([^/?]+)(?:\?|$)/);
   const id = m?.[1];
   if (id) {
+    if (!isSupportedRun(opts.runsDir, decodeURIComponent(id))) {
+      sendJson(res, 404, { error: "assessment type is no longer supported" });
+      return;
+    }
     const dbPath = join(opts.runsDir, decodeURIComponent(id), "state.sqlite");
     if (!existsSync(dbPath)) {
       sendJson(res, 404, { error: "assessment not found" });
@@ -1023,7 +996,6 @@ async function serveReport(res: ServerResponse, runsDir: string, id: string, kin
     "content-type": type,
     "content-disposition": `${inline ? "inline" : "attachment"}; filename="${id}-${filename}"`,
     "cache-control": "no-store",
-    "access-control-allow-origin": "*",
   });
   res.end(body);
 }
@@ -1034,8 +1006,8 @@ function handleWsConnection(ws: WebSocket, req: IncomingMessage, opts: ServerOpt
     if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
   };
   const id = new URL(req.url ?? "", "http://localhost").searchParams.get("id");
-  if (!id) {
-    send({ type: "error", message: "missing ?id=<assessment-id>" });
+  if (!id || !/^[a-z0-9_-]+$/i.test(id)) {
+    send({ type: "error", message: "invalid or missing ?id=<assessment-id>" });
     ws.close();
     return;
   }
@@ -1092,7 +1064,17 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
   const log = opts.onLog ?? ((): void => {});
   const relay = opts.runLauncher ? new Relay() : undefined;
   const supervisor = opts.runLauncher ? new Supervisor(opts.runLauncher, relay) : undefined;
-  const httpServer = createServer((req, res) => handleHttp(req, res, opts, supervisor, relay));
+  const httpServer = createServer((req, res) => {
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
+    res.setHeader("X-Frame-Options", "DENY");
+    try {
+      if (!validateRequestPath(req)) return sendJson(res, 400, { error: "invalid request path" });
+      if (!isTrustedRequest(req, host)) return sendJson(res, 403, { error: "untrusted request origin or host" });
+      if (!hasLocalToken(req, opts.localAuthToken)) return sendJson(res, 401, { error: "unauthorized" });
+      handleHttp(req, res, opts, supervisor, relay);
+    } catch (error) { requestFailure(res, error); }
+  });
 
   // noServer + manual upgrade routing to host multiple WS paths on the same server.
   //   /ws         state projection (Cookie auth)   /ws/session  operator's attended login (Cookie auth)
@@ -1104,7 +1086,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
   wss.on("connection", (ws, req) => {
     sockets.add(ws);
     ws.on("close", () => sockets.delete(ws));
-    handleWsConnection(ws, req, { ...opts, pollMs });
+    try { handleWsConnection(ws, req, { ...opts, pollMs }); } catch { ws.close(1011, "state unavailable"); }
   });
   if (relay && agentWss) agentWss.on("connection", (ws, req) => relay.handleAgent(ws, req, log));
   if (relay && sessionWss)
@@ -1114,7 +1096,9 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
       relay.handleSession(ws, req);
     });
   httpServer.on("upgrade", (req, socket, head) => {
+    if (!validateRequestPath(req) || !isTrustedRequest(req, host)) return void socket.destroy();
     const pathname = (req.url ?? "").split("?")[0] ?? "";
+    if (pathname !== "/ws/agent" && !hasLocalToken(req, opts.localAuthToken)) return void socket.destroy();
     const cfg = opts.authPasswords;
     const role = cfg ? roleForReq(req, cfg, Date.now()) : "operator"; // no-auth is treated as operator
     if (pathname === "/ws") {

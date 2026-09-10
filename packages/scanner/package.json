@@ -23,7 +23,7 @@
   },
   "dependencies": {
     "@veritas/core": "workspace:*",
-    "undici": "^6.21.0"
+    "undici": "^6.28.1"
   },
   "devDependencies": {
     "@types/node": "^22.10.6",

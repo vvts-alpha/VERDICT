@@ -130,7 +130,8 @@
   background: var(--inset); color: var(--fg); border: 1px solid var(--line); border-radius: 6px;
   padding: 8px 10px; font: inherit; font-size: 12px;
 }
-.settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px; }
+.settings-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 0 16px; align-items: end; }
+.settings-grid .settings-field, .settings-grid input { min-width: 0; }
 .settings-actions { display: flex; align-items: center; gap: 12px; margin-top: 20px; }
 .settings-save {
   background: #1d3a4f; border: 1px solid #2f6f8f; color: #cfe; padding: 8px 20px;

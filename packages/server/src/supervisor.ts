@@ -28,7 +28,7 @@ export interface RunLauncherConfig {
 }
 
 export interface StartRunInput {
-  command: "pilot" | "assess" | "redteam" | "asr";
+  command: "pilot" | "assess" | "redteam";
   /** JSON in AssessManifest format (saved verbatim to runs/<id>/manifest.json). */
   manifest: unknown;
   /** Uploaded OpenAPI JSON; saved with the run and consumed by pilot. */
@@ -64,27 +64,27 @@ export interface StartRunInput {
     proxy?: string;
     /** redteam only: positive replays required to confirm a canary leak (default 2). */
     maxReplays?: number;
-    /** asr only: the wildcard/apex to recon (e.g. "*.example.com"). */
-    domain?: string;
-    /** asr only: hosts to exclude (comma-separated carve-outs). */
-    outOfScope?: string;
-    /** asr only: screenshot each live host. */
-    screenshot?: boolean;
-    /** asr only: probe curated high-signal paths on live hosts. */
-    paths?: boolean;
-    /** asr only: AI-triage the top-scoring hosts. */
-    triage?: boolean;
-    /** asr only: cap the number of discovered hosts probed. */
-    maxHosts?: number;
-    /** asr only: opt-in ACTIVE DNS brute (dnsx if present, else native node:dns) — the reliable path when crt.sh/subfinder can't reach the network. */
-    brute?: boolean;
-    /** asr only: brute wordlist file path (default: bundled ~130). */
-    wordlist?: string;
-    /** asr only: trusted-resolver file path for the brute. */
-    resolvers?: string;
-    /** asr only: disable external passive tools (subfinder). */
-    noTools?: boolean;
   };
+}
+
+export function isRunCommand(value: unknown): value is StartRunInput["command"] {
+  return value === "pilot" || value === "assess" || value === "redteam";
+}
+
+/** Legacy host inventories must never be resumed as web/API assessments. */
+export function isSupportedRun(runsDir: string, id: string): boolean {
+  const dir = join(runsDir, id);
+  if (existsSync(join(dir, "asset_inventory.json"))) return false;
+  const metadata = join(dir, "run.json");
+  if (!existsSync(metadata)) return true;
+  try {
+    const run: unknown = JSON.parse(readFileSync(metadata, "utf8"));
+    if (!run || typeof run !== "object") return false;
+    const command = (run as { command?: unknown }).command;
+    return command === undefined || isRunCommand(command);
+  } catch {
+    return false;
+  }
 }
 
 interface RunProc {
@@ -112,6 +112,7 @@ export class Supervisor {
 
   /** Save the manifest and spawn `<cli> <command> --manifest <f> --id <id> --out <runs>`. Returns the new id. */
   start(input: StartRunInput): { id: string } {
+    if (!isRunCommand(input.command)) throw new Error("Unsupported assessment command");
     const id = newAssessmentId();
     const dir = join(this.cfg.runsDir, id);
     mkdirSync(dir, { recursive: true });
@@ -119,13 +120,6 @@ export class Supervisor {
     writeFileSync(manifestPath, `${JSON.stringify(input.manifest, null, 2)}\n`);
     // Persist options too so resume can restore the start-time settings (attended/model/burp etc.).
     writeFileSync(join(dir, "run.json"), `${JSON.stringify({ command: input.command, options: input.options ?? {} }, null, 2)}\n`);
-    // ASR is detected by the WebUI via asset_inventory.json. Write it empty NOW (before the child has started and
-    // written it) so the run opens as an ASR view immediately, not briefly as a web assessment.
-    if (input.command === "asr") {
-      const apex = (input.options?.domain ?? "").replace(/^\*\./, "").replace(/\.$/, "");
-      writeFileSync(join(dir, "asset_inventory.json"), `${JSON.stringify({ version: 1, generatedAt: "", apex, assets: [] }, null, 2)}\n`);
-    }
-
     if (input.spec) writeFileSync(join(dir, "openapi.json"), JSON.stringify(input.spec));
     const args = [this.cfg.cliPath, input.command, "--manifest", manifestPath, "--id", id, "--out", this.cfg.runsDir];
     if (input.spec) args.push("--spec", join(dir, "openapi.json"));
@@ -135,21 +129,6 @@ export class Supervisor {
       // redteam has a strict, small flag set — do NOT pass pilot/assess-only flags (its parseArgs would reject them).
       // canary + selectors travel in the manifest's `assistant` block, read by cmdRedteam.
       if (o.maxReplays != null) args.push("--max-replays", String(o.maxReplays));
-    } else if (input.command === "asr") {
-      // asr has its own flag set — do NOT pass pilot/assess flags (its parseArgs would reject them).
-      // The domain travels in options; the base args already carry --manifest/--id/--out (cmdAsr accepts them).
-      if (o.domain) args.push("--domain", o.domain);
-      if (o.outOfScope) args.push("--out-of-scope", String(o.outOfScope));
-      if (o.screenshot) args.push("--screenshot");
-      if (o.paths) args.push("--paths");
-      if (o.triage) args.push("--triage");
-      if (o.maxHosts != null) args.push("--max-hosts", String(o.maxHosts));
-      if (o.brute) args.push("--brute"); // ACTIVE DNS brute (opt-in)
-      if (o.wordlist) args.push("--wordlist", String(o.wordlist));
-      if (o.resolvers) args.push("--resolvers", String(o.resolvers));
-      if (o.noTools) args.push("--no-tools");
-      if (o.model) args.push("--model", o.model);
-      if (o.rate != null) args.push("--rate", String(o.rate));
     } else {
       if (o.model) args.push("--model", o.model);
       if (o.fastModel) args.push("--fast-model", o.fastModel);
@@ -183,35 +162,15 @@ export class Supervisor {
   /** Resume diagnosis of an existing run (skip survey/methodology). Restore the start-time manifest/options to
    *  recover the auth material (roleCreds/cookie/httpBasic/attended) (without this, resume floods with 401s while unauthenticated). */
   resume(id: string): void {
+    if (!isSupportedRun(this.cfg.runsDir, id)) throw new Error("This saved assessment type is no longer supported");
     const dir = join(this.cfg.runsDir, id);
     const manifestPath = join(dir, "manifest.json");
-    let command = "pilot";
     let o: NonNullable<StartRunInput["options"]> = {};
     try {
       const run = JSON.parse(readFileSync(join(dir, "run.json"), "utf8")) as { command?: string; options?: unknown };
-      command = run.command ?? "pilot";
       o = (run.options ?? {}) as NonNullable<StartRunInput["options"]>;
     } catch {
       /* no run.json (old run) → continue as a pilot resume with defaults */
-    }
-
-    // ASR is one-shot — "resume" re-runs the scan (asr with the saved options), NOT pilot --resume.
-    if (command === "asr") {
-      const args = [this.cfg.cliPath, "asr", "--id", id, "--out", this.cfg.runsDir];
-      if (o.domain) args.push("--domain", o.domain);
-      if (o.outOfScope) args.push("--out-of-scope", String(o.outOfScope));
-      if (o.screenshot) args.push("--screenshot");
-      if (o.paths) args.push("--paths");
-      if (o.triage) args.push("--triage");
-      if (o.maxHosts != null) args.push("--max-hosts", String(o.maxHosts));
-      if (o.brute) args.push("--brute"); // ACTIVE DNS brute (opt-in)
-      if (o.wordlist) args.push("--wordlist", String(o.wordlist));
-      if (o.resolvers) args.push("--resolvers", String(o.resolvers));
-      if (o.noTools) args.push("--no-tools");
-      if (o.model) args.push("--model", o.model);
-      if (o.rate != null) args.push("--rate", String(o.rate));
-      this.spawnChild(id, "asr (re-scan)", args);
-      return;
     }
 
     const args = [this.cfg.cliPath, "pilot", "--resume", "--id", id, "--out", this.cfg.runsDir];
@@ -293,15 +252,14 @@ export class Supervisor {
     if (existing && existing.status === "running") return; // prevent double launch
     const log = this.cfg.onLog ?? ((): void => {});
     // --disable-warning=ExperimentalWarning: the CLI uses node:sqlite, whose first-use ExperimentalWarning would
-    // otherwise hit the child's stderr → run.log → the ASR Log tab (looks like a "SQLite read error"). args[0] is the
+    // otherwise clutter the child's stderr and run.log. args[0] is the
     // CLI script path, so the node flag must precede it.
     const childEnv = typeof this.cfg.childEnv === "function" ? this.cfg.childEnv() : (this.cfg.childEnv ?? process.env);
     const extraArgs = this.cfg.childArgs?.(command) ?? []; // e.g. desktop passes --proxy from Settings for pilot runs
     const child = spawn(this.cfg.nodePath, ["--disable-warning=ExperimentalWarning", ...args, ...extraArgs], { cwd: this.cfg.cwd ?? process.cwd(), env: childEnv, stdio: ["ignore", "pipe", "pipe"] });
     const rec: RunProc = { id, command, child, startedAt: new Date().toISOString(), status: "running", exitCode: null };
     this.procs.set(id, rec);
-    // Tee the child's stdout/stderr to runs/<id>/run.log, one timestamped line at a time (the WebUI ASR Log tab
-    // renders these with a .log-ts column, like the web diagnostic log).
+    // Save the child's stdout/stderr to runs/<id>/run.log, one timestamped line at a time.
     const logStream = createWriteStream(join(this.cfg.runsDir, id, "run.log"), { flags: "a" });
     let logBuf = "";
     const stamp = (): string => new Date().toTimeString().slice(0, 8);

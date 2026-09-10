@@ -8,7 +8,7 @@ import { useRole } from "../api";
 interface Row {
   id: string;
   phase: string;
-  type: "web" | "api" | "asr";
+  type: "web" | "api";
   screens: number;
   findings: number;
   target: TargetInput;
@@ -150,7 +150,7 @@ export function Index() {
                     {r.running ? <span className="rundot" title="running" /> : null}
                     {targetName(r.target)}
                   </div>
-                  <div className="tsub">{r.type === "asr" ? `*.${targetName(r.target)}` : targetSub(r.target)}</div>
+                  <div className="tsub">{targetSub(r.target)}</div>
                 </td>
                 <td>
                   <span className={`typepill ${r.type}`}>{r.type}</span>
@@ -174,7 +174,6 @@ export function Index() {
                       type="button"
                       className="resumebtn"
                       onClick={runCtl(r.id, "resume")}
-                      title={r.type === "asr" ? "re-runs discovery + probe (ASR re-scans from scratch — it has no partial resume)" : undefined}
                     >
                       ▶ Resume
                     </button>

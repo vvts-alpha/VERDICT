@@ -20,5 +20,4 @@ export type { Severity, FindingVerdict, FindingSource, Finding } from "./finding
 export type { HandoffReason, HandoffStatus, HumanHandoff } from "./handoff.js";
 export type { StateEvent, StateEventType, StateEventInput, ControlCommand } from "./event.js";
 export type { AssessmentState, AssessmentSummary } from "./state.js";
-export type { AssetSource, AssetBand, AssetScore, AssetTriage, AssetPathHit, FindingSeverity, AssetFinding, AssetTakeover, ListingEntry, Asset, AssetInventory } from "./asset.js";
 export type { JsAsset, JsSecret, JsSink } from "./js-asset.js";

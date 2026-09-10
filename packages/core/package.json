@@ -7,6 +7,10 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
+    "./llm-context": {
+      "types": "./dist/llm-context.d.ts",
+      "default": "./dist/llm-context.js"
+    },
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
@@ -20,6 +24,9 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --import tsx --disable-warning=ExperimentalWarning --test 'src/**/*.test.ts'",
     "clean": "rm -rf dist *.tsbuildinfo"
+  },
+  "dependencies": {
+    "tldts": "^7.4.12"
   },
   "devDependencies": {
     "@types/node": "^22.10.6",

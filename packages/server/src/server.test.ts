@@ -2,7 +2,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -10,6 +10,7 @@ import { AssessmentStore, deriveScopeFromSingleUrl } from "@veritas/core";
 import type { Screen, StateView, WsMessage } from "@veritas/core";
 import { startServer } from "./index.js";
 import { isContainedPath } from "./server.js";
+import { Supervisor, type StartRunInput } from "./supervisor.js";
 
 function screen(id: string, urlTemplate: string): Screen {
   return {
@@ -279,6 +280,50 @@ test("WebSocket sends a snapshot then pushes events on state change", async () =
     assert.ok(evMsg.events.some((e) => e.type === "screen_discovered"));
   } finally {
     ws.close();
+    await srv.close();
+    rmSync(runsDir, { recursive: true, force: true });
+  }
+});
+
+
+test("retired host reconnaissance cannot launch, resume, or expose its old endpoints", async () => {
+  const runsDir = mkdtempSync(join(tmpdir(), "verdict-retired-recon-"));
+  seed(runsDir, "web-run").close();
+  seed(runsDir, "legacy-inventory").close();
+  seed(runsDir, "legacy-command").close();
+  const inventory = '{"version":1,"apex":"example.test","assets":[]}';
+  writeFileSync(join(runsDir, "legacy-inventory", "asset_inventory.json"), inventory);
+  writeFileSync(join(runsDir, "legacy-command", "run.json"), JSON.stringify({ command: "asr" }));
+  const config = { runsDir, cliPath: join(runsDir, "must-not-launch.mjs"), nodePath: process.execPath };
+  const supervisor = new Supervisor(config);
+  const before = readdirSync(runsDir).sort();
+  assert.throws(() => supervisor.start({ command: "asr", manifest: {} } as unknown as StartRunInput), /Unsupported assessment command/);
+  assert.deepEqual(readdirSync(runsDir).sort(), before, "invalid commands must not create a run");
+  for (const id of ["legacy-inventory", "legacy-command"]) {
+    assert.throws(() => supervisor.resume(id), /no longer supported/);
+    assert.equal(supervisor.isRunning(id), false);
+  }
+  const srv = await startServer({ runsDir, runLauncher: config });
+  try {
+    const launch = await fetch(`${srv.url}/api/run`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ command: "asr", manifest: { target: "https://example.test/" } }),
+    });
+    assert.equal(launch.status, 400);
+    assert.match((await launch.json() as { error: string }).error, /command must be/);
+    const list = await (await fetch(`${srv.url}/api/assessments`)).json() as Array<{ id: string; type: string }>;
+    assert.deepEqual(list.map(({ id, type }) => ({ id, type })), [{ id: "web-run", type: "web" }]);
+    for (const id of ["legacy-inventory", "legacy-command"]) {
+      assert.equal((await fetch(`${srv.url}/api/run/${id}/resume`, { method: "POST" })).status, 400);
+      assert.equal((await fetch(`${srv.url}/api/assessments/${id}`)).status, 404);
+    }
+    for (const endpoint of ["assets", "hosts/example.test/screenshot", "run-log"]) {
+      assert.equal((await fetch(`${srv.url}/api/assessments/web-run/${endpoint}`)).status, 404, endpoint);
+    }
+    assert.equal((await fetch(`${srv.url}/api/assessments/web-run`)).status, 200);
+    assert.equal(readFileSync(join(runsDir, "legacy-inventory", "asset_inventory.json"), "utf8"), inventory);
+    assert.deepEqual(readdirSync(runsDir).sort(), before, "rejected requests must not create child runs");
+  } finally {
     await srv.close();
     rmSync(runsDir, { recursive: true, force: true });
   }

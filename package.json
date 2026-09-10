@@ -13,5 +13,14 @@
     "typecheck": "pnpm -r run typecheck",
     "test": "pnpm -r run test",
     "clean": "pnpm -r run clean"
+  },
+  "pnpm": {
+    "overrides": {
+      "esbuild@>=0.27.3 <0.28.1": "^0.28.1",
+      "postcss@<8.5.23": "^8.5.23",
+      "nanoid@<3.3.18": "^3.3.18",
+      "browserslist@<4.28.7": "^4.28.7",
+      "baseline-browser-mapping@>=2.0.0 <2.11.0": "^2.11.0"
+    }
   }
 }

@@ -1,4 +1,5 @@
 import type { ReadinessCheck } from "@veritas/core";
+import { DEFAULT_CONTEXT_TOKENS, MIN_CONTEXT_TOKENS, parseContextTokens } from "@veritas/core/llm-context";
 import { MODEL_PROVIDERS, type ModelProvider } from "../src/model-providers";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 
@@ -12,7 +13,7 @@ const appBridge = () => (typeof window !== "undefined" ? window.verdictDesktop?.
 const EMPTY: DesktopSettings = { provider: "claude-cli" };
 const SECTIONS = ["Models", "Agent", "Network", "OOB", "Burp", "About"] as const;
 type Section = (typeof SECTIONS)[number];
-type StringKey = Exclude<keyof DesktopSettings, "provider" | "burpScan" | "oobProvider">;
+type StringKey = Exclude<keyof DesktopSettings, "provider" | "burpScan" | "oobProvider" | "deepContextTokens" | "lightContextTokens">;
 
 // Hoisted: defining these inside Settings remounted every <input> on each keystroke (focus lost after 1 char).
 function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
@@ -47,7 +48,7 @@ function TextArea({ value, onChange, ph, rows = 4 }: { value: string; onChange: 
 
 export function Settings({ onClose }: { onClose: () => void }) {
     const [s, setS] = useState<DesktopSettings>(EMPTY);
-    const modelDrafts = useRef<Partial<Record<ModelProvider, Pick<DesktopSettings, "baseURL" | "apiKey" | "deepModel" | "lightModel">>>>({});
+    const modelDrafts = useRef<Partial<Record<ModelProvider, Pick<DesktopSettings, "baseURL" | "apiKey" | "deepModel" | "lightModel" | "deepContextTokens" | "lightContextTokens">>>>({});
     const [section, setSection] = useState<Section>("Models");
     const [saved, setSaved] = useState(false);
     const [checking, setChecking] = useState(false);
@@ -71,10 +72,10 @@ export function Settings({ onClose }: { onClose: () => void }) {
 
     const selectProvider = (provider: ModelProvider): void => {
         if (provider === s.provider) return;
-        const { baseURL, apiKey, deepModel, lightModel } = s;
-        modelDrafts.current[s.provider] = { baseURL, apiKey, deepModel, lightModel };
+        const { baseURL, apiKey, deepModel, lightModel, deepContextTokens, lightContextTokens } = s;
+        modelDrafts.current[s.provider] = { baseURL, apiKey, deepModel, lightModel, deepContextTokens, lightContextTokens };
         const draft = modelDrafts.current[provider] ?? { baseURL: MODEL_PROVIDERS[provider].baseURL };
-        setS({ ...s, provider, baseURL: draft.baseURL, apiKey: draft.apiKey, deepModel: draft.deepModel, lightModel: draft.lightModel });
+        setS({ ...s, provider, baseURL: draft.baseURL, apiKey: draft.apiKey, deepModel: draft.deepModel, lightModel: draft.lightModel, deepContextTokens: draft.deepContextTokens, lightContextTokens: draft.lightContextTokens });
         setSaved(false);
         setChecks([]);
         setError("");
@@ -82,11 +83,16 @@ export function Settings({ onClose }: { onClose: () => void }) {
     };
 
     const save = async (): Promise<void> => {
-        const v = await bridge()?.set(s);
-        if (v) {
-            setS(v);
-            setSaved(true);
-        }
+        setError("");
+        try {
+            parseContextTokens(s.deepContextTokens);
+            parseContextTokens(s.lightContextTokens);
+            const v = await bridge()?.set(s);
+            if (v) {
+                setS(v);
+                setSaved(true);
+            }
+        } catch (e) { setError(e instanceof Error ? e.message : "Settings could not be saved."); }
     };
 
     const check = async (): Promise<void> => {
@@ -134,8 +140,19 @@ export function Settings({ onClose }: { onClose: () => void }) {
                                     <p className="settings-note-inline">The Claude subscription CLI needs the `claude` binary on PATH. Choose OpenCodeGo, OrcaRouter, or Other to use an API provider.</p>
                                 )}
                                 <div className="settings-sec">Model tiering</div>
-                                <Field label="Deep model" hint="high-value diagnosis / scenario"><Text value={s.deepModel ?? ""} onChange={setStr("deepModel")} ph={openai ? "Model ID from your provider" : "Claude model name"} /></Field>
-                                <Field label="Light model" hint="survey / methodology / low-value"><Text value={s.lightModel ?? ""} onChange={setStr("lightModel")} ph={openai ? "Model ID from your provider" : "Claude model name"} /></Field>
+                                <div className={openai ? "settings-grid" : undefined}>
+                                    <Field label="Deep model" hint="high-value diagnosis / scenario"><Text value={s.deepModel ?? ""} onChange={setStr("deepModel")} ph={openai ? "Model ID from your provider" : "Claude model name"} /></Field>
+                                    {openai ? <Field label="Deep max context" hint="tokens">
+                                        <input type="number" min={MIN_CONTEXT_TOKENS} step="1" value={s.deepContextTokens ?? ""} placeholder={String(DEFAULT_CONTEXT_TOKENS)} onChange={(e) => set("deepContextTokens", e.target.value === "" ? undefined : e.target.valueAsNumber)} />
+                                    </Field> : null}
+                                    <Field label="Light model" hint="survey / methodology / low-value"><Text value={s.lightModel ?? ""} onChange={setStr("lightModel")} ph={openai ? "Model ID from your provider" : "Claude model name"} /></Field>
+                                    {openai ? <Field label="Light max context" hint="tokens">
+                                        <input type="number" min={MIN_CONTEXT_TOKENS} step="1" value={s.lightContextTokens ?? ""} placeholder={String(!s.lightModel || s.lightModel === s.deepModel ? s.deepContextTokens ?? DEFAULT_CONTEXT_TOKENS : DEFAULT_CONTEXT_TOKENS)} onChange={(e) => set("lightContextTokens", e.target.value === "" ? undefined : e.target.valueAsNumber)} />
+                                    </Field> : null}
+                                </div>
+                                <p className="settings-note-inline">{openai
+                                    ? "Max context includes input and response. VERDICT reserves room for replies and summarizes older history as it fills. Blank defaults to 256,000 tokens; Light inherits Deep when they use the same model. Use each model's supported limit."
+                                    : "Claude manages its context window and automatic compaction."}</p>
                             </>
                         ) : null}
 

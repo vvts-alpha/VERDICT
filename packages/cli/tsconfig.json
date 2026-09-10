@@ -3,7 +3,6 @@
   "compilerOptions": {
     "paths": {
       "@veritas/agent": ["../agent/src/index.ts"],
-      "@veritas/asr": ["../asr/src/index.ts"],
       "@veritas/core": ["../core/src/index.ts"],
       "@veritas/crawler": ["../crawler/src/index.ts"],
       "@veritas/llm": ["../llm/src/index.ts"],

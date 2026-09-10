@@ -10,3 +10,4 @@ export { makeLlmClient, resolveLlmConfig, createLlmClient } from "./factory.js";
 export type { LlmProvider, LlmProviderConfig, LlmConfigOverrides } from "./factory.js";
 export { FakeLlmClient } from "./fake.js";
 export type { FakeResponder } from "./fake.js";
+export { createProviderHeaders } from "./provider-headers.js";

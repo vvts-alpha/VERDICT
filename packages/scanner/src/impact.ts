@@ -317,8 +317,12 @@ export function impactOracle(responseText: string, ctx: ImpactContext = {}): Imp
     out.push({ kind, severity, marker, detail });
   };
   for (const d of DETECTORS) {
-    const m = d.re.exec(body);
-    if (m) emit(d.kind, d.severity, m[0], d.detail);
+    // Iterate ALL matches, not just the first: emit() suppresses placeholders / ambient (baseline) / public-by-design
+    // keys, so a suppressed FIRST match must not mask a REAL secret of the same detector later in the body (e.g. a public
+    // Maps AIza key before a leaked server-side AIza key). Clone with the global flag (detectors are non-global) so
+    // matchAll walks every occurrence; emit() dedups by marker, so repeats collapse.
+    const re = d.re.global ? d.re : new RegExp(d.re.source, `${d.re.flags}g`);
+    for (const m of body.matchAll(re)) emit(d.kind, d.severity, m[0], d.detail);
   }
   // cross-user: the requested victim ID appears as a DISTINCT token in the response, the attacker's own ID does not, and it
   // is not in the baseline either. identityAppears (word-boundary + min length) stops a bare short id like "42" from

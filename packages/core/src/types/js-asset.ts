@@ -1,5 +1,5 @@
 // Contract type — one first-party JavaScript bundle the agent statically analyzed (endpoints / secrets mined from it).
-// Shared like Screen/Finding/Asset: the WebUI reads it (types-only), so it lives in @veritas/core.
+// Shared like Screen/Finding: the WebUI reads it (types-only), so it lives in @veritas/core.
 
 export interface JsSecret {
   /** the secret class, e.g. "secret" | "source-leak" (from the impact oracle) */

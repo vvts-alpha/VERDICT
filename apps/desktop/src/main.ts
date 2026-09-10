@@ -6,6 +6,7 @@
 // runs, just hosted by Electron instead of a bare Node process with the same backend.
 
 import { app, BrowserWindow, ipcMain, Menu, session, shell, type WebContents } from "electron";
+import { randomBytes } from "node:crypto";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
@@ -45,9 +46,12 @@ function stripAppMenu(created: BrowserWindow): void {
 
 /** Same-origin preview popups stay in-app without a menu; everything else goes to the OS browser. */
 function attachPopupPolicy(contents: WebContents): void {
+    contents.on("will-navigate", (event, url) => {
+        if (!server || !isAppUrl(url, server.url)) event.preventDefault();
+    });
     contents.setWindowOpenHandler(({ url }) => {
         const origin = server?.url ?? "http://127.0.0.1";
-        if (!url.startsWith(origin)) {
+        if (!isAppUrl(url, origin)) {
             void shell.openExternal(url);
             return { action: "deny" };
         }
@@ -59,6 +63,10 @@ function attachPopupPolicy(contents: WebContents): void {
             },
         };
     });
+}
+
+function isAppUrl(url: string, origin: string): boolean {
+    try { return new URL(url).origin === new URL(origin).origin; } catch { return false; }
 }
 
 async function boot(): Promise<void> {
@@ -101,12 +109,13 @@ async function boot(): Promise<void> {
     // must live on process.env (childEnv only wraps spawned scans).
     applyLlmSettingsToEnv();
 
+    const localAuthToken = randomBytes(32).toString("hex");
     server = await startServer({
         runsDir,
         host: "127.0.0.1", // single-user localhost — never bind 0.0.0.0 from the desktop app
         port: 0, // ephemeral: avoid clashing with a separately-running `serve`
         webRoot,
-        // no authPasswords: local single-user app (loopback only)
+        localAuthToken,
         ...(runLauncher ? { runLauncher } : {}),
         onLog: (m) => console.log("[server]", m),
     });
@@ -117,6 +126,12 @@ async function boot(): Promise<void> {
     // ERR_PROXY_CONNECTION_FAILED. The attended Browser tab uses partition persist:attended and is pointed
     // at Settings' upstream proxy separately (applyAttendedProxy).
     await session.defaultSession.setProxy({ mode: "direct" });
+    // Main-process injection covers navigation, fetch, downloads and WebSockets without exposing the token
+    // through a preload bridge or a cookie shared with other localhost ports. Attended targets use another session.
+    session.defaultSession.webRequest.onBeforeSendHeaders(
+        { urls: [`${server.url}/*`, `${server.url.replace("http:", "ws:")}/*`] },
+        (details, callback) => callback({ requestHeaders: { ...details.requestHeaders, "x-verdict-token": localAuthToken } }),
+    );
     // Do not setSavePath: Electron must ask for a destination on every report export.
     session.defaultSession.on("will-download", (_event, item) => {
         if (!server) return;

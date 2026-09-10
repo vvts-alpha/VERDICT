@@ -1,6 +1,6 @@
 // Ambient declaration for the desktop shell bridge injected by apps/desktop/preload.cjs.
 // Present only when running inside the Electron app; undefined in a plain browser (the `serve` web UI).
-export {};
+import type { ModelContextSettings } from "@veritas/core";
 
 // Side-effect CSS imports (webui styles + desktop chrome) — Vite handles these; tell tsc they resolve.
 declare module "*.css";
@@ -33,7 +33,7 @@ declare global {
         capture(assessmentId?: string): Promise<AttBrowserCapture>;
         onNavigated(cb: (s: AttBrowserNavState) => void): () => void;
     }
-    interface DesktopSettings {
+    interface DesktopSettings extends ModelContextSettings {
         provider: import("../src/model-providers").ModelProvider;
         baseURL?: string;
         apiKey?: string;

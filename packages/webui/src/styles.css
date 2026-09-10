@@ -50,7 +50,6 @@ body {
 .log-ts, .log-msg,
 .evpre, .evbody, .evreq, .evres, .evhdr,
 .mode-cli, .sess-url, .plan-url,
-.asr-meta-v, .asr-finding-d,
 table.kv td,
 pre, code, .mono { font-family: var(--font-mono); }
 
@@ -83,7 +82,6 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { outline-offs
 .typepill { font-size: 10px; font-weight: 700; letter-spacing: 0.4px; text-transform: uppercase; padding: 1px 7px; border-radius: 999px; border: 1px solid; white-space: nowrap; }
 .typepill.web { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, transparent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
 .typepill.api { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); background: color-mix(in srgb, var(--ok) 12%, transparent); }
-.typepill.asr { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); background: color-mix(in srgb, var(--warn) 12%, transparent); }
 .idxempty { padding: 2rem 4px; color: var(--muted); }
 .idxempty code { background: var(--inset); padding: 1px 6px; border-radius: 4px; }
 .idxblank { display: flex; flex-direction: column; align-items: center; text-align: center; gap: 12px; padding: 72px 20px; color: var(--muted); }
@@ -262,35 +260,6 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { outline-offs
   padding: 1px 6px; border-radius: 9px; text-transform: lowercase;
 }
 
-/* ASR discovery-source + promotion badges (S5) */
-.asr-src {
-  flex: 0 0 auto; font-size: 9px; letter-spacing: 0.3px; margin-left: 6px;
-  color: var(--muted); background: var(--elev); border: 1px solid var(--line);
-  padding: 1px 6px; border-radius: 9px; white-space: nowrap;
-}
-.asr-src[data-src="active"] { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); }
-.asr-src[data-src="import"] { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, transparent); }
-.node .asr-piloted-chip {
-  flex: 0 0 auto; font-size: 9px; font-weight: 700; letter-spacing: 0.3px; margin-left: 6px;
-  color: var(--ok); background: color-mix(in srgb, var(--ok) 12%, transparent);
-  border: 1px solid color-mix(in srgb, var(--ok) 40%, transparent); padding: 1px 6px; border-radius: 9px; white-space: nowrap;
-}
-a.asr-piloted-link {
-  margin-left: 10px; font-size: 11px; font-weight: 700; text-decoration: none; white-space: nowrap;
-  color: var(--ok); border: 1px solid color-mix(in srgb, var(--ok) 45%, transparent);
-  background: color-mix(in srgb, var(--ok) 12%, transparent); padding: 2px 9px; border-radius: 8px;
-}
-a.asr-piloted-link:hover { background: color-mix(in srgb, var(--ok) 22%, transparent); }
-.asr-srcmix { display: inline-flex; gap: 8px; align-items: center; }
-.asr-srcmix .active-tag {
-  color: var(--warn); border: 1px solid color-mix(in srgb, var(--warn) 40%, transparent);
-  border-radius: 8px; padding: 0 7px; font-size: 10px; font-weight: 700; letter-spacing: 0.5px;
-}
-.asr-srcmix .passive-tag {
-  color: var(--ok); border: 1px solid color-mix(in srgb, var(--ok) 40%, transparent);
-  border-radius: 8px; padding: 0 7px; font-size: 10px; font-weight: 700; letter-spacing: 0.5px;
-}
-
 .detail { overflow: auto; padding: 0 0 2rem; }
 .detail .pane-title { position: sticky; top: 0; background: var(--bg); }
 .detail h4 { margin: 16px 14px 6px; font-size: 11px; letter-spacing: 1px; color: var(--muted); }
@@ -365,56 +334,7 @@ button:hover { background: var(--btn-hover); }
 .logline.lt-finding_created .log-msg { color: var(--warn); font-weight: 600; }
 .logline.lt-phase_changed .log-msg { color: var(--accent); }
 .logline.lt-halted .log-msg { color: var(--err); }
-/* ASR run-log line types (parity with the web diagnostic log's colour coding) */
-.logline.lt-ok .log-msg { color: var(--ok); }
-.logline.lt-alert .log-msg { color: var(--warn); font-weight: 600; }
-.logline.lt-dead .log-msg { color: var(--muted); }
 .log-empty { padding: 14px; }
-
-/* ASR viewer — Host detail + Findings (uses the design-system variables so it matches the web/API viewer). */
-.pane-subtitle { font-size: 11px; letter-spacing: 0.6px; text-transform: uppercase; color: var(--muted); margin: 4px 0 8px; }
-.asr-host-h { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
-.asr-host-h a { color: #fff; font-weight: 700; font-size: 15px; text-decoration: none; }
-.asr-host-h a:hover { text-decoration: underline; }
-.asr-shot { width: 100%; max-height: 220px; object-fit: cover; object-position: top; border: 1px solid var(--line); border-radius: 8px; margin-bottom: 14px; display: block; }
-.asr-metabox { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin: 8px 0 12px; }
-.asr-meta { display: flex; gap: 10px; font-size: 12.5px; padding: 3px 0; }
-.asr-meta-k { color: var(--muted); min-width: 84px; }
-.asr-meta-v { color: var(--fg); word-break: break-all; font-family: ui-monospace, monospace; }
-.asr-finding { background: var(--panel); border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; margin-bottom: 6px; }
-.asr-finding-h { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 3px; }
-.asr-finding-t { font-size: 13px; font-weight: 600; color: var(--fg); }
-.asr-finding-host { font-size: 12px; color: var(--accent); }
-.asr-finding-d { font-size: 12px; color: var(--muted); font-family: ui-monospace, monospace; word-break: break-word; }
-.sev { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.3px; border: 1px solid; border-radius: 999px; padding: 0 6px; }
-.asr-ai { background: color-mix(in srgb, var(--accent) 6%, var(--panel)); border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent); border-radius: 8px; padding: 10px 12px; }
-.asr-ai-h { font-size: 12px; color: var(--accent); font-weight: 700; margin-bottom: 5px; }
-.asr-ai-r { font-size: 12.5px; color: var(--muted); margin-bottom: 5px; }
-.asr-ai-a { font-size: 12.5px; color: var(--fg); }
-.asr-ai-a b { color: var(--accent); }
-
-/* Assets table (the sortable host list) — same ink/line tokens as the rest of the UI, no bespoke palette */
-.asr-table-wrap { overflow-x: auto; padding: 4px 2px 2rem; }
-.asr-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
-.asr-table thead th { position: sticky; top: 0; background: var(--bg); text-align: left; padding: 7px 10px; color: var(--muted); font-weight: 600; border-bottom: 1px solid var(--line); white-space: nowrap; }
-.asr-table th.sortable { cursor: pointer; user-select: none; }
-.asr-table th.sortable:hover { color: var(--fg); }
-.asr-table th.sorted { color: var(--accent); }
-.asr-table .sortarrow { font-size: 10px; }
-.asr-table tbody td { padding: 6px 10px; border-bottom: 1px solid color-mix(in srgb, var(--line) 60%, transparent); white-space: nowrap; }
-.asr-table tbody tr { cursor: pointer; }
-.asr-table tbody tr:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
-.asr-table tbody tr.sel { background: color-mix(in srgb, var(--accent) 15%, transparent); }
-.asr-table td.host { color: var(--fg); font-weight: 600; }
-.asr-table tbody tr.dead td.host { color: var(--muted); font-weight: 400; }
-.asr-table td.num { text-align: right; }
-
-/* band badge (shared by the Assets table; same colours as the Findings severity pills) */
-.bandpill { font-size: 10px; font-weight: 700; letter-spacing: 0.4px; text-transform: uppercase; padding: 1px 7px; border-radius: 8px; border: 1px solid transparent; }
-.bandpill.band-critical { color: #fff; background: #c0392b; }
-.bandpill.band-high { color: #2a0d10; background: var(--err); }
-.bandpill.band-medium { color: #2a1e08; background: var(--warn); }
-.bandpill.band-low { color: var(--muted); background: var(--elev); border-color: var(--line); }
 
 /* 進捗バー(global, run の現在地) */
 .progress { padding: 6px 14px; border-bottom: 1px solid var(--line); background: var(--panel); }
@@ -562,7 +482,7 @@ button:hover { background: var(--btn-hover); }
   color: var(--fg); font: inherit;
   transition: border-color .12s ease, background .12s ease, transform .12s ease;
 }
-.mode-card:hover { border-color: var(--accent); background: var(--elev); transform: translateY(-1px); }
+.mode-card:not(:disabled):hover { border-color: var(--accent); background: var(--elev); transform: translateY(-1px); }
 .mode-ic { color: var(--accent); line-height: 0; }
 .mode-ic svg { width: 30px; height: 30px; display: block; }
 .mode-t { font-weight: 600; font-size: 14px; color: var(--fg); }
@@ -571,3 +491,5 @@ button:hover { background: var(--btn-hover); }
   padding: 12px 14px; border-radius: 8px; background: var(--inset); border: 1px solid var(--line);
   color: var(--fg); font-size: 12px; line-height: 1.6; overflow-x: auto; margin: 10px 0;
 }
+
+.mode-card:disabled { cursor: default; opacity: 0.6; }

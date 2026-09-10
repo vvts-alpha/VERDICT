@@ -7,8 +7,7 @@ import { seedSpecInventory } from "./spec-inventory.js";
 import { parseArgs } from "node:util";
 import { createRequire } from "node:module";
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import { lookup, resolve4, resolveCname } from "node:dns/promises";
+import { dirname, join } from "node:path";
 
 import {
   AssessmentStore,
@@ -29,8 +28,6 @@ import {
   newAssessmentId,
   parseTargetUrl,
   type AssessmentState,
-  type Asset,
-  type AssetBand,
   type Screen,
   type ScopeMode,
   type ScopePolicy,
@@ -46,11 +43,7 @@ import { assessLogicInventory, assessScreenLogic, authDiffScreen } from "@verita
 import type { RoleContext } from "@veritas/agent";
 import { runPilot, verifyBurpFindings, triageAndDeepDiveBurp, LiveControl } from "@veritas/pilot";
 import { BrowserChatAdapter, runLlmRedteam, defaultInjectedContextProbes, generateCanary } from "@veritas/llm-attacks";
-import { discoverCrtSh, fetchHttpGet, primarySourceFailureAction, filterInScope, mergeCandidates, orderCandidatesForProbe, importRecon, execFileRunTool, subfinderDiscover, dnsxBrute, dnsxReachable, nativeBrute, DEFAULT_SUBDOMAIN_WORDLIST, parseWordlist, probeHost, probeSurface, enumerateListing, detectTakeover, reconFindings, scoreAsset, triageAsset, buildAssetInventory, writeAssetInventory, readAssetInventory } from "@veritas/asr";
-import type { HostCandidate } from "@veritas/asr";
-import { runFromAsr, spawnPilotLauncher } from "./from-asr.js";
-import type { AsrScopePins } from "./from-asr.js";
-import { startServer } from "@veritas/server";
+import { isSupportedRun, startServer } from "@veritas/server";
 import { loadDotEnv } from "./dotenv.js";
 import { resolveUpstreamProxy, proxyFlagGivenButEmpty } from "./proxy.js";
 
@@ -78,7 +71,6 @@ commands:
   pilot --spec <openapi.json> --url <base-url> [--manifest <file.json>] [--out <dir>]
             seed the API inventory from a JSON specification, then plan and diagnose in the same run
   pilot --resume --id <id> [--manifest <file.json>] [--browser-path <bin>] [--no-sandbox] [--out <dir>]
-  pilot --from-asr <asr-id|asset_inventory.json> [--from-asr-top <n>] [--from-asr-band critical|high|medium|low] [--from-asr-concurrency <n>] [--out <dir>]
             continue an existing run: skip survey/methodology, diagnose only undiagnosed (queued) screens (finish a crashed run)
   pilot --attended[ a,b,c] (--manifest <file.json> | --url <url>) [--login-url <u>] [--keepalive-min <n>] [...]
             manual multi-session auth (headed required): opens a persistent context per role for a human to log in (clear CAPTCHA/MFA/Arkose)
@@ -117,11 +109,6 @@ commands:
             Phase2 business logic: hypothesis generation (LLM) → verify IDOR etc. with evidence discipline. --manifest injects auth headers for a spec-seeded API run.
   spec-import --spec <openapi.json> --url <base> [--id <existing>] [--manifest <m.json>] [--out <dir>]
             ingest an OpenAPI 3.x / Swagger 2.0 spec (JSON) → seed the screen inventory so the browser-free scan/logic can assess a pure-API target. --url = where the API lives (base). with --id, overlay the spec on an existing crawl (fills endpoints the UI never called). token-protected APIs: put Authorization: Bearer … in the manifest's http.headers.
-  asr     --domain <apex|*.wildcard> [--tools subfinder|--no-tools] [--brute [--wordlist <file>] [--resolvers <file>]] [--import <httpx.json|hosts.txt|dir> [--import-trust-liveness]] [--allow-degraded] [--out-of-scope a.ex.com,b.ex.com] [--screenshot] [--paths] [--triage [--triage-top <n>] [--model <m>]] [--max-hosts <n>] [--rate <ms>] [--browser-path <bin>] [--no-sandbox] [--headed] [--out <dir>]
-            Attack Surface Recon: passive discovery (crt.sh CT logs) → dns resolve + HTTP liveness → deterministic attack-target score (ranked) → runs/<id>/asset_inventory.json
-            [--screenshot] per-host screenshot · [--paths] probe curated high-signal paths on live hosts (/.git/, /.env, /actuator, swagger, server-status…) → real exposure + auto-escalate
-            [--triage] Claude classifies the top-N by score (default 15, --triage-top) → category / band / attack-angle (a lead, not a finding; claude CLI subscription, no metered API)
-            wide-shallow triage feeding pilot; observe-only (no attacks). view in the WebUI (serve) 🌐 ASR tab (sorted by score, band badges)
   redteam --url <chat-ui-url> | --manifest <file.json>  --canary <token> [--headed] [--max-replays <n>] [--composer <sel>] [--send <sel>] [--new-chat <sel>] [--file-input <sel>] [--transcript <sel>] [--browser-path <bin>] [--no-sandbox] [--out <dir>]
             (alias: assistant) LLM/AI-assistant red-team: drive a deployed chatbot and confirm canary leaks. the canary is planted out-of-band by the operator in the system prompt / custom instructions and passed via --canary or manifest assistant.canary
   serve   [--port <n>] [--host <h>] [--out <dir>] [--web-root <dir>] [--no-web] [--password <pw>] [--viewer-password <pw>] [--no-auth] [--no-launch]
@@ -1005,55 +992,6 @@ export function extractOptValueFlag(args: string[], flag: string): { args: strin
 }
 
 // Claude-led assessment: Claude drives the tools to autonomously explore, verify, and record (@veritas/pilot).
-// P3 handoff resolver: turn a `--from-asr <asr-id | asset_inventory.json | run-dir>` reference into the inventory path
-// + the ASR run's authorization boundary (pins), then promote. Pins come from the ASR run's STORED assessment (apex +
-// carve-outs) so promotion inherits exactly what ASR was authorized for — never widens. Apex-only fallback (with a
-// loud warning) only if no store is found beside the inventory.
-async function runFromAsrCli(ref: string, runsDir: string, o: { top: number; band?: string; concurrency: number }): Promise<void> {
-  const band = o.band;
-  if (band && !["critical", "high", "medium", "low"].includes(band)) fail("--from-asr-band must be one of critical|high|medium|low");
-  let dir: string;
-  let invPath: string;
-  if (ref.endsWith(".json")) {
-    invPath = resolve(ref);
-    dir = dirname(invPath);
-  } else if (isAbsolute(ref) || ref.includes("/") || ref.includes("\\")) {
-    dir = resolve(ref);
-    invPath = join(dir, "asset_inventory.json");
-  } else {
-    dir = join(runsDir, ref); // a bare asr-id → runs/<id>/
-    invPath = join(dir, "asset_inventory.json");
-  }
-  if (!existsSync(invPath)) fail(`pilot --from-asr: no asset_inventory.json at ${invPath}`);
-
-  // Pins = the ASR run's stored authorization boundary (id = the run-dir name). Promotion may only NARROW, never widen.
-  let stored: AssessmentState | null = null;
-  const dbPath = join(dir, "state.sqlite");
-  const storedId = basename(dir);
-  if (existsSync(dbPath)) {
-    const s = AssessmentStore.open(dbPath);
-    stored = s.loadAssessment(storedId);
-    s.close();
-  }
-  let pins: AsrScopePins;
-  if (stored) {
-    pins = { inScopeHosts: stored.scope.inScopeHosts, outOfScopeHosts: stored.scope.outOfScopeHosts };
-  } else {
-    const apex = readAssetInventory(invPath).apex;
-    pins = { inScopeHosts: [`*.${apex}`], outOfScopeHosts: [] };
-    console.log(`⚠ from-asr: no stored scope for ${storedId} — pinning apex-only *.${apex} (out-of-scope carve-outs not recoverable; keep the ASR run's state.sqlite present to inherit them)`);
-  }
-  console.log(`▶ pilot --from-asr ${storedId}: scope pinned to ${pins.inScopeHosts.join(",")}${pins.outOfScopeHosts.length ? ` (−${pins.outOfScopeHosts.join(",")})` : ""}`);
-
-  const results = await runFromAsr(
-    { invPath, runsDir, pins, top: o.top, ...(band ? { minBand: band as AssetBand } : {}), concurrency: o.concurrency, newId: newAssessmentId },
-    spawnPilotLauncher,
-  );
-  const ok = results.filter((r) => r.ok).length;
-  console.log(`\nfrom-asr: launched ${results.length} pilot run(s)${results.length ? ` (${ok} ok)` : ""} — promoted links written to ${invPath}`);
-  for (const r of results) console.log(`  ${r.ok ? "✓" : "✗"} ${r.host} → ${r.childId}`);
-}
-
 async function cmdPilot(rawArgs: string[]): Promise<void> {
   const a1 = extractAttendedRoles(rawArgs);
   const inlineAttendedRoles = a1.roles;
@@ -1101,24 +1039,13 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       "keepalive-url": { type: "string" }, // explicit URL for the keepalive touch (default: the authed page being diagnosed; never `/`)
       "anchor-url": { type: "string" }, // goto-safe authed hub (menu): reach cold-nav-bouncing routes by clicking their link from here; also the keepalive target
       "control-url": { type: "string" }, // attended×LiveHands: reverse-connection target for serve (supplied by the supervisor)
-      "from-asr": { type: "string" }, // P3 handoff: promote an ASR run's ranked assets into per-host pilot runs (arg = asr-id | asset_inventory.json)
-      "from-asr-top": { type: "string" }, // take the top-N promotable hosts (default 5)
-      "from-asr-band": { type: "string" }, // band floor: critical|high|medium|low (only promote at/above)
-      "from-asr-concurrency": { type: "string" }, // parallel child pilots (default 1 — Claude subscription concurrency)
     },
   });
   const runsDir = values.out ?? RUNS_DIR_DEFAULT;
-  // P3 — pilot --from-asr <asr-id|inventory.json>: promote an ASR run's ranked assets into per-host deep pilot runs.
-  // A distinct mode (no survey/manifest of its own); the child pilots inherit the ASR scope, pinned — never widened.
-  if (values["from-asr"]) {
-    await runFromAsrCli(values["from-asr"], runsDir, {
-      top: values["from-asr-top"] ? Math.max(1, Number.parseInt(values["from-asr-top"], 10)) : 5,
-      band: values["from-asr-band"],
-      concurrency: values["from-asr-concurrency"] ? Math.max(1, Number.parseInt(values["from-asr-concurrency"], 10)) : 1,
-    });
-    return;
-  }
   let resume = !!values.resume;
+  if (resume && values.id && !isSupportedRun(runsDir, values.id)) {
+    fail("This saved assessment type is no longer supported");
+  }
   // resume skips survey/methodology and resumes only diagnosis. Even without --manifest, it reads back the
   // runs/<id>/manifest.json persisted at start to restore the auth material (roleCreds/cookie/httpBasic/attended).
   // Note: without this, everything after resume becomes unauth and everything behind the auth wall returns 401, making diagnosis impossible.
@@ -1611,344 +1538,6 @@ async function cmdShots(args: string[]): Promise<void> {
     store.close();
   }
   console.log(`\n${n}/${state.screens.length} screenshots captured → reload the WebUI (serve)`);
-}
-
-// ASR — Attack Surface Recon. A wildcard/apex → crt.sh passive discovery → dns resolve +
-// HTTP liveness → (optional) per-host screenshot → runs/<id>/asset_inventory.json. Wide-shallow triage feeding pilot.
-// P0: passive discovery + liveness + screenshots + inventory. Active DNS brute, scoring and AI triage are later slices.
-async function cmdAsr(args: string[]): Promise<void> {
-  const { values } = parseArgs({
-    args,
-    options: {
-      domain: { type: "string" },
-      id: { type: "string" },
-      manifest: { type: "string" },
-      "out-of-scope": { type: "string" },
-      screenshot: { type: "boolean" },
-      paths: { type: "boolean" },
-      triage: { type: "boolean" },
-      "triage-top": { type: "string" },
-      model: { type: "string" },
-      "max-hosts": { type: "string" },
-      rate: { type: "string" },
-      out: { type: "string" },
-      import: { type: "string" },
-      "import-trust-liveness": { type: "boolean" },
-      "allow-degraded": { type: "boolean" },
-      tools: { type: "string" },
-      "no-tools": { type: "boolean" },
-      brute: { type: "boolean" },
-      wordlist: { type: "string" },
-      resolvers: { type: "string" },
-      "browser-path": { type: "string" },
-      "no-sandbox": { type: "boolean" },
-      headed: { type: "boolean" },
-    },
-  });
-  if (!values.domain) fail("asr requires --domain <apex|*.wildcard> (e.g. --domain '*.example.com')");
-  const apex = values.domain.trim().toLowerCase().replace(/^\*\./, "").replace(/\.$/, "");
-  const base = `https://${apex}`;
-  try {
-    parseTargetUrl(base); // the apex must form a valid http(s) origin
-  } catch (e) {
-    fail(e instanceof Error ? e.message : String(e));
-  }
-  const outOfScope = (values["out-of-scope"] ?? "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0);
-  const maxHosts = values["max-hosts"] ? Math.max(1, Number.parseInt(values["max-hosts"], 10)) : 200;
-  const minDelayMs = values.rate ? Math.max(0, Number.parseInt(values.rate, 10)) : 250;
-  const runsDir = values.out ?? RUNS_DIR_DEFAULT;
-
-  const scope: ScopePolicy = {
-    ...deriveScopeFromUrls([base], "etld"),
-    inScopeHosts: [`*.${apex}`], // scope to the operator's --domain, not the registrable domain (a deep apex must not widen)
-    outOfScopeHosts: outOfScope.map((d) => (d.startsWith("*.") ? d : `*.${d}`)), // carve-outs enforced at the probe gate too, not just discovery
-  };
-  const id = values.id ?? newAssessmentId(); // the WebUI launch passes a pre-generated id via the supervisor
-  mkdirSync(join(runsDir, id), { recursive: true });
-  const store = AssessmentStore.open(dbPathFor(runsDir, id));
-  if (!store.loadAssessment(id)) {
-    // fresh run; a --id re-scan (resume) reuses the existing assessment row (avoids a UNIQUE conflict)
-    store.createAssessment({ id, target: { kind: "single_url", url: base, followLinks: false, maxDepth: 0 }, scope });
-  }
-  // Drive the assessment phase so the WebUI project list shows a live phase (recon → done) instead of a stuck "init"
-  // like the pilot does. (Assets persist to asset_inventory.json; the store row just carries phase/scope. Kept open
-  // through the run and closed at the end / on the degraded-abort.)
-  store.setPhase(id, "phase1_recon");
-  const invPath = join(runsDir, id, "asset_inventory.json");
-  writeAssetInventory(invPath, buildAssetInventory(apex, [], new Date(), undefined, undefined, "phase1_recon")); // write empty now so the WebUI detects an ASR run while it scans
-
-  // ① DISCOVER — merge sources (passive crt.sh CT logs + offline --import of recon.sh output), then funnel the whole set
-  //   through the ONE scope filter (§1.2) + the probe-loop isInScope backstop. crt.sh touches no target host; import is offline.
-  const importPath = values.import;
-  const trustLiveness = !!values["import-trust-liveness"];
-  console.log(`▶ asr ${id}: discovering *.${apex} via crt.sh${importPath ? ` + import(${importPath})` : ""}…`);
-  let crtHosts: string[] = [];
-  let crtFailed: string | null = null;
-  try {
-    crtHosts = await discoverCrtSh({ domain: apex, outOfScope }, fetchHttpGet);
-  } catch (e) {
-    crtFailed = String(e).slice(0, 160);
-    console.error(`  crt.sh discovery failed: ${crtFailed}`);
-  }
-  const crtCandidates = crtHosts.map((h) => ({ host: h, source: "crt.sh" as const }));
-  const importCandidates = importPath ? importRecon(importPath) : [];
-  // subfinder (PASSIVE external tool: aggregates OSINT feeds, no brute) — auto-run if the binary is present, unless
-  // --no-tools; --tools <list> opts specific tools in/out. A missing binary degrades to [] + a one-line note.
-  const toolsList = values.tools ? values.tools.split(",").map((t) => t.trim()).filter(Boolean) : null;
-  const subfinderEnabled = !values["no-tools"] && (toolsList === null || toolsList.includes("subfinder"));
-  if (subfinderEnabled) console.log("▶ subfinder: querying passive feeds…"); // pre-run line so the Log doesn't look stuck on the crt.sh error during subfinder's ~45s
-  const sf = subfinderEnabled ? await subfinderDiscover(execFileRunTool, apex) : { candidates: [], missing: false };
-  if (subfinderEnabled && sf.missing) console.log("  subfinder not installed — skipping (install it or pass --no-tools to silence)");
-  else if (subfinderEnabled) console.log(`  subfinder: ${sf.candidates.length} host(s)`);
-  // --brute (ACTIVE, opt-in): resolve <word>.<apex> against a resolver pool. dnsx if present (needs a wordlist FILE, so
-  // the bundled default is materialized to a run-dir file), else the native node:dns fallback (zero external deps).
-  let bruteCandidates: HostCandidate[] = [];
-  if (values.brute) {
-    const wlPathGiven = values.wordlist;
-    const words = wlPathGiven ? parseWordlist(readFileSync(wlPathGiven, "utf8")) : DEFAULT_SUBDOMAIN_WORDLIST;
-    // dnsx reads a file; if none was given, write the bundled default beside the run so dnsx and native brute the same set.
-    const dnsxWordlist = wlPathGiven ?? join(runsDir, id, "brute-wordlist.txt");
-    if (!wlPathGiven) writeFileSync(dnsxWordlist, DEFAULT_SUBDOMAIN_WORDLIST.join("\n") + "\n");
-    console.log(`▶ brute: resolving ${words.length} subdomain word(s) under *.${apex} (ACTIVE — dnsx or native node:dns)…`);
-    // Fast reachability probe (~8s) so a dnsx whose resolvers are unreachable doesn't dead-air the full brute timeout
-    // (~60s) before we fall back. A healthy dnsx answers in well under a second. Then dnsx brute (native on error),
-    // else straight to the native node:dns brute (system resolver — works even where dnsx's public resolvers don't).
-    const dnsxOk = await dnsxReachable(execFileRunTool, apex, values.resolvers ? { resolvers: values.resolvers } : undefined);
-    if (dnsxOk) {
-      const dx = await dnsxBrute(execFileRunTool, apex, { wordlist: dnsxWordlist, ...(values.resolvers ? { resolvers: values.resolvers } : {}) });
-      if (dx.failed) console.log("  dnsx errored mid-run — native node:dns fallback");
-      bruteCandidates = dx.failed ? await nativeBrute((h) => resolve4(h).catch(() => []), apex, words, { concurrency: 10 }) : dx.candidates;
-    } else {
-      console.log("  dnsx unavailable / resolvers unreachable — using native node:dns brute (system resolver)");
-      bruteCandidates = await nativeBrute((h) => resolve4(h).catch(() => []), apex, words, { concurrency: 10 });
-    }
-    console.log(`  brute: ${bruteCandidates.length} host(s) resolved`);
-  }
-  const merged = mergeCandidates(crtCandidates, importCandidates, sf.candidates, bruteCandidates);
-  const inScopeHosts = new Set(filterInScope(merged.map((c) => c.host), { domain: apex, outOfScope })); // same filter as crt.sh
-  let candidates = merged.filter((c) => inScopeHosts.has(c.host));
-  console.log(
-    `  ${crtCandidates.length} crt.sh${importPath ? ` + ${importCandidates.length} import` : ""}${subfinderEnabled && !sf.missing ? ` + ${sf.candidates.length} subfinder` : ""}${values.brute ? ` + ${bruteCandidates.length} brute` : ""} → ${candidates.length} in-scope host(s)`,
-  );
-  // A crt.sh (primary-source) outage DEGRADES the map but does NOT discard a run other sources still populated:
-  // subfinder / --import / brute routinely carry a run on their own (subfinder alone returned 2564 hosts where crt.sh
-  // timed out). We refuse only to present a degraded map as COMPLETE — brand it `degraded` + warn loudly — and hard-stop
-  // solely when the whole result is empty, cleanly (a one-line error, NOT the usage dump) and overridable with --allow-degraded.
-  let degraded: { reason: string } | undefined;
-  if (crtFailed) {
-    const action = primarySourceFailureAction({ primaryFailed: true, otherHostCount: candidates.length, allowDegraded: !!values["allow-degraded"] });
-    degraded = { reason: `crt.sh (a primary source) failed: ${crtFailed} — map built from the remaining sources (subfinder/import/brute); may be INCOMPLETE` };
-    if (action.abort) {
-      writeAssetInventory(invPath, buildAssetInventory(apex, [], new Date(), undefined, degraded, "phase1_recon"));
-      store.close();
-      console.error(
-        `\nerror: discovery found 0 hosts and crt.sh (a primary source) failed: ${crtFailed}\n` +
-          `  nothing to assess — this looks like a source outage, not necessarily an empty surface.\n` +
-          `  → retry when crt.sh recovers (it 502s under load), add --import <recon.json|hosts.txt>, or pass --allow-degraded to accept an empty result.`,
-      );
-      process.exit(1);
-    }
-    console.log(`  ⚠ DEGRADED: crt.sh failed — proceeding with ${candidates.length} host(s) from the other sources; asset map marked INCOMPLETE.`);
-  }
-  if (candidates.length > maxHosts) {
-    // Order by probe priority BEFORE the cap so a flood of auto-generated ephemeral hosts (deep CNAME chains / random
-    // leftmost labels, e.g. *.hydra.<apex> from CT logs) doesn't starve the budget of high-value named hosts.
-    candidates = orderCandidatesForProbe(candidates);
-    console.log(`  capping to --max-hosts ${maxHosts} (${candidates.length - maxHosts} dropped; named/shallow hosts prioritized over ephemeral)`);
-    candidates = candidates.slice(0, maxHosts);
-  }
-
-  // ② PROBE — dns resolve + HTTP liveness (scope-gated + rate-limited via FetchHttpClient)
-  const http = new FetchHttpClient({ allow: (u) => isInScope(u, scope), minDelayMs, timeoutMs: 10_000 });
-  const assets: Asset[] = [];
-  // Probe one candidate → Asset. A resolving-but-dead host costs ~20s (https 10s + http 10s timeout), so the loop below
-  // runs these CONCURRENTLY (each worker probes a DIFFERENT host, so no single host is hit more than its own 1-2 GETs).
-  const probeOne = async (cand: (typeof candidates)[number]): Promise<Asset> => {
-    const host = cand.host;
-    if (trustLiveness && cand.hint && cand.hint.alive != null) {
-      // --import-trust-liveness: trust the imported httpx liveness/fingerprint — no re-probe
-      return {
-        host,
-        source: cand.source,
-        resolved: [],
-        alive: cand.hint.alive,
-        scheme: cand.hint.scheme ?? (cand.hint.alive ? "https" : null),
-        status: cand.hint.status ?? null,
-        title: cand.hint.title ?? null,
-        tech: cand.hint.tech ?? (cand.hint.server ? [cand.hint.server] : []),
-        screenshot: null,
-        inScope: isInScope(`https://${host}/`, scope),
-      };
-    }
-    const p = await probeHost(
-      host,
-      async (h) => {
-        try {
-          return (await lookup(h, { all: true })).map((a) => a.address);
-        } catch {
-          return [];
-        }
-      },
-      (url) => http.send({ method: "GET", url }),
-      (h) => resolveCname(h).catch(() => []),
-    );
-    const asset: Asset = {
-      host,
-      source: cand.source, // provenance from the merged candidate, not hardcoded
-      resolved: p.addresses,
-      alive: p.alive,
-      scheme: p.scheme,
-      status: p.status,
-      title: p.title,
-      tech: p.server ? [p.server] : [],
-      screenshot: null,
-      inScope: isInScope(`https://${host}/`, scope),
-    };
-    const tko = detectTakeover({ cnames: p.cnames, status: p.status, body: p.bodySample });
-    if (tko) {
-      asset.takeover = tko;
-      console.log(`  ! ${host}: possible subdomain takeover — ${tko.service} (${tko.confidence})`);
-    }
-    return asset;
-  };
-  // Bounded-concurrency probe pool: dead hosts (which each block ~20s on timeouts) overlap instead of stacking, so
-  // probing N hosts is ~(dead-host-seconds / concurrency) rather than the sum. Each worker takes a distinct candidate.
-  const PROBE_CONCURRENCY = 8;
-  let pIdx = 0;
-  const probeWorker = async (): Promise<void> => {
-    for (;;) {
-      const cand = candidates[pIdx++]; // idx++ is synchronous between awaits → each worker gets a distinct host
-      if (!cand) break;
-      const asset = await probeOne(cand);
-      assets.push(asset);
-      console.log(asset.alive ? `  ✓ ${asset.host}  ${asset.status ?? ""} ${asset.title ?? ""}`.trimEnd() : `  · ${asset.host}`);
-      // Incremental write → the WebUI (polling /assets) shows hosts appear. First 10 completions each write (immediate
-      // feedback), then every 10 (bounded I/O). Writes are synchronous so concurrent workers don't corrupt the file.
-      if (assets.length <= 10 || assets.length % 10 === 0) writeAssetInventory(invPath, buildAssetInventory(apex, assets, new Date(), candidates.length, degraded, "phase1_recon"));
-    }
-  };
-  await Promise.all(Array.from({ length: Math.max(1, Math.min(PROBE_CONCURRENCY, candidates.length)) }, () => probeWorker()));
-  const live = assets.filter((a) => a.alive);
-
-  // ③ SCREENSHOT (optional) — one nav per live host, scope-gated
-  if (values.screenshot && live.length > 0) {
-    const browserPath = values["browser-path"] ?? (process.env.VERDICT_BROWSER_PATH ?? process.env.VERITAS_BROWSER_PATH);
-    const artifactsDir = join(runsDir, id, "artifacts");
-    console.log(`▶ screenshotting ${live.length} live host(s)…`);
-    const driver = await PlaywrightDriver.launch({
-      userDataDir: join(runsDir, id, "browser-profile"),
-      headless: !values.headed,
-      ...(browserPath ? { executablePath: browserPath } : {}),
-      ...(values["no-sandbox"] ? { args: ["--no-sandbox"] } : {}),
-    });
-    try {
-      for (const a of live) {
-        const url = `${a.scheme}://${a.host}/`;
-        if (!isInScope(url, scope)) continue;
-        try {
-          await driver.visit(url);
-          const rel = `hosts/${a.host}.png`;
-          if (await driver.saveScreenshot(join(artifactsDir, rel))) {
-            a.screenshot = rel;
-            console.log(`  ✓ ${a.host}`);
-          }
-        } catch (e) {
-          console.log(`  ✗ ${a.host} — ${String(e).slice(0, 60)}`);
-        }
-      }
-    } finally {
-      await driver.close();
-    }
-  }
-
-  // ③b SURFACE (P1, opt-in) — curated path probing on live in-scope hosts → real exposure + auto-escalate
-  if (values.paths && live.length > 0) {
-    console.log(`▶ probing curated paths on ${live.length} live host(s)…`);
-    for (const a of live) {
-      if (!a.scheme || !isInScope(`${a.scheme}://${a.host}/`, scope)) continue;
-      a.notablePaths = await probeSurface(a.host, a.scheme, (u) => http.send({ method: "GET", url: u }));
-      if (a.notablePaths.length > 0) {
-        console.log(`  ${a.host}: ${a.notablePaths.map((h) => (h.escalate ? `⚠${h.path}` : h.path)).join(", ")}`);
-      }
-      // open directory listing → enumerate it into a tree (depth/entry-bounded)
-      if ((a.title ?? "").toLowerCase().includes("index of")) {
-        a.listing = await enumerateListing(`${a.scheme}://${a.host}`, "/", (u) => http.send({ method: "GET", url: u }));
-        if (a.listing.length > 0) console.log(`  ${a.host}: open directory listing (${a.listing.length} top-level entries)`);
-      }
-    }
-  }
-
-  // ④ SCORE — recon findings + deterministic attack-target rubric, then rank by band (auto-escalate first), then score
-  for (const a of assets) a.findings = reconFindings(a);
-  for (const a of assets) a.score = scoreAsset(a);
-  const bandRank = (b: string | undefined): number => (b === "critical" ? 3 : b === "high" ? 2 : b === "medium" ? 1 : 0);
-  assets.sort(
-    (x, y) =>
-      bandRank(y.score?.band) - bandRank(x.score?.band) ||
-      (y.score?.total ?? 0) - (x.score?.total ?? 0) ||
-      Number(y.alive) - Number(x.alive) ||
-      x.host.localeCompare(y.host),
-  );
-
-  // ④b AI TRIAGE (P1, opt-in) — Claude classifies the top-scoring live hosts (category/band/angle). A lead, not a finding.
-  if (values.triage) {
-    const topN = values["triage-top"] ? Math.max(1, Number.parseInt(values["triage-top"], 10)) : 15;
-    const targets = assets.filter((a) => a.alive).slice(0, topN);
-    if (targets.length > 0) {
-      const llm = makeLlmClient(resolveLlmConfig(process.env, { explicitModel: values.model, claudeDefaultModel: "claude-sonnet-5" }));
-      console.log(`▶ AI triage on the top ${targets.length} live host(s)…`);
-      for (const a of targets) {
-        try {
-          a.ai = (await triageAsset(a, llm, values.model)) ?? undefined;
-          if (a.ai) console.log(`  [${a.ai.band}] ${a.host} — ${a.ai.category}${a.ai.angle ? `: ${a.ai.angle}` : ""}`);
-        } catch (e) {
-          console.log(`  ✗ ${a.host}: ${String(e).slice(0, 70)}`);
-        }
-      }
-    }
-  }
-
-  // ⑤ persist the asset inventory (overwrite the early empty file with the scored, ranked set)
-  writeAssetInventory(invPath, buildAssetInventory(apex, assets, new Date(), candidates.length, degraded, "report"));
-  console.log(`\nasr ${id}: ${assets.length} asset(s), ${live.length} live → ${invPath}`);
-  const top = assets.filter((a) => a.alive).slice(0, 10);
-  if (top.length > 0) {
-    console.log(`  top targets by score:`);
-    for (const a of top) {
-      console.log(`    [${(a.score?.band ?? "low").padEnd(8)} ${String(a.score?.total ?? 0).padStart(3)}]  ${a.host}  ${a.status ?? ""}`);
-    }
-  }
-  console.log(`  view in the WebUI: serve → open ${id} → Assets tab`);
-
-  // Persist recon findings into the store too (they otherwise live only in asset_inventory.json). This makes them show
-  // up in the shared report renderer (`report` command / the WebUI Export → Report) AND in the project-list findings
-  // count — the SAME surfaces a web/pilot run's findings use. Recon findings are attack-surface *leads*, not
-  // control+2-replay confirmations, so they are recorded as `suspected` (the honest verdict — never hand-mark
-  // `confirmed`; the report headlines confirmed and lists suspected under "needs manual verification"). Stable ids
-  // (`asr-<host>-<category>-<i>`) make a re-scan idempotent.
-  for (const a of assets) {
-    (a.findings ?? []).forEach((f, i) => {
-      store.upsertFinding(id, {
-        id: `asr-${a.host.replace(/[^a-zA-Z0-9.-]/g, "_")}-${f.category}-${i}`,
-        screenId: null,
-        title: `[${f.category}] ${f.title}`,
-        severity: f.severity,
-        verdict: "suspected",
-        anomaly: `${a.host}: ${f.detail}`,
-        source: { kind: "validator", validatorName: "asr-recon" },
-        description: `${f.detail} (host: ${a.host}${a.status ? `, HTTP ${a.status}` : ""})`,
-        reproSteps: `Recon observation on ${a.scheme}://${a.host} — manually verify before relying on it.`,
-        evidenceIds: [],
-        scopeBasis: "authorized in-scope host (recon)",
-      });
-    });
-  }
-
-  store.setPhase(id, "report");
-  store.close();
 }
 
 // Info-level security-header audit (deterministic, no LLM). Checks each screen's response headers in an existing run
@@ -2963,9 +2552,6 @@ async function main(): Promise<void> {
       return;
     case "spec-import":
       await cmdSpecImport(rest);
-      return;
-    case "asr":
-      await cmdAsr(rest);
       return;
     case "status":
       cmdStatus(rest);

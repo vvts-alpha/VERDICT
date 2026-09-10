@@ -1,6 +1,6 @@
 {
   "name": "@veritas/desktop",
-  "version": "2026.9.7",
+  "version": "2026.9.11",
   "private": true,
   "type": "module",
   "main": "dist/main.js",
@@ -15,6 +15,7 @@
     "build:main": "tsc -p tsconfig.build.json",
     "build": "pnpm build:renderer && pnpm build:main",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p renderer/tsconfig.json --noEmit",
+    "test": "node --import tsx --experimental-test-module-mocks --disable-warning=ExperimentalWarning --test 'src/**/*.test.ts'",
     "start": "electron dist/main.js",
     "dev": "pnpm build && electron dist/main.js",
     "spike": "electron src/spike.mjs",
@@ -25,7 +26,8 @@
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
-    "electron": "^38.0.0",
+    "electron": "44.3.0",
+    "tsx": "^4.19.2",
     "typescript": "^5.7.3",
     "vite": "^6.0.7"
   },

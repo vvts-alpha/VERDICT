@@ -15,7 +15,7 @@ test("survey ended without a survey_done marker but methodology ran → survey d
   // real data a-mqbm5fn5: phase=report, 80 screens, no survey_done marker
   const s = resumeStageState({ phase: "report", events: [note("📋 PLAN s-0001: test idor on /users/{id}")] });
   assert.equal(s.surveyDone, true);
-  assert.equal(s.methodologyDone, true);
+  assert.equal(s.methodologyDone, false, "a partial PLAN log is not methodology completion");
 });
 
 test("survey-only completion marker → survey done, methodology not yet", () => {

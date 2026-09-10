@@ -13,7 +13,7 @@
 appId: com.verdict.desktop
 productName: VERDICT
 asar: false
-electronVersion: "38.0.0"
+# Infer Electron from the pinned desktop dependency so installers use the audited runtime.
 directories:
   output: dist-installer
 files:

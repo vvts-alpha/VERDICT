@@ -2,7 +2,7 @@
 // unconfigured install is byte-identical to `new ClaudeCliClient(...)`; setting VERDICT_LLM_PROVIDER=openai
 // (+ base URL / key / model) routes the deterministic pipeline through an OpenAI-compatible endpoint instead.
 //
-// NB: this covers the *one-shot* complete() path (label / assess / logic / asr-triage / server chat). The pilot's
+// NB: this covers the *one-shot* complete() path (label / assess / logic / server chat). The pilot's
 // agentic loop still runs on the Claude Agent SDK (query()) and is NOT affected by this — see the 2026 roadmap.
 
 import { ClaudeCliClient } from "./claude-cli.js";

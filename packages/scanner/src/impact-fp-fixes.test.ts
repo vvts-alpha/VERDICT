@@ -22,6 +22,16 @@ test("isPublicByDesignClientCredential: a Stripe sk_live_ marker beside a public
   assert.equal(isPublicByDesignClientCredential(body, maps), true); // the Maps key itself is still public
 });
 
+// impactOracle DETECTORS multi-match: a SUPPRESSED first match (a public-by-design Maps key) must not mask a REAL leaked
+// secret of the same detector later in the body — the loop must iterate ALL matches, not just exec()'s first.
+test("impactOracle surfaces a real leaked key even when a public Maps key of the same detector comes first", () => {
+  const maps = "AIza" + "M".repeat(35); // public Maps key (suppressed by isPublicByDesignClientCredential)
+  const real = "AIza" + "R".repeat(35); // a genuinely leaked server-side key, well past the Maps window
+  const body = `<script src="https://maps.googleapis.com/maps/api/js?key=${maps}"></script>` + " ".repeat(400) + `SERVER_API_KEY=${real}`;
+  const hits = impactOracle(body);
+  assert.ok(hits.some((h) => h.kind === "secret" && h.marker === real), "the real leaked key must be reported despite the public Maps key matching first");
+});
+
 // #11 impactOracle cross-user — a SHORT incidental self id ("1" in "unread":1) must not suppress a real cross-user read.
 test("impactOracle: a short incidental self id does not suppress a real cross-user hit", () => {
   const body = '{"userId":2,"name":"Bob","phone":"555-0000","unread":1}';

@@ -1,7 +1,7 @@
 # VERDICT が検出対象にしている脆弱性
 
 **正:** `packages/pilot/src/tools.ts` の `CATEGORIES` と確認プローブ。Finding の `category` はこの一覧に正規化される。  
-**対象外の書き方:** ASR は findings を書かない。Burp 取り込みは下の「外部」を参照。
+Burp 取り込みは下の「外部」を参照。
 
 `confirmed` になる条件は共通で、**陰性対照が失敗し、陽性が 2 回安定して成功する**こと。クラスによってはマーカー出現・ブラウザ実行・OOB コールバックがそれに代わる。幻覚や「形が怪しい」だけでは記録されない。診断のあと **findings QA** がエージェント自身の finding を独立に見る（定型 FP は機械的に落とす。残り High+ confirmed と suspected A06 は証拠本文＋ヘッダの懐疑ワンショット。**最初の writeup は渡さない**）。Burp 取り込みの High+ は従来どおり `verifyBurpFindings`。誤検知の方針は下の §8。
 

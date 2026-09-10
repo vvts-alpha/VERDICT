@@ -252,3 +252,20 @@ test("auto mode falls back to text when the endpoint ignores the tools param (re
     assert.equal(res.stopped, "shouldStop");
     assert.deepEqual(calls, ["act:{\"v\":\"go\"}"], "after falling back to text mode, tools actually ran");
 });
+
+test("OpenCode session survives native-to-text fallback and all turns", async () => {
+    const ids: string[] = [];
+    let calls = 0;
+    await runOpenAiAgentLoop({ baseURL: "https://opencode.ai/zen/go/v1", model: "deepseek-v4-flash", system: "test", goal: "test", tools: [], allowed: [], maxTurns: 1, mode: "auto", shouldStop: () => false,
+        fetchImpl: async (_url, init) => {
+            const headers = new Headers(init.headers);
+            ids.push(headers.get("x-opencode-session")!);
+            assert.match(headers.get("user-agent")!, /^VERDICT\//);
+            calls++;
+            return Response.json({ choices: [{ message: { content: "done" } }] });
+        },
+    });
+    assert.equal(calls, 2);
+    assert.match(ids[0]!, /^[a-f0-9-]{36}$/);
+    assert.equal(ids[0], ids[1]);
+});
