@@ -3,7 +3,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { execFileSync } = require("node:child_process");
-const { sha256, validateBuildRuns, validateArtifact, validateLiveEvidence, renderNotes } = require("./release-validation.cjs");
+const { sha256, validateBuildRuns, validateArtifact, validateLiveEvidence, renderNotes, validateDownloadLinks } = require("./release-validation.cjs");
 
 const [mode, runId, argument, liveFile] = process.argv.slice(2);
 assert.ok(["prepare", "check", "publish"].includes(mode), "Usage: promote-release.cjs prepare <run-id> <directory> | check|publish <run-id> <changes.json> <live-validation.json>");
@@ -11,6 +11,7 @@ assert.match(runId ?? "", /^\d+$/, "A Windows workflow run ID is required");
 const repository = process.env.GITHUB_REPOSITORY || execFileSync("gh", ["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"], { encoding: "utf8" }).trim();
 assert.match(repository, /^[\w.-]+\/[\w.-]+$/);
 const root = path.resolve(__dirname, "..");
+validateDownloadLinks(fs.readFileSync(path.join(root, "README.md"), "utf8"));
 function gh(args, input) {
   return execFileSync("gh", args, { input, encoding: "utf8", maxBuffer: 8 * 1024 * 1024 });
 }

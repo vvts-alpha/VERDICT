@@ -8,7 +8,7 @@
 
 Map the application. Test across account roles. Review the requests, responses, and browser behavior behind each finding.
 
-[**Download Windows v2026.9.7**](https://github.com/vvts-alpha/VERDICT/releases/download/v2026.9.7/VERDICT.Setup.2026.9.7.exe) · [Get started](#get-started) · [Benchmarks](https://github.com/vvts-alpha/verdict-pub) · [Development](#development)
+[**Download Windows**](https://github.com/vvts-alpha/VERDICT/releases/latest) · [Get started](#get-started) · [Benchmarks](https://github.com/vvts-alpha/verdict-pub) · [Development](#development)
 
 [![Release](https://img.shields.io/github/v/release/vvts-alpha/VERDICT)](https://github.com/vvts-alpha/VERDICT/releases/latest)
 [![CI](https://github.com/vvts-alpha/VERDICT/actions/workflows/ci.yml/badge.svg)](https://github.com/vvts-alpha/VERDICT/actions/workflows/ci.yml)
@@ -42,7 +42,7 @@ The engine covers injection, access control, sessions, business logic, secret ex
 
 ### 1. Install
 
-Download [VERDICT.Setup.2026.9.7.exe](https://github.com/vvts-alpha/VERDICT/releases/download/v2026.9.7/VERDICT.Setup.2026.9.7.exe) and run it on **Windows x64**. Close VERDICT before upgrading. The [release](https://github.com/vvts-alpha/VERDICT/releases/tag/v2026.9.7) also includes checksums, a Windows quickstart, and the optional Burp extension.
+Download [the latest Windows installer](https://github.com/vvts-alpha/VERDICT/releases/latest) and run it on **Windows x64**. Close VERDICT before upgrading. The [release](https://github.com/vvts-alpha/VERDICT/releases/latest) also includes checksums, a Windows quickstart, and the optional Burp extension.
 
 You need **Chrome or Edge** for automated browsing and PDF generation, plus your own LLM credentials or an authenticated Windows `claude` command. The embedded browser for manual login is included.
 
@@ -86,7 +86,7 @@ For an existing assessment, use **Continue this run →** or the handoff's **Log
 
 ### Optional: connect Burp
 
-Active scanning and Collaborator require **Burp Suite Professional**. Set Burp's proxy listener under **Settings → Network → Upstream proxy**. For active scanning, load the [attached Audit REST extension](https://github.com/vvts-alpha/VERDICT/releases/download/v2026.9.7/verdict-burp-audit.jar), configure its URL/token under **Settings → Burp**, and enable the post-diagnosis scan. See the [extension guide](tools/burp-audit-ext/README.md).
+Active scanning and Collaborator require **Burp Suite Professional**. Set Burp's proxy listener under **Settings → Network → Upstream proxy**. For active scanning, load the [attached Audit REST extension](https://github.com/vvts-alpha/VERDICT/releases/latest/download/verdict-burp-audit.jar), configure its URL/token under **Settings → Burp**, and enable the post-diagnosis scan. See the [extension guide](tools/burp-audit-ext/README.md).
 
 Use the updated **v0.2.0 serial API extension**. VERDICT submits one request, waits for its audit, saves the findings, then submits the next. Older extensions are refused. Pauses, failures, connection errors, and the default 30-minute task timeout stop further submissions and leave partial results. Standard REST scans also use one seed URL per task.
 
@@ -133,8 +133,9 @@ node packages/cli/dist/main.js serve  # http://127.0.0.1:4317
 
 ## Documentation
 
-- [Windows release and quickstart](https://github.com/vvts-alpha/VERDICT/releases/tag/v2026.9.7)
+- [Windows release and quickstart](https://github.com/vvts-alpha/VERDICT/releases/latest)
 - [CLI/operator guide](docs/USAGE.md): manifests, authentication, reports, and advanced workflows.
+- [Release procedure and validation gates](docs/RELEASING.md).
 - [Desktop packaging](apps/desktop/PACKAGING.md) and [Windows build workflow](.github/workflows/windows-build.yml).
 - [Detection coverage](docs/VULNERABILITIES.md).
 - [Architecture](DESIGN.md), [UI conventions](docs/WEBUI_CONVENTIONS.md), and [contributor guidelines](AGENTS.md).

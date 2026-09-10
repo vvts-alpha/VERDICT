@@ -86,4 +86,8 @@ function renderNotes(change, manifest, buildUrl, ciUrl) {
   return `## Summary\n\n${change.summary}\n\n## Changes\n\n${list(change.changes)}\n\n## Upgrade\n\n${list(change.upgrade)}\n\n## Validation\n\n- [Windows build and packaged application checks](${buildUrl})\n- [Dependency audit, build, typecheck and regression tests](${ciUrl})\n- Source: \`${manifest.sourceCommit}\`\n- Windows x64 installer: ${(manifest.installer.bytes / 1_000_000).toFixed(1)} MB\n- SHA-256: \`${manifest.installer.sha256}\`\n- Packaged runtime: Electron ${manifest.runtime.electron}, Node ${manifest.runtime.node}\n\n## Known limitations\n\n${list(change.knownLimitations)}\n`;
 }
 
-module.exports = { REQUIRED_CHECKS, MAX_INSTALLER_BYTES, MAX_UNPACKED_BYTES, MAX_GROWTH_RATIO, sha256, validateBuildRuns, validateArtifact, validateLiveEvidence, renderNotes };
+function validateDownloadLinks(readme) {
+  assert.ok(!/github\.com\/[^/\s]+\/[^/\s]+\/releases\/(?:tag|download)\/v\d/.test(readme), "README download instructions pin an old release; use releases/latest links");
+}
+
+module.exports = { REQUIRED_CHECKS, MAX_INSTALLER_BYTES, MAX_UNPACKED_BYTES, MAX_GROWTH_RATIO, sha256, validateBuildRuns, validateArtifact, validateLiveEvidence, renderNotes, validateDownloadLinks };

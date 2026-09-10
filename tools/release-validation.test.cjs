@@ -3,7 +3,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { sha256, validateBuildRuns, validateArtifact, validateLiveEvidence, renderNotes } = require("./release-validation.cjs");
+const { sha256, validateBuildRuns, validateArtifact, validateLiveEvidence, renderNotes, validateDownloadLinks } = require("./release-validation.cjs");
 
 function fixture(t) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "verdict-release-test-"));
@@ -90,4 +90,10 @@ test("public evidence rejects unexpected credential fields and stale results", t
   assert.throws(() => validateLiveEvidence({ ...live, apiKey: "private-fixture" }, manifest));
   assert.throws(() => validateLiveEvidence({ ...live, checkedAt: "2020-01-01T00:00:00Z" }, manifest));
   assert.throws(() => validateLiveEvidence({ ...live, checkedAt: "invalid" }, manifest));
+});
+
+test("download instructions cannot send users back to a superseded release", () => {
+  validateDownloadLinks("[Download](https://github.com/vvts-alpha/VERDICT/releases/latest)");
+  assert.throws(() => validateDownloadLinks("[Download](https://github.com/vvts-alpha/VERDICT/releases/download/v2026.9.7/VERDICT.Setup.2026.9.7.exe)"));
+  validateDownloadLinks(fs.readFileSync(path.join(__dirname, "../README.md"), "utf8"));
 });

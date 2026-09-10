@@ -6,6 +6,10 @@ on:
     branches:
       - main
 
+concurrency:
+  group: windows-build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: Build on Windows runner
