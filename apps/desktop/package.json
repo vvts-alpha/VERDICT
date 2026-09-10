@@ -1,6 +1,6 @@
 {
   "name": "@veritas/desktop",
-  "version": "2026.9.11",
+  "version": "2026.9.11-1",
   "private": true,
   "type": "module",
   "main": "dist/main.js",
@@ -8,14 +8,15 @@
     "dist",
     "dist-renderer",
     "preload.cjs",
-    "electron-builder.yml"
+    "electron-builder.yml",
+    "packaging/after-pack.cjs"
   ],
   "scripts": {
     "build:renderer": "vite build",
     "build:main": "tsc -p tsconfig.build.json",
     "build": "pnpm build:renderer && pnpm build:main",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p renderer/tsconfig.json --noEmit",
-    "test": "node --import tsx --experimental-test-module-mocks --disable-warning=ExperimentalWarning --test 'src/**/*.test.ts'",
+    "test": "node --import tsx --experimental-test-module-mocks --disable-warning=ExperimentalWarning --test 'src/**/*.test.ts' 'packaging/*.test.cjs'",
     "start": "electron dist/main.js",
     "dev": "pnpm build && electron dist/main.js",
     "spike": "electron src/spike.mjs",

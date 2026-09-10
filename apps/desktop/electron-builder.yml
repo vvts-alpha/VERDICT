@@ -13,6 +13,7 @@
 appId: com.verdict.desktop
 productName: VERDICT
 asar: false
+afterPack: ./packaging/after-pack.cjs
 # Infer Electron from the pinned desktop dependency so installers use the audited runtime.
 directories:
   output: dist-installer

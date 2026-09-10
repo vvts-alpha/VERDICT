@@ -42,7 +42,7 @@ jobs:
 
       - name: Package Windows installer (electron-builder)
         working-directory: bundle
-        run: npx --yes electron-builder --config electron-builder.yml --win --x64
+        run: npx --yes electron-builder@26.15.3 --config electron-builder.yml --win --x64
         shell: bash
 
       - name: Upload VERDICT installer
