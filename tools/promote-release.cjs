@@ -4,6 +4,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { execFileSync } = require("node:child_process");
 const { sha256, validateBuildRuns, validateArtifact, validateLiveEvidence, renderNotes, validateDownloadLinks } = require("./release-validation.cjs");
+const { ensureReleaseTag, publishVerifiedRelease } = require("./release-publish.cjs");
 
 const [mode, runId, argument, liveFile] = process.argv.slice(2);
 assert.ok(["prepare", "check", "publish"].includes(mode), "Usage: promote-release.cjs prepare <run-id> <directory> | check|publish <run-id> <changes.json> <live-validation.json>");
@@ -81,6 +82,7 @@ console.log(JSON.stringify({ validation: "passed", mode, version: manifest.versi
 if (mode === "check") process.exit(0);
 
 const tag = `v${manifest.version}`;
+ensureReleaseTag(api, repo, tag, manifest.sourceCommit);
 let release;
 try {
   const existing = JSON.parse(gh(["release", "view", tag, "--repo", repository, "--json", "apiUrl"]));
@@ -95,7 +97,7 @@ if (release) {
 } else {
   release = api(`${repo}/releases`, "POST", { tag_name: tag, target_commitish: manifest.sourceCommit, name: `${tag} — ${changes.summary}`, body: notes, draft: true, prerelease: false });
 }
-api(`${repo}/releases/${release.id}`, "PATCH", { body: notes });
+api(`${repo}/releases/${release.id}`, "PATCH", { body: notes, tag_name: tag, target_commitish: manifest.sourceCommit });
 const token = process.env.GH_TOKEN || process.env.GITHUB_TOKEN || gh(["auth", "token"]).trim();
 assert.ok(token && !/[\r\n"]/.test(token), "Invalid GitHub credential");
 const nativeWindowsCurl = process.platform === "linux" && fs.existsSync("/mnt/c/Windows/System32/curl.exe");
@@ -130,8 +132,5 @@ const finalBuild = api(`${repo}/actions/runs/${runId}`);
 const finalCi = api(`${repo}/actions/workflows/ci.yml/runs?head_sha=${build.head_sha}&per_page=10`).workflow_runs[0];
 assert.ok(finalCi, "CI result disappeared before publication");
 validateBuildRuns(finalBuild, finalCi, workflow.id);
-api(`${repo}/releases/${release.id}`, "PATCH", { draft: false, make_latest: "true" });
-const published = api(`${repo}/releases/latest`);
-assert.equal(published.id, release.id, "Release did not become latest");
-assert.equal(published.draft, false);
+const published = publishVerifiedRelease(api, repo, { id: release.id, tag, sourceCommit: manifest.sourceCommit, repository });
 console.log(JSON.stringify({ published: published.html_url, sourceCommit: manifest.sourceCommit, installer: manifest.installer }, null, 2));
