@@ -201,8 +201,8 @@ function screenIsHighValue(sc: Screen): boolean {
 /** A recorded plan is progress, not completion. Resume only skips planning when every saved screen has a plan. */
 export function resumeStageState(
   prev: { phase: string; screens?: ReadonlyArray<{ screenId: string }>; events: ReadonlyArray<{ type: string; payload: unknown }> } | null,
-): { surveyDone: boolean; methodologyDone: boolean } {
-  if (!prev) return { surveyDone: false, methodologyDone: false };
+): { surveyDone: boolean; methodologyDone: boolean; reconDone: boolean } {
+  if (!prev) return { surveyDone: false, methodologyDone: false, reconDone: false };
   const notes = prev.events.filter((e) => e.type === "note").map((e) => {
     const m = (e.payload as { message?: unknown } | null)?.message;
     return typeof m === "string" ? m : "";
@@ -212,7 +212,10 @@ export function resumeStageState(
   const methodologyDone = completed && !!prev.screens && prev.screens.every((s) => plans.has(s.screenId));
   const surveyDone = new Set(["phase1_label", "phase2_scan", "report", "done"]).has(prev.phase) ||
     plans.size > 0 || notes.some((m) => m.includes("SURVEY done"));
-  return { surveyDone, methodologyDone };
+  const reconDone = prev.events.some((e) => e.type === "recon_completed") ||
+    new Set(["phase1_label", "phase2_scan", "report", "done"]).has(prev.phase) || plans.size > 0 ||
+    notes.some((m) => m.includes("SURVEY done (survey-only)") || m.startsWith("🔮 recon extrapolation done:"));
+  return { surveyDone, methodologyDone, reconDone };
 }
 
 /** Pure function that decides whether an error is a Claude (subscription CLI / SDK) usage-limit / token-exhaustion error.
@@ -867,8 +870,9 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     // On resume, decide from events how far survey/methodology got last time.
     // Note: survey-only is also "done" but the phase stays phase1_recon, so phase can't distinguish it from an interruption.
     //   Decide via the "SURVEY done" marker survey_done emits and methodology's "📋 PLAN" events.
-    const { surveyDone: surveyDonePrev, methodologyDone: methodologyDonePrev } = resumeStageState(prev);
+    const { surveyDone: surveyDonePrev, methodologyDone: methodologyDonePrev, reconDone: reconDonePrev } = resumeStageState(prev);
     const doSurvey = !opts.resume || !surveyDonePrev; // even on resume, if survey is incomplete start from survey
+    const doRecon = doSurvey || !reconDonePrev;
     const doMethodology = !opts.surveyOnly && (!surveyDonePrev || !methodologyDonePrev);
 
     if (doSurvey) {
@@ -903,7 +907,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     //   stays unmapped — an un-clickable folder in the site tree. Probe each unmapped static ancestor and enroll the
     //   real ones (a 404 / error-catch-all is dropped). Runs whenever survey ran (survey-only included) so those parents
     //   enter the inventory before methodology plans them.
-    if (doSurvey && !session.done) {
+    if (doRecon && !session.done) {
       try {
         const bf = await backfillParentPrefixes(session);
         if (bf.enrolled > 0) opts.onText?.(`🧭 parent-prefix backfill: +${bf.enrolled} screen(s) from ${bf.probed} unmapped parent path(s)`);
@@ -917,7 +921,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     //   source-map exposure. Endpoints/keys that link-following + XHR-capture never trigger live in the bundles. Bundles
     //   are usually shared across pages and deduped by URL, so a handful of representative pages covers the app. Runs
     //   before methodology so the newly-enrolled endpoints get planned. (The analyze_js tool is also available to the model.)
-    if (doSurvey && !session.done) {
+    if (doRecon && !session.done) {
       try {
         const root = session.targetUrl;
         const pages = [root, ...session.inv.screens().map((sc) => sc.observedUrls[0]).filter((u): u is string => !!u && u !== root)].slice(0, 6);
@@ -941,7 +945,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     //   it predicts exist but were never linked (missing CRUD actions, sibling controllers, admin variants, API
     //   resources). Real hits enroll; 404s drop. A fresh, single-job query() guesses far better than tacking this onto the
     //   survey loop (where the model drifts to survey_done). Skipped under a URL-list lock or once the survey cap is hit.
-    if (doSurvey && !session.done && !opts.lockToSeeds && !session.surveyCapped && session.inv.screens().length > 0) {
+    if (doRecon && !session.done && !opts.lockToSeeds && !session.surveyCapped && session.inv.screens().length > 0) {
       opts.store.setPhase(opts.assessmentId, "phase1_recon");
       turns += await runStage({
         system: RECON_GUESS_PROMPT,
@@ -952,6 +956,10 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         contextWindowTokens: contextWindows.light,
         shouldStop: () => session.reconGuessDone,
       });
+    }
+
+    if (doRecon && !session.done) {
+      opts.store.appendEvent(opts.assessmentId, { type: "recon_completed", payload: { screenIds: session.inv.screens().map((screen) => screen.screenId) } });
     }
 
     // ── Early fingerprint (before methodology) ── detect the stack and produce tech-aware attack-plan hints.

@@ -1699,6 +1699,9 @@ export function buildTools(s: PilotSession) {
       "Finish the SURVEY stage once the frontier is empty and every role's authenticated surface is mapped. Provide a one-line coverage summary.",
       { summary: z.string() },
       async ({ summary }) => {
+        if (s.frontier.size > 0 && !s.surveyCapped) {
+          return txt(`survey_done REFUSED — ${s.frontier.size} in-scope URL(s) remain unvisited. Continue mapping the frontier reported by survey_status before completing.`);
+        }
         // Structural auth gate: if roles are configured but no authenticated session was ever established
         // (both currentCookie and Bearer empty), the entire post-login surface is unmapped = an anonymous survey.
         // Refuse survey_done here and require login() per role before completing (same "structurally prevent

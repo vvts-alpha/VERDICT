@@ -31,5 +31,5 @@ test("mid-diagnosis crash (phase2_scan) → survey done", () => {
 
 test("no prior run → nothing done", () => {
   const s = resumeStageState(null);
-  assert.deepEqual(s, { surveyDone: false, methodologyDone: false });
+  assert.deepEqual(s, { surveyDone: false, methodologyDone: false, reconDone: false });
 });

@@ -45,6 +45,7 @@ export type StateEvent =
   | EventEnvelope<"js_analyzed", JsAsset>
   | EventEnvelope<"methodology_recorded", { screenId: string; vulnClasses: string[]; plan: string }>
   | EventEnvelope<"methodology_completed", { screenIds: string[]; summary: string }>
+  | EventEnvelope<"recon_completed", { screenIds: string[] }>
   | EventEnvelope<"note", { message: string }>;
 
 /** A live reconfigure command for a running scan, applied by the pilot at its next between-screens checkpoint.
