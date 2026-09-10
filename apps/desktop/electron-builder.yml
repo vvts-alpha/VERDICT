@@ -2,7 +2,9 @@
 #
 # Run against a MATERIALIZED bundle (pnpm's symlinked node_modules trips electron-builder), e.g.:
 #   pnpm -r build
-#   pnpm --filter @veritas/desktop deploy ./bundle        # self-contained (all @veritas/* + deps materialized)
+#   node tools/package-desktop.cjs prepare ./production ./bundle
+#   pnpm --dir ./production install --frozen-lockfile --prod --node-linker=hoisted --ignore-scripts
+#   node tools/package-desktop.cjs materialize ./production ./bundle
 #   cd bundle && npx electron-builder --config electron-builder.yml
 # The deploy bundle already runs as-is with `electron .` (verified); this step wraps it into an installer.
 #

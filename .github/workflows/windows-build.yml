@@ -33,16 +33,26 @@ jobs:
         run: pnpm -r build
         shell: bash
 
-      - name: Materialize self-contained desktop bundle
+      - name: Stage production workspace
         run: |
-          pnpm --filter @veritas/desktop deploy ./bundle
-          # deploy copies package "files"; keep the builder config at the bundle root even if packing omits it
-          cp apps/desktop/electron-builder.yml bundle/electron-builder.yml
+          node tools/package-desktop.cjs prepare "$RUNNER_TEMP/verdict-production" ./bundle
+        shell: bash
+
+      - name: Install locked production dependencies for Windows
+        run: pnpm --dir "$RUNNER_TEMP/verdict-production" install --frozen-lockfile --prod --node-linker=hoisted --ignore-scripts
+        shell: bash
+
+      - name: Materialize self-contained desktop bundle
+        run: node tools/package-desktop.cjs materialize "$RUNNER_TEMP/verdict-production" ./bundle
         shell: bash
 
       - name: Package Windows installer (electron-builder)
         working-directory: bundle
-        run: npx --yes electron-builder@26.15.3 --config electron-builder.yml --win --x64
+        run: npx --yes electron-builder@26.15.3 --config electron-builder.yml --win --x64 --publish never
+        shell: bash
+
+      - name: Verify packaged Windows executables
+        run: node tools/check-desktop-bundle.cjs bundle/dist-installer/win-unpacked
         shell: bash
 
       - name: Upload VERDICT installer
