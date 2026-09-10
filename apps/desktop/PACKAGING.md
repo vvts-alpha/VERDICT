@@ -1,41 +1,31 @@
 # Packaging the VERDICT desktop app
 
-The app is a pnpm-workspace Electron app: the Electron main hosts `@veritas/server` in-process and spawns the
-`@veritas/cli` as a child to run assessments. There are **no native modules** (the store uses Node's builtin
-`node:sqlite`; `playwright-core` drives an external chromium), so packaging needs no node-gyp rebuild.
+The Electron main process hosts the local server and spawns the packaged CLI. OpenAI-compatible providers run without a Claude subprocess; the optional Claude path requires its platform-specific executable. Automation uses installed Chrome/Edge or an explicit browser path.
 
-## 1. Self-contained bundle (verified, the simplest distributable)
+## Build a production bundle
 
-`pnpm deploy` materializes the app + every workspace dependency (`@veritas/*`, `playwright-core`, `zod`, …) into
-one self-contained folder with its own `node_modules` — no symlinks into the repo:
+Run on the destination operating system with Node 24+ and pnpm 9.15.4:
 
 ```bash
-pnpm -r build                                   # all dist/ (tsc + the desktop renderer via Vite)
-pnpm --filter @veritas/desktop deploy ./bundle  # → ./bundle, self-contained
-cd bundle && electron .                          # runs: window + in-process server + can launch assessments
-```
-
-Verified end-to-end: the deployed app renders the UI and its spawned child resolves `playwright-core` + all
-`@veritas/*` from the bundle and runs a headless assessment. `node:sqlite` works (the packaged Electron 38.0.0 runtime was checked with Node 22.18.0).
-
-The only external dependency is a **Chromium for automation** — set its path in the app's **Settings**
-(`VERDICT_BROWSER_PATH`). The LLM provider (OpenCodeGo / OpenAI / Claude) is also configured in Settings.
-
-## 2. Native installer (AppImage / nsis / dmg)
-
-electron-builder does not follow pnpm's symlinked `node_modules`, so run it against the **materialized bundle**:
-
-```bash
+pnpm install --frozen-lockfile
 pnpm -r build
-pnpm --filter @veritas/desktop deploy ./bundle
-cd bundle && npx electron-builder --config electron-builder.yml   # → bundle/dist-installer/
+node tools/package-desktop.cjs prepare /path/to/fresh-production /path/to/fresh-bundle
+pnpm --dir /path/to/fresh-production install --frozen-lockfile --prod --node-linker=hoisted --ignore-scripts
+node tools/package-desktop.cjs materialize /path/to/fresh-production /path/to/fresh-bundle
 ```
 
-`asar` is off (the app spawns the CLI child as a real process; spawning/`require.resolve` inside an asar archive
-is unsupported and there are no native modules to hide). Build per-platform on that platform (or via CI).
+Staging retains the original lockfile. Materialization copies runtime files and native optional dependencies into a flat directory. Do not substitute an unfrozen deploy or copy a Linux dependency tree into a Windows release.
 
-### Bundling Chromium (optional)
+## Package and validate
 
-To ship a fully self-contained installer, drop a Playwright chromium build under `resources/chromium`, enable the
-`extraResources` block in `electron-builder.yml`, and set `VERDICT_BROWSER_PATH` to that path at runtime
-(`process.resourcesPath`). It adds ~150MB per platform, so it's opt-in.
+From the bundle directory:
+
+```bash
+npx --yes electron-builder@26.15.3 --config electron-builder.yml --win --x64 --publish never
+```
+
+The builder infers the pinned Electron version. Its Windows hook verifies the native SDK executable and removes foreign platforms/architectures. `asar` remains disabled so CLI and native executables are accessible as real files.
+
+CI runs `tools/check-desktop-bundle.cjs` using Node 24+ and 7-Zip. It binds the tested directory to installer contents, checks size and private-file exclusions, starts packaged CLI/SDK executables, launches the GUI in an isolated profile, and checks authenticated API access plus rejection of external unauthenticated requests. It emits an artifact manifest and checksum file.
+
+Follow [the release procedure](../../docs/RELEASING.md) to run live checks and promote the exact CI artifact. Packaging success alone is not release readiness.

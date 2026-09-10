@@ -59,7 +59,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: verdict-windows-installer
-          path: bundle/dist-installer/*.exe
+          path: |
+            bundle/dist-installer/*.exe
+            bundle/dist-installer/artifact-manifest.json
+            bundle/dist-installer/SHA256SUMS.txt
+            bundle/dist-installer/smoke.png
           if-no-files-found: error
 
       - name: Upload win-unpacked

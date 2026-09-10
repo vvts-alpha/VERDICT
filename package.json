@@ -12,6 +12,7 @@
     "build": "pnpm -r run build",
     "typecheck": "pnpm -r run typecheck",
     "test": "pnpm -r run test",
+    "test:release": "node --test tools/*.test.cjs",
     "clean": "pnpm -r run clean"
   },
   "pnpm": {

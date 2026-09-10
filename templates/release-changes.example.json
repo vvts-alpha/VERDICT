@@ -1,0 +1,6 @@
+{
+  "summary": "Describe the concrete problem this release fixes.",
+  "changes": ["Describe a user-visible behavior change and its trigger."],
+  "upgrade": ["Close VERDICT and install the new Windows installer.", "State any settings or saved-assessment migration required."],
+  "knownLimitations": ["Name any unverified platform, provider, upgrade path, or remaining defect."]
+}

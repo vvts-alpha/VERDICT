@@ -1,11 +1,11 @@
-## What & why
+## Change
 
-Brief description of the change and the motivation.
+Describe the concrete trigger, previous behavior, and resulting behavior.
 
-## Checklist
+## Validation
 
-- [ ] `pnpm -r build` and `pnpm -r test` pass (Node ≥ 24)
-- [ ] New/changed behavior has tests (uses `FakeDriver` / `FakeHttpClient` / `FakeLlmClient` — no real network/LLM in tests)
-- [ ] Evidence discipline preserved — no finding is marked `confirmed` without a failing negative control + ≥2 stable positive replays
-- [ ] Contract types stay in `@veritas/core` (not redeclared elsewhere); scope gate intact on any new network action
-- [ ] Docs/README updated if user-facing
+List checks actually completed and their results. For runtime or packaging changes, include the Windows artifact version, build run, and relevant smoke checks. State what remains unverified; a skipped check is not a pass.
+
+## Compatibility and risk
+
+Describe effects on saved assessments, settings, scope, permissions, provider support, and package size where applicable. Link the regression test or explain why this change needs no new test.

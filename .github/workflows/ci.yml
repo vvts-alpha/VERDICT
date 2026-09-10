@@ -26,3 +26,5 @@ jobs:
         run: pnpm -r typecheck
       - name: Test (node:test via tsx)
         run: pnpm -r test
+      - name: Test release gates
+        run: node --test tools/*.test.cjs

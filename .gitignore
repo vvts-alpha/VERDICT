@@ -71,4 +71,5 @@ dist-renderer/
 !/docs/USAGE.md
 !/docs/VULNERABILITIES.md
 !/docs/WEBUI_CONVENTIONS.md
+!/docs/RELEASING.md
 !/docs/burp-audit-api.openapi.yaml

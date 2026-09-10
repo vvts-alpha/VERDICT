@@ -1,0 +1,29 @@
+name: Bug report
+description: Report a reproducible VERDICT problem without private assessment data.
+body:
+  - type: input
+    id: version
+    attributes:
+      label: VERDICT version and installer filename
+      description: Copy the version from About and name the installed release file.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS version, installation method, and provider/model IDs if relevant. Do not include credentials.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps, expected result, and actual result
+      description: Use a minimal example. Omit private target details and assessment artifacts.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Redacted error or logs
+      description: Remove API keys, tokens, cookies, passwords, and private target data.

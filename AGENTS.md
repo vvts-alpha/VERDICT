@@ -32,3 +32,7 @@ Follow the history's Conventional Commit style: `feat(desktop): ...`, `fix(pilot
 ## Security & Architecture Rules
 
 Keep shared contracts in `core` and WebUI imports from core type-only. Preserve scope gates and append-only state events. Confirmation requires a failing negative control and at least two successful positive replays. Never commit `.env`, credentials, cookies, or private run artifacts; use authorized targets only.
+
+## Release Gates
+
+Follow `docs/RELEASING.md`. Release only the exact CI installer tested on Windows, with successful CI and Windows workflow runs for the same source commit. Use `tools/promote-release.cjs`; do not substitute a local rebuild, bypass a failing gate, or mutate published assets. Run `pnpm test:release` after changing release tooling. Record actual checks and limitations using the shared templates. Existing release authorization is sufficient; do not add repeated permission questions.
