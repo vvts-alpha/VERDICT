@@ -76,3 +76,20 @@ jobs:
           name: verdict-windows-unpacked
           path: bundle/dist-installer/win-unpacked/
           if-no-files-found: error
+          include-hidden-files: true
+
+      - name: Download installer for artifact roundtrip verification
+        uses: actions/download-artifact@v4
+        with:
+          name: verdict-windows-installer
+          path: artifact-check
+
+      - name: Download application for artifact roundtrip verification
+        uses: actions/download-artifact@v4
+        with:
+          name: verdict-windows-unpacked
+          path: artifact-check/win-unpacked
+
+      - name: Verify downloaded artifacts preserve the tested application
+        run: node tools/check-desktop-bundle.cjs artifact-check/win-unpacked
+        shell: bash
