@@ -78,3 +78,46 @@ test("probe_proto does NOT confirm when nothing leaks", () =>
     const r = await callTool(dir, "probe_proto", { url: BASE + "api/profile" }, send);
     assert.equal(r.confirmed, false);
   }));
+
+test("probe_proto does NOT confirm a document store that merely echoes the posted __proto__ field", () =>
+  withDir(async (dir) => {
+    // The app stores unknown JSON fields and echoes the document back verbatim — a stored own-property echo,
+    // not pollution (JSON.stringify serializes own properties only; a real leak appears outside any __proto__ key).
+    const send = async (req: Req): Promise<Res> => {
+      if ((req.method ?? "GET").toUpperCase() === "POST") return { status: 200, finalUrl: req.url, durationMs: 3, headers: {}, body: "{}" };
+      return { status: 200, finalUrl: req.url, durationMs: 3, headers: {}, body: '{"name":"x","__proto__":{"verdictPP9137":"verdictPP9137VAL"}}' };
+    };
+    const r = await callTool(dir, "probe_proto", { url: BASE + "api/profile" }, send);
+    assert.equal(r.confirmed, false);
+  }));
+
+test("probe_proto does NOT confirm when every pollution request was rejected but the marker leaks anyway", () =>
+  withDir(async (dir) => {
+    let polluted = false;
+    const send = async (req: Req): Promise<Res> => {
+      if ((req.method ?? "GET").toUpperCase() === "POST") {
+        polluted = true; // the marker leak appears even though every POST is rejected — an unattributed source
+        return { status: 404, finalUrl: req.url, durationMs: 3, headers: {}, body: "not found" };
+      }
+      return { status: 200, finalUrl: req.url, durationMs: 3, headers: {}, body: polluted ? '{"ok":true,"verdictPP9137":"verdictPP9137VAL"}' : '{"ok":true}' };
+    };
+    const r = await callTool(dir, "probe_proto", { url: BASE + "api/profile" }, send);
+    assert.equal(r.confirmed, false);
+    assert.match(String(r.verdict), /unattributed/);
+  }));
+
+test("probe_proto confirms through constructor.prototype when the literal __proto__ key is filtered", () =>
+  withDir(async (dir) => {
+    let polluted = false;
+    const send = async (req: Req): Promise<Res> => {
+      const b = req.body ?? "";
+      if ((req.method ?? "GET").toUpperCase() === "POST") {
+        if (b.includes("__proto__")) return { status: 400, finalUrl: req.url, durationMs: 3, headers: {}, body: '{"error":"bad key"}' };
+        polluted = true;
+        return { status: 200, finalUrl: req.url, durationMs: 3, headers: {}, body: "{}" };
+      }
+      return { status: 200, finalUrl: req.url, durationMs: 3, headers: {}, body: polluted ? '{"ok":true,"verdictPP9137":"verdictPP9137VAL"}' : '{"ok":true}' };
+    };
+    const r = await callTool(dir, "probe_proto", { url: BASE + "api/profile" }, send);
+    assert.equal(r.confirmed, true);
+  }));

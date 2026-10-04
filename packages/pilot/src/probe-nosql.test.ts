@@ -71,3 +71,19 @@ test("probe_nosql does NOT confirm a non-injectable login (control and operators
     const r = await callTool(dir, "probe_nosql", { url: BASE + "rest/user/login", body: '{"email":"admin@x","password":{{NOSQL}}}', successMarker: "authentication" }, send);
     assert.equal(r.technique, null);
   }));
+
+test("probe_nosql does NOT confirm a WAF soft-challenge that only the operator payloads trigger", () =>
+  withDir(async (dir) => {
+    // Benign literal control 401s; the operator characters trip a Cloudflare-style 200 challenge page.
+    // Without the looksBlocked guard this reads as "control failed, operators 2xx twice" = fake bypass.
+    const send = async (req: Req): Promise<Res> => {
+      const pw = parsePw(req.body);
+      const bypass = pw !== null && typeof pw === "object";
+      return bypass
+        ? { status: 200, finalUrl: req.url, durationMs: 4, headers: {}, body: "<html><title>Just a moment...</title><script src=\"https://challenges.cloudflare.com/turnstile/v0/api.js\"></script></html>" }
+        : { status: 401, finalUrl: req.url, durationMs: 4, headers: {}, body: "Invalid email or password" };
+    };
+    const r = await callTool(dir, "probe_nosql", { url: BASE + "rest/user/login", body: '{"email":"admin@x","password":{{NOSQL}}}' }, send);
+    assert.equal(r.technique, null);
+    assert.match(String(r.verdict), /not confirmed/);
+  }));

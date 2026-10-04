@@ -17,7 +17,7 @@ import { analyzeJsSinksFull } from "./jssinks.js";
 import { bumpJwtExp, jwtForgeCandidates, parseJwt, pemFromJwks } from "./jwt.js";
 import { placeUserIdentity, userEnumMarker } from "./user-enum.js";
 import { disclosureHit, looksLikePublicWebFile } from "./disclosure.js";
-import { formatRequestDump, glanceCookie, parseCookieHeader, peekJwt } from "./session-glance.js";
+import { auditSessionCookieFlags, formatRequestDump, glanceCookie, isSessionCookieName, parseCookieHeader, parseSetCookieLines, peekJwt, SESSION_COOKIE_ATTR_KEYS } from "./session-glance.js";
 import { bearerFromOrigins, normalizeOrigins, type StorageOrigin } from "./storage-state.js";
 import { SSRF_CONTROL, SSRF_PAYLOADS, placeSsrfTarget, ssrfHit } from "./ssrf.js";
 import { NOSQL_OP_OBJECTS, NOSQL_OP_QUERY, NOSQL_CONTROL_VALUE, nosqlTimeObject, nosqlErrorSignature, nosqlBypassConfirms, nosqlQueryUrl } from "./nosql.js";
@@ -153,7 +153,7 @@ export const STAGE_TOOLS = {
   // recon extrapolation: after survey, read the mapped surface and forced-browse LLM-predicted unlinked endpoints.
   reconGuess: ["get_inventory", "probe_guesses", "browser_navigate", "guess_done"],
   methodology: ["get_inventory", "record_methodology", "record_methodologies", "methodology_done"],
-  diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_dom_xss", "probe_stored_xss", "probe_ssti", "probe_sqli", "probe_nosql", "probe_cmdi", "probe_traversal", "probe_redirect", "probe_cors", "probe_proto", "probe_jwt", "probe_csrf", "probe_oob", "probe_ssrf", "probe_upload", "probe_logic", "probe_race", "probe_reset_poison", "probe_user_enum", "probe_secrets", "probe_headers", "analyze_session", "verify_access", "probe_idor", "analyze_js", "browser_navigate", "browser_fill", "browser_click", "browser_upload", "record_finding", "screen_done", "skip_screen"],
+  diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_dom_xss", "probe_stored_xss", "probe_ssti", "probe_sqli", "probe_nosql", "probe_cmdi", "probe_traversal", "probe_redirect", "probe_cors", "probe_graphql", "probe_proto", "probe_jwt", "probe_csrf", "probe_oob", "probe_ssrf", "probe_upload", "probe_logic", "probe_race", "probe_reset_poison", "probe_user_enum", "probe_secrets", "probe_headers", "analyze_session", "verify_access", "probe_idor", "analyze_js", "browser_navigate", "browser_fill", "browser_click", "browser_upload", "record_finding", "screen_done", "skip_screen"],
   // scenario (A04 cross-cutting logic): overview the inventory + fire multi-step request chains via probe_scenario. Once, after per-screen diagnosis.
   scenario: ["get_inventory", "login", "http_request", "browser_navigate", "browser_fill", "browser_click", "probe_scenario", "probe_race", "probe_reset_poison", "probe_user_enum", "probe_secrets", "record_finding", "scenario_done"],
   // fingerprint (A06 known-vulnerable components): fingerprint_scan to collect versions, evaluate known CVEs (cve_lookup opt-in) and record.
@@ -354,6 +354,27 @@ export function isSessionDestroyingPath(pathOrUrl: string): boolean {
     /* relative/malformed: judge as-is */
   }
   return SESSION_DESTROYING.test(p);
+}
+
+/** Strip a literal "__proto__": {...} subtree before the prototype-pollution leak check. An app that merely STORES /
+ *  ECHOES unknown JSON fields (a per-user document store) round-trips our own POST body verbatim — that stored
+ *  own-property echo is NOT pollution (JSON.stringify serializes own properties only; a real leak shows the marker
+ *  as a field the APP itself serialized, outside any "__proto__" key). */
+export function stripProtoEcho(body: string): string {
+  return body.replace(/"__proto__"\s*:\s*\{[^{}]*\}/g, "");
+}
+
+/** Structural marker for GraphQL request batching: a JSON array of >=2 GraphQL results. Shared by probe_graphql and
+ *  record_finding's rate-limit/batching branch — the evidence is the response SHAPE (array vs single object), which
+ *  the body-length/status differential cannot express (the array is exactly 2x a small body on the same status).
+ *  The per-element "(data|errors)" requirement keeps a verbatim request-echo from satisfying it. */
+export function isGraphqlBatchResponse(body: string): boolean {
+  try {
+    const j = JSON.parse(body) as unknown;
+    return Array.isArray(j) && j.length >= 2 && j.every((e) => !!e && typeof e === "object" && /"(data|errors)"/.test(JSON.stringify(e)));
+  } catch {
+    return false;
+  }
 }
 
 /** IDOR fuzzing: candidate neighbour ids around a self-owned id, for when the model has NO known victim id (cross-tenant /
@@ -2617,6 +2638,9 @@ export function buildTools(s: PilotSession) {
             errSig = errSig ?? nosqlErrorSignature(p1.body);
             const p2 = await fire(op.u, op.b, "positive_replay", `op ${op.label} #2`);
             if (!p2) continue;
+            // WAF/CDN soft-challenge guard: the operator characters can trigger a 200 challenge page while the benign
+            // control failed — that is NOT an operator bypass. Same guard the timing path already applies.
+            if (looksBlocked(p1) || looksBlocked(p2) || looksBlocked(control)) continue;
             if (nosqlBypassConfirms({ status: control.status, body: control.body }, [{ status: p1.status, body: p1.body }, { status: p2.status, body: p2.body }], successMarker))
               return txt(JSON.stringify({ technique: "operator-bypass", negativeControl: control.evId, positiveReplays: [p1.evId, p2.evId], effectMarker: successMarker ?? `status ${p1.status}`, verdict: `NoSQL OPERATOR INJECTION CONFIRMED — benign control (status ${control.status}) failed, operator ${op.label} succeeded (status ${p1.status}) twice${successMarker ? ` with marker "${successMarker}"` : ""}. record_finding(category sqli) — title it NoSQL/operator injection — with these evidenceIds + effectMarker.` }));
           }
@@ -2686,13 +2710,27 @@ export function buildTools(s: PilotSession) {
         try {
           const control = await fire(fu, null, "GET", "negative_control", "follow(before pollution)");
           if (!control) return txt("BLOCKED: url out of scope.");
-          if (control.body.includes(markerVal)) return txt("not confirmed: the marker is ambiently present before pollution — pick a fresh followUrl.");
-          await fire(url, pollution, method ?? "POST", "positive_replay", "pollute");
+          if (stripProtoEcho(control.body).includes(markerVal)) return txt("not confirmed: the marker is ambiently present before pollution — pick a fresh followUrl.");
+          // Two vectors: the classic __proto__ key, and constructor.prototype (sinks that filter the literal
+          // "__proto__" key often still merge the equivalent path). A pollution request that was REJECTED (>=400)
+          // cannot be the source of a later leak — without this check a stored echo from an earlier request
+          // confirms a HIGH finding the sink never produced.
+          let polluteAccepted = false;
+          for (const pv of [
+            { body: pollution, tag: "pollute __proto__" },
+            { body: `{"constructor":{"prototype":{"${marker}":"${markerVal}"}}}`, tag: "pollute constructor.prototype" },
+          ]) {
+            const pr = await fire(url, pv.body, method ?? "POST", "positive_replay", pv.tag);
+            if (pr && pr.status < 400) polluteAccepted = true;
+          }
           const p1 = await fire(fu, null, "GET", "positive_replay", "follow(after) #1");
           const p2 = await fire(fu, null, "GET", "positive_replay", "follow(after) #2");
-          const leaked = (r: { body: string } | null): boolean => !!r && r.body.includes(markerVal);
-          if (p1 && p2 && leaked(p1) && leaked(p2))
+          const leaked = (r: { body: string } | null): boolean => !!r && stripProtoEcho(r.body).includes(markerVal);
+          if (p1 && p2 && leaked(p1) && leaked(p2)) {
+            if (!polluteAccepted)
+              return txt(JSON.stringify({ confirmed: false, verdict: "not confirmed: the marker appeared in the follow-up, but every pollution request was REJECTED (status >=400) — the leak is unattributed (likely a stored echo from an earlier request). Re-run with a fresh followUrl." }));
             return txt(JSON.stringify({ confirmed: true, negativeControl: control.evId, positiveReplays: [p1.evId, p2.evId], effectMarker: markerVal, verdict: `PROTOTYPE POLLUTION CONFIRMED — after POSTing {"__proto__":{"${marker}":...}}, the injected inherited property "${markerVal}" appeared in the follow-up response (absent before). record_finding(category prototype-pollution, high) with these evidenceIds + effectMarker.` }));
+          }
           return txt(JSON.stringify({ confirmed: false, verdict: "not confirmed: the injected __proto__ property did not leak into the follow-up. Try a gadget (__proto__.status / a config key the app reads) via http_request, or a different merge sink." }));
         } catch (e) {
           return txt(`ERROR: ${String(e).slice(0, 180)}`);
@@ -3024,6 +3062,108 @@ export function buildTools(s: PilotSession) {
                 missing.length === 0
                   ? "not confirmed: all checked security headers are present (or HSTS n/a on http)."
                   : `MISSING HEADERS — ${missing.map((r) => r.header).join(", ")}. record_finding(category headers, param=<key>) for each, citing these evidenceIds (absence class: no control differential required).`,
+            }),
+          );
+        } catch (e) {
+          return txt(`ERROR: ${String(e).slice(0, 180)}`);
+        }
+      },
+    ),
+    tool(
+      "probe_graphql",
+      'Confirm GraphQL-specific weaknesses on `url` (the GraphQL endpoint, POST JSON {query}): (1) introspection publicly enabled — the whole schema is readable via __schema (info-disclosure; harvest it for hidden queries/mutations and plan field-level authz on them); (2) field-suggestion leakage — validation errors name real schema fields ("Did you mean") even when introspection is disabled, proven with the universal __typename typo; (3) request batching — an array body is accepted (rate-limit/lockout bypass primitive). Each returns negativeControl + positiveReplays evidenceIds (+ effectMarker for 1-2) → record_finding(category info-disclosure, param introspection|field-suggestions; category rate-limit, param batching). READ-ONLY: meta-fields only ({__typename}/__schema), never sends mutations or depth/complexity queries.',
+      { url: z.string() },
+      async ({ url }) => {
+        if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} is out of scope`);
+        const fire = async (body: string, kind: "negative_control" | "positive_replay", tag: string) => {
+          const req: HttpRequest = { method: "POST", url, headers: { ...authHeaders(s), "content-type": "application/json", accept: "application/json" }, body };
+          const res = await s.http.send(req);
+          bumpHttp(s, res.status);
+          const ev = s.evidence.record({
+            screenId: s.currentScreenId ?? "pilot",
+            validator: "claude-pilot-graphql",
+            kind,
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
+            response: res,
+            note: `graphql ${tag}`,
+          });
+          return { evId: ev.id, status: res.status, body: res.body };
+        };
+        // Markers are matched on the RESPONSE body only, and each is impossible for a request-echo / catch-all to
+        // satisfy: the query text never contains the quoted JSON key "queryType", and a parsed array of GraphQL
+        // results cannot come from echoing the single-object control.
+        const INTRO = JSON.stringify({ query: "{__schema{queryType{name}}}" });
+        const INTRO_TYPO = JSON.stringify({ query: "{__schemaX{queryType{name}}}" });
+        const TYPENAME = JSON.stringify({ query: "{__typename}" });
+        const TYPENAME_TYPO = JSON.stringify({ query: "{__typenme}" });
+        const BATCH = JSON.stringify([{ query: "{__typename}" }, { query: "{__typename}" }]);
+        const introHit = (b: string): boolean => b.includes('"queryType"');
+        const suggestHit = (b: string): boolean => /did you mean/i.test(b);
+        try {
+          // Ping with the always-valid {__typename} meta-field: gates the endpoint being GraphQL at all (and doubles
+          // as the suggestion check's negative control — a valid query yields no validation error).
+          const ping = await fire(TYPENAME, "negative_control", "ping {__typename}");
+          if (!/"(data|errors)"/.test(ping.body))
+            return txt(
+              JSON.stringify({
+                negativeControl: ping.evId,
+                control: { status: ping.status },
+                verdict: `NOT CONFIRMED: ${url} did not answer a GraphQL-shaped response to a POST {__typename} (no "data"/"errors" JSON; status ${ping.status}). Confirm this really is a GraphQL endpoint (POST JSON {query}), and login(role) first if it is auth-gated, then retry.`,
+              }),
+            );
+          const check = async (
+            name: string,
+            control: { evId: string; status: number; body: string },
+            positiveBody: string,
+            hit: (b: string) => boolean,
+            tag: string,
+          ) => {
+            const p1 = await fire(positiveBody, "positive_replay", `${name} ${tag} #1`);
+            const p2 = await fire(positiveBody, "positive_replay", `${name} ${tag} #2`);
+            const logic = checkLogicEvidence(
+              { status: control.status, hasMarker: hit(control.body) },
+              [p1, p2].map((p) => ({ status: p.status, hasMarker: hit(p.body) })),
+              // GraphQL validation errors legitimately carry the marker on a non-2xx JSON error body (express-graphql
+              // 400s with "Did you mean"), so the marker — not the status — is the proof (same rationale as XSS).
+              { requireSuccess: false },
+            );
+            return { name, confirmed: logic.ok, ...(logic.ok ? {} : { reason: logic.reason }), negativeControl: control.evId, positiveReplays: [p1.evId, p2.evId] };
+          };
+          // (1) introspection: control = typo'd meta-field (__schemaX → validation error, no schema);
+          //     positives = the __schema query → the schema's own "queryType" key is the marker.
+          const introControl = await fire(INTRO_TYPO, "negative_control", "introspection control (__schemaX)");
+          const intro = await check("introspection", introControl, INTRO, introHit, "__schema query");
+          // (2) field suggestions: control = the valid {__typename} ping; positives = the __typenme typo →
+          //     'Did you mean "__typename"?' leaks schema names even with introspection disabled.
+          const suggest = await check("field-suggestions", ping, TYPENAME_TYPO, suggestHit, "__typename typo");
+          // (3) batching: array body accepted = a rate-limit / lockout bypass primitive. Structural evidence (array
+          //     vs the single-object control) — confirmed via record_finding's rate-limit/batching branch.
+          const b1 = await fire(BATCH, "positive_replay", "batching #1");
+          const b2 = await fire(BATCH, "positive_replay", "batching #2");
+          const batching = {
+            name: "batching",
+            accepted: isGraphqlBatchResponse(b1.body) && isGraphqlBatchResponse(b2.body) && !isGraphqlBatchResponse(ping.body),
+            negativeControl: ping.evId,
+            positiveReplays: [b1.evId, b2.evId],
+            category: "rate-limit",
+            param: "batching",
+            note:
+              isGraphqlBatchResponse(b1.body) && isGraphqlBatchResponse(b2.body) && !isGraphqlBatchResponse(ping.body)
+                ? "request batching (array body) ACCEPTED — a rate-limit/lockout bypass primitive. Record at low/info: acceptance alone is the finding; an actually observed overrun would raise it."
+                : "array body not accepted",
+          };
+          const confirmed = [intro, suggest].filter((c) => c.confirmed);
+          return txt(
+            JSON.stringify({
+              checks: [
+                { ...intro, category: "info-disclosure", param: "introspection", effectMarker: '"queryType"', note: "full schema readable via __schema (public introspection) — harvest it for hidden queries/mutations and plan field-level authz (probe_idor / probe_logic with the GraphQL variables as the param) on them" },
+                { ...suggest, category: "info-disclosure", param: "field-suggestions", effectMarker: "Did you mean", note: "validation errors disclose real schema field names (works with introspection disabled)" },
+              ],
+              batching,
+              verdict:
+                confirmed.length > 0 || batching.accepted
+                  ? `GRAPHQL WEAKNESS CONFIRMED — ${[...confirmed.map((c) => c.name), ...(batching.accepted ? ["batching"] : [])].join(", ")}. record_finding per check (info-disclosure: introspection|field-suggestions; rate-limit: batching), citing that check's negativeControl + positiveReplays evidenceIds and its effectMarker (batching is structural — no effectMarker needed).`
+                  : `not confirmed: introspection (${intro.reason}); field-suggestions (${suggest.reason})`,
             }),
           );
         } catch (e) {
@@ -3834,6 +3974,11 @@ export function buildTools(s: PilotSession) {
                 : `REJECTED: '${category}' is deterministically observable (you either saw it or you didn't), not a "suspected" class — if you saw it record verdict:"confirmed" (control + 2 replays), else skip. Reserve 'suspected' for serious exploitation classes you could not fully confirm this run (idor/idor-write/sqli/ssti/rce/path-traversal/ssrf/xxe/auth-bypass/mass-assignment/vulnerable-component/secret-exposure/session).`,
             );
           }
+          // analyze_session's deterministic cookie flags (secure/httponly/samesite/domain-scope) are an absence
+          // class, exactly like headers: deterministically observable → confirm-or-skip, NEVER suspected, and
+          // never waved through the sessionGlance exemption below.
+          if (category === "session" && SESSION_COOKIE_ATTR_KEYS.has(param ?? ""))
+            return txt(`REJECTED: session cookie flag '${param}' is deterministically observable — analyze_session returns negativeControl + positiveReplays evidenceIds for it (absence class, like headers). Record verdict:"confirmed" with those evidenceIds, or skip. Do not file it suspected.`);
           // version-based CVE(未 exploit)は High/Critical(RCE/path-traversal/auth-bypass 級)だけ surface。
           //   medium/EOL-only の版ノートはアクション性が低くノイズ(PHP EOL・Bootstrap EOL・dev server 等)。
           if (category === "vulnerable-component" && normSev !== "high" && normSev !== "critical")
@@ -3946,6 +4091,37 @@ export function buildTools(s: PilotSession) {
           if (missing.length === 0) return txt("REJECTED: cited responses already carry the checked security headers.");
           if (param && !missing.some((r) => r.key === param || r.header === param.toLowerCase()))
             return txt(`REJECTED: '${param}' is present (or not a checked rule). Missing: ${missing.map((r) => r.key).join(", ")}.`);
+        } else if (category === "rate-limit" && param === "batching") {
+          // GraphQL batching (probe_graphql): the marker is STRUCTURAL — positives are JSON ARRAYS of >=2 GraphQL
+          // results where the single-query control is a JSON object. Same rationale as headers: a deterministic
+          // shape the length/status differential cannot express (the array is exactly 2x a small body, same status).
+          if (isGraphqlBatchResponse(negRec.response.body))
+            return txt("REJECTED: the cited control ALSO returned an array — not a batching differential. Cite probe_graphql's single-query control.");
+          if (!posRecs.every((r) => isGraphqlBatchResponse(r!.response.body)))
+            return txt("REJECTED: batching positives are not JSON arrays of >=2 GraphQL results. Cite probe_graphql's batching positiveReplays evidenceIds.");
+        } else if (category === "session" && SESSION_COOKIE_ATTR_KEYS.has(param ?? "")) {
+          // Absence class (analyze_session's deterministic cookie flags): same rationale as headers — two stable
+          // GETs of the same URL; the issue is a MISSING Set-Cookie attribute, so control and positives may cite
+          // the same response. Re-verify against the cited responses: reject when the attribute is actually
+          // present, the rule does not apply, or the session cookie is not identifiable from the evidence (a
+          // browser-jar observation is NOT recorded evidence — these never ride the sessionGlance exemption).
+          if (posRecs.length < 2) return txt("REJECTED: session cookie-flag findings require >=2 GET evidenceIds (analyze_session).");
+          const p0 = posRecs[0]!;
+          if (looksLikeProxyError(p0.response.body))
+            return txt("REJECTED: the cited response is an upstream proxy/connection error page (host unreachable through the proxy), not the target — the host was never actually reached. Do not record cookie-flag findings on it.");
+          if (!posRecs.every((r) => r!.response.status === p0.response.status))
+            return txt("REJECTED: session cookie-flag replays disagree (unstable).");
+          const sc = p0.response.headers["set-cookie"] ?? p0.response.headers["Set-Cookie"] ?? "";
+          const scSession = parseSetCookieLines(sc).filter((l) => isSessionCookieName(l.name));
+          if (scSession.length === 0)
+            return txt("REJECTED: the cited responses carry no session-cookie Set-Cookie to re-verify (a browser-jar observation is not recorded evidence). Run analyze_session at a URL whose response issues the cookie (e.g. the login response) and cite that.");
+          const recheck = auditSessionCookieFlags({
+            setCookie: sc,
+            requestCookieNames: parseCookieHeader((p0.request.headers ?? {})["cookie"] ?? (p0.request.headers ?? {})["Cookie"] ?? "").map((c) => c.name),
+            url: p0.request.url,
+          });
+          if (!recheck.findings.some((f) => f.key === param))
+            return txt(`REJECTED: '${param}' is present (or the rule does not apply, e.g. Secure on non-TLS) on the session cookie(s) ${scSession.map((l) => l.name).join(", ")} in the cited Set-Cookie.`);
         } else if (category !== "auth-bypass") {
           if (category === "sqli" && sqliHtmlLengthOnlyFp(negRec.response.body, posRecs.map((r) => r!.response.body), negRec.response.status, posRecs.map((r) => r!.response.status)))
             return txt("REJECTED: cited SQLi evidence is HTML/text length (search/result-page variance), not a JSON/XML boolean differential, a SQL error, or measured timing experiment. That is the Drupal/marketing-search false positive — do NOT confirm. Re-run probe_sqli and record only if it returns SQLi CONFIRMED.");
@@ -4220,7 +4396,7 @@ export function buildTools(s: PilotSession) {
     // ───────────────────────── セッション解析(B) ─────────────────────────
     tool(
       "analyze_session",
-      "Dump ONE live authenticated request (Cookie + Authorization + Set-Cookie + cookie flags + JWT alg/claims) so YOU can judge whether the session LOOKS weak. Fires a GET at `url` (default: current page / target). Hints (username-as-cookie, alg:none, short plaintext) are leads, not confirmation. JWT Bearer → also probe_jwt. To CONFIRM forgeability, http_request as another identity (invalid forged value must fail). If you cannot swap identity, record_finding(verdict:suspected, category session) citing the returned evidenceId.",
+      "Dump ONE live authenticated request (Cookie + Authorization + Set-Cookie + cookie flags + JWT alg/claims) so YOU can judge whether the session LOOKS weak. Fires TWO authed GETs at `url` (default: current page / target). Hints (username-as-cookie, alg:none, short plaintext) are leads, not confirmation. JWT Bearer → also probe_jwt. To CONFIRM forgeability, http_request as another identity (invalid forged value must fail). If you cannot swap identity, record_finding(verdict:suspected, category session) citing the returned evidenceId. ALSO runs a DETERMINISTIC session-cookie attribute audit (absence class, like probe_headers): missing Secure (https only) / HttpOnly / SameSite (incl. SameSite=None) / a parent Domain on the session cookie (name matches sess|sid|auth|token|jwt|remember; locale/lang/theme/csrf/analytics noise is never checked) → deterministic[] findings + negativeControl/positiveReplays evidenceIds → record_finding(category session, param=secure|httponly|samesite|domain-scope) — confirmed absence, never suspected.",
       { url: z.string().optional() },
       async ({ url }) => {
         let pageUrl = url?.trim() || "";
@@ -4246,37 +4422,78 @@ export function buildTools(s: PilotSession) {
         if (jar.length === 0 && cookieHeader) jar = parseCookieHeader(cookieHeader);
         const identities = [s.currentRole, ...[...s.roleCreds.values()].map((c) => c.username)].filter((x): x is string => Boolean(x && x.trim()));
         const cookies = jar.map((c) => glanceCookie(c, identities));
-        const req: HttpRequest = { method: "GET", url: pageUrl, headers: authHeaders(s), body: null };
-        let res: HttpResponse;
-        try {
-          res = await s.http.send(req);
+        // ── deterministic Set-Cookie attribute audit (absence class — same rationale as probe_headers: a missing
+        //    flag needs no control differential). Two authed GETs: #1 = negative control, #2 = positive replay;
+        //    absence findings legitimately cite #1 as both (headers works the same way).
+        const fire = async (kind: "negative_control" | "positive_replay", tag: string) => {
+          const req: HttpRequest = { method: "GET", url: pageUrl, headers: authHeaders(s), body: null };
+          const res = await s.http.send(req);
           bumpHttp(s, res.status);
+          const ev = s.evidence.record({
+            screenId: s.currentScreenId ?? "pilot",
+            validator: "claude-pilot-session",
+            kind,
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
+            response: res,
+            note: `session glance ${tag} (live authed request for the model to judge)`,
+          });
+          return { evId: ev.id, status: res.status, headers: res.headers, body: res.body };
+        };
+        let g1: Awaited<ReturnType<typeof fire>>;
+        let g2: Awaited<ReturnType<typeof fire>>;
+        try {
+          g1 = await fire("negative_control", "#1");
+          g2 = await fire("positive_replay", "#2");
         } catch (e) {
           return txt(`ERROR: ${String(e).slice(0, 180)}`);
         }
-        const ev = s.evidence.record({
-          screenId: s.currentScreenId ?? "pilot",
-          validator: "claude-pilot-session",
-          kind: "positive_replay",
-          request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
-          response: res,
-          note: "session glance (live authed request for the model to judge)",
-        });
-        const setCookie = res.headers["set-cookie"] ?? res.headers["Set-Cookie"] ?? "";
+        const setCookie = g1.headers["set-cookie"] ?? g1.headers["Set-Cookie"] ?? "";
         const bearerJwt = bearer ? peekJwt(bearer) : null;
         const hints = [
           ...cookies.flatMap((c) => c.hints.map((h) => `${c.name}: ${h}`)),
           ...(bearerJwt?.unsigned ? [`Bearer JWT alg=${bearerJwt.alg} looks unsigned`] : []),
         ];
+        const evidenceIds = [g1.evId, g2.evId];
+        let deterministic: Array<{ key: string; cookieName: string; severity: string; evidenceIds: string[] }> = [];
+        const deterministicNotes: string[] = [];
+        let deterministicVerdict = "";
+        if (looksLikeProxyError(g1.body ?? "")) {
+          deterministicVerdict =
+            "NOT CONFIRMED: the response is an upstream proxy/connection error page (host unreachable through the proxy), NOT the target — the host was never actually reached. Do NOT record cookie-flag findings on it.";
+        } else if (g1.status !== g2.status) {
+          deterministicVerdict = `unstable, not confirmed — the two authed GETs returned different statuses (${g1.status} vs ${g2.status}). Re-run analyze_session before recording anything.`;
+        } else {
+          const audit = auditSessionCookieFlags({
+            setCookie,
+            requestCookieNames: parseCookieHeader(cookieHeader).map((c) => c.name),
+            url: pageUrl,
+            jar,
+          });
+          deterministic = audit.findings.map((f) => ({ ...f, evidenceIds }));
+          if (audit.sessionCookies.length === 0)
+            deterministicNotes.push(
+              "no session cookie identified (name must match sess|sid|auth|token|jwt|remember, excluding locale/lang/theme/currency/tz/timezone/csrf/xsrf/_ga/_gid/consent/style/ui noise). Bearer/JWT-only session → probe_jwt for token weaknesses.",
+            );
+          deterministicNotes.push(...audit.unknown);
+          deterministicVerdict =
+            deterministic.length === 0
+              ? "no deterministic session-cookie flag findings (Secure/HttpOnly/SameSite/Domain-scope are checked on the session cookie only)."
+              : `SESSION COOKIE FLAG FINDINGS — ${deterministic.map((f) => `${f.cookieName}: ${f.key}`).join(", ")}. record_finding(category session, param=<key>) for each, citing these evidenceIds (absence class: no control differential required, like probe_headers).`;
+        }
         return txt(
           JSON.stringify({
-            evidenceId: ev.id,
+            evidenceId: g2.evId,
+            negativeControl: g1.evId,
+            positiveReplays: evidenceIds,
             currentRole: s.currentRole || "unauth",
             requestDump: formatRequestDump("GET", pageUrl, cookieHeader, authorization),
-            response: { status: res.status, setCookie: setCookie || undefined },
+            response: { status: g1.status, setCookie: setCookie || undefined },
             cookies,
             ...(bearerJwt ? { bearerJwt } : {}),
             hints,
+            deterministic,
+            ...(deterministicNotes.length ? { deterministicNotes } : {}),
+            deterministicVerdict,
             judge:
               "YOU judge this request. Weak-looking session material (username/userid as cookie, sequential id, alg:none / unsigned JWT, session value = the role) is a lead. Confirm forge with http_request as another identity (garbage cookie must fail) → record_finding(session, confirmed). Cannot swap identity this run → record_finding(verdict:suspected, category session, medium+) citing this evidenceId. Do not confirm from the dump alone. Missing HttpOnly on a locale/csrf cookie is not a session finding. JWT in Authorization → also probe_jwt.",
           }),
