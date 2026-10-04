@@ -16,6 +16,8 @@ export interface HttpRequest {
   body?: string | null;
   /** When set, body is ignored and the request is sent as multipart/form-data (for file-upload attacks = XXE-SVG / webshell / pickle). */
   multipart?: MultipartSpec;
+  /** Bounded read override for asset analysis; ordinary probes use the client default. */
+  maxBodyBytes?: number;
 }
 
 export interface HttpResponse {
@@ -24,6 +26,9 @@ export interface HttpResponse {
   body: string;
   finalUrl: string;
   durationMs: number;
+  /** The body is a prefix only. Never use its length/absence as complete-response evidence. */
+  truncated?: boolean;
+  bodyBytes?: number;
 }
 
 export interface HttpClient {
@@ -43,6 +48,8 @@ export interface FetchHttpClientOptions {
   /** Upstream HTTP proxy (e.g. Burp http://127.0.0.1:8080). Only when set are all requests routed through it.
    *  If unset, behaviour is unchanged (none of the proxy code runs = byte-identical). */
   proxy?: string;
+  /** Called after scope/rate checks, immediately before each attempted network request. May refuse it. */
+  beforeSend?: (req: HttpRequest) => void;
 }
 
 /** Merge header maps case-insensitively, last-wins by lowercased name (keeping the last casing seen for a name). A
@@ -131,15 +138,40 @@ export class FetchHttpClient implements HttpClient {
         signal: controller.signal,
       };
       if (dispatcher) init.dispatcher = dispatcher; // via Burp (only when a proxy is set)
+      const max = req.maxBodyBytes ?? this.opts.maxBodyBytes ?? 64 * 1024;
+      if (!Number.isSafeInteger(max) || max < 1) throw new Error("maxBodyBytes must be a positive integer");
+      this.opts.beforeSend?.(req);
       const res = await fetch(req.url, init as unknown as RequestInit);
-      const max = this.opts.maxBodyBytes ?? 64 * 1024;
-      const body = Buffer.from(await res.arrayBuffer()).subarray(0, max).toString("utf8");
+      const chunks: Uint8Array[] = [];
+      let bodyBytes = 0;
+      let truncated = false;
+      const reader = res.body?.getReader();
+      if (reader) {
+        try {
+          while (bodyBytes < max) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            const kept = value.subarray(0, max - bodyBytes);
+            chunks.push(kept.slice());
+            bodyBytes += kept.byteLength;
+            if (bodyBytes === max) {
+              // Do not wait for another chunk: a server may leave a capped response open forever.
+              const length = res.headers.get("content-length");
+              truncated = value.byteLength > kept.byteLength || !!res.headers.get("content-encoding") || length === null || Number(length) !== bodyBytes;
+              await reader.cancel();
+            }
+          }
+        } finally {
+          reader.releaseLock();
+        }
+      }
+      const body = Buffer.concat(chunks, bodyBytes).toString("utf8");
       const headers: Record<string, string> = {};
       res.headers.forEach((value, key) => {
         headers[key] = value;
       });
       this.lastSentAt = Date.now();
-      return { status: res.status, headers, body, finalUrl: res.url || req.url, durationMs: Date.now() - started };
+      return { status: res.status, headers, body, bodyBytes, truncated, finalUrl: res.url || req.url, durationMs: Date.now() - started };
     } finally {
       clearTimeout(timer);
     }
@@ -162,6 +194,8 @@ export class FakeHttpClient implements HttpClient {
       body: r.body ?? "",
       finalUrl: r.finalUrl ?? req.url,
       durationMs: r.durationMs ?? 1,
+      ...(r.truncated !== undefined ? { truncated: r.truncated } : {}),
+      ...(r.bodyBytes !== undefined ? { bodyBytes: r.bodyBytes } : {}),
     };
   }
 }

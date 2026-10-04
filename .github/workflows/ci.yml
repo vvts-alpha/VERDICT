@@ -30,5 +30,9 @@ jobs:
         run: pnpm -r typecheck
       - name: Test (node:test via tsx)
         run: pnpm -r test
+      - name: Install browser for built-driver regression tests
+        run: pnpm --filter @veritas/crawler exec playwright-core install --with-deps chromium
+      - name: Test built browser driver
+        run: pnpm test:browser
       - name: Test release gates
         run: node --test tools/*.test.cjs

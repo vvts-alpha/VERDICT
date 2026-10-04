@@ -40,21 +40,8 @@ export interface StopOptions {
 export function evaluateStop(state: AssessmentState, opts: StopOptions = {}): StopDecision {
   if (state.phase === "halted") return { stop: true, reason: "human_halt", detail: "already halted" };
 
-  const b = state.budget;
-  if (b.tokensUsed >= b.limits.maxTokens) {
-    return { stop: true, reason: "budget_exceeded", detail: `tokens ${b.tokensUsed}/${b.limits.maxTokens}` };
-  }
-  if (b.totalRequests >= b.limits.maxTotalRequests) {
-    return { stop: true, reason: "budget_exceeded", detail: `requests ${b.totalRequests}/${b.limits.maxTotalRequests}` };
-  }
-  if (elapsedMs(b, opts.now) >= b.limits.maxWallClockMs) {
-    return { stop: true, reason: "budget_exceeded", detail: "wall-clock exceeded" };
-  }
-  for (const [host, n] of Object.entries(b.requestsPerTarget)) {
-    if (n >= b.limits.maxRequestsPerTarget) {
-      return { stop: true, reason: "budget_exceeded", detail: `requests to ${host} ${n}/${b.limits.maxRequestsPerTarget}` };
-    }
-  }
+  const budgetStop = evaluateBudget(state.budget, opts.now);
+  if (budgetStop.stop) return budgetStop;
 
   if (opts.consecutiveUnreachable != null && opts.consecutiveUnreachable >= (opts.unreachableThreshold ?? 10)) {
     return { stop: true, reason: "unreachable", detail: `target unreachable (${opts.consecutiveUnreachable} consecutive)` };
@@ -70,4 +57,24 @@ export function evaluateStop(state: AssessmentState, opts: StopOptions = {}): St
   }
 
   return { stop: false, detail: "continue" };
+}
+
+/** Resource limits only; coverage must not stop a multi-stage pilot before later stages. */
+export function evaluateBudget(b: BudgetState, now?: number): StopDecision {
+  if (b.tokensUsed >= b.limits.maxTokens) {
+    return { stop: true, reason: "budget_exceeded", detail: `tokens ${b.tokensUsed}/${b.limits.maxTokens}` };
+  }
+  if (b.totalRequests >= b.limits.maxTotalRequests) {
+    return { stop: true, reason: "budget_exceeded", detail: `requests ${b.totalRequests}/${b.limits.maxTotalRequests}` };
+  }
+  if (elapsedMs(b, now) >= b.limits.maxWallClockMs) {
+    return { stop: true, reason: "budget_exceeded", detail: "wall-clock exceeded" };
+  }
+  for (const [host, n] of Object.entries(b.requestsPerTarget)) {
+    if (n >= b.limits.maxRequestsPerTarget) {
+      return { stop: true, reason: "budget_exceeded", detail: `requests to ${host} ${n}/${b.limits.maxRequestsPerTarget}` };
+    }
+  }
+
+  return { stop: false, detail: "within budget" };
 }

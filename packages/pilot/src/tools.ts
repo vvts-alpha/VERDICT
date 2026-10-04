@@ -1,3 +1,4 @@
+import { MAX_TOOL_RESULT_CHARS } from "./tool-output.js";
 // The toolbox Claude drives (in-process MCP). Existing deterministic primitives are demoted to Claude tools.
 // Scope / marker / rate are enforced inside the tools (= the safety valves remain, but we don't stop for human approval).
 //
@@ -9,8 +10,8 @@ import { findingVerdict, isInScope } from "@veritas/core";
 import type { LoginCreds, Observation, PlaywrightDriver } from "@veritas/crawler";
 import { InventoryBuilder, normalizePath, smartLogin, guessParamType, extractApiRefs, apiCallToBuiltScreen } from "@veritas/crawler";
 import type { LlmClient } from "@veritas/llm";
-import type { EvidenceStore, FetchHttpClient, HttpRequest, HttpResponse, OobProvider, TechComponent, TechSample } from "@veritas/scanner";
-import { fingerprintTech, formatTechInventory, lookupCves, formatCveResults, impactOracle, identityAppears, classifyCrossUserBody, auditHeaders, isPublicByDesignClientCredential, isVersionlessComponentLead } from "@veritas/scanner";
+import type { EvidenceStore, TimingProof, FetchHttpClient, HttpRequest, HttpResponse, OobProvider, TechComponent, TechSample } from "@veritas/scanner";
+import { checkTimingEvidence, fingerprintTech, formatTechInventory, lookupCves, formatCveResults, impactOracle, identityAppears, classifyCrossUserBody, auditHeaders, isPublicByDesignClientCredential, isVersionlessComponentLead } from "@veritas/scanner";
 import { placePayload, parseLocation, oobFilesToMultipart, filesHaveOobPlaceholder } from "./inject.js";
 import { analyzeJsSinksFull } from "./jssinks.js";
 import { bumpJwtExp, jwtForgeCandidates, parseJwt, pemFromJwks } from "./jwt.js";
@@ -151,7 +152,7 @@ export const STAGE_TOOLS = {
   survey: ["browser_navigate", "browser_fill", "browser_click", "login", "probe_paths", "analyze_js", "ignore_paths", "survey_status", "survey_done"],
   // recon extrapolation: after survey, read the mapped surface and forced-browse LLM-predicted unlinked endpoints.
   reconGuess: ["get_inventory", "probe_guesses", "browser_navigate", "guess_done"],
-  methodology: ["get_inventory", "record_methodology", "methodology_done"],
+  methodology: ["get_inventory", "record_methodology", "record_methodologies", "methodology_done"],
   diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_dom_xss", "probe_stored_xss", "probe_ssti", "probe_sqli", "probe_nosql", "probe_cmdi", "probe_traversal", "probe_redirect", "probe_cors", "probe_proto", "probe_jwt", "probe_csrf", "probe_oob", "probe_ssrf", "probe_upload", "probe_logic", "probe_race", "probe_reset_poison", "probe_user_enum", "probe_secrets", "probe_headers", "analyze_session", "verify_access", "probe_idor", "analyze_js", "browser_navigate", "browser_fill", "browser_click", "browser_upload", "record_finding", "screen_done", "skip_screen"],
   // scenario (A04 cross-cutting logic): overview the inventory + fire multi-step request chains via probe_scenario. Once, after per-screen diagnosis.
   scenario: ["get_inventory", "login", "http_request", "browser_navigate", "browser_fill", "browser_click", "probe_scenario", "probe_race", "probe_reset_poison", "probe_user_enum", "probe_secrets", "record_finding", "scenario_done"],
@@ -784,7 +785,7 @@ export const SQLI_BOOLEAN_PAIRS: ReadonlyArray<{ t: string; f: string }> = [
 const SQL_ERR_RE =
   /sql syntax|you have an error in your sql|warning:\s*mysql|ORA-\d{3,}|PostgreSQL.*ERROR|SQLite3?::|ODBC[^;]*SQL|unclosed quotation|quoted string not properly terminated|SQLSTATE\[/i;
 
-/** Full HTML document (Drupal/marketing search). JSON APIs and TIME-BASED proof strings are not this. */
+/** Full HTML document (Drupal/marketing search), distinct from structured API data. */
 export function looksLikeHtmlDocument(body: string): boolean {
   const head = body.slice(0, 512).toLowerCase();
   return head.includes("<!doctype html") || /<html[\s>]/.test(head);
@@ -822,11 +823,10 @@ export function booleanLengthConfirmsSqli(trueBody: string, falseBody: string, t
   return t !== f && t.length > 0;
 }
 
-/** True → refuse confirmed SQLi: cited bodies are HTML/text length, not JSON/XML, a SQL error, a time-based proof, or a
+/** True → refuse confirmed SQLi: cited bodies are HTML/text length, not JSON/XML, a SQL error, or a
  *  status flip. Optional statuses let a 401/403→200 auth-bypass (even with HTML bodies) escape the HTML-length veto. */
 export function sqliHtmlLengthOnlyFp(_controlBody: string, positiveBodies: ReadonlyArray<string>, controlStatus?: number, positiveStatuses?: ReadonlyArray<number>): boolean {
   if (positiveBodies.some((b) => SQL_ERR_RE.test(b))) return false;
-  if (positiveBodies.some((b) => /TIME-BASED BLIND SQLi CONFIRMED/i.test(b))) return false;
   // A STATUS FLIP (e.g. a 401/403 control → 200 positives) is a real SQL auth-bypass signal, not HTML-length variance —
   // even when the positive bodies are HTML (an authenticated dashboard). Judge the EFFECT, not the body kind.
   if (controlStatus !== undefined && positiveStatuses && positiveStatuses.length > 0 && positiveStatuses.every((s) => s >= 200 && s < 300 && s !== controlStatus)) return false;
@@ -1338,6 +1338,7 @@ function screenBrief(sc: Screen): Record<string, unknown> {
   return {
     screenId: sc.screenId,
     url: sc.urlTemplate,
+    observedUrl: sc.observedUrls[0],
     type: sc.screenType,
     auth: sc.authState,
     labels: sc.labels,
@@ -1360,6 +1361,34 @@ export interface AnalyzeJsResult {
   note?: string;
 }
 
+async function probeTiming(s: PilotSession, build: (value: string) => HttpRequest | null, validator: string, payloads: string[], delayMs = 5000) {
+  const send = async (value: string, kind: "negative_control" | "positive_replay", timingProof?: TimingProof) => {
+    const request = build(value);
+    if (!request || !isInScope(request.url, s.scope)) return null;
+    const response = await s.http.send(request);
+    bumpHttp(s, response.status);
+    return s.evidence.record({ screenId: s.currentScreenId ?? "pilot", validator, kind,
+      request: { ...request, headers: s.http.effectiveHeaders(request.headers) }, response,
+      note: `time experiment ${kind}`, ...(timingProof ? { timingProof } : {}) });
+  };
+  const usable = (r: Awaited<ReturnType<typeof send>>) => r && !r.response.truncated && !looksBlocked(r.response) && r.response.status >= 200 && r.response.status < 300;
+  for (const payload of payloads) {
+    const c0 = await send("1", "negative_control");
+    const p1 = await send(payload, "positive_replay");
+    if (!c0 || !p1 || !usable(c0) || !usable(p1) || p1.response.durationMs - c0.response.durationMs < delayMs * 0.8) continue;
+    const c1 = await send("1", "negative_control");
+    if (!c1 || !usable(c1) || Math.abs(c1.response.durationMs - c0.response.durationMs) > Math.min(1000, delayMs * 0.2)) continue;
+    const p2 = await send(payload, "positive_replay");
+    if (!p2 || !usable(p2)) continue;
+    const c2 = await send("1", "negative_control", { controlIds: [c0.id, c1.id], positiveIds: [p1.id, p2.id], delayMs });
+    if (c2 && usable(c2) && checkTimingEvidence(c2, [p1, p2], s.evidence.records)) {
+      return { technique: "time-based", negativeControl: c2.id, positiveReplays: [p1.id, p2.id],
+        verdict: `${validator.endsWith("sqli") ? "BLIND SQLi" : validator.endsWith("nosql") ? "BLIND NoSQL INJECTION" : "BLIND OS COMMAND INJECTION"} CONFIRMED (time-based): two measured delays matched ${delayMs}ms with three stable interleaved benign controls. Raw response bodies and measured durations are preserved.` };
+    }
+  }
+  return null;
+}
+
 /**
  * Fetch a page's in-scope FIRST-PARTY <script src> bundles and mine each: enroll discovered endpoints as synthetic screens
  * (so diagnosis probes them), scan for hardcoded secrets, flag exposed source maps, and record a js_analyzed event
@@ -1371,7 +1400,7 @@ export async function analyzePageJs(s: PilotSession, pageUrl: string): Promise<A
   if (!isInScope(pageUrl, s.scope)) return { ...empty, note: "out of scope" };
   let html = "";
   try {
-    const r = await s.http.send({ method: "GET", url: pageUrl, headers: authHeaders(s), body: null });
+    const r = await s.http.send({ method: "GET", url: pageUrl, headers: authHeaders(s), body: null, maxBodyBytes: 1024 * 1024 });
     bumpHttp(s, r.status);
     html = r.body;
   } catch (e) {
@@ -1405,23 +1434,27 @@ export async function analyzePageJs(s: PilotSession, pageUrl: string): Promise<A
   let sinksTruncated = false;
   for (const burl of bundles) {
     let body = "";
+    let complete = true;
+    let bodyBytes = 0;
     try {
-      const r = await s.http.send({ method: "GET", url: burl, headers: authHeaders(s), body: null });
+      const r = await s.http.send({ method: "GET", url: burl, headers: authHeaders(s), body: null, maxBodyBytes: 8 * 1024 * 1024 });
       bumpHttp(s, r.status);
       if (r.status >= 400) {
         perBundle.push({ url: burl, error: `status ${r.status}` });
         continue;
       }
       body = r.body;
+      complete = !r.truncated;
+      bodyBytes = r.bodyBytes ?? Buffer.byteLength(body);
     } catch (e) {
       perBundle.push({ url: burl, error: String(e).slice(0, 100) });
       continue;
     }
     // (1) endpoints → enroll each NEW in-scope one as its own synthetic screen (diagnosed by Stage 3)
-    const refs = extractApiRefs([body], s.targetUrl);
+    const refs = extractApiRefs([body], burl);
     let enrolled = 0;
     for (const api of refs) {
-      const built = apiCallToBuiltScreen(api, s.targetUrl);
+      const built = apiCallToBuiltScreen(api, burl);
       if (!built || !isInScope(built.observedUrl, s.scope) || isSessionDestroyingPath(built.observedUrl)) continue;
       const { screen, isNew } = s.inv.ingestBuilt(built);
       s.store.upsertScreen(s.assessmentId, screen);
@@ -1462,7 +1495,8 @@ export async function analyzePageJs(s: PilotSession, pageUrl: string): Promise<A
       type: "js_analyzed",
       payload: {
         url: burl,
-        bytes: body.length,
+        bytes: bodyBytes,
+        complete,
         endpointsFound: refs.map((a) => `${a.method} ${a.urlTemplate}`),
         secretsFound,
         sinksFound,
@@ -1470,7 +1504,7 @@ export async function analyzePageJs(s: PilotSession, pageUrl: string): Promise<A
         analyzedAt: new Date().toISOString(),
       },
     });
-    perBundle.push({ url: burl, bytes: body.length, endpoints: refs.length, enrolled, secrets: secretsFound.length, sinks: sinksFound.length, sourceMap });
+    perBundle.push({ url: burl, bytes: bodyBytes, complete, endpoints: refs.length, enrolled, secrets: secretsFound.length, sinks: sinksFound.length, sourceMap });
   }
   if (perBundle.length > 0)
     s.store.appendEvent(s.assessmentId, {
@@ -1731,22 +1765,39 @@ export function buildTools(s: PilotSession) {
     tool(
       "get_inventory",
       "Return the mapped screen inventory as a COMPACT per-screen brief (screenId, url, type, auth, labels, param NAMES, API endpoints) — enough to plan an attack per screen and to spot multi-step workflows. PAGINATED so a large survey can't overflow the context: pass offset/limit (default limit 60, max 120); the response includes `total` and `nextOffset` (call again with nextOffset until it is null). Use the exact `screenId` values returned here for record_methodology.",
-      { offset: z.number().optional(), limit: z.number().optional() },
+      { offset: z.number().int().nonnegative().optional(), limit: z.number().int().positive().optional() },
       async ({ offset, limit }) => {
         const all = s.inv.screens();
-        const off = Math.max(0, offset ?? 0);
-        const lim = Math.min(Math.max(1, limit ?? 60), 120);
-        const page = all.slice(off, off + lim);
-        const nextOffset = off + page.length < all.length ? off + page.length : null;
-        return txt(
-          JSON.stringify({
-            total: all.length,
-            offset: off,
-            returned: page.length,
-            nextOffset,
-            screens: page.map(screenBrief),
-          }),
-        );
+        const off = Math.min(all.length, Math.max(0, Math.floor(offset ?? 0)));
+        const lim = Math.min(Math.max(1, Math.floor(limit ?? 60)), 120);
+        const page: Record<string, unknown>[] = [];
+        const encode = () => JSON.stringify({ total: all.length, offset: off, returned: page.length,
+          nextOffset: off + page.length < all.length ? off + page.length : null, screens: page });
+        for (const sc of all.slice(off, off + lim)) {
+          let brief: Record<string, unknown> = { ...screenBrief(sc), planned: s.plans.has(sc.screenId) };
+          if (JSON.stringify(brief).length > MAX_TOOL_RESULT_CHARS - 300) {
+            brief = { screenId: sc.screenId, url: sc.urlTemplate.slice(0, 1000), observedUrl: sc.observedUrls[0]?.slice(0, 1000),
+              type: sc.screenType, auth: sc.authState, detailsAbbreviated: true, detailTool: "get_screen", planned: s.plans.has(sc.screenId) };
+          }
+          page.push(brief);
+          if (encode().length > MAX_TOOL_RESULT_CHARS) { page.pop(); break; }
+        }
+        return txt(encode());
+      },
+    ),
+    tool(
+      "record_methodologies",
+      "Record up to 20 per-screen attack plans in one call. Use exact screenIds from get_inventory; skip screens marked planned. Each plan must specify applicable classes and concrete tests.",
+      { plans: z.array(z.object({ screenId: z.string(), vulnClasses: z.array(z.string()), plan: z.string() })).min(1).max(20) },
+      async ({ plans }) => {
+        const ids = new Set(s.inv.screens().map((sc) => sc.screenId));
+        if (plans.some((p) => !ids.has(p.screenId)) || new Set(plans.map((p) => p.screenId)).size !== plans.length)
+          return txt("REJECTED: use distinct mapped screenIds from get_inventory. No plans were changed.");
+        for (const { screenId, vulnClasses, plan } of plans) {
+          s.store.appendEvent(s.assessmentId, { type: "methodology_recorded", payload: { screenId, vulnClasses, plan } });
+          s.plans.set(screenId, `classes=[${vulnClasses.join(",")}] ${plan}`);
+        }
+        return txt(`planned ${plans.length} screens (${s.plans.size}/${ids.size} screens planned)`);
       },
     ),
     tool(
@@ -1808,8 +1859,9 @@ export function buildTools(s: PilotSession) {
     ),
     tool(
       "http_request",
-      "Send a scoped raw HTTP request to probe a hypothesis (IDOR/auth/exposure). Uses the current login session. Records evidence; returns an evidenceId to cite in findings. The full response body is scanned for CONCRETE IMPACT (leaked /etc/passwd, private keys/secrets, command output like uid=…, cross-user data) and any hit is surfaced in `impact` — that is your effectMarker for a CONFIRMED finding. For an IDOR/BOLA test, pass `victimId` (the other user's id you requested) and `selfId` (your own id): if the response carries the victim's id but not yours, you get a cross-user impact hit = the IDOR is real. FILE UPLOAD: pass `files` (and optional `fields`) to send a correct multipart/form-data upload — the boundary/CRLF are built for you (do NOT hand-craft a multipart body in `body`). Each file has {name (the form field), filename, contentType?, and either `content` (text, e.g. an XXE SVG) or `base64` (binary/magic-byte polyglot)}. Use this to test upload attacks: XXE via an SVG DOCTYPE ENTITY, a webshell behind image magic bytes (e.g. GIF89a; then <?php…), a pickle/deserialization blob, extension/type-filter bypass. EVIDENCE LABEL — when you send the benign/baseline CONTROL for a finding (no payload, or a non-existent id; it MUST fail), pass kind:'negative_control'; attack requests are kind:'positive_replay' (the default). Labeling the control makes the control-fails + ≥2-positives discipline explicit in the evidence.",
+      "Send a scoped raw HTTP request to probe a hypothesis (IDOR/auth/exposure). Uses the current login session. Records evidence; returns an evidenceId to cite in findings. The full response body is scanned for CONCRETE IMPACT (leaked /etc/passwd, private keys/secrets, command output like uid=…, cross-user data) and any hit is surfaced in `impact` — that is your effectMarker for a CONFIRMED finding. For an IDOR/BOLA test, pass `victimId` (the other user's id you requested) and `selfId` (your own id): if the response carries the victim's id but not yours, you get a cross-user impact hit = the IDOR is real. FILE UPLOAD: pass `files` (and optional `fields`) to send a correct multipart/form-data upload — the boundary/CRLF are built for you (do NOT hand-craft a multipart body in `body`). Each file has {name (the form field), filename, contentType?, and either `content` (text, e.g. an XXE SVG) or `base64` (binary/magic-byte polyglot)}. Use this to test upload attacks: XXE via an SVG DOCTYPE ENTITY, a webshell behind image magic bytes (e.g. GIF89a; then <?php…), a pickle/deserialization blob, extension/type-filter bypass. EVIDENCE LABEL — when you send the benign/baseline CONTROL for a finding (no payload, or a non-existent id; it MUST fail), pass kind:'negative_control'; attack requests are kind:'positive_replay' (the default). A truncated response is only a prefix: retry with maxBodyBytes (up to 8 MiB) before confirming a body differential or claiming absence. Labeling the control makes the control-fails + ≥2-positives discipline explicit in the evidence.",
       {
+        maxBodyBytes: z.number().int().min(1).max(8 * 1024 * 1024).optional(),
         method: z.string(),
         url: z.string(),
         headers: z.record(z.string()).optional(),
@@ -1827,7 +1879,7 @@ export function buildTools(s: PilotSession) {
           .optional()
           .describe("file part(s) for a multipart upload; each has a text `content` OR binary `base64`"),
       },
-      async ({ method, url, headers, body, note, kind, victimId, selfId, fields, files }) => {
+      async ({ method, url, headers, body, note, kind, victimId, selfId, fields, files, maxBodyBytes }) => {
         if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} is out of scope`);
         const multipart =
           files && files.length
@@ -1847,6 +1899,7 @@ export function buildTools(s: PilotSession) {
           headers: { ...authHeaders(s), ...(headers ?? {}) },
           body: multipart ? null : body ?? null,
           ...(multipart ? { multipart } : {}),
+          ...(maxBodyBytes ? { maxBodyBytes } : {}),
         };
         let res: HttpResponse;
         try {
@@ -1879,6 +1932,8 @@ export function buildTools(s: PilotSession) {
             status: res.status,
             headers: pick(res.headers, ["content-type", "location", "set-cookie", "www-authenticate", "access-control-allow-origin"]),
             bodyLength: res.body.length,
+            truncated: res.truncated ?? false,
+            ...(res.truncated ? { incomplete: "Only a response prefix was read. Retry with a larger maxBodyBytes before concluding from missing content or body length." } : {}),
             ...(impact.length
               ? {
                   impact: impact.map((i) => ({ kind: i.kind, severity: i.severity, marker: i.marker, detail: i.detail })),
@@ -2104,7 +2159,7 @@ export function buildTools(s: PilotSession) {
           if (!isInScope(req.url, s.scope)) return null;
           return req;
         };
-        const send = async (val: string, kind: "negative_control" | "positive_replay", tag: string, overrideBody?: string) => {
+        const send = async (val: string, kind: "negative_control" | "positive_replay", tag: string) => {
           const req = buildReq(val);
           if (!req) return null;
           const res = await s.http.send(req);
@@ -2114,7 +2169,7 @@ export function buildTools(s: PilotSession) {
             validator: "claude-pilot-cmdi",
             kind,
             request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
-            response: overrideBody != null ? { ...res, body: overrideBody } : res,
+            response: res,
             note: `cmdi ${tag}`,
           });
           return { evId: ev.id, status: res.status, body: res.body, ms: res.durationMs };
@@ -2150,21 +2205,8 @@ export function buildTools(s: PilotSession) {
               continue; // single/flaky echo not reproduced on replay → not a reliable injection; try the next payload
             }
           }
-          // ── time-based (blind) ──
-          const baselineMs = Math.min(benign.ms, (await rawSend("1"))?.ms ?? benign.ms);
-          for (const sp of [";sleep 5;", "|sleep 5", "$(sleep 5)", "&&sleep 5", "%0asleep 5%0a", "&ping -n 5 127.0.0.1", "|ping -c 5 127.0.0.1"]) {
-            const r = await rawSend(sp);
-            if (!r || r.ms < baselineMs + 4000) continue;
-            const r2 = await rawSend(sp);
-            if (r2 && r2.ms >= baselineMs + 4000) {
-              const proof = `BLIND COMMAND INJECTION CONFIRMED (time-based) — payload="${sp}" baseline=${baselineMs}ms observed=${r.ms}ms and ${r2.ms}ms (delta +${r.ms - baselineMs}ms, x2 stable). No output: the DELAY is the proof.`;
-              const p1 = await send(sp, "positive_replay", "time-proof#1", proof);
-              const p2 = await send(sp, "positive_replay", "time-proof#2", proof);
-              const ctl = await send("1", "negative_control", "time baseline-proof", `baseline ${baselineMs}ms — no injection, fast response.`);
-              if (p1 && p2 && ctl)
-                return txt(JSON.stringify({ technique: "time-based", negativeControl: ctl.evId, positiveReplays: [p1.evId, p2.evId], verdict: `BLIND OS COMMAND INJECTION CONFIRMED (time-based): ${sp} added ~${r.ms - baselineMs}ms x2 vs ${baselineMs}ms baseline. record_finding(category rce, critical) with these evidenceIds.` }));
-            }
-          }
+          const timing = await probeTiming(s, buildReq, "claude-pilot-cmdi", [";sleep 5;", "|sleep 5", "$(sleep 5)", "&&sleep 5", "%0asleep 5%0a", "&ping -n 5 127.0.0.1", "|ping -c 5 127.0.0.1"]);
+          if (timing) return txt(JSON.stringify(timing));
           return txt(JSON.stringify({ technique: null, verdict: "not confirmed: no product echo and no time delay across separator/substitution payloads. If a URL/host param, also try probe_oob (blind CMDi via a DNS/HTTP callback)." }));
         } catch (e) {
           return txt(`ERROR: ${String(e).slice(0, 180)}`);
@@ -2447,7 +2489,7 @@ export function buildTools(s: PilotSession) {
           if (!isInScope(req.url, s.scope)) return null;
           return req;
         };
-        const send = async (val: string, kind: "negative_control" | "positive_replay", tag: string, overrideBody?: string) => {
+        const send = async (val: string, kind: "negative_control" | "positive_replay", tag: string) => {
           const req = buildReq(val);
           if (!req) return null;
           const res = await s.http.send(req);
@@ -2457,7 +2499,7 @@ export function buildTools(s: PilotSession) {
             validator: "claude-pilot-sqli",
             kind,
             request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
-            response: overrideBody != null ? { ...res, body: overrideBody } : res,
+            response: res,
             note: `sqli ${tag}`,
           });
           return { evId: ev.id, status: res.status, len: res.body.length, nlen: normalizeVolatile(res.body).length, ms: res.durationMs, body: res.body };
@@ -2506,22 +2548,8 @@ export function buildTools(s: PilotSession) {
             if (t2 && usable(t2) && booleanLengthConfirmsSqli(t2.body, falseR.body, pair.t, pair.f, thr) && Math.abs(t2.nlen - t1.nlen) <= thr)
               return txt(JSON.stringify({ technique: "boolean", negativeControl: falseR.evId, positiveReplays: [t1.evId, t2.evId], verdict: `SQLi CONFIRMED (boolean): TRUE(${pair.t}) vs FALSE ${pair.f} on a structured (JSON/XML) response (delta > noise-floor ${thr}). record_finding(category sqli) with these evidenceIds.${errSig ? ` (SQL error also seen: ${errSig})` : ""}` }));
           }
-          // ── time-based(blind: 一定の遅延) ── reuse the noise baseline (benign2) instead of sending a third baseline.
-          const baselineMs = Math.min(benign.ms, benign2?.ms ?? benign.ms);
-          for (const sp of ["' AND SLEEP(5)-- -", " AND SLEEP(5)-- -", "' AND pg_sleep(5)-- -", "'; WAITFOR DELAY '0:0:5'-- -", "' OR SLEEP(5)-- -"]) {
-            const a = await send(sp, "positive_replay", `time ${sp}`);
-            if (!a || a.ms < baselineMs + 4000) continue;
-            const b2 = await send(sp, "positive_replay", `time#2 ${sp}`);
-            if (b2 && b2.ms >= baselineMs + 4000) {
-              // blind = 内容不変 → record_finding の length gate 用に timing-proof を distinguishable な evidence body で残す。
-              const proof = `TIME-BASED BLIND SQLi CONFIRMED — payload="${sp}" baseline=${baselineMs}ms observed=${a.ms}ms and ${b2.ms}ms (delta +${a.ms - baselineMs}ms, x2 stable). Blind injection: response content is unchanged, the DELAY is the proof.`;
-              const p1 = await send(sp, "positive_replay", "time-proof#1", proof);
-              const p2 = await send(sp, "positive_replay", "time-proof#2", proof);
-              const ctl = await send("1", "negative_control", "time baseline-proof", `baseline ${baselineMs}ms — no injection, fast response.`);
-              if (p1 && p2 && ctl)
-                return txt(JSON.stringify({ technique: "time-based", negativeControl: ctl.evId, positiveReplays: [p1.evId, p2.evId], verdict: `BLIND SQLi CONFIRMED (time-based): SLEEP(5) added ~${a.ms - baselineMs}ms x2 vs ${baselineMs}ms baseline (payload ${sp}). record_finding(category sqli, high+) with these evidenceIds.` }));
-            }
-          }
+          const timing = await probeTiming(s, buildReq, "claude-pilot-sqli", ["' AND SLEEP(5)-- -", " AND SLEEP(5)-- -", "' AND pg_sleep(5)-- -", "'; WAITFOR DELAY '0:0:5'-- -", "' OR SLEEP(5)-- -"]);
+          if (timing) return txt(JSON.stringify(timing));
           if (unstructuredLength)
             return txt(JSON.stringify({
               technique: null,
@@ -2593,13 +2621,8 @@ export function buildTools(s: PilotSession) {
               return txt(JSON.stringify({ technique: "operator-bypass", negativeControl: control.evId, positiveReplays: [p1.evId, p2.evId], effectMarker: successMarker ?? `status ${p1.status}`, verdict: `NoSQL OPERATOR INJECTION CONFIRMED — benign control (status ${control.status}) failed, operator ${op.label} succeeded (status ${p1.status}) twice${successMarker ? ` with marker "${successMarker}"` : ""}. record_finding(category sqli) — title it NoSQL/operator injection — with these evidenceIds + effectMarker.` }));
           }
           if (body != null) {
-            const baseMs = control.ms;
-            const t1 = await fire(url, body.replace(/\{\{NOSQL\}\}/g, nosqlTimeObject(3000)), "positive_replay", "$where sleep #1");
-            if (t1 && t1.ms - baseMs > 2200) {
-              const t2 = await fire(url, body.replace(/\{\{NOSQL\}\}/g, nosqlTimeObject(3000)), "positive_replay", "$where sleep #2");
-              if (t2 && t2.ms - baseMs > 2200)
-                return txt(JSON.stringify({ technique: "time-based", negativeControl: control.evId, positiveReplays: [t1.evId, t2.evId], verdict: `BLIND NoSQL INJECTION CONFIRMED ($where sleep): +${Math.round(t1.ms - baseMs)}ms x2 vs ${Math.round(baseMs)}ms baseline. record_finding(category sqli) — NoSQL — with these evidenceIds.` }));
-            }
+            const timing = await probeTiming(s, (value) => value === "1" ? mkReq(controlSpec.u, controlSpec.b) : mkReq(url, body.replace(/\{\{NOSQL\}\}/g, value)), "claude-pilot-nosql", [nosqlTimeObject(3000)], 3000);
+            if (timing) return txt(JSON.stringify(timing));
           }
           return txt(JSON.stringify({ technique: null, errorSignature: errSig ?? null, verdict: errSig ? `NoSQL error signature seen ("${errSig}") — likely a Mongo/Mongoose backend, but operator/time did not confirm. Try tailored payloads via http_request (login: password={"$ne":null}; or $where).` : "not confirmed: operator payloads did not bypass and $where showed no delay. On a login form, set successMarker to the token/success string and retry." }));
         } catch (e) {
@@ -3874,6 +3897,13 @@ export function buildTools(s: PilotSession) {
         const missing = [negativeControl, ...positiveReplays].filter((eid) => !findEv(eid));
         if (!negRec || posRecs.some((r) => !r))
           return txt(`REJECTED: unknown evidenceId(s) ${missing.join(", ")}. Cite ids returned by http_request / verify_access / probe_logic in THIS run (1 negativeControl + >=2 positiveReplays).`);
+        if (category !== "headers" && [negRec, ...posRecs].some((r) => r?.response.truncated))
+          return txt("REJECTED: cited HTTP responses were truncated. Fetch complete bounded evidence before confirming.");
+        if ((category === "sqli" || category === "rce") && negRec.timingProof) {
+          if (!checkTimingEvidence(negRec, posRecs.filter((r) => !!r), s.evidence.records) || [negRec.id, ...negRec.timingProof.controlIds, ...positiveReplays].some((id) => looksBlocked(findEv(id)!.response)))
+            return txt("REJECTED: measured timing evidence does not show two stable delayed replays with fast interleaved controls.");
+          return txt(await commit("confirmed", [...new Set([negativeControl, ...positiveReplays, ...negRec.timingProof.controlIds])]));
+        }
         if (MARKER_BASED_CATEGORIES.has(category)) {
           // マーカーベース: 長さ差分でなく「印(effectMarker)」の有無で確証する。
           //   business-logic → probe_logic/probe_scenario の effectMarker / xss → 未エスケープ反射 / redirect → OOB host。
@@ -3918,7 +3948,7 @@ export function buildTools(s: PilotSession) {
             return txt(`REJECTED: '${param}' is present (or not a checked rule). Missing: ${missing.map((r) => r.key).join(", ")}.`);
         } else if (category !== "auth-bypass") {
           if (category === "sqli" && sqliHtmlLengthOnlyFp(negRec.response.body, posRecs.map((r) => r!.response.body), negRec.response.status, posRecs.map((r) => r!.response.status)))
-            return txt("REJECTED: cited SQLi evidence is HTML/text length (search/result-page variance), not a JSON/XML boolean differential, a SQL error, or TIME-BASED BLIND SQLi CONFIRMED. That is the Drupal/marketing-search false positive — do NOT confirm. Re-run probe_sqli and record only if it returns SQLi CONFIRMED.");
+            return txt("REJECTED: cited SQLi evidence is HTML/text length (search/result-page variance), not a JSON/XML boolean differential, a SQL error, or measured timing experiment. That is the Drupal/marketing-search false positive — do NOT confirm. Re-run probe_sqli and record only if it returns SQLi CONFIRMED.");
           if ((category === "idor" || category === "idor-write") && posRecs.every((r) => classifyCrossUserBody(r!.response.body).class === "public-directory"))
             return txt("REJECTED: cited bodies are a PUBLIC DIRECTORY (tenant people-picker, or a store/location/dealer locator — og:type place, Find a Station, sequential store ids). Typically intended, not IDOR. Do not confirm. Mark idor tested-clean unless the body also has a person's phone/home address/SSN/DOB, another tenant's private object, or order/hold/document contents.");
           // IDOR proven by cross-user CONTENT, not length: if every positive carries real cross-user data (sensitive-pii /

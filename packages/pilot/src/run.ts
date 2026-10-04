@@ -9,7 +9,7 @@ import { restoreMethodologyPlans } from "./methodology.js";
 import { createSdkMcpServer, query } from "@anthropic-ai/claude-agent-sdk";
 import type { HookCallback } from "@anthropic-ai/claude-agent-sdk";
 import type { AssessmentStore, Screen, ScopePolicy } from "@veritas/core";
-import { isInScope, isScannable, recordTokens } from "@veritas/core";
+import { isInScope, isScannable, recordTokens, recordRequests, evaluateBudget } from "@veritas/core";
 import { modelContextWindows } from "@veritas/core/llm-context";
 import type { LoginCreds } from "@veritas/crawler";
 import { InventoryBuilder, PlaywrightDriver, smartLogin } from "@veritas/crawler";
@@ -448,6 +448,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
   const http = new FetchHttpClient({
     allow: (u) => isInScope(u, opts.scope),
     minDelayMs: opts.rateMs ?? 250,
+    beforeSend: (req) => reserveRequest(req.url),
     headers: {
       "x-verdict": "assessment",
       // Site-wide Basic: inject Authorization on the raw http path too (Digest is browser-path only).
@@ -690,14 +691,14 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
   // If a stage dies from token/usage-limit exhaustion, pause the run rather than skipping to the next screen.
   //   done=true stops all subsequent stages/screens; paused=true keeps the final step from dropping to report (resumable).
   //   Once the quota recovers, `pilot --resume --id <id>` (the WebUI's ▶ resume) continues from the un-diagnosed queued screens.
-  const pauseRun = (detail: string, cause: "usage" | "context" | "incomplete" | "auth" = "usage"): void => {
+  const pauseRun = (detail: string, cause: "usage" | "context" | "incomplete" | "auth" | "budget" = "usage"): void => {
     if (session.paused) return; // don't double-count
     session.done = true;
     session.paused = true;
-    const reason = cause === "context" ? "Model context could not be summarized" : cause === "usage" ? "Model usage/token limit reached" : cause === "auth" ? "Target authentication is required" : "Model stage did not complete";
+    const reason = cause === "budget" ? `Assessment budget reached: ${detail}` : cause === "context" ? "Model context could not be summarized" : cause === "usage" ? "Model usage/token limit reached" : cause === "auth" ? "Target authentication is required" : "Model stage did not complete";
     session.doneSummary = cause === "context"
       ? `⏸ paused — ${reason}. Check Max context and model availability, then resume: pilot --resume --id ${opts.assessmentId}`
-      : `⏸ paused — ${reason}. ${cause === "auth" ? "Check target authentication" : "Check model availability and stage limits"}, then resume: pilot --resume --id ${opts.assessmentId}`;
+      : `⏸ paused — ${reason}. ${cause === "auth" ? "Check target authentication" : cause === "budget" ? "Raise the assessment budget" : "Check model availability and stage limits"}, then resume: pilot --resume --id ${opts.assessmentId}`;
     opts.onText?.(`${session.doneSummary}${detail ? ` (${detail})` : ""}`);
     opts.store.appendEvent(opts.assessmentId, {
       type: "note",
@@ -705,6 +706,46 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     });
     opts.store.setPaused(opts.assessmentId, true, reason);
   };
+
+  const checkBudget = (): boolean => {
+    if (session.paused) return true;
+    if (!budget) return false;
+    const decision = evaluateBudget(budget);
+    if (decision.stop) pauseRun(decision.detail, "budget");
+    return decision.stop;
+  };
+  const reserveRequest = (url: string): void => {
+    if (checkBudget()) throw new Error("Assessment budget exhausted");
+    if (budget) {
+      budget = recordRequests(budget, new URL(url).host);
+      opts.store.updateBudget(opts.assessmentId, budget);
+    }
+  };
+  const addTokens = (delta: number): void => {
+    if (!Number.isFinite(delta) || delta <= 0) return;
+    runTokens += delta;
+    if (budget) {
+      budget = recordTokens(budget, delta);
+      opts.store.updateBudget(opts.assessmentId, budget);
+    }
+    checkBudget();
+  };
+  // Browser requests share the same accounting as raw probes, including failed attempts.
+  const gateBrowserRequest = (url: string): void => {
+    if (checkBudget()) throw new Error("Assessment budget exhausted");
+    if (isInScope(url, opts.scope)) reserveRequest(url);
+  };
+  driver.setRequestGate?.(gateBrowserRequest);
+  for (const rs of roleSessions?.values() ?? []) rs.driver.setRequestGate?.(gateBrowserRequest);
+  if (session.loginLlm) {
+    const client = session.loginLlm;
+    session.loginLlm = { complete: async (req) => {
+      if (checkBudget()) throw new Error("Assessment budget exhausted");
+      const response = await client.complete(req);
+      addTokens(response.tokensUsed ?? 0);
+      return response;
+    } };
+  }
 
   // A stage may stop early, but only its accepted completion tool makes it complete.
   const runStage = async (p: {
@@ -716,6 +757,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     contextWindowTokens: number;
     shouldStop: () => boolean;
   }): Promise<number> => {
+    if (checkBudget()) return 0;
     // Operator context (target facts) is appended to EVERY stage's system prompt — additive, never a replacement
     // (the SAFETY/discipline text in p.system still governs; see operatorContextBlock). One choke point covers all stages.
     const sys = opts.operatorContext?.trim() ? `${p.system}\n\n${operatorContextBlock(opts.operatorContext)}` : p.system;
@@ -759,14 +801,8 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
           opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: t.slice(0, 400) } });
         },
         onToolUse: (n, i) => opts.onTool?.(n, i),
-        onTokens: (delta) => {
-          runTokens += delta;
-          if (budget) {
-            budget = recordTokens(budget, delta);
-            opts.store.updateBudget(opts.assessmentId, budget);
-          }
-        },
-        shouldStop: () => p.shouldStop() || session.done,
+        onTokens: addTokens,
+        shouldStop: () => checkBudget() || p.shouldStop() || session.done,
       });
       if (res.stopped === "error") {
         opts.onText?.(`⚠ stage ended early: ${res.error}`);
@@ -794,7 +830,10 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
           disallowedTools: DISALLOWED,
           permissionMode: "bypassPermissions",
           // allowlist that PreToolUse-denies everything other than veritas MCP tools (incl. Task/Agent/Monitor/Skill/ToolSearch/...).
-          hooks: { PreToolUse: [{ hooks: [onlyVeritasToolsHook] }] },
+          hooks: { PreToolUse: [{ hooks: [async (...args) => {
+            if (checkBudget()) return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: "Assessment budget exhausted" } };
+            return onlyVeritasToolsHook(...args);
+          }] }] },
           ...(p.model ? { model: p.model } : {}),
           systemPrompt: { type: "preset", preset: "claude_code", append: sys },
           maxTurns: p.maxTurns,
@@ -806,7 +845,9 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         const structuredLimit = usageLimitFromMessage(msg);
         if (structuredLimit) pauseRun(structuredLimit.slice(0, 160));
         if (msg.type === "assistant") {
-          assistantTokens += tally((msg.message as unknown as { usage?: Record<string, number> }).usage);
+          const spent = tally((msg.message as unknown as { usage?: Record<string, number> }).usage);
+          assistantTokens += spent;
+          addTokens(spent);
           for (const block of msg.message.content) {
             if (block.type === "text" && block.text.trim()) {
               turns += 1;
@@ -849,13 +890,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     // Tally once after the stage ends (never dropped on early break / maxTurns / normal finish).
     // If the result is readable use its cumulative; otherwise fall back to the assistant accumulation.
     const delta = stageTokenDelta(assistantTokens, resultTokens, sawResult);
-    if (delta > 0) {
-      runTokens += delta;
-      if (budget) {
-        budget = recordTokens(budget, delta);
-        opts.store.updateBudget(opts.assessmentId, budget); // live-reflect to WebUI/status
-      }
-    }
+    addTokens(Math.max(0, delta - assistantTokens));
     if (!p.shouldStop() && !session.paused) pauseRun("Stage ended without its completion tool", "incomplete");
     return turns;
   };
@@ -1009,9 +1044,9 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       opts.store.setPhase(opts.assessmentId, "phase1_label");
       turns += await runStage({
         system: METHODOLOGY_PROMPT,
-        goal: `${techClause}${session.inv.screens().length} screens were mapped. Call get_inventory, then record_methodology for EVERY screen, then methodology_done.`,
+        goal: `${techClause}${session.inv.screens().length} screens were mapped. Call get_inventory (follow nextOffset), then record_methodologies in batches of up to 20 for screens not marked planned, then methodology_done. Existing persisted plans do not need to be repeated; record_methodology also accepts one plan at a time.`,
         allowed: allowedFor("methodology"),
-        maxTurns: Math.min(maxTurns, 30),
+        maxTurns: Math.min(maxTurns, Math.max(30, session.inv.screens().filter((sc) => !session.plans.has(sc.screenId)).length * 2 + 3)),
         model: fastModel, // methodology is fast too (structured plan authoring)
         contextWindowTokens: contextWindows.light,
         shouldStop: () => session.methodologyDone,
@@ -1386,6 +1421,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       }
     }
 
+    checkBudget();
     // survey-only stays at phase1_recon (all screens queued = un-diagnosed) -> can be resumed later.
     if (session.paused) {
       // Paused on token exhaustion = still incomplete. Don't drop the phase to report (keep the diagnosis phase),

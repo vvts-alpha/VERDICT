@@ -60,11 +60,11 @@ test("js_analyzed events: analyzedJsUrls dedups + buildStateView projects jsAsse
     });
     store.appendEvent(id, {
       type: "js_analyzed",
-      payload: { url: "https://app.test/main.js", bytes: 1024, endpointsFound: ["GET /api/x"], secretsFound: [{ kind: "secret", detail: "Google API key: AIza…QXh4" }], sourceMap: true, analyzedAt: "2026-01-01T00:00:00Z" },
+      payload: { url: "https://app.test/main.js", bytes: 1024, complete: true, endpointsFound: ["GET /api/x"], secretsFound: [{ kind: "secret", detail: "Google API key: AIza…QXh4" }], sourceMap: true, analyzedAt: "2026-01-01T00:00:00Z" },
     });
     store.appendEvent(id, {
       type: "js_analyzed",
-      payload: { url: "https://app.test/vendor.js", bytes: 2048, endpointsFound: [], secretsFound: [], sourceMap: false, analyzedAt: "2026-01-01T00:00:01Z" },
+      payload: { url: "https://app.test/vendor.js", bytes: 2048, complete: true, endpointsFound: [], secretsFound: [], sourceMap: false, analyzedAt: "2026-01-01T00:00:01Z" },
     });
 
     const urls = store.analyzedJsUrls(id); // dedup source the analyze_js tool reads

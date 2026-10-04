@@ -13,7 +13,8 @@
     "typecheck": "pnpm -r run typecheck",
     "test": "pnpm -r run test",
     "test:release": "node --test tools/*.test.cjs",
-    "clean": "pnpm -r run clean"
+    "clean": "pnpm -r run clean",
+    "test:browser": "pnpm --filter @veritas/crawler test:browser"
   },
   "pnpm": {
     "overrides": {

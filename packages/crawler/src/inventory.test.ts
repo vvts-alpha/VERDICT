@@ -193,3 +193,27 @@ test("InventoryBuilder still caps DOM-skeleton churn within a single SPA hash ro
   }
   assert.equal(inv.screens().length, 3, "churn on one hash route is still capped (backstop preserved)");
 });
+
+test("same skeleton preserves distinct origins and SPA routes, including independent caps", () => {
+  const inv = new InventoryBuilder(1);
+  const urls = ["https://one.test/account", "https://two.test/account", "http://one.test/account", "https://app.test/#/orders", "https://app.test/#/wallet"];
+  const ids = urls.map((finalUrl) => inv.ingest(obs({ finalUrl })).screen.screenId);
+  assert.equal(new Set(ids).size, urls.length);
+  for (const [i, finalUrl] of urls.entries()) {
+    assert.equal(inv.ingest(obs({ finalUrl, domSkeleton: "html>(body>(table))" })).screen.screenId, ids[i]);
+  }
+  assert.equal(inv.screens().length, urls.length);
+});
+
+test("resume keeps route identity while merging authenticated DOM changes and normalized hash IDs", () => {
+  const old = new InventoryBuilder();
+  const urls = ["https://one.test/account", "https://two.test/account", "https://app.test/#/orders/1", "https://app.test/#/wallet"];
+  const ids = urls.map((finalUrl) => old.ingest(obs({ finalUrl })).screen.screenId);
+  const resumed = new InventoryBuilder();
+  resumed.seed(old.screens());
+  for (const [i, finalUrl] of urls.entries()) {
+    assert.equal(resumed.ingest(obs({ finalUrl: finalUrl.replace("orders/1", "orders/2"), domSkeleton: "html>(body>(nav,main))" }), "post-login").screen.screenId, ids[i]);
+  }
+  assert.equal(resumed.screens().length, 4);
+  assert.equal(resumed.ingest(obs({ finalUrl: "https://third.test/account" })).isNew, true);
+});

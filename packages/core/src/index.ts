@@ -73,7 +73,7 @@ export { buildStateView } from "./view.js";
 export type { StateView, WsMessage } from "./view.js";
 
 // Budget / stop conditions / report (M7)
-export { recordRequests, recordTokens, elapsedMs, evaluateStop } from "./budget-guard.js";
+export { recordRequests, recordTokens, elapsedMs, evaluateStop, evaluateBudget } from "./budget-guard.js";
 export type { StopDecision, StopOptions } from "./budget-guard.js";
 export { buildReport, renderMarkdown } from "./report.js";
 export { buildReportModel, SEVERITY_ORDER, findingVerdict } from "./report-model.js";

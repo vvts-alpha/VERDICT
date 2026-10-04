@@ -32,6 +32,8 @@ export interface JsAsset {
   /** the bundle URL — natural dedup key */
   url: string;
   bytes: number;
+  /** False when the bounded asset fetch returned only a prefix; such assets remain eligible for retry. */
+  complete?: boolean;
   /** endpoint URL-templates statically extracted from the bundle (fetch/axios/XHR/`/api` literals) */
   endpointsFound: string[];
   secretsFound: JsSecret[];

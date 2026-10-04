@@ -223,6 +223,11 @@ const PAGE_EXTRACT_FN = (): {
 };
 
 export class PlaywrightDriver implements Driver {
+  private requestGate?: (url: string) => void;
+
+  /** Assessment-owned request accounting. Throwing refuses a request without falling back to continue(). */
+  setRequestGate(gate: (url: string) => void): void { this.requestGate = gate; }
+
   private buffer: CapturedExchange[] = [];
 
   private constructor(
@@ -263,6 +268,8 @@ export class PlaywrightDriver implements Driver {
     const extraHeaders = options.extraHeaders;
     const hasExtra = !!extraHeaders && Object.keys(extraHeaders).length > 0;
     await context.route("**/*", async (route) => {
+      try { driver.requestGate?.(route.request().url()); }
+      catch { await route.abort("blockedbyclient").catch(() => {}); return; }
       try {
         const req = route.request();
         let sameOrigin = false;
@@ -915,24 +922,37 @@ export class PlaywrightDriver implements Driver {
       }
     };
 
-    // (1) forms
-    const forms = await this.page.$$("form").catch(() => []);
-    for (const form of forms) {
+    // Snapshot selectors, not ElementHandles: submitting one form replaces the document.
+    // Attribute identities also survive reordered forms; identical forms use their occurrence index.
+    const snapshot = async (base: string, attributes: string[]) => {
+      const seen = new Map<string, number>();
+      const specs: Array<{ selector: string; index: number }> = [];
+      for (const el of await this.page.locator(base).all()) {
+        let selector = base;
+        for (const attr of attributes) {
+          const value = await el.getAttribute(attr);
+          if (value !== null) selector += `[${attr}=${JSON.stringify(value)}]`;
+          else selector += `:not([${attr}])`;
+        }
+        const index = seen.get(selector) ?? 0;
+        seen.set(selector, index + 1);
+        specs.push({ selector, index });
+      }
+      return specs;
+    };
+    const forms = await snapshot("form", ["id", "name", "action", "method"]);
+    for (const spec of forms) {
       if (exercised >= cap) break;
+      let touched = false;
       try {
+        const form = this.page.locator(spec.selector).nth(spec.index);
+        if (await form.count() === 0) continue;
         const method = ((await form.getAttribute("method")) || "get").toLowerCase();
         const action = (await form.getAttribute("action")) || origin;
-        let actionUrl = origin;
-        try {
-          actionUrl = new URL(action, origin).toString();
-        } catch {
-          /* relative/garbage → treat as origin */
-        }
-        if (!opts.allow(actionUrl)) continue;
-        if (method === "delete" || method === "put" || method === "patch") continue;
-        if (method === "post" && !opts.aggressive) continue;
+        const actionUrl = new URL(action, origin).toString();
+        if (!opts.allow(actionUrl) || ["delete", "put", "patch"].includes(method) || (method === "post" && !opts.aggressive)) continue;
         let filled = false;
-        for (const el of await form.$$("input, textarea, select")) {
+        for (const el of await form.locator("input, textarea, select").all()) {
           const tag = await el.evaluate((n: { tagName: string }) => n.tagName.toLowerCase()).catch(() => "");
           if (tag === "select") {
             await el.selectOption({ index: 1 }).then(() => { filled = true; }).catch(() => {});
@@ -943,34 +963,39 @@ export class PlaywrightDriver implements Driver {
           await el.fill(MARK).then(() => { filled = true; }).catch(() => {});
         }
         if (!filled) continue;
+        touched = true;
         const before = this.page.url();
-        const btn = await form.$("button[type=submit], input[type=submit], button");
-        if (btn) await btn.click({ timeout: 3000 }).catch(() => {});
-        else await form.evaluate((f: { requestSubmit?: () => void; submit: () => void }) => { if (f.requestSubmit) f.requestSubmit(); else f.submit(); }).catch(() => {});
+        const btn = form.locator('button[type="submit"], input[type="submit"], button:not([type])').first();
+        if (await btn.count()) await btn.click({ timeout: 3000 });
+        else await form.evaluate((f: { requestSubmit?: () => void; submit: () => void }) => { if (f.requestSubmit) f.requestSubmit(); else f.submit(); });
         await this.page.waitForLoadState("networkidle", { timeout: 4000 }).catch(() => {});
         exercised += 1;
         collect(before);
-        await this.gotoUrl(origin); // restore
       } catch {
-        /* on to the next form */
+        /* A failed interaction does not count as a submitted form. */
+      } finally {
+        if (touched) await this.gotoUrl(origin).catch(() => {});
       }
     }
 
-    // (2) standalone search/text inputs outside a form (SPA search boxes etc. often have no <form>)
-    const loose = await this.page.$$("input[type=search], input[type=text]").catch(() => []);
-    for (const el of loose) {
+    const loose = await snapshot('input:is([type="search"], [type="text"]):not(form input)', ["id", "name", "type"]);
+    for (const spec of loose) {
       if (exercised >= cap) break;
+      let touched = false;
       try {
-        if (await el.evaluate((n: { closest: (s: string) => unknown }) => !!n.closest("form")).catch(() => true)) continue; // inside a form: already handled in (1)
-        await el.fill(MARK).catch(() => {});
+        const el = this.page.locator(spec.selector).nth(spec.index);
+        if (await el.count() === 0) continue;
+        await el.fill(MARK);
+        touched = true;
         const before = this.page.url();
-        await el.press("Enter").catch(() => {});
+        await el.press("Enter");
         await this.page.waitForLoadState("networkidle", { timeout: 4000 }).catch(() => {});
         exercised += 1;
         collect(before);
-        await this.gotoUrl(origin);
       } catch {
-        /* on to the next input */
+        /* Continue with the next input using the restored document. */
+      } finally {
+        if (touched) await this.gotoUrl(origin).catch(() => {});
       }
     }
     return { exercised, discovered: [...discovered] };

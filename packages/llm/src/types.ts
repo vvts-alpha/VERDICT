@@ -11,6 +11,8 @@ export interface LlmRequest {
 export interface LlmResponse {
   text: string;
   model: string;
+  /** Actual provider-reported usage when available. */
+  tokensUsed?: number;
 }
 
 export interface LlmClient {

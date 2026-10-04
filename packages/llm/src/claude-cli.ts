@@ -15,6 +15,7 @@ export interface ClaudeCliOptions {
 }
 
 interface ClaudeJsonEnvelope {
+  usage?: Record<string, number>;
   type?: string;
   subtype?: string;
   is_error?: boolean;
@@ -61,7 +62,8 @@ export class ClaudeCliClient implements LlmClient {
             reject(new Error(`claude CLI error envelope: ${JSON.stringify(env).slice(0, 300)}`));
             return;
           }
-          resolve({ text: env.result, model });
+          const tokensUsed = env.usage ? ["input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"].reduce((n, key) => n + (env.usage?.[key] ?? 0), 0) : undefined;
+          resolve({ text: env.result, model, ...(tokensUsed !== undefined ? { tokensUsed } : {}) });
         },
       );
       child.stdin?.end(req.prompt);

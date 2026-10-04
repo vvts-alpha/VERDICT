@@ -49,6 +49,13 @@ export function readEvidenceArtifact(artifactsDir: string, evidenceId: string, m
 
 export type EvidenceKind = "negative_control" | "positive_replay";
 
+/** Attached to the final benign control of an interleaved timing experiment. Bodies remain raw. */
+export interface TimingProof {
+  controlIds: [string, string];
+  positiveIds: [string, string];
+  delayMs: number;
+}
+
 export interface EvidenceInput {
   screenId: string;
   validator: string;
@@ -56,6 +63,7 @@ export interface EvidenceInput {
   request: HttpRequest;
   response: HttpResponse;
   note: string;
+  timingProof?: TimingProof;
 }
 
 export interface EvidenceRecord extends EvidenceInput {
@@ -119,6 +127,8 @@ export class EvidenceStore {
       status: input.response.status,
       finalUrl: input.response.finalUrl,
       durationMs: input.response.durationMs,
+      truncated: input.response.truncated ?? false,
+      bodyBytes: input.response.bodyBytes ?? Buffer.byteLength(input.response.body),
       headers: maskHeaders(input.response.headers),
     };
     writeFileSync(join(dir, "request.json"), JSON.stringify(safeRequest, null, 2));
@@ -130,7 +140,7 @@ export class EvidenceStore {
     writeFileSync(
       join(dir, "meta.json"),
       JSON.stringify(
-        { id, screenId: input.screenId, validator: input.validator, kind: input.kind, note: input.note, recordedAt: rec.recordedAt },
+        { id, screenId: input.screenId, validator: input.validator, kind: input.kind, note: input.note, timingProof: input.timingProof, recordedAt: rec.recordedAt },
         null,
         2,
       ),

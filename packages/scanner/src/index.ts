@@ -4,7 +4,7 @@ export type { HttpClient, HttpRequest, HttpResponse, MultipartSpec, FetchHttpCli
 export { FetchHttpClient, FakeHttpClient } from "./http.js";
 
 export { EvidenceStore, readEvidenceArtifact } from "./evidence.js";
-export type { EvidenceInput, EvidenceRecord, EvidenceKind, EvidenceArtifact } from "./evidence.js";
+export type { EvidenceInput, EvidenceRecord, EvidenceKind, EvidenceArtifact, TimingProof } from "./evidence.js";
 
 export { runValidator, makeTarget, concretizeApiUrl } from "./validator.js";
 export type {
@@ -52,3 +52,5 @@ export { lookupCves, formatCveResults } from "./cve-lookup.js";
 export type { CveMatch, CveLookupResult, CveLookupOptions, FetchLike } from "./cve-lookup.js";
 export { impactOracle, formatImpact, identityAppears, classifyCrossUserBody, looksLikePublicCatalogPage, isBrowserGoogleMapsApiKey, isFirebaseWebApiKey, isRecaptchaSiteKey, isPublicByDesignClientCredential } from "./impact.js";
 export type { ImpactKind, ImpactContext, ImpactSignal, CrossUserBodyClass, CrossUserBodyClassification } from "./impact.js";
+
+export { checkTimingEvidence } from "./timing-evidence.js";

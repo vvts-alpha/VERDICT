@@ -150,3 +150,10 @@ test("provider session metadata is not sent to other compatible endpoints", asyn
     } });
     await client.complete({ prompt: "hello" });
 });
+
+test("OpenAiClient exposes provider usage for assessment budget accounting", async () => {
+    for (const usage of [{ total_tokens: 42 }, { prompt_tokens: 30, completion_tokens: 12 }]) {
+        const client = new OpenAiClient({ baseURL: "http://model.test/v1", defaultModel: "fake", fetchImpl: async () => Response.json({ usage, choices: [{ message: { content: "ok" } }] }) });
+        assert.equal((await client.complete({ prompt: "fixture" })).tokensUsed, 42);
+    }
+});

@@ -95,7 +95,7 @@ test("booleanLengthConfirmsSqli: refuses unmatched-length payloads (quoted FALSE
   assert.equal(booleanLengthConfirmsSqli(jsonT, jsonF, " OR 1=1-- -", "' OR '1'='2'-- -", 64), false);
 });
 
-test("sqliHtmlLengthOnlyFp: HTML length-only is the Valero FP; JSON / SQL error / time-proof are not", () => {
+test("sqliHtmlLengthOnlyFp: HTML length-only is the Valero FP; JSON / SQL error remain leads; synthetic timing claims are rejected", () => {
   const html = (n: number) => `<!DOCTYPE html><html><body>${"z".repeat(n)}</body></html>`;
   assert.equal(sqliHtmlLengthOnlyFp(html(32468), [html(32348), html(32348)]), true);
   const jsonT = '{"n":40,"rows":[' + '"a"'.repeat(80) + "]}";
@@ -105,5 +105,5 @@ test("sqliHtmlLengthOnlyFp: HTML length-only is the Valero FP; JSON / SQL error 
   assert.equal(sqliHtmlLengthOnlyFp("baseline 3ms — no injection, fast response.", [
     "TIME-BASED BLIND SQLi CONFIRMED — payload=SLEEP(5)",
     "TIME-BASED BLIND SQLi CONFIRMED — payload=SLEEP(5)",
-  ]), false);
+  ]), true);
 });

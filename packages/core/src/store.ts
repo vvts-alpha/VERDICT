@@ -303,7 +303,11 @@ export class AssessmentStore {
     const urls = new Set<string>();
     for (const r of rows) {
       try {
-        urls.add((JSON.parse(r.payload) as { url: string }).url);
+        const asset = JSON.parse(r.payload) as { url: string; complete?: boolean };
+        // Legacy records counted characters, so even a small byte field may conceal a truncated UTF-8 body.
+        // Revisit legacy assets once; only an explicitly complete analysis is safe to deduplicate.
+        if (asset.complete === true) urls.add(asset.url);
+        else urls.delete(asset.url);
       } catch {
         /* skip malformed */
       }

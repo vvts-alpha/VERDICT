@@ -7,7 +7,7 @@ import { schemaToJsonShape } from "@veritas/core";
 import { normalizePath } from "./url.js";
 import { hashDomSkeleton } from "./dom.js";
 import { classifyScreenType, deriveLabels, describeScreen, guessParamType } from "./labeler.js";
-import { InventoryBuilder } from "./inventory.js";
+import { InventoryBuilder, screenRouteKey } from "./inventory.js";
 import type { BuiltScreen } from "./inventory.js";
 
 type OANode = Record<string, unknown>;
@@ -178,9 +178,9 @@ export function parseOpenApiToScreens(rawDoc: unknown, baseUrl: string, existing
       const labels = deriveLabels(screenType, params, [api], "");
       const domSkeletonHash = hashDomSkeleton(`api:${ep.template}`); // deterministic, DOM-less; distinct from real skeleton hashes
       const built: BuiltScreen = {
-        dedupKey: `${ep.template} ${domSkeletonHash}`,
+        dedupKey: `${screenRouteKey(ep.template, ep.observedUrl)}\0${domSkeletonHash}`,
         observedUrl: ep.observedUrl,
-        capTemplate: ep.template, // spec endpoints are real API paths (no SPA hash) → cap key = the template
+        capTemplate: screenRouteKey(ep.template, ep.observedUrl),
         screen: {
           urlTemplate: ep.template,
           observedUrls: [ep.observedUrl],
@@ -231,9 +231,9 @@ export function apiCallToBuiltScreen(api: ApiCall, baseUrl: string): BuiltScreen
   const domSkeletonHash = hashDomSkeleton(`api:${template}`); // DOM-less, deterministic, distinct from real skeleton hashes
   const authState: AuthState = api.auth === "none" ? "unauth" : "post-login";
   return {
-    dedupKey: `${template} ${domSkeletonHash}`,
+    dedupKey: `${screenRouteKey(template, observedUrl)}\0${domSkeletonHash}`,
     observedUrl,
-    capTemplate: template,
+    capTemplate: screenRouteKey(template, observedUrl),
     screen: {
       urlTemplate: template,
       observedUrls: [observedUrl],

@@ -17,7 +17,7 @@ import { findingVerdict } from "@veritas/core";
 import type { LlmClient } from "@veritas/llm";
 import { extractJson } from "@veritas/llm";
 import type { EvidenceRecord, EvidenceStore } from "@veritas/scanner";
-import { classifyCrossUserBody, impactOracle, isPublicByDesignClientCredential, isVersionlessComponentLead } from "@veritas/scanner";
+import { checkTimingEvidence, classifyCrossUserBody, impactOracle, isPublicByDesignClientCredential, isVersionlessComponentLead } from "@veritas/scanner";
 import { looksBlocked, sqliHtmlLengthOnlyFp } from "./tools.js";
 import { looksLikePublicWebFile } from "./disclosure.js";
 import { consolidateFindings, qualifyFinding } from "./finding-review.js";
@@ -106,7 +106,14 @@ export function judgeConfirmedFinding(f: Finding, evidence: EvidenceStore): QaJu
   const got = bodiesOf(evidence, f.evidenceIds);
   if (!got) return { demote: false };
 
-  if (cat === "sqli" && sqliHtmlLengthOnlyFp(got.control, got.positives, got.controlStatus, got.positiveStatuses))
+  const timingControl = got.recs.find((r) => r.timingProof);
+  const timingValid = timingControl && checkTimingEvidence(timingControl, got.recs.filter((r) => r.kind === "positive_replay"), evidence.records) && !got.recs.some((r) => looksBlocked(r.response));
+  if (got.recs.some((r) => r.response.truncated)) return { demote: true, reason: "Incomplete HTTP response evidence cannot establish a confirmed differential." };
+  if ((cat === "sqli" || cat === "rce") && timingControl && !timingValid)
+    return { demote: true, reason: "Measured timing replays or interleaved controls failed validation." };
+  if ((cat === "sqli" || cat === "rce") && got.positives.some((b) => /TIME-BASED BLIND SQLi CONFIRMED|BLIND COMMAND INJECTION CONFIRMED \(time-based\)/i.test(b)))
+    return { demote: true, reason: "A synthetic timing claim in the response body is not measured evidence." };
+  if (cat === "sqli" && !timingValid && sqliHtmlLengthOnlyFp(got.control, got.positives, got.controlStatus, got.positiveStatuses))
     return { demote: true, reason: "HTML/text length-only SQLi (search/result-page variance) — not a JSON/XML boolean differential, SQL error, or time-based proof. Scanner-style false positive." };
 
   if ((cat === "idor" || cat === "idor-write") && got.positives.every((b) => classifyCrossUserBody(b).class === "public-directory"))
@@ -140,7 +147,7 @@ const TRIAGE_SYSTEM =
   "- A SharePoint hive path (/_layouts/15/, corev15.css) is NOT SharePoint Server 2013 and does not prove CVE-2019-0604. false_positive. Keep only if a build header (MicrosoftSharePointTeamServices: 15.0.0.xxxx) is in the evidence.\n" +
   "- A Server/X-Powered-By/script banner that includes a concrete version (Apache/2.4.49, PHP/7.4.3, jquery-1.12.4) IS a version-based lead — keep it (not false_positive) when that version is known-vulnerable. Do not invent a version from a URL path digit.\n" +
   "- A JSON or XML API whose TRUE vs FALSE SQL payloads return extra rows / a stable structured differential IS SQL injection. confirmed.\n" +
-  "- A body containing TIME-BASED BLIND SQLi CONFIRMED IS SQL injection. confirmed.\n" +
+  "- A timing claim in a response body is NEVER proof. For blind injection, examine measured durations: two delayed positives and three stable interleaved benign controls must support the requested delay.\n" +
   "- Phone, home address, SSN/DOB, or another user's order/hold/document in a cross-user body IS IDOR. confirmed.\n" +
   "Reply JSON only: {\"verdict\":\"confirmed\"|\"false_positive\",\"reason\":\"one sentence\"}.";
 
@@ -187,6 +194,7 @@ function buildEvidencePrompt(f: Finding, evidence: EvidenceStore): string | null
   if (!got) return null;
   const ctrl = got.recs.find((r) => r.kind === "negative_control") ?? got.recs[0]!;
   const pos = got.recs.filter((r) => r.kind === "positive_replay" && r !== ctrl);
+  const timing = ctrl.timingProof ? `Timing experiment: requested delay ${ctrl.timingProof.delayMs}ms; interleaved control durations ${[...ctrl.timingProof.controlIds, ctrl.id].map((id) => `${id}=${evidence.records.find((r) => r.id === id)?.response.durationMs}ms`).join(", ")}.\n` : "";
   const posLine = (r: EvidenceRecord, i: number): string => {
     // Re-run the impact oracle vs the control body so the window centers on the ACTUAL leaked marker (not the head),
     // and tell the reviewer what an automated oracle flagged — its job is to judge whether that is a real exploited
@@ -196,10 +204,10 @@ function buildEvidencePrompt(f: Finding, evidence: EvidenceStore): string | null
     const impactStr = hits.length
       ? `\nimpact-oracle flagged: ${hits.slice(0, 3).map((h) => `${h.kind}=${JSON.stringify(String(h.marker).slice(0, 80))}`).join(", ")}`
       : "";
-    return `positive#${i + 1}: status ${r.response.status} len ${r.response.body.length} ${headerGlance(r.response.headers)}${impactStr}\n${evidenceView(r.response.body, { control: ctrl.response.body, ...(marker ? { marker } : {}) })}`;
+    return `positive#${i + 1}: status ${r.response.status} duration ${r.response.durationMs}ms len ${r.response.body.length} ${headerGlance(r.response.headers)}${impactStr}\n${evidenceView(r.response.body, { control: ctrl.response.body, ...(marker ? { marker } : {}) })}`;
   };
   return (
-    `category: ${categoryOfFinding(f) || "?"}\nseverity: ${f.severity}\n` +
+    timing + `category: ${categoryOfFinding(f) || "?"}\nseverity: ${f.severity}\n` +
     `control: status ${ctrl.response.status} len ${ctrl.response.body.length} ${headerGlance(ctrl.response.headers)}\n${evidenceView(ctrl.response.body)}\n` +
     pos.map(posLine).join("\n")
   );
@@ -209,9 +217,9 @@ function buildEvidencePrompt(f: Finding, evidence: EvidenceStore): string | null
 // anchors on a plausible story; diverse lenses catch failure modes redundancy misses. A finding is demoted only when a
 // MAJORITY refute. Demote-only, never promote — the deterministic evidence floor stays the confirm authority.
 const REVIEW_LENSES: ReadonlyArray<{ key: string; guidance: string }> = [
-  { key: "exploitability", guidance: "LENS — exploitability: verdict false_positive UNLESS the positive body carries a concrete exploited EFFECT the control does not — a leaked secret/PII, cross-user data, real file content, command/query output, or an unescaped payload in a live HTML context. A status flip, a body-length difference, or the input merely echoed back is NOT an exploited effect." },
+  { key: "exploitability", guidance: "LENS — exploitability: verdict false_positive UNLESS the positive body carries a concrete exploited EFFECT the control does not — a leaked secret/PII, cross-user data, real file content, command/query output, an unescaped payload in a live HTML context, or a validated timing experiment with two delayed positives and three stable interleaved controls. A status flip, a body-length difference, or the input merely echoed back is NOT an exploited effect." },
   { key: "scanner-fp", guidance: "LENS — known scanner false positives: apply the catalog strictly. A public directory / people-picker / store-locator is not IDOR; a public-by-design client key (Maps/Firebase/reCAPTCHA) is not secret-exposure; robots.txt/sitemap is not info-disclosure; a product-family banner without a concrete version is not A06; a WAF/challenge page length is not a finding; an HTML search/marketing page whose length changes with the query is not SQLi. If the evidence matches any, false_positive." },
-  { key: "reproducibility", guidance: "LENS — reproducibility & control: verdict false_positive UNLESS the negative control genuinely FAILS (or lacks the effect) AND the positives genuinely SUCCEED showing the SAME discriminating signal. If control and positive are ~indistinguishable, or the 'impact-oracle flagged' marker is actually present in the control too / is ambient, false_positive." },
+  { key: "reproducibility", guidance: "LENS — reproducibility & control: verdict false_positive UNLESS the negative control genuinely FAILS (or lacks the effect) AND the positives genuinely SUCCEED showing the SAME discriminating signal. If control and positive have neither a distinct content effect nor a repeatable timing differential, or the 'impact-oracle flagged' marker is actually present in the control too / is ambient, false_positive." },
 ];
 
 /** One skeptic: a single Deep-model call with the base skeptical prompt + one lens. Returns fp/keep, or null on an

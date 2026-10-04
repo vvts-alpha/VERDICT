@@ -12,6 +12,7 @@ Use Node.js 24+ and pinned pnpm 9.15.4 (`corepack enable pnpm`).
 - `pnpm -r build`: build packages in dependency order, including Vite renderers.
 - `pnpm -r typecheck`: run package TypeScript checks.
 - `pnpm -r test`: run all package test suites.
+- `pnpm test:browser`: real-browser crawler tests in `packages/crawler/test/`; needs Chromium (`pnpm --filter @veritas/crawler exec playwright-core install --with-deps chromium`).
 - `pnpm --filter @veritas/desktop dev`: build and launch Electron.
 - `pnpm --filter @veritas/cli dev serve`: start the local server/WebUI at `127.0.0.1:4317`.
 
@@ -23,7 +24,7 @@ Use strict TypeScript, ESM, explicit `import type`, and `.js` extensions for Nod
 
 ## Testing Guidelines
 
-Tests use `node:test`, `node:assert/strict`, and `tsx`. Add behavior-focused regression tests using `FakeDriver`, `FakeHttpClient`, or `FakeLlmClient`; avoid real LLM calls. Run one suite with `pnpm --filter @veritas/core test`. CI builds and tests; no numeric coverage threshold is configured. For UI changes, build, serve, and visually verify against the WebUI conventions.
+Tests use `node:test`, `node:assert/strict`, and `tsx`. Add behavior-focused regression tests using `FakeDriver`, `FakeHttpClient`, or `FakeLlmClient`; avoid real LLM calls. Run one suite with `pnpm --filter @veritas/core test`. CI audits dependencies (`pnpm audit --audit-level low`), builds, typechecks, runs all suites, then the browser and release-tooling tests; no numeric coverage threshold is configured. For UI changes, build, serve, and visually verify against the WebUI conventions.
 
 ## Commit & Pull Request Guidelines
 

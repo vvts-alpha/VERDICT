@@ -19,7 +19,8 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --import tsx --disable-warning=ExperimentalWarning --test 'src/**/*.test.ts'",
-    "clean": "rm -rf dist *.tsbuildinfo"
+    "clean": "rm -rf dist *.tsbuildinfo",
+    "test:browser": "node --test test/*.test.mjs"
   },
   "dependencies": {
     "@veritas/core": "workspace:*",

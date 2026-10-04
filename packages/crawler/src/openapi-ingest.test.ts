@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { parseOpenApiToScreens, apiCallToBuiltScreen } from "./index.js";
+import { InventoryBuilder, parseOpenApiToScreens, apiCallToBuiltScreen } from "./index.js";
 import { buildOpenApi } from "@veritas/core";
 import type { ApiCall, Screen } from "@veritas/core";
 
@@ -174,4 +174,14 @@ test("API upload validation accepts supported operations and rejects wrong forma
   }
   validateOpenApiDocument({ openapi: "3.1.0", paths: { "/items": { post: {} } } });
   validateOpenApiDocument({ swagger: "2.0", paths: { "/items": { get: {} } } });
+});
+
+test("synthetic API endpoints on different origins retain independent screen identities", () => {
+  const inv = new InventoryBuilder();
+  const api = { method: "GET", urlTemplate: "/api/account", auth: "none" as const, reqSchema: null, resSchema: null };
+  const first = inv.ingestBuilt(apiCallToBuiltScreen(api, "https://one.test/")!);
+  const second = inv.ingestBuilt(apiCallToBuiltScreen(api, "https://two.test/")!);
+  assert.notEqual(first.screen.screenId, second.screen.screenId);
+  const resumed = new InventoryBuilder(); resumed.seed(inv.screens());
+  assert.equal(resumed.ingestBuilt(apiCallToBuiltScreen(api, "https://two.test/")!).screen.screenId, second.screen.screenId);
 });

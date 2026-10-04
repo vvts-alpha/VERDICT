@@ -1,3 +1,4 @@
+import { boundedToolText } from "./tool-output.js";
 import { createProviderHeaders } from "@veritas/llm";
 // Provider-agnostic agentic tool-calling loop for the pilot stages, against an OpenAI-compatible
 // /chat/completions endpoint (OpenCodeGo, OpenAI, Ollama, vLLM, LiteLLM, …). This is the non-Anthropic
@@ -80,7 +81,6 @@ const AGENT_PREAMBLE =
     "file system, or web access beyond them. When the goal for this stage is complete, call the stage's done/record tool " +
     "(e.g. survey_done / screen_done / record_finding / record_methodology). Keep any prose brief.\n\n";
 
-const MAX_TOOL_RESULT_CHARS = 16000; // cap each tool result so a large HTTP body can't blow up the context
 
 interface ChatResponse {
     choices?: Array<{ message?: { content?: unknown; tool_calls?: ToolCall[] }; finish_reason?: string }>;
@@ -128,7 +128,7 @@ function textOf(r: ToolResult): string {
         .filter(Boolean)
         .join("\n");
     const body = t || "(no output)";
-    return body.length > MAX_TOOL_RESULT_CHARS ? `${body.slice(0, MAX_TOOL_RESULT_CHARS)}\n…(truncated)` : body;
+    return boundedToolText(body);
 }
 
 // Some compatible models require the newer completion-limit spelling. Remember an explicit server rejection
@@ -146,6 +146,7 @@ async function chatCompletion(
     const url = chatCompletionsUrl(p.baseURL);
     let lastErr = "";
     for (let attempt = 0; attempt < 3; attempt++) {
+        if (p.shouldStop()) throw new Error("Stage stopped before model request");
         const limitField = completionLimitFields.get(p) ?? "max_tokens";
         const body = JSON.stringify({ model: p.model, messages, ...(maxTokens ? { [limitField]: maxTokens } : {}), ...(tools && tools.length ? { tools, tool_choice: "auto" } : {}) });
         const ac = new AbortController();
@@ -178,7 +179,8 @@ async function chatCompletion(
             }
             const response = (await res.json()) as ChatResponse;
             if (response.error && isContextLimitError(JSON.stringify(response.error))) throw new ContextBudgetError(JSON.stringify(response.error).slice(0, 300));
-            if (response.usage?.total_tokens) p.onTokens?.(response.usage.total_tokens);
+            const tokens = response.usage?.total_tokens ?? (response.usage ? (response.usage.prompt_tokens ?? 0) + (response.usage.completion_tokens ?? 0) : 0);
+            if (tokens > 0) p.onTokens?.(tokens);
             return response;
         } catch (e) {
             if (e instanceof ContextBudgetError) throw e;
@@ -263,6 +265,7 @@ async function runNativeMode(p: OpenAiLoopParams, byName: ToolMap): Promise<Open
     let turns = 0;
     let toolCallCount = 0;
     for (let iter = 0; iter < p.maxTurns; iter++) {
+        if (p.shouldStop()) return { turns, stopped: "shouldStop", toolCalls: toolCallCount };
         let resp: ChatResponse;
         try {
             resp = await managedCompletion(p, context, messages, oaTools);
@@ -286,6 +289,7 @@ async function runNativeMode(p: OpenAiLoopParams, byName: ToolMap): Promise<Open
         }
         if (toolCalls.length === 0) return { turns, stopped: "no_tool_calls", toolCalls: toolCallCount };
         for (const tc of toolCalls) {
+            if (p.shouldStop()) return { turns, stopped: "shouldStop", toolCalls: toolCallCount };
             toolCallCount += 1;
             const text = await dispatchTool(byName, tc.function?.name ?? "", parseToolArgs(tc.function?.arguments), p.onToolUse);
             messages.push({ role: "tool", tool_call_id: tc.id, content: text });
@@ -318,6 +322,7 @@ async function runTextMode(p: OpenAiLoopParams, byName: ToolMap): Promise<OpenAi
     const context = createContext(p);
     let turns = 0;
     for (let iter = 0; iter < p.maxTurns; iter++) {
+        if (p.shouldStop()) return { turns, stopped: "shouldStop" };
         let resp: ChatResponse;
         try {
             resp = await managedCompletion(p, context, messages); // no tools param — plain chat
@@ -350,6 +355,7 @@ async function runTextMode(p: OpenAiLoopParams, byName: ToolMap): Promise<OpenAi
             return { turns, stopped: "no_tool_calls" };
         }
         turns += 1;
+        if (p.shouldStop()) return { turns, stopped: "shouldStop" };
         const args = ((action?.args ?? action?.arguments) as Record<string, unknown>) ?? {};
         const result = await dispatchTool(byName, toolName, args, p.onToolUse);
         messages.push({ role: "user", content: `Tool ${toolName} returned:\n${result}\n\nCall the next tool as a JSON object, or reply {"tool":"stop"} if the goal is done.` });

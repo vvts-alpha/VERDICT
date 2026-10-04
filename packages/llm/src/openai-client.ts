@@ -26,6 +26,7 @@ export interface OpenAiClientOptions {
 }
 
 interface ChatCompletionsResponse {
+    usage?: { total_tokens?: number; prompt_tokens?: number; completion_tokens?: number };
     model?: string;
     choices?: Array<{ message?: { role?: string; content?: string } }>;
 }
@@ -76,7 +77,8 @@ export class OpenAiClient implements LlmClient {
             if (typeof text !== "string") {
                 throw new Error(`OpenAI-compatible response from ${url} had no choices[0].message.content: ${JSON.stringify(json).slice(0, 300)}`);
             }
-            return { text, model: json.model ?? model };
+            const tokensUsed = json.usage?.total_tokens ?? (json.usage ? (json.usage.prompt_tokens ?? 0) + (json.usage.completion_tokens ?? 0) : undefined);
+            return { text, model: json.model ?? model, ...(tokensUsed !== undefined ? { tokensUsed } : {}) };
         } catch (e) {
             if (ac.signal.aborted) throw new Error(`OpenAI-compatible request to ${url} timed out after ${timeout}ms`);
             throw e instanceof Error ? e : new Error(String(e));
