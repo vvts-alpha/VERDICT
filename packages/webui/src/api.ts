@@ -5,21 +5,24 @@ import type { StateView, WsMessage } from "@veritas/core";
 
 export type ConnState = "connecting" | "open" | "closed";
 
-/** POST a minimal control action (§8.3) to the server. The result is reflected in the UI via a WS push. */
-export async function postControl(path: string): Promise<void> {
+/** POST a minimal control action (§8.3) to the server. Success is reflected in the UI via a WS push.
+ *  Returns `true` on 2xx, otherwise an error string — callers surface it instead of failing silently. */
+export async function postControl(path: string): Promise<true | string> {
   try {
-    await fetch(path, { method: "POST" });
+    const r = await fetch(path, { method: "POST" });
+    return r.ok ? true : `HTTP ${r.status}`;
   } catch {
-    /* WS re-syncs on the next tick */
+    return "server unreachable"; // WS re-syncs on the next tick if the action still went through
   }
 }
 
-/** Control POST with a JSON body (e.g. bulk exclude). The result is reflected in the UI via a WS push. */
-export async function postControlBody(path: string, body: unknown): Promise<void> {
+/** Control POST with a JSON body (e.g. bulk exclude). Same contract as postControl. */
+export async function postControlBody(path: string, body: unknown): Promise<true | string> {
   try {
-    await fetch(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const r = await fetch(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    return r.ok ? true : `HTTP ${r.status}`;
   } catch {
-    /* WS re-syncs on the next tick */
+    return "server unreachable";
   }
 }
 
@@ -68,7 +71,12 @@ export function useStateView(id: string | null): { view: StateView | null; conn:
       setConn("connecting");
       ws.onopen = () => setConn("open");
       ws.onmessage = (ev) => {
-        const msg = JSON.parse(ev.data as string) as WsMessage;
+        let msg: WsMessage;
+        try {
+          msg = JSON.parse(ev.data as string) as WsMessage;
+        } catch {
+          return; // a malformed frame must not kill the stream
+        }
         if (msg.type === "snapshot" || msg.type === "events") setView(msg.view);
       };
       ws.onclose = () => {

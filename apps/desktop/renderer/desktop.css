@@ -13,7 +13,7 @@
   font-size: 12px; font-weight: 700; letter-spacing: 2px; color: var(--fg); cursor: default;
   transition: color 0.12s;
 }
-.desk-brand:hover { color: #fff; }
+.desk-brand:hover { color: var(--fg-strong); }
 .desk-mark { width: 9px; height: 9px; border-radius: 2px; background: var(--accent); display: inline-block; }
 .desk-drag { flex: 1 1 auto; }
 .desk-winctl { display: flex; align-items: stretch; -webkit-app-region: no-drag; }
@@ -23,7 +23,7 @@
   color: var(--muted); cursor: default; transition: background 0.12s, color 0.12s;
 }
 .desk-wbtn:hover { background: color-mix(in srgb, var(--fg) 10%, transparent); color: var(--fg); }
-.desk-wclose:hover { background: var(--err); color: #fff; }
+.desk-wclose:hover { background: var(--err); color: var(--fg-strong); }
 /* the app content fills the space under the title bar; full-height children (.page/.app) shrink to fit */
 .desk-content { flex: 1 1 auto; min-height: 0; overflow: auto; position: relative; }
 .desk-content > .page, .desk-content > .app { height: 100%; }
@@ -59,14 +59,14 @@
 }
 .attb-capture {
   height: 28px; padding: 0 12px; border-radius: 6px; font-weight: 700; font-size: 12px; cursor: default;
-  background: #1d3a4f; border: 1px solid #2f6f8f; color: #cfe;
+  background: var(--cta-bg); border: 1px solid var(--cta-line); color: var(--tint-ink);
 }
-.attb-capture:hover { background: #244a63; }
+.attb-capture:hover { background: var(--cta-bg-hover); }
 .attb-scan {
   height: 28px; padding: 0 12px; border-radius: 6px; font-weight: 700; font-size: 12px; cursor: default; white-space: nowrap;
-  background: #1d4f3a; border: 1px solid #2f8f6f; color: #cfe9dc;
+  background: var(--scan-bg); border: 1px solid var(--scan-line); color: var(--scan-ink);
 }
-.attb-scan:hover:not(:disabled) { background: #245f47; }
+.attb-scan:hover:not(:disabled) { background: var(--scan-bg-hover); }
 .attb-scan:disabled { opacity: 0.5; }
 .attb-close {
   height: 28px; padding: 0 12px; border-radius: 6px; font-size: 12px; cursor: default;
@@ -79,12 +79,23 @@
 }
 .attb-copy:disabled { opacity: 0.35; }
 .attb-copy:not(:disabled):hover { background: var(--btn-hover); }
+/* Row 2 of the attended panel — the session-flow actions (capture → contextual continue). Wraps instead of
+   ever pushing the browser chrome around; grows as the captured session unlocks more actions. */
+.attb-actions {
+  display: flex; align-items: center; gap: 6px; padding: 6px 8px; flex-wrap: wrap;
+  background: var(--panel); border-bottom: 1px solid var(--line);
+}
+.attb-role { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); white-space: nowrap; }
+.attb-role select {
+  background: var(--inset); color: var(--fg); border: 1px solid var(--line); border-radius: 6px;
+  padding: 4px 6px; font: inherit; font-size: 12px;
+}
 .attb-note { padding: 5px 12px; font-size: 12px; border-bottom: 1px solid var(--line); }
 .attb-note.ok { color: var(--accent); }
 .attb-note.err { color: var(--err); }
 .attb-handoff {
   padding: 6px 12px; font-size: 12px; line-height: 1.45;
-  color: #f0d9a8; background: #3a2e1a; border-bottom: 1px solid var(--warn, #c9a227);
+  color: var(--warn-tint-ink); background: var(--warn-tint-bg); border-bottom: 1px solid var(--warn);
 }
 /* placeholder the native Chromium view is drawn over — keep it empty (a subtle ground while it loads) */
 .attb-view { flex: 1 1 auto; min-height: 0; background: var(--inset); }
@@ -113,19 +124,27 @@
 .settings-pane { overflow-y: auto; padding: 2px 4px 2px 0; }
 .settings-toggle { display: flex; align-items: flex-start; gap: 8px; margin: 6px 0 14px; color: var(--fg); font-size: 13px; cursor: default; }
 .settings-toggle input { margin-top: 3px; }
-.settings-toggle em { display: block; font-style: normal; color: #5a6472; font-size: 11px; }
+.settings-toggle em { display: block; font-style: normal; color: var(--faint); font-size: 11px; }
 .settings-note-inline { color: var(--muted); font-size: 12px; line-height: 1.6; margin: 8px 0; }
 .settings-about { margin-top: 10px; }
-.settings-about-row { display: flex; justify-content: space-between; align-items: baseline; padding: 6px 0; border-bottom: 1px solid var(--border, #2a2f37); font-size: 13px; }
+.settings-about-row { display: flex; justify-content: space-between; align-items: baseline; padding: 6px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
 .settings-about-row > span { color: var(--muted); }
 .settings-about-row > b { font-variant-numeric: tabular-nums; }
-.settings-head h2 { margin: 0; font-size: 16px; color: #fff; }
+.settings-head h2 { margin: 0; font-size: 16px; color: var(--fg-strong); }
 .settings-x { background: transparent; border: 0; color: var(--muted); font-size: 20px; line-height: 1; cursor: default; }
 .settings-x:hover { color: var(--fg); }
+/* Inline confirm bar for closing with unsaved edits (replaces a native confirm() dialog) */
+.settings-discard {
+  display: flex; align-items: center; gap: 10px; margin: 10px 0 4px; padding: 8px 12px;
+  background: var(--warn-tint-bg); border: 1px solid var(--warn); border-radius: 6px;
+  color: var(--warn-tint-ink); font-size: 12px;
+}
+.settings-discard > span { flex: 1; }
+.settings-discard .yes { background: var(--warn); color: var(--on-warn); border-color: var(--warn); font-weight: 700; }
 .settings-sec { margin: 16px 0 6px; font-size: 11px; letter-spacing: 0.5px; text-transform: uppercase; color: var(--accent); }
 .settings-field { display: flex; flex-direction: column; gap: 4px; margin: 8px 0; }
 .settings-field > span { color: var(--muted); font-size: 12px; }
-.settings-field > span em { font-style: normal; color: #5a6472; font-size: 11px; margin-left: 6px; }
+.settings-field > span em { font-style: normal; color: var(--faint); font-size: 11px; margin-left: 6px; }
 .settings-field input, .settings-field select {
   background: var(--inset); color: var(--fg); border: 1px solid var(--line); border-radius: 6px;
   padding: 8px 10px; font: inherit; font-size: 12px;
@@ -134,10 +153,10 @@
 .settings-grid .settings-field, .settings-grid input { min-width: 0; }
 .settings-actions { display: flex; align-items: center; gap: 12px; margin-top: 20px; }
 .settings-save {
-  background: #1d3a4f; border: 1px solid #2f6f8f; color: #cfe; padding: 8px 20px;
+  background: var(--cta-bg); border: 1px solid var(--cta-line); color: var(--tint-ink); padding: 8px 20px;
   border-radius: 6px; font-weight: 700; font-size: 12px; cursor: default;
 }
-.settings-save:hover { background: #244a63; }
+.settings-save:hover { background: var(--cta-bg-hover); }
 .settings-saved { color: var(--ok); font-size: 12px; }
 
 .settings-checks { max-height: 180px; overflow-y: auto; font-size: 12px; line-height: 1.5; }

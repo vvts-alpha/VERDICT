@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 VERDICT is a TypeScript/pnpm monorepo for web/API security assessments. The primary interface is the Electron desktop app.
 
 - **Contributor guidance:** follow `AGENTS.md`; see `DESIGN.md` for architecture and `docs/WEBUI_CONVENTIONS.md` for UI rules.
-- **Public documentation:** `README.md` is the desktop quickstart; `docs/USAGE.md` covers CLI/operator workflows. Internal plans, handoff notes, and private run artifacts stay local and must not be committed.
+- **Public documentation:** `README.md` is the desktop quickstart; `docs/USAGE.md` covers CLI/operator workflows; `docs/VULNERABILITIES.md` records coverage/limitations. Internal plans, handoff notes, and private run artifacts stay local and must not be committed.
 - **Benchmark publications:** reports and benchmark tooling belong in https://github.com/vvts-alpha/verdict-pub, not this source repository.
 - **Authorized targets only.** Every network action passes the scope gate (`isInScope`); out-of-scope is denied. `--url` derives scope as same-origin + path-prefix; a manifest gives explicit scope.
 
@@ -31,6 +31,8 @@ pnpm -r build           # build all packages (respects workspace dep order)
 pnpm -r typecheck       # tsc --noEmit across packages
 pnpm -r test            # node:test via tsx across packages
 pnpm -r clean
+pnpm test:browser       # real-browser crawler tests (needs chromium installed)
+pnpm test:release       # node --test tools/*.test.cjs (release tooling gates)
 
 pnpm --filter @veritas/core build      # one package
 pnpm --filter @veritas/crawler test    # one package's whole suite
@@ -71,6 +73,8 @@ pnpm --filter @veritas/cli dev <command> [opts]            # tsx, src-resolved
 | `run` / `crawl` / `label` / `scan` / `logic` | Deterministic pipeline steps (the internals of `assess`). |
 | `report` / `status` / `list` | `report --format md,html,csv,pdf` (the `pdf` path prints `renderReportHtml` output through `crawler/pdf.ts`'s Chromium `page.pdf()`, so it needs a browser binary); phase/coverage/stop-condition; list `runs/`. |
 | `inventory` / `openapi` | Dump/derive the screen inventory (the deterministic-pipeline internals). |
+
+Retired reconnaissance commands (`asr`, `--from-asr`) were removed; `packages/cli/src/removed-commands.test.ts` guards that they stay rejected — don't reintroduce them.
 
 ## Architecture (big picture)
 
@@ -118,6 +122,7 @@ The Electron desktop shell hosts `@veritas/server` in-process on an ephemeral lo
 - **Auth = operator-provided material (creds OR a pre-captured cookie file).** A role is either credentials (`{name, pass}` → `smartLogin` auto-discovers the login form) OR a cookie file (`{name, cookieFile}` → `loadCookieFile` reads a raw `Cookie:` header or a Playwright `storageState` JSON, and the `login` tool injects it into the browser + http session). The cookie path is for walls the agent can't auto-login (Arkose/MFA). **The agent never fabricates or steals cookies — it only uses material the operator explicitly supplies; cookie files are secrets (gitignored).** MFA/CAPTCHA without a cookie file → `detectStuck` raises a non-blocking `HumanHandoff` (headed browser, human logs in the live profile). `roles[0]` = primary; multiple roles drive `authDiffScreen`.
 - **Brand is "VERDICT" but code-internal names are intentionally kept (VERITAS→AMRAAM→VERDICT lineage).** Everything an operator sees is VERDICT: display brand, the traffic marker (`x-verdict`), the scanner UA (`verdict-scanner`), the session cookie (`verdict_session`), and the env vars **`VERDICT_WEB_PASSWORD[_VIEWER]`** / **`VERDICT_BROWSER_PATH`** (the old `AMRAAM_WEB_PASSWORD*` / `VERITAS_BROWSER_PATH` names are still accepted as **fallbacks** so existing `.env` files don't break — see `cmdServe` and the browser-path resolution in `packages/cli/src/main.ts`). But the **truly invisible code namespaces stay VERITAS/AMRAAM-era**: the package scope **`@veritas/*`**, the MCP namespace **`mcp__veritas__`** (tool prefix in `STAGE_TOOLS`/`allowedTools`), the in-page globals **`__veritasRoutes`/`__verdict_xss`**, and only the Burp extension's Java **package + maven group `com.amraam.burpaudit`** (the package path & group stay AMRAAM-era; everything else about the extension is VERDICT — display name "VERDICT Audit REST", jar `verdict-burp-audit.jar`, config `verdict-audit.properties`, env `VERDICT_AUDIT_*`). Renaming those namespaces is churn across every import/package.json/gradle with zero user benefit — don't "fix" the inconsistency.
 - **Burp integration is opt-in and additive.** `--burp-proxy` and `burp-import` only act when invoked; with the flag off, behaviour is byte-identical (the `undici` ProxyAgent is lazy-imported only when a proxy is set). Keep it that way.
+- **Never commit run artifacts or secrets.** `.gitignore` blocks these on purpose: `runs/` (state + evidence), `projects/` (per-target workdirs), `cookies/` + `*.cookies*` + `*cookie*.json` (session secrets), `scope_manifest_*.json` (real manifests), `*.burp.xml` (raw req/resp), `vault.json`, `.env`, `browser-profiles/`. Only `templates/scope_manifest.example.json` is committable.
 
 ## TypeScript strictness gotchas
 

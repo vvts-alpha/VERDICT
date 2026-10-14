@@ -76,7 +76,8 @@ export function DesktopChrome({ children }: { children: ReactNode }) {
                     <span className="desk-mark" aria-hidden="true" />
                     VERDICT
                 </button>
-                <div className="desk-drag" />
+                {/* Native title-bar convention: double-click the empty drag region to toggle maximize/restore. */}
+                <div className="desk-drag" onDoubleClick={() => desktop?.toggleMaximize()} />
                 <button
                     type="button"
                     className={`desk-tool${onMain ? " active" : ""}`}

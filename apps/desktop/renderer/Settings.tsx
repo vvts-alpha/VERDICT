@@ -51,6 +51,10 @@ export function Settings({ onClose }: { onClose: () => void }) {
     const modelDrafts = useRef<Partial<Record<ModelProvider, Pick<DesktopSettings, "baseURL" | "apiKey" | "deepModel" | "lightModel" | "deepContextTokens" | "lightContextTokens">>>>({});
     const [section, setSection] = useState<Section>("Models");
     const [saved, setSaved] = useState(false);
+    // True while the form holds edits the main process has not stored — guards the silent-discard close paths.
+    const [dirty, setDirty] = useState(false);
+    // Closing with unsaved edits shows an inline confirm bar instead of a native confirm() dialog.
+    const [confirmDiscard, setConfirmDiscard] = useState(false);
     const [checking, setChecking] = useState(false);
     const [checks, setChecks] = useState<ReadinessCheck[]>([]);
     const [error, setError] = useState("");
@@ -58,13 +62,18 @@ export function Settings({ onClose }: { onClose: () => void }) {
     const [info, setInfo] = useState<AppInfo | null>(null);
 
     useEffect(() => {
-        void bridge()?.get().then((v) => setS(v ?? EMPTY));
+        void bridge()?.get().then((v) => {
+            setS(v ?? EMPTY);
+            setDirty(false);
+        });
         void appBridge()?.info().then(setInfo);
     }, []);
 
     const set = <K extends keyof DesktopSettings>(k: K, v: DesktopSettings[K]): void => {
         setS((prev) => ({ ...prev, [k]: v }));
         setSaved(false);
+        setDirty(true);
+        setConfirmDiscard(false); // fresh edits re-arm the close guard
         setChecks([]);
         editVersion.current++;
     };
@@ -77,6 +86,8 @@ export function Settings({ onClose }: { onClose: () => void }) {
         const draft = modelDrafts.current[provider] ?? { baseURL: MODEL_PROVIDERS[provider].baseURL };
         setS({ ...s, provider, baseURL: draft.baseURL, apiKey: draft.apiKey, deepModel: draft.deepModel, lightModel: draft.lightModel, deepContextTokens: draft.deepContextTokens, lightContextTokens: draft.lightContextTokens });
         setSaved(false);
+        setDirty(true);
+        setConfirmDiscard(false);
         setChecks([]);
         setError("");
         editVersion.current++;
@@ -91,6 +102,8 @@ export function Settings({ onClose }: { onClose: () => void }) {
             if (v) {
                 setS(v);
                 setSaved(true);
+                setDirty(false);
+                setConfirmDiscard(false);
             }
         } catch (e) { setError(e instanceof Error ? e.message : "Settings could not be saved."); }
     };
@@ -105,13 +118,29 @@ export function Settings({ onClose }: { onClose: () => void }) {
 
     const openai = s.provider !== "claude-cli";
 
+    // Backdrop click and × must not silently discard edits — show the inline confirm bar first.
+    const requestClose = (): void => {
+        if (dirty && !confirmDiscard) {
+            setConfirmDiscard(true);
+            return;
+        }
+        onClose();
+    };
+
     return (
-        <div className="settings-overlay" onClick={onClose}>
+        <div className="settings-overlay" onClick={requestClose}>
             <div className="settings-card" onClick={(e) => e.stopPropagation()}>
                 <div className="settings-head">
                     <h2>Settings</h2>
-                    <button type="button" className="settings-x" onClick={onClose} aria-label="Close">×</button>
+                    <button type="button" className="settings-x" onClick={requestClose} aria-label="Close">×</button>
                 </div>
+                {confirmDiscard ? (
+                    <div className="settings-discard" role="alert">
+                        <span>Unsaved changes — discard them?</span>
+                        <button type="button" className="yes" onClick={onClose}>Discard</button>
+                        <button type="button" onClick={() => setConfirmDiscard(false)}>Keep editing</button>
+                    </div>
+                ) : null}
 
                 <div className="settings-body">
                     <nav className="settings-nav">

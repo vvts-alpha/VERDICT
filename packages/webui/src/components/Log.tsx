@@ -37,7 +37,7 @@ export function Log({ events }: { events: StateEvent[] }) {
   if (events.length === 0) {
     return <p className="muted log-empty">No activity yet.</p>;
   }
-  const rows = [...events].reverse(); // newest first (what's happening now is on top)
+  const rows = [...events].slice(-300).reverse(); // newest first + capped (same bound as the store projection)
   return (
     <div className="log">
       {rows.map((e) => (

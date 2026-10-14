@@ -24,6 +24,18 @@ export function App() {
   const { view, conn } = useStateView(id);
   const [selected, setSelected] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>("screen");
+  // Transient error toast for rejected/dropped control POSTs (they used to fail silently).
+  const [notice, setNotice] = useState<string | null>(null);
+  useEffect(() => {
+    if (!notice) return;
+    const t = window.setTimeout(() => setNotice(null), 4500);
+    return () => window.clearTimeout(t);
+  }, [notice]);
+  const ctl = (label: string, p: Promise<true | string>): void => {
+    void p.then((r) => {
+      if (r !== true) setNotice(`${label} failed — ${r}`);
+    });
+  };
 
   // Poll the number of sessions awaiting login → highlight the Sessions tab (a sign the operator's input is needed).
   const [awaitingSessions, setAwaitingSessions] = useState(0);
@@ -54,7 +66,7 @@ export function App() {
   }
 
   const selectedScreen = view.screens.find((s) => s.screenId === selected) ?? view.screens[0];
-  const control = (path: string) => () => void postControl(`/api/assessments/${view.id}/${path}`);
+  const control = (path: string, label = "control") => () => ctl(label, postControl(`/api/assessments/${view.id}/${path}`));
   const onSelect = (sid: string): void => {
     setSelected(sid);
     setTab("screen");
@@ -62,10 +74,10 @@ export function App() {
 
   return (
     <div className="page">
-      <StatusBar view={view} conn={conn} onTogglePause={control(view.paused ? "resume" : "pause")} />
+      <StatusBar view={view} conn={conn} onTogglePause={control(view.paused ? "resume" : "pause", "pause/resume")} />
       <HandoffBar
         handoffs={view.handoffs}
-        onResolve={(hid) => void postControl(`/api/assessments/${view.id}/handoffs/${hid}/resolve`)}
+        onResolve={(hid) => ctl("resolve handoff", postControl(`/api/assessments/${view.id}/handoffs/${hid}/resolve`))}
       />
       <Progress view={view} />
       <div className="body">
@@ -73,7 +85,7 @@ export function App() {
           tree={view.tree}
           selected={selectedScreen?.screenId ?? null}
           onSelect={onSelect}
-          onExclude={(ids) => void postControlBody(`/api/assessments/${view.id}/exclude-screens`, { screenIds: ids })}
+          onExclude={(ids) => ctl("exclude screens", postControlBody(`/api/assessments/${view.id}/exclude-screens`, { screenIds: ids }))}
         />
         <main className="scroll">
           <div className="tabs">
@@ -118,7 +130,7 @@ export function App() {
               <ScreenView
                 view={view}
                 screen={selectedScreen}
-                onExclude={(sid) => void postControl(`/api/assessments/${view.id}/screens/${sid}/exclude`)}
+                onExclude={(sid) => ctl("exclude screen", postControl(`/api/assessments/${view.id}/screens/${sid}/exclude`))}
               />
             ) : null}
             {tab === "findings" ? <Findings view={view} onJump={onSelect} /> : null}
@@ -133,6 +145,11 @@ export function App() {
           </div>
         </main>
       </div>
+      {notice ? (
+        <div className="ctlnote" role="alert">
+          {notice}
+        </div>
+      ) : null}
     </div>
   );
 }

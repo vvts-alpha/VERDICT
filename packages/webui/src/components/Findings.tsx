@@ -7,6 +7,7 @@ const SEVS = ["critical", "high", "medium", "low", "info"];
 
 export function Findings({ view, onJump }: { view: StateView; onJump: (screenId: string) => void }) {
   const [sev, setSev] = useState<string | null>(null);
+  const [q, setQ] = useState("");
   const all = view.findings;
 
   if (all.length === 0) {
@@ -20,7 +21,9 @@ export function Findings({ view, onJump }: { view: StateView; onJump: (screenId:
 
   const counts: Record<string, number> = {};
   for (const f of all) counts[f.severity] = (counts[f.severity] ?? 0) + 1;
+  const needle = q.trim().toLowerCase();
   const shown = (sev ? all.filter((f) => f.severity === sev) : all)
+    .filter((f) => !needle || `${f.id} ${f.title}\n${f.description}`.toLowerCase().includes(needle))
     .slice()
     .sort((a, b) => (SEV_ORDER[a.severity] ?? 9) - (SEV_ORDER[b.severity] ?? 9));
 
@@ -41,6 +44,14 @@ export function Findings({ view, onJump }: { view: StateView; onJump: (screenId:
             {s} ({counts[s] ?? 0})
           </button>
         ))}
+        <input
+          className="ffind"
+          type="search"
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          placeholder="filter text…"
+          aria-label="Filter findings by text"
+        />
       </div>
       <div className="findings">
         {shown.map((f) => {

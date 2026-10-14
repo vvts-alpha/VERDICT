@@ -69,6 +69,30 @@ function isAppUrl(url: string, origin: string): boolean {
     try { return new URL(url).origin === new URL(origin).origin; } catch { return false; }
 }
 
+/** The single window factory — initial boot AND the macOS dock re-activate path must produce the identical
+ *  shell: frameless with the preload bridge (DesktopChrome renders only when window.verdictDesktop exists)
+ *  plus the popup policy and load logging. A previous drift left the re-activated window framed and without
+ *  the preload, so the desktop chrome silently vanished on macOS. */
+function createMainWindow(): BrowserWindow {
+    const created = new BrowserWindow({
+        width: 1400,
+        height: 900,
+        minWidth: 900,
+        minHeight: 600,
+        title: "VERDICT",
+        backgroundColor: "#0f1116", // matches the web UI --bg so there is no white flash before load
+        frame: false, // custom in-app title bar (DesktopChrome) — the app frame, not a browser window
+        webPreferences: {
+            contextIsolation: true,
+            nodeIntegration: false,
+            preload: join(APP_ROOT, "preload.cjs"),
+        },
+    });
+    attachPopupPolicy(created.webContents);
+    created.webContents.on("did-fail-load", (_e, code, desc, url) => console.error(`[verdict] did-fail-load ${code} ${desc} ${url}`));
+    return created;
+}
+
 async function boot(): Promise<void> {
     // All writable state lives under userData (the install dir is read-only in a packaged app).
     const runsDir = join(app.getPath("userData"), "runs");
@@ -155,20 +179,7 @@ async function boot(): Promise<void> {
         attachPopupPolicy(created.webContents);
     });
 
-    win = new BrowserWindow({
-        width: 1400,
-        height: 900,
-        minWidth: 900,
-        minHeight: 600,
-        title: "VERDICT",
-        backgroundColor: "#0f1116", // matches the web UI --bg so there is no white flash before load
-        frame: false, // custom in-app title bar (DesktopChrome) — the app frame, not a browser window
-        webPreferences: {
-            contextIsolation: true,
-            nodeIntegration: false,
-            preload: join(APP_ROOT, "preload.cjs"),
-        },
-    });
+    win = createMainWindow();
 
     // Window controls (the custom title bar calls these over the preload bridge).
     ipcMain.on("win:minimize", () => win?.minimize());
@@ -191,8 +202,6 @@ async function boot(): Promise<void> {
 
     // Attended embedded browser (human login / CAPTCHA inside the one window; session handoff to the auto pilot).
     const attb = setupAttendedBrowser(win, runsDir);
-    attachPopupPolicy(win.webContents);
-    win.webContents.on("did-fail-load", (_e, code, desc, url) => console.error(`[verdict] did-fail-load ${code} ${desc} ${url}`));
     await win.loadURL(server.url); // resolves after the page finishes loading
 
     // Debug self-test: VERDICT_ATTB_URL loads that URL in the embedded browser, captures the VIEW (proving Electron's
@@ -244,7 +253,8 @@ app.whenReady()
 
 app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0 && server) {
-        win = new BrowserWindow({ width: 1400, height: 900, title: "VERDICT", backgroundColor: "#0f1116" });
+        // Same factory as boot: frameless + preload, so the desktop chrome is identical after a macOS re-activate.
+        win = createMainWindow();
         void win.loadURL(server.url);
     }
 });

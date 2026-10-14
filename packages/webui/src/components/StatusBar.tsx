@@ -121,6 +121,13 @@ export function StatusBarShell({
   );
 }
 
+/** Token counter: 115116300 → "115.1M", 15342 → "15.3k", 742 → "742". */
+function fmtTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+  return String(n);
+}
+
 export function StatusBar({
   view,
   conn,
@@ -144,7 +151,7 @@ export function StatusBar({
           <span title="Screens omitted from diagnosis">excluded: <b>{c.byStatus.excluded}</b></span>
           <span title="Queued, in progress, blocked, or failed; diagnosis is not complete">unfinished: <b>{c.remaining}</b></span>
           <span>findings: <b>{view.findings.length}</b></span>
-          <span>tokens: <b>{view.budget.tokensUsed >= 1000 ? `${(view.budget.tokensUsed / 1000).toFixed(1)}k` : view.budget.tokensUsed}</b></span>
+          <span>tokens: <b>{fmtTokens(view.budget.tokensUsed)}</b></span>
           <span>handoffs: <b>{view.handoffs.filter((h) => h.status === "pending").length}</b></span>
         </>
       }

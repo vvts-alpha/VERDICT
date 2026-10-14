@@ -1,16 +1,11 @@
-import { useState } from "react";
+import { useEffect, useMemo, useState, type KeyboardEvent } from "react";
 import type { TreeNode } from "@veritas/core";
 import { useRole } from "../api";
 
 // Exclude targets = only screens not yet scanned (or in-progress/errored). Keep clean/finding/suspected.
 const EXCLUDABLE = new Set(["queued", "scanning", "error"]);
-function collectExcludable(node: TreeNode, out: string[] = []): string[] {
-  if (node.screenId && (node.scanStatus === null || EXCLUDABLE.has(node.scanStatus))) out.push(node.screenId);
-  for (const c of node.children) collectExcludable(c, out);
-  return out;
-}
 
-// Status → accessibility label (the dot's color is handled by CSS).
+// Status → accessibility label (the row's tooltip; the dot's color is handled by CSS).
 const STATUS_LABEL: Record<string, string> = {
   queued: "queued",
   scanning: "scanning",
@@ -29,6 +24,20 @@ function countFindings(node: TreeNode): number {
   return n;
 }
 
+/** One DFS over the tree → excludable screen-ids per subtree (replaces per-node subtree walks: O(n) total). */
+function buildExcludableMap(tree: TreeNode[]): Map<TreeNode, string[]> {
+  const map = new Map<TreeNode, string[]>();
+  const walk = (n: TreeNode): string[] => {
+    const out: string[] = [];
+    if (n.screenId && (n.scanStatus === null || EXCLUDABLE.has(n.scanStatus))) out.push(n.screenId);
+    for (const c of n.children) out.push(...walk(c));
+    map.set(n, out);
+    return out;
+  };
+  for (const n of tree) walk(n);
+  return map;
+}
+
 function Node({
   node,
   selected,
@@ -37,6 +46,10 @@ function Node({
   toggle,
   canWrite,
   onExclude,
+  excludableMap,
+  focusPath,
+  defaultPath,
+  onFocusRow,
 }: {
   node: TreeNode;
   selected: string | null;
@@ -45,6 +58,10 @@ function Node({
   toggle: (path: string) => void;
   canWrite: boolean;
   onExclude: (screenIds: string[], label: string) => void;
+  excludableMap: Map<TreeNode, string[]>;
+  focusPath: string | null;
+  defaultPath: string | undefined;
+  onFocusRow: (path: string) => void;
 }) {
   const isSelected = node.screenId !== null && node.screenId === selected;
   const status = node.scanStatus ?? "";
@@ -53,14 +70,55 @@ function Node({
   // If a collapsed branch has findings, show a count badge (when expanded, each child shows its own).
   const rolledFindings = hasChildren && isCollapsed ? countFindings(node) : 0;
   // Excludable (un-scanned) screens in this subtree. Can be excluded wholesale from the parent node.
-  const excludable = canWrite ? collectExcludable(node) : [];
+  const excludable = canWrite ? excludableMap.get(node) ?? [] : [];
+  // Multi-screen exclusion arms the button instead of a blocking window.confirm — click again within 3s to confirm.
+  const [armed, setArmed] = useState(false);
+  useEffect(() => {
+    if (!armed) return;
+    const t = setTimeout(() => setArmed(false), 3000);
+    return () => clearTimeout(t);
+  }, [armed]);
+
+  const activate = (): void => {
+    if (node.screenId) onSelect(node.screenId);
+    else if (hasChildren) toggle(node.path);
+  };
+  // Tree keyboard nav: Enter/Space activates; Right expands, Left collapses; Up/Down moves between visible rows.
+  const onKey = (e: KeyboardEvent<HTMLDivElement>): void => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      activate();
+      return;
+    }
+    if (e.key === "ArrowRight" && hasChildren && isCollapsed) {
+      toggle(node.path);
+      return;
+    }
+    if (e.key === "ArrowLeft" && hasChildren && !isCollapsed) {
+      toggle(node.path);
+      return;
+    }
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      const rows = Array.from(e.currentTarget.closest(".tree")?.querySelectorAll<HTMLElement>(".node") ?? []);
+      const next = rows[rows.indexOf(e.currentTarget) + (e.key === "ArrowDown" ? 1 : -1)];
+      next?.focus();
+    }
+  };
 
   return (
-    <li>
+    <li role="none">
       <div
         className={`node ${isSelected ? "sel" : ""} ${status}`}
-        onClick={() => (node.screenId ? onSelect(node.screenId) : hasChildren && toggle(node.path))}
+        onClick={activate}
+        onKeyDown={onKey}
+        onFocus={() => onFocusRow(node.path)}
         data-screen={node.screenId ?? ""}
+        role="treeitem"
+        tabIndex={node.path === (focusPath ?? defaultPath) ? 0 : -1}
+        aria-selected={node.screenId ? isSelected : undefined}
+        aria-expanded={hasChildren ? !isCollapsed : undefined}
+        title={STATUS_LABEL[status]}
       >
         {hasChildren ? (
           <button
@@ -70,6 +128,7 @@ function Node({
               e.stopPropagation();
               toggle(node.path);
             }}
+            tabIndex={-1}
             aria-label={isCollapsed ? "expand" : "collapse"}
           >
             ▸
@@ -77,7 +136,7 @@ function Node({
         ) : (
           <span className="twist-spacer" />
         )}
-        <span className="dot" title={STATUS_LABEL[status] ?? ""} />
+        <span className="dot" aria-hidden="true" />
         <span className="seg" {...(/^\{.*\}$/.test(node.segment) ? { "data-dyn": "" } : {})}>
           {node.segment}
         </span>
@@ -86,21 +145,39 @@ function Node({
         {excludable.length > 0 ? (
           <button
             type="button"
-            className="tree-exclude"
-            title={hasChildren ? `Exclude this branch — ${excludable.length} un-scanned screen(s)` : "Exclude this screen from scanning"}
+            className={`tree-exclude${armed ? " armed" : ""}`}
+            title={armed ? "Click again to confirm" : hasChildren ? `Exclude this branch — ${excludable.length} un-scanned screen(s)` : "Exclude this screen from scanning"}
             onClick={(e) => {
               e.stopPropagation();
+              if (excludable.length > 1 && !armed) {
+                setArmed(true);
+                return;
+              }
               onExclude(excludable, node.path);
             }}
+            tabIndex={-1}
           >
-            ⊘{excludable.length > 1 ? ` ${excludable.length}` : ""}
+            {armed ? `Exclude ${excludable.length}?` : `⊘${excludable.length > 1 ? ` ${excludable.length}` : ""}`}
           </button>
         ) : null}
       </div>
       {hasChildren && !isCollapsed ? (
-        <ul>
+        <ul role="group">
           {node.children.map((child) => (
-            <Node key={child.path} node={child} selected={selected} onSelect={onSelect} collapsed={collapsed} toggle={toggle} canWrite={canWrite} onExclude={onExclude} />
+            <Node
+              key={child.path}
+              node={child}
+              selected={selected}
+              onSelect={onSelect}
+              collapsed={collapsed}
+              toggle={toggle}
+              canWrite={canWrite}
+              onExclude={onExclude}
+              excludableMap={excludableMap}
+              focusPath={focusPath}
+              defaultPath={defaultPath}
+              onFocusRow={onFocusRow}
+            />
           ))}
         </ul>
       ) : null}
@@ -121,6 +198,9 @@ export function SiteTree({
 }) {
   const { canWrite } = useRole();
   const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
+  // Roving tabindex: the focused row is the tree's single Tab stop (default = first row).
+  const [focusPath, setFocusPath] = useState<string | null>(null);
+  const excludableMap = useMemo(() => buildExcludableMap(tree), [tree]);
   const toggle = (path: string): void =>
     setCollapsed((prev) => {
       const next = new Set(prev);
@@ -128,21 +208,30 @@ export function SiteTree({
       else next.add(path);
       return next;
     });
-  // Confirm only when excluding multiple (a subtree). A single screen is excluded immediately.
-  const handleExclude = (screenIds: string[], label: string): void => {
-    if (screenIds.length > 1 && !window.confirm(`Exclude ${screenIds.length} un-scanned screen(s) under "${label}" from scanning?`)) return;
-    onExclude(screenIds);
-  };
+
 
   return (
-    <nav className="tree">
+    <nav className="tree" aria-label="Site tree">
       <div className="pane-title">SITE TREE</div>
       {tree.length === 0 ? (
         <p className="muted">no screens yet — run a crawl</p>
       ) : (
-        <ul className="root">
+        <ul className="root" role="tree">
           {tree.map((node) => (
-            <Node key={node.path} node={node} selected={selected} onSelect={onSelect} collapsed={collapsed} toggle={toggle} canWrite={canWrite} onExclude={handleExclude} />
+            <Node
+              key={node.path}
+              node={node}
+              selected={selected}
+              onSelect={onSelect}
+              collapsed={collapsed}
+              toggle={toggle}
+              canWrite={canWrite}
+              onExclude={onExclude}
+              excludableMap={excludableMap}
+              focusPath={focusPath}
+              defaultPath={tree[0]?.path}
+              onFocusRow={setFocusPath}
+            />
           ))}
         </ul>
       )}

@@ -199,6 +199,7 @@ export function AttendedBrowser({
 
     return (
         <div className="attb">
+            {/* Row 1 — pure browser chrome: navigation, the URL, and close. Stable regardless of session state. */}
             <div className="attb-bar">
                 <button type="button" className="attb-btn" disabled={!nav.canGoBack} onClick={() => bridge()?.back()} title="Back" aria-label="Back">‹</button>
                 <button type="button" className="attb-btn" disabled={!nav.canGoForward} onClick={() => bridge()?.forward()} title="Forward" aria-label="Forward">›</button>
@@ -211,12 +212,25 @@ export function AttendedBrowser({
                     onKeyDown={(e) => { if (e.key === "Enter") go(); }}
                     placeholder="https://target/login"
                 />
-                <button type="button" className="attb-copy" disabled={!urlField.trim() && !currentUrl} onClick={() => void copyUrl()} title="Copy URL" aria-label="Copy URL">Copy</button>
+                <button type="button" className="attb-copy" disabled={!urlField.trim() && !currentUrl} onClick={() => void copyUrl()} title="Copy URL" aria-label="Copy URL">Copy URL</button>
+                <button type="button" className="attb-close" onClick={onClose} title="Close">Close</button>
+            </div>
+            {/* Row 2 — the attended-session flow: capture, then the one contextual action the state allows
+                (mid-run continue / new scan / handoff resume). Growing here never moves the browser chrome. */}
+            <div className="attb-actions">
                 <button type="button" className="attb-capture" onClick={() => void capture()} title="Save cookies + localStorage (SPA Bearer) for the scan">Capture session</button>
                 {captured?.header ? (
                     <button type="button" className="attb-copy" onClick={() => void copyCookies()} title="Copy the Cookie header to the clipboard (Repeater / curl)">Copy cookies</button>
                 ) : null}
-                    {sessionRoles.length ? <label>Logged-in role <select value={sessionRole} onChange={(e) => setSessionRole(e.target.value)}><option value="">Choose role</option>{sessionRoles.map((role) => <option key={role} value={role}>{role}</option>)}</select></label> : null}
+                {sessionRoles.length ? (
+                    <label className="attb-role" title="Which manifest role the captured login belongs to">
+                        Logged-in role
+                        <select value={sessionRole} onChange={(e) => setSessionRole(e.target.value)}>
+                            <option value="">Choose role</option>
+                            {sessionRoles.map((role) => <option key={role} value={role}>{role}</option>)}
+                        </select>
+                    </label>
+                ) : null}
                 {captured && currentRunId && !handoffId ? (
                     <button type="button" className="attb-scan" disabled={launching} onClick={() => void inject()} title="Apply the captured login and continue this diagnosis; restart it if stopped">
                         {launching ? "Continuing…" : "Continue this run →"}
@@ -238,7 +252,6 @@ export function AttendedBrowser({
                         {launching ? "Continuing…" : "Logged in → continue"}
                     </button>
                 ) : null}
-                <button type="button" className="attb-close" onClick={onClose} title="Close">Close</button>
             </div>
             {handoffId ? (
                 <div className="attb-handoff">
