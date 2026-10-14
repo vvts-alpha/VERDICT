@@ -24,7 +24,10 @@
       "browserslist@<4.28.7": "^4.28.7",
       "baseline-browser-mapping@>=2.0.0 <2.11.0": "^2.11.0",
       "fast-uri@>=3.0.0 <3.1.8": "^3.1.8",
-      "ip-address@<=10.7.0": "^10.7.3"
+      "ip-address@<=10.7.0": "^10.7.3",
+      "proxy-addr@<2.0.8": "^2.0.8",
+      "source-map-js@<1.2.2": "^1.2.2",
+      "@modelcontextprotocol/sdk": "^1.31.0"
     }
   }
 }

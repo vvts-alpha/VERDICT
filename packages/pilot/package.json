@@ -27,6 +27,7 @@
     "@veritas/llm": "workspace:*",
     "@veritas/scanner": "workspace:*",
     "@anthropic-ai/claude-agent-sdk": "^0.3.169",
+    "@modelcontextprotocol/sdk": "^1.31.0",
     "zod": "^3.24.0",
     "zod-to-json-schema": "^3.24.0"
   },
