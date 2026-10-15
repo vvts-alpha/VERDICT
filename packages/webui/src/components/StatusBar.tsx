@@ -13,7 +13,9 @@ import {
 
 // Upload a Burp Pro XML report to import net-new issues (the API version of the CLI burp-import).
 // On success, the server calls upsertFinding → emits WS events, so findings grow automatically.
-function BurpImport({ id }: { id: string }) {
+// The file input + status MUST live outside the DropdownMenu: onSelect closes (unmounts) the menu,
+// so an input inside it is destroyed before the picker fires change — the POST would never run.
+function useBurpImport(id: string): { fileRef: React.RefObject<HTMLInputElement | null>; input: ReactNode; status: ReactNode } {
   const fileRef = useRef<HTMLInputElement>(null);
   const [status, setStatus] = useState<string>("");
   async function onPick(e: React.ChangeEvent<HTMLInputElement>) {
@@ -37,14 +39,13 @@ function BurpImport({ id }: { id: string }) {
       setStatus(`⚠ ${String(err).slice(0, 120)}`);
     }
   }
-  return (
-    <>
-      <DropdownMenuLabel>Import</DropdownMenuLabel>
-      <DropdownMenuItem onSelect={() => fileRef.current?.click()}><Upload /> Burp XML report</DropdownMenuItem>
-      <input ref={fileRef} type="file" accept=".xml,application/xml,text/xml" className="hidden" onChange={onPick} />
-      {status && <span role="status" className="block max-w-60 px-2 text-xs text-muted-foreground">{status}</span>}
-    </>
-  );
+  return {
+    fileRef,
+    input: <input ref={fileRef} type="file" accept=".xml,application/xml,text/xml" className="hidden" onChange={onPick} />,
+    status: status ? (
+      <span role="status" className="max-w-56 truncate text-xs text-muted-foreground" title={status}>{status}</span>
+    ) : null,
+  };
 }
 
 // The Report section of an Export menu — the assessment report in every format (HTML/PDF/Markdown/Findings CSV),
@@ -68,20 +69,31 @@ export function ReportLinks({ id }: { id: string }) {
 // Reports download as attachments; the inventory HTML keeps its separate preview.
 function DownloadMenu({ id, canWrite }: { id: string; canWrite: boolean }) {
   const inv = (f: string): string => `/api/assessments/${encodeURIComponent(id)}/inventory?format=${f}`;
+  const burp = useBurpImport(id);
   return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <Button type="button" variant="outline" size="xs"><Download /> {canWrite ? "Export / Import" : "Export"}</Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="min-w-44">
-        <ReportLinks id={id} />
-        <DropdownMenuSeparator />
-        <DropdownMenuLabel>Screen inventory</DropdownMenuLabel>
-        <DropdownMenuItem asChild><a href={inv("html")} target="_blank" rel="noreferrer">Inventory HTML</a></DropdownMenuItem>
-        <DropdownMenuItem asChild><a href={inv("csv")}>Screens CSV</a></DropdownMenuItem>
-        {canWrite ? <><DropdownMenuSeparator /><BurpImport id={id} /></> : null}
-      </DropdownMenuContent>
-    </DropdownMenu>
+    <>
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button type="button" variant="outline" size="xs"><Download /> {canWrite ? "Export / Import" : "Export"}</Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end" className="min-w-44">
+          <ReportLinks id={id} />
+          <DropdownMenuSeparator />
+          <DropdownMenuLabel>Screen inventory</DropdownMenuLabel>
+          <DropdownMenuItem asChild><a href={inv("html")} target="_blank" rel="noreferrer">Inventory HTML</a></DropdownMenuItem>
+          <DropdownMenuItem asChild><a href={inv("csv")}>Screens CSV</a></DropdownMenuItem>
+          {canWrite ? (
+            <>
+              <DropdownMenuSeparator />
+              <DropdownMenuLabel>Import</DropdownMenuLabel>
+              <DropdownMenuItem onSelect={() => burp.fileRef.current?.click()}><Upload /> Burp XML report</DropdownMenuItem>
+            </>
+          ) : null}
+        </DropdownMenuContent>
+      </DropdownMenu>
+      {burp.input}
+      {burp.status}
+    </>
   );
 }
 

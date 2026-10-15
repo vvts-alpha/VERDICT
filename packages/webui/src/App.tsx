@@ -154,7 +154,9 @@ export function App() {
   );
 
   return (
-    <div className="flex h-screen flex-col">
+    // h-full (not h-screen): in the desktop shell the 38px title bar already consumed viewport height —
+    // 100vh here would overflow the flex-1 container below it and clip the tree/content bottom edge.
+    <div className="flex h-full flex-col">
       {/* Common top nav — same row in web and desktop. Desktop-only entries come from the shell context. */}
       <nav className="flex h-11 shrink-0 items-center gap-1 border-b border-border bg-card px-2" aria-label="Main">
         {!isDesktop ? (
