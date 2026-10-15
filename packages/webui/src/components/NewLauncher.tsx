@@ -4,7 +4,7 @@
 //  a separate project.)
 import { useState, type ReactNode } from "react";
 import { ArrowLeft } from "lucide-react";
-import { NewAssessment } from "./NewAssessment";
+import { NewAssessment, type LaunchInput } from "./NewAssessment";
 import { Button } from "./ui/button";
 
 type Mode = "web";
@@ -46,11 +46,12 @@ function Card({ icon, title, desc, onClick, disabled = false }: { icon: ReactNod
   );
 }
 
-export function NewLauncher({ onCancel }: { onCancel: () => void }) {
-  const [mode, setMode] = useState<Mode | null>(null);
+export function NewLauncher({ onCancel, initial }: { onCancel: () => void; initial?: LaunchInput }) {
+  // A duplicate skips the mode picker — the run's own command/spec decides which form opens.
+  const [mode, setMode] = useState<Mode | null>(initial ? "web" : null);
   const back = (): void => setMode(null);
 
-  if (mode === "web") return <NewAssessment onCancel={back} />;
+  if (mode === "web") return <NewAssessment onCancel={initial ? onCancel : back} apiSpec={!!initial?.spec} initial={initial} />;
 
   return (
     <div className="space-y-5 pb-10">

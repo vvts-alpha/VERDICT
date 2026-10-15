@@ -668,6 +668,32 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptio
     sendJson(res, 200, rows);
     return;
   }
+  // Re-launch input for "Duplicate": the manifest + options + spec this run was started with, so the launcher can
+  // reopen pre-filled. Read-only (GET) — the actual launch still goes through POST /api/run validation.
+  // Operator-only: the manifest can carry role credentials / httpBasic / auth headers a viewer must not read.
+  const li = url.match(/^\/api\/assessments\/([^/]+)\/launch-input$/);
+  if (li) {
+    if (role !== "operator") return sendJson(res, 403, { error: "forbidden: operator only" });
+    const id = decodeURIComponent(li[1] ?? "");
+    if (!/^[a-zA-Z0-9_-]+$/.test(id)) return sendJson(res, 400, { error: "invalid assessment id" });
+    const dir = join(opts.runsDir, id);
+    try {
+      const manifest = JSON.parse(readFileSync(join(dir, "manifest.json"), "utf8")) as Record<string, unknown>;
+      let command: string | undefined;
+      let options: Record<string, unknown> = {};
+      try {
+        const run = JSON.parse(readFileSync(join(dir, "run.json"), "utf8")) as { command?: string; options?: Record<string, unknown> };
+        command = run.command;
+        options = run.options ?? {};
+      } catch { /* old run without run.json → defaults */ }
+      let spec: unknown;
+      try { spec = JSON.parse(readFileSync(join(dir, "openapi.json"), "utf8")) as unknown; } catch { /* no spec */ }
+      sendJson(res, 200, { command, manifest, options, ...(spec !== undefined ? { spec } : {}) });
+    } catch {
+      sendJson(res, 404, { error: "no launch input saved for this assessment" });
+    }
+    return;
+  }
   // attended×LiveHands: the list of role sessions held by the child (agent) reverse-connected to this run.
   const sess = url.match(/^\/api\/assessments\/([^/?]+)\/sessions$/);
   if (sess) {

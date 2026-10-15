@@ -20,6 +20,15 @@ interface Role {
   loginUrl: string;
 }
 
+/** The launch input a previous run was started with — GET /api/assessments/:id/launch-input.
+ *  Duplicate pre-fills the whole form from it so a re-run starts identical until the operator adjusts. */
+export interface LaunchInput {
+  command?: string;
+  manifest?: Record<string, unknown>;
+  options?: Record<string, unknown>;
+  spec?: unknown;
+}
+
 // Selectable models. Used for tiering: deep (high-value screens) / fast (survey, low-value screens).
 const MODELS = [
   { id: "claude-opus-4-8", label: "Opus 4.8" },
@@ -34,7 +43,7 @@ function lines(s: string): string[] {
     .filter((x) => x.length > 0);
 }
 
-export function NewAssessment({ onCancel, apiSpec = false }: { onCancel: () => void; apiSpec?: boolean }) {
+export function NewAssessment({ onCancel, apiSpec = false, initial }: { onCancel: () => void; apiSpec?: boolean; initial?: LaunchInput }) {
   const [command, setCommand] = useState<"pilot" | "assess">("pilot");
   const [target, setTarget] = useState("");
   const [specText, setSpecText] = useState("");
@@ -44,17 +53,20 @@ export function NewAssessment({ onCancel, apiSpec = false }: { onCancel: () => v
   const [useDesktopSettings, setUseDesktopSettings] = useState(false);
   const desktopBridge = typeof window !== "undefined" ? (window as any).verdictDesktop : undefined;
 
-  // If running inside the desktop app, prefer its persisted settings (Deep / Light models)
+  // If running inside the desktop app, prefer its persisted settings (Deep / Light models).
+  // A duplicated run brings its own model/context — don't let the desktop defaults overwrite them.
   useEffect(() => {
     if (!desktopBridge?.settings) return;
     void desktopBridge.settings.get().then((s: any) => {
       if (!s) return;
-      if (s.deepModel) setModel(s.deepModel);
-      if (s.lightModel) setFastModel(s.lightModel);
-      if (s.operatorContext) setContext((prev) => prev || s.operatorContext); // pre-fill from the global Settings default (per-run edits win)
+      if (!initial) {
+        if (s.deepModel) setModel(s.deepModel);
+        if (s.lightModel) setFastModel(s.lightModel);
+        if (s.operatorContext) setContext((prev) => prev || s.operatorContext); // pre-fill from the global Settings default (per-run edits win)
+      }
       setUseDesktopSettings(true);
     });
-  }, [desktopBridge]);
+  }, [desktopBridge, initial]);
   const [rate, setRate] = useState("250");
   const [maxTurns, setMaxTurns] = useState("");
   const [focus, setFocus] = useState(""); // operator's emphasis hint → top priority of the scenario stage
@@ -112,6 +124,59 @@ export function NewAssessment({ onCancel, apiSpec = false }: { onCancel: () => v
   const [checking, setChecking] = useState(false);
   const [checks, setChecks] = useState<ReadinessCheck[]>([]);
   const [err, setErr] = useState<string | null>(null);
+
+  // Duplicate: pre-fill every field from the run's saved manifest + options. Runs once on mount.
+  useEffect(() => {
+    if (!initial) return;
+    const m = (initial.manifest ?? {}) as Record<string, any>;
+    const o = (initial.options ?? {}) as Record<string, any>;
+    if (initial.command === "pilot" || initial.command === "assess") setCommand(initial.command);
+    if (typeof m.target === "string") setTarget(m.target);
+    if (Array.isArray(m.targets)) setTargetUrls(m.targets.join("\n"));
+    if (m.lockToTargets) setLockToTargets(true);
+    if (m.scopeMode === "same-origin" || m.scopeMode === "etld" || m.scopeMode === "unrestricted") setScopeMode(m.scopeMode);
+    const sc = m.scope ?? {};
+    if (Array.isArray(sc.inScopeHosts)) setInHosts(sc.inScopeHosts.join("\n"));
+    if (Array.isArray(sc.outOfScopeHosts)) setOutHosts(sc.outOfScopeHosts.join("\n"));
+    if (Array.isArray(sc.inScopePathPrefixes)) setInPaths(sc.inScopePathPrefixes.join("\n"));
+    if (Array.isArray(sc.outOfScopePathPrefixes)) setOutPaths(sc.outOfScopePathPrefixes.join("\n"));
+    if (m.crawl) {
+      if (m.crawl.followLinks === false) setFollowLinks(false);
+      if (m.crawl.maxDepth != null) setMaxDepth(String(m.crawl.maxDepth));
+    }
+    const auth = m.auth ?? {};
+    if (Array.isArray(auth.roles)) {
+      setRoles(auth.roles.map((r: any) => ({
+        name: String(r.name ?? ""),
+        method: r.pass ? "credentials" : r.cookieFile ? "cookie" : "manual",
+        password: r.pass ?? "",
+        description: r.description ?? "",
+        cookieFile: r.cookieFile ?? "",
+        loginUrl: r.loginUrl ?? "",
+      })));
+    }
+    if (auth.httpBasic) { setBasicUser(auth.httpBasic.user ?? ""); setBasicPass(auth.httpBasic.pass ?? ""); }
+    if (m.http?.headers && typeof m.http.headers === "object") {
+      setHeadersList(Object.entries(m.http.headers).map(([name, value]) => ({ name, value: String(value) })));
+    }
+    if (o.model) setModel(String(o.model));
+    if (o.fastModel) setFastModel(String(o.fastModel));
+    if (o.rate != null) setRate(String(o.rate));
+    if (o.maxTurns != null) setMaxTurns(String(o.maxTurns));
+    if (o.headed) setHeaded(true);
+    if (o.surveyOnly) setSurveyOnly(true);
+    if (o.exhaustive) setExhaustive(true);
+    if (o.burpScan) setBurpScan(true);
+    if (o.burpProxy) setBurpProxy(true);
+    if (o.loginUrl) setLoginUrl(String(o.loginUrl));
+    if (o.maxScreens != null) setMaxScreens(String(o.maxScreens));
+    if (o.maxSurveyScreens != null) setMaxSurveyScreens(String(o.maxSurveyScreens));
+    if (o.keepAliveMin != null) setKeepAliveMin(String(o.keepAliveMin));
+    if (o.anchorUrl) setAnchorUrl(String(o.anchorUrl));
+    if (o.focus) setFocus(String(o.focus));
+    if (o.context) setContext(String(o.context));
+    if (apiSpec && initial.spec) { setSpecText(JSON.stringify(initial.spec)); setSpecName("openapi.json (from run)"); }
+  }, []); // mount-only — the launch input never changes
 
   const setHeader = (i: number, patch: Partial<{ name: string; value: string }>): void =>
     setHeadersList((hs) => hs.map((h, j) => (j === i ? { ...h, ...patch } : h)));
@@ -255,7 +320,7 @@ export function NewAssessment({ onCancel, apiSpec = false }: { onCancel: () => v
   return (
     <div className="space-y-3 pb-10">
       <div className="flex items-center justify-between border-b border-border pb-3">
-        <h2 className="text-base font-semibold">{apiSpec ? "API specification assessment" : "New assessment"}</h2>
+        <h2 className="text-base font-semibold">{initial ? "Duplicate assessment" : apiSpec ? "API specification assessment" : "New assessment"}</h2>
         <Button type="button" variant="ghost" onClick={onCancel}>
           <ArrowLeft /> Cancel
         </Button>

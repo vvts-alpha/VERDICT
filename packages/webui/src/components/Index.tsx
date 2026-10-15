@@ -1,13 +1,17 @@
 // Project (assessment) list. Shown at `/` (no ?id). Clicking a row goes to ?id=<id>.
 // "+ New" launches a run; each row has Stop/Resume (the control plane where the server spawns the CLI).
-import { useEffect, useState, type MouseEvent } from "react";
+import { useEffect, useState } from "react";
 import type { TargetInput } from "@veritas/core";
 import { NewLauncher } from "./NewLauncher";
+import type { LaunchInput } from "./NewAssessment";
 import { useRole } from "../api";
-import { Play, Square } from "lucide-react";
+import { Copy, MoreHorizontal, Play, Square } from "lucide-react";
 import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
 import { Card, CardContent } from "./ui/card";
+import {
+  DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger,
+} from "./ui/dropdown-menu";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "./ui/table";
 
 interface Row {
@@ -49,7 +53,7 @@ function fmt(iso: string): string {
 export function Index() {
   const [rows, setRows] = useState<Row[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
-  const [creating, setCreating] = useState(false);
+  const [creating, setCreating] = useState<{ initial?: LaunchInput } | null>(null);
   const { canWrite } = useRole();
 
   useEffect(() => {
@@ -75,13 +79,22 @@ export function Index() {
     };
   }, []);
 
-  const runCtl = (id: string, action: "stop" | "resume") => (e: MouseEvent): void => {
-    e.stopPropagation();
+  const runCtl = (id: string, action: "stop" | "resume") => (): void => {
     void fetch(`/api/run/${encodeURIComponent(id)}/${action}`, { method: "POST" });
+  };
+  // Duplicate: reopen the launcher pre-filled with this run's saved manifest+options (the operator reviews,
+  // adjusts, then launches a fresh run — no blind re-fire of the old config).
+  const duplicate = (id: string) => (): void => {
+    void fetch(`/api/assessments/${encodeURIComponent(id)}/launch-input`)
+      .then(async (r) => {
+        if (!r.ok) { setErr((await r.json().catch(() => ({}))).error ?? `no launch input (${r.status})`); return; }
+        setCreating({ initial: (await r.json()) as LaunchInput });
+      })
+      .catch(() => setErr("Can't reach server"));
   };
 
   if (creating) {
-    return <div className="mx-auto max-w-[1100px] px-5 py-6"><NewLauncher onCancel={() => setCreating(false)} /></div>;
+    return <div className="mx-auto max-w-[1100px] px-5 py-6"><NewLauncher onCancel={() => setCreating(null)} initial={creating.initial} /></div>;
   }
 
   return (
@@ -91,7 +104,7 @@ export function Index() {
           <h1 className="text-base font-semibold">Projects</h1>
           <span className="text-muted-foreground">{rows?.length ?? ""}</span>
         </div>
-        {canWrite ? <Button type="button" size="sm" onClick={() => setCreating(true)}>+ New</Button> : null}
+        {canWrite ? <Button type="button" size="sm" onClick={() => setCreating({})}>+ New</Button> : null}
       </header>
       {err ? <p role="alert" className="p-4 text-destructive">{err}</p> : null}
       {rows && rows.length === 0 ? (
@@ -99,7 +112,7 @@ export function Index() {
           <CardContent className="flex flex-col items-center gap-3 py-12 text-center">
             <h2 className="text-lg font-semibold">No assessments yet</h2>
             <p className="max-w-md text-muted-foreground">Point VERDICT at a target and it maps the app, then hunts for vulnerabilities — autonomously.</p>
-            {canWrite ? <Button type="button" onClick={() => setCreating(true)}>+ New assessment</Button> : <p className="text-muted-foreground">Ask an operator to start one.</p>}
+            {canWrite ? <Button type="button" onClick={() => setCreating({})}>+ New assessment</Button> : <p className="text-muted-foreground">Ask an operator to start one.</p>}
           </CardContent>
         </Card>
       ) : null}
@@ -133,13 +146,23 @@ export function Index() {
                 <TableCell className={r.findings > 0 ? "text-right font-semibold text-warning" : "text-right"}>{r.findings}</TableCell>
                 <TableCell className="text-muted-foreground">{fmt(r.updatedAt)}</TableCell>
                 <TableCell className="font-mono text-[11px] text-muted-foreground">{r.id}</TableCell>
-                <TableCell className="text-right">
+                <TableCell className="text-right" onClick={(e) => e.stopPropagation()}>
                   {!canWrite ? (
                     r.running ? <span className="inline-block size-2 rounded-full bg-primary" title="running" /> : null
-                  ) : r.running ? (
-                    <Button type="button" variant="destructive" size="xs" onClick={runCtl(r.id, "stop")}><Square /> Stop</Button>
                   ) : (
-                    <Button type="button" variant="secondary" size="xs" onClick={runCtl(r.id, "resume")}><Play /> Resume</Button>
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button type="button" variant="ghost" size="icon-sm" aria-label={`Actions for ${r.id}`} title="Actions"><MoreHorizontal /></Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end">
+                        {r.running ? (
+                          <DropdownMenuItem onSelect={runCtl(r.id, "stop")}><Square /> Stop</DropdownMenuItem>
+                        ) : (
+                          <DropdownMenuItem onSelect={runCtl(r.id, "resume")}><Play /> Resume</DropdownMenuItem>
+                        )}
+                        <DropdownMenuItem onSelect={duplicate(r.id)}><Copy /> Duplicate…</DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
                   )}
                 </TableCell>
               </TableRow>

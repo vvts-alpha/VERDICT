@@ -115,7 +115,7 @@ full-height flex column
 - One `TableRow` per run: Target (name + sub), type/phase badges, numeric Screens / Findings, Updated, ID, action. The target name is a real focusable link, even when the row also responds to mouse clicks.
 - **Findings count = the store's finding count** (`state.findings.length`). A view whose findings live only in a
   side file will read **0 here** — persist to the store so the dashboard is truthful.
-- Idle-run action is `Resume` (Play icon); running-run action is `Stop` (Square icon). Unsupported legacy run types are hidden and cannot be resumed.
+- Row actions live in a per-row `⋯` `DropdownMenu` (ghost `icon-sm` trigger, `stopPropagation` so the menu never triggers row navigation): running runs offer `Stop`, finished/stopped runs `Resume`, and every run offers `Duplicate…` — which GETs `/api/assessments/<id>/launch-input` (operator-only; the saved manifest can carry credentials) and reopens the launcher pre-filled so the operator reviews before launching a fresh run. Unsupported legacy run types are hidden and cannot be resumed.
 
 
 ## Terminology & colour
