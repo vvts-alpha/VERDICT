@@ -3,6 +3,13 @@ import type { ReactNode } from "react";
 import type { StateView } from "@veritas/core";
 import type { ConnState } from "../api";
 import { useRole } from "../api";
+import { Download, Pause, Play, Upload } from "lucide-react";
+import { Badge } from "./ui/badge";
+import { Button } from "./ui/button";
+import {
+  DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel,
+  DropdownMenuSeparator, DropdownMenuTrigger,
+} from "./ui/dropdown-menu";
 
 // Upload a Burp Pro XML report to import net-new issues (the API version of the CLI burp-import).
 // On success, the server calls upsertFinding → emits WS events, so findings grow automatically.
@@ -32,12 +39,10 @@ function BurpImport({ id }: { id: string }) {
   }
   return (
     <>
-      <span className="dl-h">Import</span>
-      <button type="button" className="dl-imp" onClick={() => fileRef.current?.click()}>
-        ⬆ Burp XML report
-      </button>
-      <input ref={fileRef} type="file" accept=".xml,application/xml,text/xml" style={{ display: "none" }} onChange={onPick} />
-      {status && <span className="dl-status">{status}</span>}
+      <DropdownMenuLabel>Import</DropdownMenuLabel>
+      <DropdownMenuItem onSelect={() => fileRef.current?.click()}><Upload /> Burp XML report</DropdownMenuItem>
+      <input ref={fileRef} type="file" accept=".xml,application/xml,text/xml" className="hidden" onChange={onPick} />
+      {status && <span role="status" className="block max-w-60 px-2 text-xs text-muted-foreground">{status}</span>}
     </>
   );
 }
@@ -50,11 +55,11 @@ export function ReportLinks({ id }: { id: string }) {
   const rep = (f: string): string => `/api/assessments/${encodeURIComponent(id)}/report?format=${f}`;
   return (
     <>
-      <span className="dl-h">Report</span>
-      <a href={rep("html")} download={`${id}-report.html`}>HTML</a>
-      <a href={rep("pdf")} download={`${id}-report.pdf`}>PDF</a>
-      <a href={rep("md")}>Markdown</a>
-      <a href={rep("csv")}>Findings CSV</a>
+      <DropdownMenuLabel>Report</DropdownMenuLabel>
+      <DropdownMenuItem asChild><a href={rep("html")} download={`${id}-report.html`}>HTML</a></DropdownMenuItem>
+      <DropdownMenuItem asChild><a href={rep("pdf")} download={`${id}-report.pdf`}>PDF</a></DropdownMenuItem>
+      <DropdownMenuItem asChild><a href={rep("md")}>Markdown</a></DropdownMenuItem>
+      <DropdownMenuItem asChild><a href={rep("csv")}>Findings CSV</a></DropdownMenuItem>
     </>
   );
 }
@@ -64,59 +69,67 @@ export function ReportLinks({ id }: { id: string }) {
 function DownloadMenu({ id, canWrite }: { id: string; canWrite: boolean }) {
   const inv = (f: string): string => `/api/assessments/${encodeURIComponent(id)}/inventory?format=${f}`;
   return (
-    <details className="dl">
-      <summary>{canWrite ? "⬇ Export / Import" : "⬇ Export"}</summary>
-      <div className="dl-menu">
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button type="button" variant="outline" size="xs"><Download /> {canWrite ? "Export / Import" : "Export"}</Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="min-w-44">
         <ReportLinks id={id} />
-        <span className="dl-h">Screen inventory</span>
-        <a href={inv("html")} target="_blank" rel="noreferrer">Inventory HTML</a>
-        <a href={inv("csv")}>Screens CSV</a>
-        {canWrite ? <BurpImport id={id} /> : null}
-      </div>
-    </details>
+        <DropdownMenuSeparator />
+        <DropdownMenuLabel>Screen inventory</DropdownMenuLabel>
+        <DropdownMenuItem asChild><a href={inv("html")} target="_blank" rel="noreferrer">Inventory HTML</a></DropdownMenuItem>
+        <DropdownMenuItem asChild><a href={inv("csv")}>Screens CSV</a></DropdownMenuItem>
+        {canWrite ? <><DropdownMenuSeparator /><BurpImport id={id} /></> : null}
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }
 
 /**
- * The shared status-bar chrome — brand · role badge · sign-out · `● {conn}` dot — with slots for the middle metrics,
- * optional actions (pause), and an export menu. Assessment views
- * render through this, so the header is byte-identical across target types: same role badge, same sign-out link, same
- * connection indicator. Add anything header-common here, never re-implement it per view.
+ * The shared header chrome — breadcrumb · role badge · sign-out · `● {conn}` dot — with slots for
+ * optional actions (pause) and an export menu. Assessment views render through this, so the header is
+ * byte-identical across target types: same role badge, same sign-out link, same connection indicator.
+ * Add anything header-common here, never re-implement it per view. (The brand/logo lives in the sidebar.)
  */
 export function StatusBarShell({
   conn,
   paused,
-  metrics,
+  crumbs,
+  stats,
   actions,
   exportMenu,
 }: {
-  conn: ConnState;
+  conn?: ConnState;
   paused?: boolean;
-  metrics: ReactNode;
+  crumbs: ReactNode;
+  /** Compact run metrics, rendered right after the context slot (may truncate on narrow widths). */
+  stats?: ReactNode;
   actions?: ReactNode;
   exportMenu?: ReactNode;
 }) {
   const { canWrite, authEnabled, role } = useRole();
   return (
-    <header className="statusbar">
-      <a className="brand" href="?" title="Back to projects"><img className="brand-logo" src="/verdict-title.png" alt="VERDICT" /></a>
-      {authEnabled ? (
-        <span className={`rolebadge ${role}`} title={canWrite ? "operator — full access" : "viewer — read-only"}>
-          {role}
-        </span>
-      ) : null}
-      {metrics}
+    <header className="flex h-12 shrink-0 items-center gap-3 border-b border-border px-4 whitespace-nowrap">
+      {crumbs}
+      {stats}
       {/* single spacer owns the right-alignment for the trailing controls group (pause · export · sign out · conn),
           so it right-aligns identically whether or not a view supplies a pause button. */}
-      <span className="sb-spacer" />
+      <span className="ml-auto" />
       {actions}
       {exportMenu}
       {authEnabled ? (
-        <a className="logout" href="/logout" title="sign out">
+        <Badge variant="outline" className={canWrite ? "border-primary/40 bg-primary/15 text-primary" : "text-muted-foreground"} title={canWrite ? "operator — full access" : "viewer — read-only"}>
+          {role}
+        </Badge>
+      ) : null}
+      {authEnabled ? (
+        <a className="text-xs text-muted-foreground hover:text-foreground" href="/logout" title="sign out">
           sign out
         </a>
       ) : null}
-      <span className={`conn ${conn}`}>● {paused ? "paused" : conn}</span>
+      {conn ? (
+        <span className={conn === "open" ? "text-success" : conn === "connecting" ? "text-warning" : "text-destructive"}>● {paused ? "paused" : conn}</span>
+      ) : null}
     </header>
   );
 }
@@ -132,37 +145,56 @@ export function StatusBar({
   view,
   conn,
   onTogglePause,
+  crumbs,
 }: {
   view: StateView;
   conn: ConnState;
   onTogglePause: () => void;
+  crumbs: ReactNode;
 }) {
-  const c = view.coverage;
   const { canWrite } = useRole();
   return (
     <StatusBarShell
       conn={conn}
       paused={view.paused}
-      metrics={
-        <>
-          <span>phase: <b>{view.phase}</b></span>
-          <span>screens: <b>{c.total}</b></span>
-          <span title="Screens whose diagnosis finished; excludes omitted screens">tested: <b>{c.byStatus.clean + c.byStatus.finding + c.byStatus.suspected}/{c.total}</b></span>
-          <span title="Screens omitted from diagnosis">excluded: <b>{c.byStatus.excluded}</b></span>
-          <span title="Queued, in progress, blocked, or failed; diagnosis is not complete">unfinished: <b>{c.remaining}</b></span>
-          <span>findings: <b>{view.findings.length}</b></span>
-          <span>tokens: <b>{fmtTokens(view.budget.tokensUsed)}</b></span>
-          <span>handoffs: <b>{view.handoffs.filter((h) => h.status === "pending").length}</b></span>
-        </>
-      }
+      crumbs={crumbs}
+      stats={<RunStats view={view} />}
       actions={
         canWrite ? (
-          <button type="button" className="pausebtn" onClick={onTogglePause}>
-            {view.paused ? "▶ resume" : "⏸ pause"}
-          </button>
+          <Button type="button" variant="secondary" size="xs" onClick={onTogglePause}>
+            {view.paused ? <><Play /> resume</> : <><Pause /> pause</>}
+          </Button>
         ) : null
       }
       exportMenu={<DownloadMenu id={view.id} canWrite={canWrite} />}
     />
+  );
+}
+
+/** The run's numeric metrics as a compact inline status line — phase/progress/findings/attention first,
+    so truncation at narrow widths drops only the least important numbers. Each item carries a tooltip. */
+export function RunStats({ view }: { view: StateView }) {
+  const c = view.coverage;
+  const tested = c.byStatus.clean + c.byStatus.finding + c.byStatus.suspected;
+  const pending = view.handoffs.filter((h) => h.status === "pending").length;
+  const items: { label: string; value: ReactNode; title?: string; warn?: boolean }[] = [
+    { label: "phase", value: view.phase },
+    { label: "tested", value: `${tested}/${c.total}`, title: "Screens whose diagnosis finished; excludes omitted screens" },
+    { label: "findings", value: view.findings.length, warn: view.findings.length > 0 },
+    { label: "unfinished", value: c.remaining, title: "Queued, in progress, blocked, or failed; diagnosis is not complete", warn: c.remaining > 0 },
+    { label: "screens", value: c.total },
+    { label: "excluded", value: c.byStatus.excluded, title: "Screens omitted from diagnosis", warn: c.byStatus.excluded > 0 },
+    { label: "tokens", value: fmtTokens(view.budget.tokensUsed) },
+    { label: "handoffs", value: pending, warn: pending > 0 },
+  ];
+  return (
+    <div className="flex min-w-0 items-center gap-x-3 overflow-hidden text-xs whitespace-nowrap" aria-label="Run metrics">
+      {items.map((it) => (
+        <span key={it.label} className="shrink-0" title={it.title}>
+          <span className="text-muted-foreground">{it.label}</span>{" "}
+          <span className={it.warn ? "font-medium text-warning" : "font-medium"}>{it.value}</span>
+        </span>
+      ))}
+    </div>
   );
 }

@@ -5,7 +5,7 @@ const ORDER = ["finding", "suspected", "scanning", "queued", "clean", "excluded"
 const COLOR: Record<string, string> = {
   finding: "var(--warn)",
   suspected: "var(--warn)",
-  scanning: "var(--accent)",
+  scanning: "var(--fg)",
   queued: "var(--line)",
   clean: "var(--ok)",
   excluded: "var(--muted)",
@@ -26,34 +26,33 @@ export function Progress({ view }: { view: StateView }) {
   const lastLog = last ? eventLine(last) : "";
 
   return (
-    <div className="progress">
-      <div className="pbar">
+    <div className="border-b border-border bg-card px-3 py-2">
+      <div className="flex h-2 overflow-hidden rounded-sm bg-inset" role="img" aria-label="Diagnosis progress by status">
         {ORDER.filter((s) => (counts[s] ?? 0) > 0).map((s) => {
           const c = counts[s] ?? 0;
           return (
             <span
               key={s}
-              className="pseg"
               style={{ width: `${(c / total) * 100}%`, background: COLOR[s] }}
               title={`${s}: ${c}`}
             />
           );
         })}
       </div>
-      <div className="pmeta muted" aria-label="Diagnosis breakdown">
+      <div className="mt-1 flex gap-1 text-[11px] text-muted-foreground" aria-label="Diagnosis breakdown">
         {ORDER.filter((status) => (counts[status] ?? 0) > 0).map((status) => (
           <span key={status}>{status === "clean" ? "tested, no findings" : status === "finding" ? "tested, findings" : status === "suspected" ? "tested, unconfirmed leads" : status}: {counts[status]} · </span>
         ))}
       </div>
-      <div className="pmeta muted">
+      <div className="mt-1 flex items-baseline gap-1 text-[11px] text-muted-foreground">
         {scanning ? (
           <span>
-            ▶ now: <b className="mono">{scanning.urlTemplate}</b>
+            ▶ now: <b className="font-mono text-foreground">{scanning.urlTemplate}</b>
           </span>
         ) : (
           <span>{view.phase}</span>
         )}
-        {lastLog ? <span className="plast"> · {lastLog.slice(0, 120)}</span> : null}
+        {lastLog ? <span className="truncate"> · {lastLog.slice(0, 120)}</span> : null}
       </div>
     </div>
   );

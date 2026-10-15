@@ -1,6 +1,11 @@
 // LLM / AI-assistant red-team form → POST /api/run (command "redteam") → navigate to the launched run.
 // The canary must be planted out-of-band by the operator in the assistant's system prompt / custom instructions.
 import { useState } from "react";
+import { ArrowLeft, Play } from "lucide-react";
+import { Disclosure } from "./Disclosure";
+import { Button } from "./ui/button";
+import { Checkbox } from "./ui/checkbox";
+import { Input } from "./ui/input";
 
 export function RedteamForm({ onCancel }: { onCancel: () => void }) {
   const [chatUrl, setChatUrl] = useState("");
@@ -76,73 +81,72 @@ export function RedteamForm({ onCancel }: { onCancel: () => void }) {
   };
 
   return (
-    <div className="newform">
-      <div className="nf-row nf-head">
-        <h2>AI assistant red-team</h2>
-        <button type="button" className="nf-cancel" onClick={onCancel}>
-          ← Back
-        </button>
+    <div className="space-y-3 pb-10">
+      <div className="flex items-center justify-between border-b border-border pb-3">
+        <h2 className="text-base font-semibold">AI assistant red-team</h2>
+        <Button type="button" variant="ghost" onClick={onCancel}>
+          <ArrowLeft /> Back
+        </Button>
       </div>
 
-      <label className="nf-field">
+      <label className="my-2 flex flex-col gap-1 text-xs [&>span]:text-muted-foreground">
         <span>Chat UI URL *</span>
-        <input value={chatUrl} onChange={(e) => setChatUrl(e.target.value)} placeholder="https://your-bot.example/chat" />
+        <Input value={chatUrl} onChange={(e) => setChatUrl(e.target.value)} placeholder="https://your-bot.example/chat" />
       </label>
 
-      <label className="nf-field nf-wide">
+      <label className="my-2 flex flex-col gap-1 text-xs [&>span]:text-muted-foreground">
         <span>Canary * — plant this in the assistant's system prompt / custom instructions first, then paste it here</span>
-        <div style={{ display: "flex", gap: 8 }}>
-          <input value={canary} onChange={(e) => setCanary(e.target.value)} placeholder="VERDICT-CANARY-…" style={{ flex: 1 }} />
-          <button type="button" onClick={genCanary}>
+        <div className="flex gap-2">
+          <Input className="flex-1" value={canary} onChange={(e) => setCanary(e.target.value)} placeholder="VERDICT-CANARY-…" />
+          <Button type="button" onClick={genCanary}>
             generate
-          </button>
+          </Button>
         </div>
       </label>
 
-      <div className="nf-checks">
+      <div className="my-3 flex flex-wrap items-center gap-4 [&_label]:inline-flex [&_label]:items-center [&_label]:gap-2">
         <label title="screencast the chat into the Sessions tab: log into the chatbot manually, then click Done to start the probes">
-          <input type="checkbox" checked={attended} onChange={(e) => setAttended(e.target.checked)} /> open in browser (log in / watch in the Sessions tab)
+          <Checkbox checked={attended} onCheckedChange={(checked) => setAttended(checked === true)} /> open in browser (log in / watch in the Sessions tab)
         </label>
         <label title="open a real browser window on the runner — only useful when running locally with a display">
-          <input type="checkbox" checked={headed} onChange={(e) => setHeaded(e.target.checked)} /> headed window
+          <Checkbox checked={headed} onCheckedChange={(checked) => setHeaded(checked === true)} /> headed window
         </label>
-        <label className="nf-field nf-inline">
+        <label className="flex items-center gap-2 text-xs [&_input]:w-20">
           <span>max replays</span>
-          <input value={maxReplays} onChange={(e) => setMaxReplays(e.target.value)} placeholder="2" inputMode="numeric" />
+          <Input value={maxReplays} onChange={(e) => setMaxReplays(e.target.value)} placeholder="2" inputMode="numeric" />
         </label>
       </div>
 
-      <details className="nf-section">
-        <summary>Selectors (optional — override the adapter's auto-discovery when it misfires)</summary>
-        <div className="nf-grid">
-          <label className="nf-field">
+      <Disclosure title="Selectors (optional — override the adapter's auto-discovery when it misfires)">
+        <div className="grid grid-cols-1 gap-x-4 sm:grid-cols-2">
+          <label className="my-2 flex flex-col gap-1 text-xs [&>span]:text-muted-foreground">
             <span>Composer</span>
-            <input value={composer} onChange={(e) => setComposer(e.target.value)} placeholder="textarea" />
+            <Input value={composer} onChange={(e) => setComposer(e.target.value)} placeholder="textarea" />
           </label>
-          <label className="nf-field">
+          <label className="my-2 flex flex-col gap-1 text-xs [&>span]:text-muted-foreground">
             <span>Send button</span>
-            <input value={send} onChange={(e) => setSend(e.target.value)} placeholder="button[type='submit']" />
+            <Input value={send} onChange={(e) => setSend(e.target.value)} placeholder="button[type='submit']" />
           </label>
-          <label className="nf-field">
+          <label className="my-2 flex flex-col gap-1 text-xs [&>span]:text-muted-foreground">
             <span>New chat</span>
-            <input value={newChat} onChange={(e) => setNewChat(e.target.value)} placeholder="[data-testid*='new-chat' i]" />
+            <Input value={newChat} onChange={(e) => setNewChat(e.target.value)} placeholder="[data-testid*='new-chat' i]" />
           </label>
-          <label className="nf-field">
+          <label className="my-2 flex flex-col gap-1 text-xs [&>span]:text-muted-foreground">
             <span>File input</span>
-            <input value={fileInput} onChange={(e) => setFileInput(e.target.value)} placeholder="input[type='file']" />
+            <Input value={fileInput} onChange={(e) => setFileInput(e.target.value)} placeholder="input[type='file']" />
           </label>
-          <label className="nf-field">
+          <label className="my-2 flex flex-col gap-1 text-xs [&>span]:text-muted-foreground">
             <span>Transcript container</span>
-            <input value={transcript} onChange={(e) => setTranscript(e.target.value)} placeholder="[role='log']" />
+            <Input value={transcript} onChange={(e) => setTranscript(e.target.value)} placeholder="[role='log']" />
           </label>
         </div>
-      </details>
+      </Disclosure>
 
-      {err ? <p className="nf-err">{err}</p> : null}
-      <div className="nf-row nf-actions">
-        <button type="button" className="nf-launch" disabled={busy} onClick={() => void submit()}>
-          {busy ? "Launching…" : "▶ Launch redteam"}
-        </button>
+      {err ? <p role="alert" className="text-destructive">{err}</p> : null}
+      <div className="mt-5 flex gap-3">
+        <Button type="button" disabled={busy} onClick={() => void submit()}>
+          {busy ? "Launching…" : <><Play /> Launch redteam</>}
+        </Button>
       </div>
     </div>
   );

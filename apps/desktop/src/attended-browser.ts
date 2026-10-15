@@ -101,15 +101,33 @@ export function setupAttendedBrowser(win: BrowserWindow, runsDir: string): Atten
         return v;
     };
 
+    // Generation counter: an `open` awaits the proxy apply before it creates the view — a `close` (or a
+    // host-page navigation) arriving in that window would otherwise be lost and leave the view painted.
+    // Bumping on every destroy makes any in-flight open bail out.
+    let openGen = 0;
+
     const destroyView = (): void => {
+        openGen += 1;
         if (!view) return;
-        win.contentView.removeChildView(view);
-        // WebContentsView's webContents is closed when the view is GC'd; drop the reference.
+        const v = view;
         view = null;
+        win.contentView.removeChildView(v);
+        // removeChildView only detaches — the webContents lingers until GC. Close it actively so the
+        // renderer process/session is released deterministically.
+        if (!v.webContents.isDestroyed()) v.webContents.close();
     };
 
+    // The view is a child of the WINDOW, not the page — a full renderer navigation (Projects link,
+    // `scan()`'s location.href redirect, reload) never runs React's unmount cleanup, so without this the
+    // native view keeps painting over the newly loaded page. Same-document (hash/pushState) navs keep it.
+    win.webContents.on("did-start-navigation", (e) => {
+        if (e.isMainFrame && !e.isSameDocument) destroyView();
+    });
+
     ipcMain.handle("attbrowser:open", async (_e, url: string) => {
+        const gen = ++openGen;
         await applyAttendedProxy();
+        if (gen !== openGen) return; // destroyed while the proxy applied — the close already won
         const v = ensureView();
         await v.webContents.loadURL(url).catch((err) => emit("attbrowser:error", String(err).slice(0, 200)));
     });

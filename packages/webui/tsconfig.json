@@ -5,6 +5,8 @@
     "moduleResolution": "Bundler",
     "lib": ["ES2023", "DOM", "DOM.Iterable"],
     "types": [],
+    "baseUrl": ".",
+    "paths": { "@/*": ["./src/*"] },
     "jsx": "react-jsx",
     "noEmit": true
   },

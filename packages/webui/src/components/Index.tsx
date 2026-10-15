@@ -4,6 +4,11 @@ import { useEffect, useState, type MouseEvent } from "react";
 import type { TargetInput } from "@veritas/core";
 import { NewLauncher } from "./NewLauncher";
 import { useRole } from "../api";
+import { Play, Square } from "lucide-react";
+import { Badge } from "./ui/badge";
+import { Button } from "./ui/button";
+import { Card, CardContent } from "./ui/card";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "./ui/table";
 
 interface Row {
   id: string;
@@ -41,14 +46,11 @@ function fmt(iso: string): string {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
-/** Running inside the Electron desktop shell? (the title bar there already shows the VERDICT brand). */
-const isDesktop = typeof window !== "undefined" && !!(window as unknown as { verdictDesktop?: unknown }).verdictDesktop;
-
 export function Index() {
   const [rows, setRows] = useState<Row[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
-  const { canWrite, authEnabled, role } = useRole();
+  const { canWrite } = useRole();
 
   useEffect(() => {
     let alive = true;
@@ -79,112 +81,73 @@ export function Index() {
   };
 
   if (creating) {
-    return (
-      <div className="idx">
-        <NewLauncher onCancel={() => setCreating(false)} />
-      </div>
-    );
+    return <div className="mx-auto max-w-[1100px] px-5 py-6"><NewLauncher onCancel={() => setCreating(false)} /></div>;
   }
 
   return (
-    <div className="idx">
-      <header className="idxhead">
-        {isDesktop ? null : <img className="brand-logo" src="/verdict-title.png" alt="VERDICT" />}
-        <span className="idxtitle">Projects</span>
-        <span className="idxcount">{rows ? `${rows.length}` : ""}</span>
-        {authEnabled ? (
-          <span className={`rolebadge ${role}`} title={canWrite ? "operator — full access" : "viewer — read-only"}>
-            {role}
-          </span>
-        ) : null}
-        {canWrite ? (
-          <button type="button" className="idxnew" onClick={() => setCreating(true)}>
-            + New
-          </button>
-        ) : null}
-        {authEnabled ? (
-          <a className="logout" href="/logout" title="sign out">
-            sign out
-          </a>
-        ) : null}
-      </header>
-      {err ? <p className="idxempty">{err}</p> : null}
-      {rows && rows.length === 0 ? (
-        <div className="idxblank">
-          <div className="idxblank-title">No assessments yet</div>
-          <p className="idxblank-sub">Point VERDICT at a target and it maps the app, then hunts for vulnerabilities — autonomously.</p>
-          {canWrite ? (
-            <button type="button" className="idxnew idxblank-cta" onClick={() => setCreating(true)}>
-              + New assessment
-            </button>
-          ) : (
-            <p className="idxblank-sub">Ask an operator to start one.</p>
-          )}
+    <div className="mx-auto max-w-[1100px] px-5 pt-6 pb-12">
+      <header className="flex items-center justify-between border-b border-border px-1 pb-5">
+        <div className="flex items-baseline gap-3">
+          <h1 className="text-base font-semibold">Projects</h1>
+          <span className="text-muted-foreground">{rows?.length ?? ""}</span>
         </div>
+        {canWrite ? <Button type="button" size="sm" onClick={() => setCreating(true)}>+ New</Button> : null}
+      </header>
+      {err ? <p role="alert" className="p-4 text-destructive">{err}</p> : null}
+      {rows && rows.length === 0 ? (
+        <Card className="mt-8">
+          <CardContent className="flex flex-col items-center gap-3 py-12 text-center">
+            <h2 className="text-lg font-semibold">No assessments yet</h2>
+            <p className="max-w-md text-muted-foreground">Point VERDICT at a target and it maps the app, then hunts for vulnerabilities — autonomously.</p>
+            {canWrite ? <Button type="button" onClick={() => setCreating(true)}>+ New assessment</Button> : <p className="text-muted-foreground">Ask an operator to start one.</p>}
+          </CardContent>
+        </Card>
       ) : null}
       {rows && rows.length > 0 ? (
-        <table className="idxtable">
-          <thead>
-            <tr>
-              <th>Target</th>
-              <th>Type</th>
-              <th>Phase</th>
-              <th className="num">Screens</th>
-              <th className="num">Findings</th>
-              <th>Updated</th>
-              <th>ID</th>
-              <th />
-            </tr>
-          </thead>
-          <tbody>
+        <Table className="mt-3 text-xs">
+          <TableHeader>
+            <TableRow>
+              <TableHead>Target</TableHead>
+              <TableHead>Type</TableHead>
+              <TableHead>Phase</TableHead>
+              <TableHead className="text-right">Screens</TableHead>
+              <TableHead className="text-right">Findings</TableHead>
+              <TableHead>Updated</TableHead>
+              <TableHead>ID</TableHead>
+              <TableHead><span className="sr-only">Action</span></TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
             {rows.map((r) => (
-              <tr
-                key={r.id}
-                className="idxrow"
-                onClick={() => {
-                  window.location.search = `?id=${encodeURIComponent(r.id)}`;
-                }}
-              >
-                <td>
-                  <div className="tname">
-                    {r.running ? <span className="rundot" title="running" /> : null}
+              <TableRow key={r.id} className="cursor-pointer" onClick={() => { window.location.search = `?id=${encodeURIComponent(r.id)}`; }}>
+                <TableCell className="min-w-48 whitespace-normal">
+                  <a href={`?id=${encodeURIComponent(r.id)}`} className="font-semibold text-foreground hover:text-primary" onClick={(e) => e.stopPropagation()}>
+                    {r.running ? <span className="mr-2 inline-block size-2 rounded-full bg-primary" title="running" /> : null}
                     {targetName(r.target)}
-                  </div>
-                  <div className="tsub">{targetSub(r.target)}</div>
-                </td>
-                <td>
-                  <span className={`typepill ${r.type}`}>{r.type}</span>
-                </td>
-                <td>
-                  <span className={`phasepill ${r.phase}`}>{r.phase}</span>
-                </td>
-                <td className="num">{r.screens}</td>
-                <td className={`num ${r.findings > 0 ? "hasf" : ""}`}>{r.findings}</td>
-                <td className="when">{fmt(r.updatedAt)}</td>
-                <td className="mono idcell">{r.id}</td>
-                <td className="ctl">
+                  </a>
+                  <div className="mt-1 break-all font-mono text-[11px] text-muted-foreground">{targetSub(r.target)}</div>
+                </TableCell>
+                <TableCell><Badge variant="outline" className={r.type === "api" ? "border-success/40 text-success" : "border-primary/40 text-primary"}>{r.type}</Badge></TableCell>
+                <TableCell><Badge variant="outline" className={r.phase === "report" ? "border-success/40 text-success" : r.phase === "phase1_recon" || r.phase === "phase2_scan" ? "border-primary/40 text-primary" : "text-muted-foreground"}>{r.phase}</Badge></TableCell>
+                <TableCell className="text-right">{r.screens}</TableCell>
+                <TableCell className={r.findings > 0 ? "text-right font-semibold text-warning" : "text-right"}>{r.findings}</TableCell>
+                <TableCell className="text-muted-foreground">{fmt(r.updatedAt)}</TableCell>
+                <TableCell className="font-mono text-[11px] text-muted-foreground">{r.id}</TableCell>
+                <TableCell className="text-right">
                   {!canWrite ? (
-                    r.running ? <span className="rundot" title="running" /> : null
+                    r.running ? <span className="inline-block size-2 rounded-full bg-primary" title="running" /> : null
                   ) : r.running ? (
-                    <button type="button" className="stopbtn" onClick={runCtl(r.id, "stop")}>
-                      ◼ Stop
-                    </button>
+                    <Button type="button" variant="destructive" size="xs" onClick={runCtl(r.id, "stop")}><Square /> Stop</Button>
                   ) : (
-                    <button
-                      type="button"
-                      className="resumebtn"
-                      onClick={runCtl(r.id, "resume")}
-                    >
-                      ▶ Resume
-                    </button>
+                    <Button type="button" variant="secondary" size="xs" onClick={runCtl(r.id, "resume")}><Play /> Resume</Button>
                   )}
-                </td>
-              </tr>
+                </TableCell>
+              </TableRow>
             ))}
-          </tbody>
-        </table>
+          </TableBody>
+        </Table>
       ) : null}
-      {!rows && !err ? <p className="idxempty">Loading…</p> : null}
+      {!rows && !err ? <p className="p-4 text-muted-foreground">Loading…</p> : null}
     </div>
   );
 }

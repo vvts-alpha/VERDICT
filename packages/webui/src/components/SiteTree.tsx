@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState, type KeyboardEvent } from "react";
 import type { TreeNode } from "@veritas/core";
 import { useRole } from "../api";
+import { Button } from "./ui/button";
+import { Badge } from "./ui/badge";
 
 // Exclude targets = only screens not yet scanned (or in-progress/errored). Keep clean/finding/suspected.
 const EXCLUDABLE = new Set(["queued", "scanning", "error"]);
@@ -15,6 +17,17 @@ const STATUS_LABEL: Record<string, string> = {
   blocked: "blocked",
   excluded: "excluded",
   error: "error",
+};
+
+const DOT_STATUS: Record<string, string> = {
+  queued: "bg-muted-foreground/50",
+  scanning: "bg-primary animate-pulse",
+  clean: "bg-success",
+  finding: "bg-warning",
+  suspected: "bg-suspected",
+  blocked: "bg-destructive",
+  excluded: "border border-muted-foreground bg-transparent",
+  error: "bg-destructive",
 };
 
 /** Number of finding screens contained in this subtree (for the rolled-up display when collapsed). */
@@ -100,7 +113,7 @@ function Node({
     }
     if (e.key === "ArrowDown" || e.key === "ArrowUp") {
       e.preventDefault();
-      const rows = Array.from(e.currentTarget.closest(".tree")?.querySelectorAll<HTMLElement>(".node") ?? []);
+      const rows = Array.from(e.currentTarget.closest("[data-site-tree]")?.querySelectorAll<HTMLElement>("[data-treeitem]") ?? []);
       const next = rows[rows.indexOf(e.currentTarget) + (e.key === "ArrowDown" ? 1 : -1)];
       next?.focus();
     }
@@ -109,7 +122,8 @@ function Node({
   return (
     <li role="none">
       <div
-        className={`node ${isSelected ? "sel" : ""} ${status}`}
+        className={`group mx-0.5 my-0.5 flex cursor-pointer select-none items-center gap-2 rounded-md px-2 py-1 hover:bg-muted ${isSelected ? "bg-secondary shadow-[inset_2px_0_0_var(--accent)]" : ""}`}
+        data-treeitem=""
         onClick={activate}
         onKeyDown={onKey}
         onFocus={() => onFocusRow(node.path)}
@@ -118,12 +132,14 @@ function Node({
         tabIndex={node.path === (focusPath ?? defaultPath) ? 0 : -1}
         aria-selected={node.screenId ? isSelected : undefined}
         aria-expanded={hasChildren ? !isCollapsed : undefined}
-        title={STATUS_LABEL[status]}
+        title={`${node.path}${STATUS_LABEL[status] ? ` — ${STATUS_LABEL[status]}` : ""}`}
       >
         {hasChildren ? (
-          <button
+          <Button
             type="button"
-            className={`twist ${isCollapsed ? "" : "open"}`}
+            variant="ghost"
+            size="icon-xs"
+            className="size-4 shrink-0 text-muted-foreground"
             onClick={(e) => {
               e.stopPropagation();
               toggle(node.path);
@@ -131,21 +147,23 @@ function Node({
             tabIndex={-1}
             aria-label={isCollapsed ? "expand" : "collapse"}
           >
-            ▸
-          </button>
+            <span className={isCollapsed ? "" : "rotate-90"}>▸</span>
+          </Button>
         ) : (
-          <span className="twist-spacer" />
+          <span className="w-4 shrink-0" />
         )}
-        <span className="dot" aria-hidden="true" />
-        <span className="seg" {...(/^\{.*\}$/.test(node.segment) ? { "data-dyn": "" } : {})}>
+        <span className={`size-2 shrink-0 rounded-full ${DOT_STATUS[status] ?? "bg-border"}`} aria-hidden="true" />
+        <span className={`truncate font-mono ${status === "finding" ? "text-warning" : /^\{.*\}$/.test(node.segment) ? "text-muted-foreground italic" : ""}`}>
           {node.segment}
         </span>
-        {rolledFindings > 0 ? <span className="roll" title={`${rolledFindings} finding(s) inside`}>{rolledFindings}</span> : null}
-        {node.screenType ? <span className="stype">{node.screenType}</span> : null}
+        {rolledFindings > 0 ? <Badge className="bg-warning text-on-warning" title={`${rolledFindings} finding(s) inside`}>{rolledFindings}</Badge> : null}
+        {node.screenType ? <Badge variant="secondary" className="ml-auto shrink-0 text-[10px]">{node.screenType}</Badge> : null}
         {excludable.length > 0 ? (
-          <button
+          <Button
             type="button"
-            className={`tree-exclude${armed ? " armed" : ""}`}
+            variant={armed ? "destructive" : "outline"}
+            size="xs"
+            className={`ml-auto h-5 text-[10px] ${armed ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"}`}
             title={armed ? "Click again to confirm" : hasChildren ? `Exclude this branch — ${excludable.length} un-scanned screen(s)` : "Exclude this screen from scanning"}
             onClick={(e) => {
               e.stopPropagation();
@@ -158,11 +176,11 @@ function Node({
             tabIndex={-1}
           >
             {armed ? `Exclude ${excludable.length}?` : `⊘${excludable.length > 1 ? ` ${excludable.length}` : ""}`}
-          </button>
+          </Button>
         ) : null}
       </div>
       {hasChildren && !isCollapsed ? (
-        <ul role="group">
+        <ul role="group" className="ml-4 border-l border-border pl-1">
           {node.children.map((child) => (
             <Node
               key={child.path}
@@ -211,12 +229,12 @@ export function SiteTree({
 
 
   return (
-    <nav className="tree" aria-label="Site tree">
-      <div className="pane-title">SITE TREE</div>
+    <nav className="min-h-0 min-w-0 flex-1 overflow-auto" data-site-tree="" aria-label="Site tree">
+      <div className="border-b border-border px-3 py-2 text-[11px] uppercase tracking-wide text-muted-foreground">SITE TREE</div>
       {tree.length === 0 ? (
-        <p className="muted">no screens yet — run a crawl</p>
+        <p className="p-2 text-muted-foreground">no screens yet — run a crawl</p>
       ) : (
-        <ul className="root" role="tree">
+        <ul className="px-2 py-2" role="tree">
           {tree.map((node) => (
             <Node
               key={node.path}

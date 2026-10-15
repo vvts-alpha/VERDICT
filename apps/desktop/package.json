@@ -7,6 +7,7 @@
   "files": [
     "dist",
     "dist-renderer",
+    "icons",
     "preload.cjs",
     "electron-builder.yml",
     "packaging/after-pack.cjs"
@@ -23,11 +24,13 @@
     "dist": "electron-builder --config electron-builder.yml"
   },
   "devDependencies": {
+    "@tailwindcss/vite": "4.3.3",
     "@types/node": "^22.10.6",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
     "electron": "44.3.0",
+    "tailwindcss": "4.3.3",
     "tsx": "^4.19.2",
     "typescript": "^5.7.3",
     "vite": "^6.0.7"
@@ -37,6 +40,7 @@
     "@veritas/core": "workspace:*",
     "@veritas/server": "workspace:*",
     "@veritas/webui": "workspace:*",
+    "lucide-react": "1.52.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   }

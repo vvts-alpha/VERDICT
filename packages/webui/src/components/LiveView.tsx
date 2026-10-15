@@ -52,10 +52,10 @@ export function LiveView({ id }: { id: string }) {
   }, [id]);
 
   return (
-    <div className="liveview">
-      <div className="liveview-bar">
-        <span className={`liveview-dot ${status}`} />
-        <span className="muted">
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="flex items-center gap-2 border-b border-border p-2">
+        <span className={`size-2 shrink-0 rounded-full ${status === "live" ? "bg-success" : status === "closed" ? "bg-destructive" : "bg-warning"}`} aria-hidden="true" />
+        <span className="text-muted-foreground">
           {status === "live"
             ? "live — watching the scan browser"
             : status === "waiting"
@@ -65,9 +65,9 @@ export function LiveView({ id }: { id: string }) {
                 : "not streaming — the scan is not running (start or resume it to watch live)"}
         </span>
       </div>
-      <div className="liveview-stage">
-        <canvas ref={canvasRef} className="liveview-canvas" style={{ display: gotFrame ? "block" : "none" }} />
-        {!gotFrame ? <div className="liveview-empty">The live view appears here while an assessment is running.</div> : null}
+      <div className="flex min-h-0 flex-1 items-center justify-center overflow-auto bg-inset p-3">
+        <canvas ref={canvasRef} className="max-h-full max-w-full rounded border border-border" style={{ display: gotFrame ? "block" : "none" }} />
+        {!gotFrame ? <div className="text-muted-foreground">The live view appears here while an assessment is running.</div> : null}
       </div>
     </div>
   );

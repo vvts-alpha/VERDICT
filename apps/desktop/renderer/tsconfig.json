@@ -5,6 +5,8 @@
     "moduleResolution": "Bundler",
     "lib": ["ES2023", "DOM", "DOM.Iterable"],
     "types": [],
+    "baseUrl": ".",
+    "paths": { "@/*": ["../../../packages/webui/src/*"] },
     "jsx": "react-jsx",
     "noEmit": true
   },

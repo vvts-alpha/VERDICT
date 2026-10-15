@@ -1,4 +1,8 @@
 import type { StateView } from "@veritas/core";
+import { SeverityBadge } from "./SeverityBadge";
+import { Badge } from "./ui/badge";
+import { Button } from "./ui/button";
+import { Card } from "./ui/card";
 
 // Scenarios tab — a read-only projection of "what the agent intends to attack per screen, and how (the methodology plan)"
 // and "the results of A04 cross-screen scenarios". Data source is events (📋 PLAN / ✓ coverage /
@@ -15,13 +19,6 @@ const A04 = new Set(["price-tampering", "qty-tampering", "workflow-bypass", "mas
 
 type Plan = { screenId: string; classes: string[]; plan: string };
 type Cov = { verdict: string; entries: Array<{ cls: string; result: string }> };
-
-function covClass(result: string): string {
-  if (result === "found") return "cov-found";
-  if (result === "tested-clean") return "cov-clean";
-  if (result.startsWith("not-applicable")) return "cov-na";
-  return "cov-other";
-}
 
 export function Scenarios({ view, onJump }: { view: StateView; onJump: (screenId: string) => void }) {
   const plans = new Map<string, Plan>();
@@ -60,78 +57,67 @@ export function Scenarios({ view, onJump }: { view: StateView; onJump: (screenId
   });
 
   return (
-    <section className="scenarios-tab">
-      <h2>Scenarios</h2>
+    <section className="space-y-4">
+      <h2 className="text-base font-semibold">Scenarios</h2>
       {focus ? (
-        <div className="focus-banner" title="operator --focus, injected as the top priority of the scenario stage">
+        <div className="rounded border border-success/40 bg-success/15 p-3 text-success" title="operator --focus, injected as the top priority of the scenario stage">
           🎯 Operator focus: <b>{focus}</b>
         </div>
       ) : null}
 
-      <h3>Per-screen attack plans ({screenIds.length})</h3>
+      <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Per-screen attack plans ({screenIds.length})</h3>
       {screenIds.length === 0 ? (
-        <p className="muted">No plans yet — methodology runs after the survey maps the surface.</p>
+        <p className="text-muted-foreground">No plans yet — methodology runs after the survey maps the surface.</p>
       ) : (
-        <div className="plan-list">
+        <div className="flex flex-col gap-2">
           {screenIds.map((sid) => {
             const p = plans.get(sid);
             const c = covs.get(sid);
             return (
-              <div key={sid} className="plan-card">
-                <div className="plan-head">
-                  <button type="button" className="screenlink" onClick={() => onJump(sid)}>
-                    {sid}
-                  </button>
-                  <span className="plan-url">{urlOf.get(sid) ?? ""}</span>
-                  {c ? <span className={`verdict v-${c.verdict}`}>{c.verdict}</span> : <span className="verdict v-pending">planned</span>}
+              <Card size="sm" key={sid} className="gap-2 p-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button type="button" variant="link" size="xs" onClick={() => onJump(sid)}>{sid}</Button>
+                  <span className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground">{urlOf.get(sid) ?? ""}</span>
+                  {c ? <Badge variant="outline" className={c.verdict === "finding" ? "border-destructive text-destructive" : "border-success text-success"}>{c.verdict}</Badge> : <Badge variant="outline">planned</Badge>}
                 </div>
                 {p && p.classes.length > 0 ? (
-                  <div className="plan-classes">
-                    {p.classes.map((cl) => (
-                      <span key={cl} className="cls-chip">
-                        {cl}
-                      </span>
-                    ))}
+                  <div className="flex flex-wrap gap-1">
+                    {p.classes.map((cl) => <Badge key={cl} variant="secondary">{cl}</Badge>)}
                   </div>
                 ) : null}
                 {c && c.entries.length > 0 ? (
-                  <div className="cov-row">
+                  <div className="flex flex-wrap gap-1">
                     {c.entries.map((e) => (
-                      <span key={e.cls} className={`cov-chip ${covClass(e.result)}`}>
-                        {e.cls}
-                        {e.result ? `: ${e.result}` : ""}
-                      </span>
+                      <Badge key={e.cls} variant="outline" className={e.result === "found" ? "border-destructive text-destructive" : e.result === "tested-clean" ? "border-success text-success" : "text-muted-foreground"}>
+                        {e.cls}{e.result ? `: ${e.result}` : ""}
+                      </Badge>
                     ))}
                   </div>
                 ) : null}
-                {p?.plan ? <p className="plan-text">{p.plan}</p> : null}
-              </div>
+                {p?.plan ? <p className="whitespace-pre-wrap break-words text-xs">{p.plan}</p> : null}
+              </Card>
             );
           })}
         </div>
       )}
 
-      <h3>A04 cross-screen scenarios ({scen.length})</h3>
+      <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">A04 cross-screen scenarios ({scen.length})</h3>
       {scen.length === 0 ? (
-        <p className="muted">No multi-step / cross-screen scenario findings (yet).</p>
+        <p className="text-muted-foreground">No multi-step / cross-screen scenario findings (yet).</p>
       ) : (
-        <div className="scen-list">
+        <div className="flex flex-col gap-2">
           {scen.map((f) => {
             const cat = /^\[([^\]]+)\]/.exec(f.title)?.[1] ?? "scenario";
             return (
-              <div key={f.id} className="scen-card">
-                <div className="scen-head">
-                  <span className={`sevpill sev-${f.severity}`}>{f.severity}</span>
-                  <span className="cls-chip">{cat}</span>
-                  <span className="scen-title">{f.title.replace(/^\[[^\]]+\]\s*/, "")}</span>
-                  {f.screenId ? (
-                    <button type="button" className="screenlink" onClick={() => onJump(f.screenId!)}>
-                      {f.screenId}
-                    </button>
-                  ) : null}
+              <Card size="sm" key={f.id} className="gap-2 p-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <SeverityBadge severity={f.severity} />
+                  <Badge variant="secondary">{cat}</Badge>
+                  <span className="flex-1">{f.title.replace(/^\[[^\]]+\]\s*/, "")}</span>
+                  {f.screenId ? <Button type="button" variant="link" size="xs" onClick={() => onJump(f.screenId!)}>{f.screenId}</Button> : null}
                 </div>
-                <p className="finding-desc">{f.description}</p>
-              </div>
+                <p className="whitespace-pre-wrap">{f.description}</p>
+              </Card>
             );
           })}
         </div>

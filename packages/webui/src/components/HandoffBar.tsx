@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import type { HumanHandoff } from "@veritas/core";
 import { useRole } from "../api";
+import { Button } from "./ui/button";
 
 const SHOW_BROWSER = "verdict-show-browser";
 
@@ -38,25 +39,29 @@ export function HandoffBar({ handoffs, onResolve }: { handoffs: HumanHandoff[]; 
   if (pending.length === 0) return null;
   const desktop = isDesktop();
   return (
-    <div className="handoffs">
+    <div className="border-b border-warning bg-warning/15">
       {pending.map((h) => (
-        <div key={h.id} className="handoff">
-          <span className="hicon">🔐</span>
-          <span className="htext">
-            Needs human [{h.reason}]: <b className="mono">{h.url ?? ""}</b> — {h.message}
+        <div key={h.id} className="flex items-center gap-3 px-3 py-2">
+          <span aria-hidden="true">🔐</span>
+          <span className="flex-1 text-warning">
+            Needs human [{h.reason}]: <b className="font-mono">{h.url ?? ""}</b> — {h.message}
             {desktop && isBrowserHandoff(h)
               ? " — log in / clear CAPTCHA in the Browser tab, then Capture session → Logged in → continue."
               : ""}
           </span>
           {canWrite && desktop && isBrowserHandoff(h) ? (
-            <button type="button" onClick={() => openInBrowser(h.url, h.id)} title="Open this URL in the in-app Browser tab">
-              Open in Browser
-            </button>
+            <Button type="button" size="sm" onClick={() => openInBrowser(h.url, h.id)} title="Open this URL in the in-app Browser tab">Open in Browser</Button>
           ) : null}
+          {/* One "continue" verb per flow: when the attended browser is the path, its own
+              "Logged in → continue" injects the captured session AND resolves — the bar's
+              resolve-only action must not look the same. On the web there is no attended
+              browser, so the resolve button stays the primary continue. */}
           {canWrite ? (
-            <button type="button" onClick={() => onResolve(h.id)}>
-              Logged in → continue
-            </button>
+            desktop && isBrowserHandoff(h) ? (
+              <Button type="button" variant="outline" size="sm" onClick={() => onResolve(h.id)} title="Resolve without capturing/applying a session">Resolve without session</Button>
+            ) : (
+              <Button type="button" size="sm" onClick={() => onResolve(h.id)}>Logged in → continue</Button>
+            )
           ) : null}
         </div>
       ))}

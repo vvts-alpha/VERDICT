@@ -35,15 +35,15 @@ function hhmmss(ts: string): string {
 
 export function Log({ events }: { events: StateEvent[] }) {
   if (events.length === 0) {
-    return <p className="muted log-empty">No activity yet.</p>;
+    return <p className="p-4 text-muted-foreground">No activity yet.</p>;
   }
   const rows = [...events].slice(-300).reverse(); // newest first + capped (same bound as the store projection)
   return (
-    <div className="log">
+    <div className="flex flex-col">
       {rows.map((e) => (
-        <div key={e.seq} className={`logline lt-${e.type}`}>
-          <span className="log-ts">{hhmmss(e.ts)}</span>
-          <span className="log-msg">{eventLine(e)}</span>
+        <div key={e.seq} className="flex gap-3 border-b border-border px-1 py-1 text-xs hover:bg-muted">
+          <span className="shrink-0 font-mono tabular-nums text-muted-foreground">{hhmmss(e.ts)}</span>
+          <span className={`break-words font-mono whitespace-pre-wrap ${e.type === "finding_created" ? "font-semibold text-warning" : e.type === "phase_changed" ? "text-primary" : e.type === "halted" ? "text-destructive" : "text-foreground"}`}>{eventLine(e)}</span>
         </div>
       ))}
     </div>

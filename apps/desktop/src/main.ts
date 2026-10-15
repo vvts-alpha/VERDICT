@@ -59,6 +59,7 @@ function attachPopupPolicy(contents: WebContents): void {
             action: "allow",
             overrideBrowserWindowOptions: {
                 title: "VERDICT",
+                icon: resolveWindowIcon(),
                 autoHideMenuBar: true,
             },
         };
@@ -67,6 +68,13 @@ function attachPopupPolicy(contents: WebContents): void {
 
 function isAppUrl(url: string, origin: string): boolean {
     try { return new URL(url).origin === new URL(origin).origin; } catch { return false; }
+}
+
+/** App icon shipped in the bundle (icons/ sits next to dist/ in dev and in the packaged app dir).
+ *  Windows taskbar/installer branding comes primarily from the exe icon (electron-builder win.icon);
+ *  BrowserWindow.icon is the in-app/taskbar fallback and drives Linux. */
+function resolveWindowIcon(): string {
+    return join(APP_ROOT, "icons", process.platform === "win32" ? "icon.ico" : "icon.png");
 }
 
 /** The single window factory — initial boot AND the macOS dock re-activate path must produce the identical
@@ -80,6 +88,7 @@ function createMainWindow(): BrowserWindow {
         minWidth: 900,
         minHeight: 600,
         title: "VERDICT",
+        icon: resolveWindowIcon(),
         backgroundColor: "#0f1116", // matches the web UI --bg so there is no white flash before load
         frame: false, // custom in-app title bar (DesktopChrome) — the app frame, not a browser window
         webPreferences: {

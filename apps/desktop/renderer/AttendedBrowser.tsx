@@ -1,4 +1,8 @@
 import { useEffect, useRef, useState } from "react";
+import { ChevronLeft, ChevronRight, RotateCw } from "lucide-react";
+import { Button } from "@veritas/webui/ui/button";
+import { Input } from "@veritas/webui/ui/input";
+import { NativeSelect } from "@veritas/webui/ui/native-select";
 
 // The attended embedded browser panel. A native Electron WebContentsView (real Chromium) is drawn by the main
 // process OVER the placeholder region below — the human navigates + logs in there (no automation fingerprint).
@@ -17,16 +21,17 @@ async function copyText(text: string): Promise<boolean> {
 const bridge = () => (typeof window !== "undefined" ? window.verdictDesktop?.browser : undefined);
 
 // A start page shown when the attended browser opens with no target — makes "Browser" read as "start an attended scan".
+// Colours/font mirror the app theme (zinc + sans) — it's a separate document, so Tailwind can't reach it.
 const START_PAGE =
     "data:text/html;charset=utf-8," +
     encodeURIComponent(
         `<!doctype html><html><head><meta charset="utf-8"><style>
         html,body{height:100%;margin:0}
-        body{background:#14161a;color:#8a93a0;font:14px ui-monospace,Menlo,Consolas,monospace;display:flex;align-items:center;justify-content:center}
-        .c{max-width:520px;padding:24px}
-        h1{color:#d7dbe0;font-size:16px;letter-spacing:1px;margin:0 0 14px}
+        body{background:#09090b;color:#a1a1aa;font:14px/1.6 ui-sans-serif,system-ui,"Segoe UI",sans-serif;display:flex;align-items:center;justify-content:center}
+        .c{max-width:560px;padding:24px}
+        h1{color:#e4e4e7;font-size:15px;font-weight:600;letter-spacing:.01em;margin:0 0 16px}
         ol{line-height:1.9;padding-left:20px;margin:0}
-        b{color:#6db0ff}
+        b{color:#e4e4e7;font-weight:600}
         </style></head><body><div class="c">
         <h1>Attended assessment</h1>
         <ol>
@@ -198,70 +203,70 @@ export function AttendedBrowser({
     };
 
     return (
-        <div className="attb">
+        <div className="flex h-full min-h-0 flex-col bg-background">
             {/* Row 1 — pure browser chrome: navigation, the URL, and close. Stable regardless of session state. */}
-            <div className="attb-bar">
-                <button type="button" className="attb-btn" disabled={!nav.canGoBack} onClick={() => bridge()?.back()} title="Back" aria-label="Back">‹</button>
-                <button type="button" className="attb-btn" disabled={!nav.canGoForward} onClick={() => bridge()?.forward()} title="Forward" aria-label="Forward">›</button>
-                <button type="button" className="attb-btn" onClick={() => bridge()?.reload()} title="Reload" aria-label="Reload">⟳</button>
-                <input
-                    className="attb-url"
+            <div className="flex items-center gap-2 border-b border-border bg-card px-2 py-1.5">
+                <Button type="button" variant="outline" size="icon-sm" disabled={!nav.canGoBack} onClick={() => bridge()?.back()} title="Back" aria-label="Back"><ChevronLeft /></Button>
+                <Button type="button" variant="outline" size="icon-sm" disabled={!nav.canGoForward} onClick={() => bridge()?.forward()} title="Forward" aria-label="Forward"><ChevronRight /></Button>
+                <Button type="button" variant="outline" size="icon-sm" onClick={() => bridge()?.reload()} title="Reload" aria-label="Reload"><RotateCw /></Button>
+                <Input
+                    className="min-w-0 flex-1 font-mono"
                     value={urlField}
                     spellCheck={false}
                     onChange={(e) => setUrlField(e.target.value)}
                     onKeyDown={(e) => { if (e.key === "Enter") go(); }}
                     placeholder="https://target/login"
                 />
-                <button type="button" className="attb-copy" disabled={!urlField.trim() && !currentUrl} onClick={() => void copyUrl()} title="Copy URL" aria-label="Copy URL">Copy URL</button>
-                <button type="button" className="attb-close" onClick={onClose} title="Close">Close</button>
+                <Button type="button" variant="outline" size="sm" disabled={!urlField.trim() && !currentUrl} onClick={() => void copyUrl()} title="Copy URL" aria-label="Copy URL">Copy URL</Button>
+                <Button type="button" variant="ghost" size="sm" onClick={onClose} title="Close">Close</Button>
             </div>
             {/* Row 2 — the attended-session flow: capture, then the one contextual action the state allows
                 (mid-run continue / new scan / handoff resume). Growing here never moves the browser chrome. */}
-            <div className="attb-actions">
-                <button type="button" className="attb-capture" onClick={() => void capture()} title="Save cookies + localStorage (SPA Bearer) for the scan">Capture session</button>
+            <div className="flex flex-wrap items-center gap-2 border-b border-border bg-card px-2 py-1.5">
+                <Button type="button" size="sm" onClick={() => void capture()} title="Save cookies + localStorage (SPA Bearer) for the scan">Capture session</Button>
                 {captured?.header ? (
-                    <button type="button" className="attb-copy" onClick={() => void copyCookies()} title="Copy the Cookie header to the clipboard (Repeater / curl)">Copy cookies</button>
+                    <Button type="button" variant="outline" size="sm" onClick={() => void copyCookies()} title="Copy the Cookie header to the clipboard (Repeater / curl)">Copy cookies</Button>
                 ) : null}
                 {sessionRoles.length ? (
-                    <label className="attb-role" title="Which manifest role the captured login belongs to">
+                    <label className="flex items-center gap-2 text-xs text-muted-foreground" title="Which manifest role the captured login belongs to">
                         Logged-in role
-                        <select value={sessionRole} onChange={(e) => setSessionRole(e.target.value)}>
+                        <NativeSelect className="w-40" value={sessionRole} onChange={(e) => setSessionRole(e.target.value)}>
                             <option value="">Choose role</option>
                             {sessionRoles.map((role) => <option key={role} value={role}>{role}</option>)}
-                        </select>
+                        </NativeSelect>
                     </label>
                 ) : null}
                 {captured && currentRunId && !handoffId ? (
-                    <button type="button" className="attb-scan" disabled={launching} onClick={() => void inject()} title="Apply the captured login and continue this diagnosis; restart it if stopped">
+                    <Button type="button" size="sm" className="bg-success text-on-success hover:bg-success/80" disabled={launching} onClick={() => void inject()} title="Apply the captured login and continue this diagnosis; restart it if stopped">
                         {launching ? "Continuing…" : "Continue this run →"}
-                    </button>
+                    </Button>
                 ) : null}
                 {captured && !handoffId ? (
-                    <button type="button" className="attb-scan" disabled={launching} onClick={() => void scan()} title={`Start a new headless authenticated scan of ${captured.host} with this session`}>
+                    <Button type="button" size="sm" className="bg-success text-on-success hover:bg-success/80" disabled={launching} onClick={() => void scan()} title={`Start a new headless authenticated scan of ${captured.host} with this session`}>
                         {launching ? "Starting…" : "Scan (new run) →"}
-                    </button>
+                    </Button>
                 ) : null}
                 {handoffId && currentRunId ? (
-                    <button
+                    <Button
                         type="button"
-                        className="attb-scan"
+                        size="sm" className="bg-success text-on-success hover:bg-success/80"
                         disabled={launching || !captured}
                         onClick={() => void continueHandoff()}
                         title="Apply the captured login, restart the diagnosis if stopped, and return to Main"
                     >
                         {launching ? "Continuing…" : "Logged in → continue"}
-                    </button>
+                    </Button>
                 ) : null}
             </div>
             {handoffId ? (
-                <div className="attb-handoff">
+                <div className="border-b border-warning bg-warning/15 px-3 py-2 text-xs text-warning">
                     Scan waiting on you — log in / clear CAPTCHA here (real browser). Then Capture session
                     {currentRunId ? " and Logged in → continue (injects cookies into the scan)." : "."}
                 </div>
             ) : null}
-            {note ? <div className={note.ok ? "attb-note ok" : "attb-note err"}>{note.text}</div> : null}
+            {note ? <div role="status" className={`border-b border-border px-3 py-1 text-xs ${note.ok ? "text-primary" : "text-destructive"}`}>{note.text}</div> : null}
             {/* The native WebContentsView is positioned by main over this region. */}
-            <div className="attb-view" ref={holderRef} />
+            <div className="min-h-0 flex-1 bg-inset" ref={holderRef} />
         </div>
     );
 }

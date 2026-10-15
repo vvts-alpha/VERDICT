@@ -2,6 +2,9 @@
 // /api/assessments/:id/sessions for the role list; /ws/session?id=&role= to receive frames + send input.
 import { useEffect, useRef, useState, type KeyboardEvent, type MouseEvent, type ClipboardEvent, type WheelEvent } from "react";
 import { useRole } from "../api";
+import { Check } from "lucide-react";
+import { Button } from "./ui/button";
+import { Input } from "./ui/input";
 
 interface RoleSession {
   role: string;
@@ -88,34 +91,28 @@ export function Sessions({ id }: { id: string }) {
   };
 
   if (!canWrite) {
-    return <p className="idxempty">Attended sessions (live browser takeover) are operator-only. Viewers have read-only access.</p>;
+    return <p className="p-4 text-muted-foreground">Attended sessions (live browser takeover) are operator-only. Viewers have read-only access.</p>;
   }
 
   return (
-    <div className="sess">
+    <div className="flex flex-col gap-3">
       {roles.length === 0 ? (
-        <p className="idxempty">No live session. (attended runs launched from “+ New” with attended on appear here.)</p>
+        <p className="p-4 text-muted-foreground">No live session. (attended runs launched from “+ New” with attended on appear here.)</p>
       ) : (
         <>
-          <div className="sess-tabs">
+          <div className="flex flex-wrap items-center gap-2">
             {roles.map((r) => (
-              <button
-                key={r.role}
-                type="button"
-                className={`${active === r.role ? "active" : ""}${r.awaiting ? " needs-input" : ""}`}
-                onClick={() => setActive(r.role)}
-                title={r.awaiting ? "waiting for login" : "logged in"}
-              >
-                {r.awaiting ? "🔴 " : ""}{r.role}
-              </button>
+              <Button key={r.role} type="button" size="sm" variant={active === r.role ? "secondary" : "outline"} className={r.awaiting ? "border-destructive text-destructive" : undefined} onClick={() => setActive(r.role)} title={r.awaiting ? "waiting for login" : "logged in"}>
+                {r.awaiting ? <span className="inline-block size-2 rounded-full bg-destructive" aria-label="awaiting login" /> : null}{r.role}
+              </Button>
             ))}
-            <span className="sess-stat">{status}</span>
-            <button type="button" className="sess-done" onClick={() => { send({ t: "done" }); setStatus("✅ done sent — agent continues"); }}>
-              ✅ Done (logged in)
-            </button>
+            <span className="text-xs text-muted-foreground">{status}</span>
+            <Button type="button" className="ml-auto" onClick={() => { send({ t: "done" }); setStatus("✅ done sent — agent continues"); }}>
+              <Check /> Done (logged in)
+            </Button>
           </div>
           <form
-            className="sess-nav"
+            className="flex gap-2"
             onSubmit={(e) => {
               e.preventDefault();
               const u = url.trim();
@@ -126,20 +123,20 @@ export function Sessions({ id }: { id: string }) {
             }}
             title="navigate the live session browser here — use this to recover from a blank/stuck page"
           >
-            <input
-              className="sess-url"
+            <Input
+              className="flex-1 font-mono"
               value={url}
               onChange={(e) => setUrl(e.target.value)}
               placeholder="https://app.example.com/login  — navigate the live session here (blank-screen recovery)"
               spellCheck={false}
               autoComplete="off"
             />
-            <button type="submit" className="sess-go">Go ↵</button>
+            <Button type="submit">Go ↵</Button>
           </form>
-          <div className="sess-wrap">
+          <div className="flex justify-center rounded-lg border border-border bg-black">
             <canvas
               ref={canvasRef}
-              className="sess-canvas"
+              className="max-w-full cursor-crosshair outline-none"
               width={1280}
               height={800}
               tabIndex={0}

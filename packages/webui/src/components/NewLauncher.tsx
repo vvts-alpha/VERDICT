@@ -3,11 +3,13 @@
 //  surfaced here; VERDICT's WebUI is the autonomous web/API pentest surface. The operator-assisted LLM tool is
 //  a separate project.)
 import { useState, type ReactNode } from "react";
+import { ArrowLeft } from "lucide-react";
 import { NewAssessment } from "./NewAssessment";
+import { Button } from "./ui/button";
 
 type Mode = "web";
 
-// Lucide-style single-color outline icons — stroke = currentColor, sized/colored via CSS (.mode-ic).
+// Lucide-style single-color outline icons — stroke = currentColor, sized/colored by the mode button.
 const svg = {
   viewBox: "0 0 24 24",
   fill: "none",
@@ -36,10 +38,10 @@ function BracesIcon() {
 }
 function Card({ icon, title, desc, onClick, disabled = false }: { icon: ReactNode; title: string; desc: string; onClick?: () => void; disabled?: boolean }) {
   return (
-    <button type="button" className="mode-card" onClick={onClick} disabled={disabled}>
-      <span className="mode-ic">{icon}</span>
-      <span className="mode-t">{title}</span>
-      <span className="mode-d">{desc}</span>
+    <button type="button" className="flex min-h-36 flex-col items-start gap-3 rounded-xl border border-border bg-card p-5 text-left transition-colors hover:border-primary hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50" onClick={onClick} disabled={disabled}>
+      <span className="text-primary [&_svg]:size-8">{icon}</span>
+      <span className="text-sm font-semibold">{title}</span>
+      <span className="text-xs text-muted-foreground">{desc}</span>
     </button>
   );
 }
@@ -51,15 +53,13 @@ export function NewLauncher({ onCancel }: { onCancel: () => void }) {
   if (mode === "web") return <NewAssessment onCancel={back} />;
 
   return (
-    <div className="newform">
-      <div className="nf-row nf-head">
-        <h2>New assessment</h2>
-        <button type="button" className="nf-cancel" onClick={onCancel}>
-          ← Cancel
-        </button>
+    <div className="space-y-5 pb-10">
+      <div className="flex items-center justify-between border-b border-border pb-3">
+        <h2 className="text-base font-semibold">New assessment</h2>
+        <Button type="button" variant="ghost" onClick={onCancel}><ArrowLeft /> Cancel</Button>
       </div>
-      <p className="mode-prompt">What are you assessing?</p>
-      <div className="mode-grid">
+      <p className="text-xs text-muted-foreground">What are you assessing?</p>
+      <div className="grid grid-cols-[repeat(auto-fit,minmax(190px,1fr))] gap-3">
         <Card
           icon={<GlobeIcon />}
           title="Web / API app"

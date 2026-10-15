@@ -1,4 +1,7 @@
 import { useState } from "react";
+import { ChevronRight } from "lucide-react";
+import { Button } from "./ui/button";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "./ui/collapsible";
 
 interface Ev {
   request?: { method?: string; url?: string; headers?: Record<string, string>; body?: string | null } | null;
@@ -47,13 +50,11 @@ export function EvidenceList({ assessmentId, evidenceIds }: { assessmentId: stri
   };
 
   return (
-    <div className="evlist">
-      <div className="evlabel muted">
+    <div className="mt-2 space-y-1">
+      <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
         evidence ({evidenceIds.length})
         {evidenceIds.length > 1 ? (
-          <button type="button" className="evtoggleall" onClick={toggleAll}>
-            {allOpen ? "collapse all" : "expand all"}
-          </button>
+          <Button type="button" variant="ghost" size="xs" onClick={toggleAll}>{allOpen ? "collapse all" : "expand all"}</Button>
         ) : null}
       </div>
       {evidenceIds.map((ev) => {
@@ -61,44 +62,41 @@ export function EvidenceList({ assessmentId, evidenceIds }: { assessmentId: stri
         const isOpen = open.has(ev);
         const hdrs = d?.response?.headers ?? {};
         const hdrLine = HDR_KEYS.filter((k) => hdrs[k]).map((k) => `${k}: ${hdrs[k]}`).join("  ·  ");
+        const pre = "mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded bg-inset p-2 font-mono";
         return (
-          <div key={ev} className="evitem">
-            <button type="button" className={`evbtn${isOpen ? " open" : ""}`} onClick={() => toggle(ev)}>
-              {isOpen ? "▾" : "▸"} {ev}
-              {d?.meta?.kind ? <span className="muted"> · {d.meta.kind}</span> : null}
-            </button>
-            {isOpen ? (
-              !d ? (
-                <div className="evbody muted">loading …</div>
-              ) : (
-                <div className="evbody">
-                  <div className="evreq mono">
-                    <span className="evarrow">▷ request</span>
+          <Collapsible key={ev} open={isOpen} onOpenChange={() => toggle(ev)}>
+            <CollapsibleTrigger asChild>
+              <Button type="button" variant="outline" size="xs" className="h-auto w-full justify-start py-1 font-mono" aria-label={`${isOpen ? "Collapse" : "Expand"} evidence ${ev}`}>
+                <ChevronRight className={`size-3 transition-transform ${isOpen ? "rotate-90" : ""}`} /> {ev}
+                {d?.meta?.kind ? <span className="text-muted-foreground"> · {d.meta.kind}</span> : null}
+              </Button>
+            </CollapsibleTrigger>
+            <CollapsibleContent className="rounded-b border border-t-0 border-border bg-inset p-2 font-mono text-xs">
+              {!d ? <div className="text-muted-foreground">loading …</div> : (
+                <>
+                  <div className="break-all">
+                    <span className="text-muted-foreground">▷ request</span>
                     {d.requestRaw ? (
                       // full request (raw HTTP: request line + all headers + body)
-                      <pre className="evpre">{d.requestRaw}</pre>
+                      <pre className={pre}>{d.requestRaw}</pre>
                     ) : (
                       <>
                         {" "}
                         <b>{d.request?.method}</b> {d.request?.url}
-                        {d.request?.headers && Object.keys(d.request.headers).length ? (
-                          <pre className="evpre">
-                            {Object.entries(d.request.headers).map(([k, v]) => `${k}: ${v}`).join("\n")}
-                          </pre>
-                        ) : null}
-                        {d.request?.body ? <pre className="evpre">{d.request.body}</pre> : null}
+                        {d.request?.headers && Object.keys(d.request.headers).length ? <pre className={pre}>{Object.entries(d.request.headers).map(([k, v]) => `${k}: ${v}`).join("\n")}</pre> : null}
+                        {d.request?.body ? <pre className={pre}>{d.request.body}</pre> : null}
                       </>
                     )}
                   </div>
-                  <div className="evres mono">
-                    <span className="evarrow">◁ res</span> <b>{d.response?.status}</b> {d.response?.finalUrl ?? ""}
-                    {hdrLine ? <div className="evhdr muted">{hdrLine}</div> : null}
-                    {d.body ? <pre className="evpre">{d.body.slice(0, 4000)}</pre> : null}
+                  <div className="mt-2 break-all">
+                    <span className="text-muted-foreground">◁ res</span> <b>{d.response?.status}</b> {d.response?.finalUrl ?? ""}
+                    {hdrLine ? <div className="text-muted-foreground">{hdrLine}</div> : null}
+                    {d.body ? <pre className={pre}>{d.body.slice(0, 4000)}</pre> : null}
                   </div>
-                </div>
-              )
-            ) : null}
-          </div>
+                </>
+              )}
+            </CollapsibleContent>
+          </Collapsible>
         );
       })}
     </div>
