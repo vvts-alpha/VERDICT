@@ -9,17 +9,17 @@ import { restoreMethodologyPlans } from "./methodology.js";
 import { createSdkMcpServer, query } from "@anthropic-ai/claude-agent-sdk";
 import type { HookCallback } from "@anthropic-ai/claude-agent-sdk";
 import type { AssessmentStore, Screen, ScopePolicy } from "@veritas/core";
-import { isInScope, isScannable, recordTokens, recordRequests, evaluateBudget } from "@veritas/core";
+import { isInScope, isScannable, recordTokens, recordRequests, evaluateBudget, screenChecks } from "@veritas/core";
 import { modelContextWindows } from "@veritas/core/llm-context";
 import type { LoginCreds } from "@veritas/crawler";
 import { InventoryBuilder, PlaywrightDriver, smartLogin } from "@veritas/crawler";
 import { makeLlmClient, resolveLlmConfig } from "@veritas/llm";
 import { runOpenAiAgentLoop, type PilotToolDef } from "./agent-loop.js";
-import { EvidenceStore, FetchHttpClient, fingerprintTech, stackAttackHints } from "@veritas/scanner";
+import { EvidenceStore, FetchHttpClient, fingerprintTech, stackAttackHints, extractBackendLibs } from "@veritas/scanner";
 import type { TechSample } from "@veritas/scanner";
 import type { OobProvider } from "@veritas/scanner";
 import { join } from "node:path";
-import { buildTools, STAGE_TOOLS, applyLoadedAuth, dedupKey, isAuthWalled, loadCookieFile, mergeSetCookie, touchIsDead, stripHash, backfillParentPrefixes, availableRoles, analyzePageJs, enrolByNavigate } from "./tools.js";
+import { buildTools, STAGE_TOOLS, applyLoadedAuth, dedupKey, isAuthWalled, loadCookieFile, mergeSetCookie, touchIsDead, stripHash, backfillParentPrefixes, availableRoles, analyzePageJs, enrolByNavigate, pathIsIgnored } from "./tools.js";
 import { triagePilotFindings } from "./findings-qa.js";
 import { resolveSkills, buildSkillTools, skillToolNamesForStage, type Stage } from "./skills.js";
 import type { PilotSession, RoleSession } from "./tools.js";
@@ -53,6 +53,15 @@ export interface RunPilotOptions {
   /** Role name -> free-text privilege description (e.g. "full admin" / "regular user (read-only)").
    *  Context for the agent to tell high/low privilege apart in auth-diff. Not secret, but not persisted in state. */
   roleDescriptions?: Map<string, string>;
+  /** Role name -> operator-declared principal (manifest auth.roles[].principal) — launch-time identity config. */
+  rolePrincipals?: Map<string, string>;
+  /** Role name -> operator-declared tenant (manifest auth.roles[].tenant). */
+  roleTenants?: Map<string, string>;
+  /** Role name -> operator-provided identity endpoint (a /me-style URL the role's session reads). */
+  roleIdentityUrls?: Map<string, string>;
+  /** Operator-declared expected-access rules (manifest auth.expectedAccess) — the ONLY source of
+   *  "should be denied/allowed" expectations; never authored by the model. */
+  expectedAccess?: import("@veritas/core").ExpectedAccessRule[];
   /** The "deep" model for diagnosis (high-value screens that need emergent reasoning). e.g. claude-opus-4-8. If unset, SDK default. */
   model?: string;
   /** The "fast" model for survey/methodology/login and low-value screens (e.g. claude-sonnet-5).
@@ -75,7 +84,7 @@ export interface RunPilotOptions {
    *  to defeat anti-bot CAPTCHAs that fingerprint Chromium. Opt-in (requires that browser installed). */
   browserChannel?: string;
   noSandbox?: boolean;
-  /** Cap on the number of screens to diagnose (default 40). */
+  /** Cap on the number of screens to diagnose (default 120). */
   maxScreens?: number;
   /** Cap on the number of screens survey maps (--max-survey-screens). Stops exploration once reached. Unset = unlimited. */
   maxSurveyScreens?: number;
@@ -556,7 +565,29 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     fingerprintDone: false,
     ...(opts.oob ? { oob: opts.oob } : {}),
     ...(roleSessions ? { roleSessions } : {}),
+    // authorization context (launch-config only — never model-authored)
+    ...(opts.rolePrincipals?.size ? { rolePrincipals: opts.rolePrincipals } : {}),
+    ...(opts.roleTenants?.size ? { roleTenants: opts.roleTenants } : {}),
+    ...(opts.roleIdentityUrls?.size ? { roleIdentityUrls: opts.roleIdentityUrls } : {}),
+    ...(opts.expectedAccess?.length ? { expectedAccess: opts.expectedAccess } : {}),
+    // per-role survey progress
+    visitedByRole: new Map(),
+    navigatedByRole: new Map(),
+    frontierByRole: new Map(),
+    gatedByRole: new Map(),
+    roleSurveyCounts: new Map(),
+    roleSurveyBlocked: new Map(),
+    sessionPrincipals: new Map(),
+    invalidRoleSessions: new Set(),
+    sessionLiveReads: new Set(),
   };
+  // Bind the initial frontier/gated sets as the STARTING role's own pending/gated — subsequent
+  // setActiveRole swaps stash/restore each role's sets so one session never eats another's frontier.
+  {
+    const startRole = session.currentRole || "unauth";
+    session.frontierByRole!.set(startRole, session.frontier);
+    session.gatedByRole!.set(startRole, session.refererGated);
+  }
 
   // Multiple seeds: push seed URLs other than target onto the frontier as survey starting points
   // (even under hard-lock the initial seeds are pushed; only later discovered-link expansion is suppressed by recordObservation).
@@ -579,7 +610,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
 
   // Live operator controls (rate / scope-widen / max-screens / session inject). Applied on a 2s poll so survey
   // (and mid-query diagnosis) can pick up a CAPTCHA login inject — not only between diagnosis screens.
-  let maxScan = opts.maxScreens ?? 40;
+  let maxScan = opts.maxScreens ?? 120;
   let lastControlSeq = 0;
   if (opts.resume) {
     const seen = opts.store.controlCommandsSince(opts.assessmentId, 0);
@@ -666,6 +697,59 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     session.currentBearer = (await driver.bearerToken().catch(() => null)) ?? ""; // reuse the SPA's Bearer JWT too
     session.currentRole = [...opts.roleCreds.keys()][0] ?? [...(opts.roleCookieFiles?.keys() ?? [])][0] ?? "";
     for (const [screenId, plan] of restoreMethodologyPlans(prev.events)) session.plans.set(screenId, plan);
+    // Per-role survey progress: replay the persisted survey_role_progress events — a role that mapped N urls
+    // (or was explicitly blocked) keeps that honest state across the restart instead of losing it (or letting
+    // one resumed role's session silently satisfy them all). Visited sets, PENDING frontiers, referer-gated
+    // routes, and the navigated dedupe set all rebuild from the last snapshot per role — links discovered
+    // before the pause do not silently disappear.
+    const lastSnap = new Map<string, { pending?: Set<string>; gated?: Set<string> }>();
+    const asUrls = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : []);
+    for (const e of prev.events) {
+      if (e.type !== "survey_role_progress") continue;
+      const p = e.payload as { role?: unknown; visited?: unknown; urls?: unknown; pending?: unknown; gated?: unknown; seen?: unknown; state?: unknown; reason?: unknown };
+      if (typeof p.role !== "string" || typeof p.visited !== "number") continue;
+      session.roleSurveyCounts?.set(p.role, Math.max(session.roleSurveyCounts.get(p.role) ?? 0, p.visited));
+      const urls = asUrls(p.urls);
+      const seen = asUrls(p.seen);
+      if (urls.length) {
+        const set = session.visitedByRole.get(p.role) ?? new Set<string>();
+        for (const u of urls) { set.add(u); session.visited.add(u); }
+        session.visitedByRole.set(p.role, set);
+      }
+      if (urls.length || seen.length) {
+        const nav = session.navigatedByRole?.get(p.role) ?? new Set<string>();
+        for (const u of [...seen, ...urls]) { nav.add(u); session.visited.add(u); }
+        session.navigatedByRole?.set(p.role, nav);
+      }
+      if (Array.isArray(p.pending) || Array.isArray(p.gated)) {
+        const snap = lastSnap.get(p.role) ?? {};
+        if (Array.isArray(p.pending)) snap.pending = new Set(asUrls(p.pending));
+        if (Array.isArray(p.gated)) snap.gated = new Set(asUrls(p.gated));
+        lastSnap.set(p.role, snap);
+      }
+      if (p.state === "blocked") session.roleSurveyBlocked.set(p.role, typeof p.reason === "string" ? p.reason : "blocked (restored)");
+      else if (p.state === "mapped") session.roleSurveyBlocked.delete(p.role);
+    }
+    // Materialize each role's pending/gated: the LAST snapshot, minus what that session has since navigated,
+    // and minus anything the operator later pruned via ignore_paths.
+    for (const [role, snap] of lastSnap) {
+      const nav = session.navigatedByRole?.get(role) ?? new Set<string>();
+      if (snap.pending)
+        session.frontierByRole?.set(role, new Set([...snap.pending].filter((u) => !nav.has(u) && !pathIsIgnored(u, session.ignorePaths, session.targetUrl))));
+      if (snap.gated) session.gatedByRole?.set(role, snap.gated);
+    }
+    // Rebind the ACTIVE role's live aliases to the restored sets (the map entries ARE the live sets), and
+    // unregister the live set from any other key — session creation binds it under the start role, but the
+    // resume-time active role may differ and two keys must never share one mutable set.
+    {
+      const active = session.currentRole || "unauth";
+      if (session.frontierByRole?.has(active)) session.frontier = session.frontierByRole.get(active)!;
+      if (session.gatedByRole?.has(active)) session.refererGated = session.gatedByRole.get(active)!;
+      session.frontierByRole?.set(active, session.frontier);
+      session.gatedByRole?.set(active, session.refererGated);
+      for (const [k, v] of session.frontierByRole ?? []) if (k !== active && v === session.frontier) session.frontierByRole!.delete(k);
+      for (const [k, v] of session.gatedByRole ?? []) if (k !== active && v === session.refererGated) session.gatedByRole!.delete(k);
+    }
     // Carry over existing findings (continue id numbering + best-effort dedup key to suppress double-reporting)
     for (const f of prev.findings) {
       const num = Number.parseInt(f.id.replace(/^f-/, ""), 10);
@@ -1022,15 +1106,20 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
           }
         }
         const components = fingerprintTech(samples);
-        if (components.length > 0) {
-          const hints = stackAttackHints(components);
+        // Backend-lib guesses from the same bodies (error pages / stack traces on root/login) —
+        // GUESSES feed attack hints but stay out of the detected-stack line (they're not confirmed).
+        const libGuesses = samples.flatMap((sm) => extractBackendLibs(sm.body));
+        const guessStr = libGuesses.map((c) => (c.version ? `${c.name} ${c.version}` : c.name)).join(", ");
+        if (components.length > 0 || libGuesses.length > 0) {
+          const hints = stackAttackHints([...components, ...libGuesses]);
           const stackStr = components.map((c) => (c.version ? `${c.name} ${c.version}` : c.name)).join(", ");
           opts.store.appendEvent(opts.assessmentId, {
             type: "note",
-            payload: { message: `🔎 early fingerprint (pre-plan): ${stackStr}${hints.length ? ` → ${hints.length} stack-specific attack hint(s) fed into planning` : ""}` },
+            payload: { message: `🔎 early fingerprint (pre-plan): ${stackStr || "(no stack components)"}${guessStr ? ` · backend-lib guesses: ${guessStr}` : ""}${hints.length ? ` → ${hints.length} stack-specific attack hint(s) fed into planning` : ""}` },
           });
           techClause =
             `DETECTED TECH STACK (fingerprinted BEFORE planning): ${stackStr}.\n` +
+            (guessStr ? `SUSPECTED backend libraries (body-signal guesses — treat as leads for n-day classes, not confirmed installs): ${guessStr}.\n` : "") +
             (hints.length ? `Stack-specific attack surface — BAKE these classes into the relevant per-screen plans:\n${hints.map((h) => `  - ${h}`).join("\n")}\n` : "") +
             `\n`;
         }
@@ -1062,9 +1151,9 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       const candidates = resumeStatus
         ? session.inv.screens().filter((sc) => !TERMINAL.has(resumeStatus.get(sc.screenId) ?? "queued"))
         : session.inv.screens();
-      const screens = candidates.slice(0, opts.maxScreens ?? 40);
+      const screens = candidates.slice(0, opts.maxScreens ?? 120);
       opts.onText?.(
-        `🔬 diagnosing ${screens.length} screen(s)${resumeStatus ? ` of ${candidates.length} queued` : ""}${candidates.length > screens.length ? ` (capped at ${opts.maxScreens ?? 40}; resume again or raise --max-screens for the rest)` : ""}`,
+        `🔬 diagnosing ${screens.length} screen(s)${resumeStatus ? ` of ${candidates.length} queued` : ""}${candidates.length > screens.length ? ` (capped at ${opts.maxScreens ?? 120}; resume again or raise --max-screens for the rest)` : ""}`,
       );
       // Screens with multiple endpoints need >25 turns to confirm IDOR. At 25 it capped out just before recording.
       const perScreen = Math.min(maxTurns, 40);
@@ -1220,13 +1309,19 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         // The ledger decides terminal by the **confidence of the finding actually recorded** (confirmed->finding / suspected->suspected /
         //   none->clean). screenVerdict is the authoritative value record_finding maintains (upgrade-only; the model's screen_done self-report never overwrites it).
         //   skip_screen flags the screen out-of-scope for active testing (high-harm / out-of-ROE) → excluded (terminal), and the run continues.
+        //   A screen with no finding but unverified/blocked/unfulfilled check-ledger gaps closes as "unverified"
+        //   (terminal, honest incomplete) — NOT clean: incomplete work is never converted to a pass.
+        const checkView = screenChecks({ checkExecutions: opts.store.checks(opts.assessmentId) }, sc.screenId);
+        const hasCheckGaps = checkView.unstarted.length > 0 || checkView.gaps.length > 0;
         const status = session.screenSkipReason
           ? "excluded"
           : session.screenVerdict === "finding"
             ? "finding"
             : session.screenVerdict === "suspected"
               ? "suspected"
-              : "clean";
+              : hasCheckGaps
+                ? "unverified"
+                : "clean";
 
         // ── Auth-wall circuit breaker ── if every probe returns 401 and nothing gets through (zero 2xx, zero findings),
         //    running more screens is pointless. Stop and prompt the operator to set auth (httpBasic/creds/cookie).

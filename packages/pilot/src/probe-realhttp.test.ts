@@ -54,6 +54,7 @@ const readBody = (req: http.IncomingMessage): Promise<string> => new Promise((re
 let server: http.Server;
 let base = "";
 let dir = "";
+const fixtureStores: AssessmentStore[] = [];
 
 before(async () => {
   server = http.createServer(async (req, res) => {
@@ -72,10 +73,19 @@ before(async () => {
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}/`;
   dir = mkdtempSync(join(tmpdir(), "veritas-realhttp-"));
 });
-after(() => { server.close(); delete (Object.prototype as Record<string, unknown>)[PP_MARKER]; rmSync(dir, { recursive: true, force: true }); });
+after(async () => {
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => error ? reject(error) : resolve());
+    server.closeAllConnections();
+  });
+  delete (Object.prototype as Record<string, unknown>)[PP_MARKER];
+  for (const store of fixtureStores) store.close();
+  rmSync(dir, { recursive: true, force: true });
+});
 
 function session(): PilotSession {
   const store = AssessmentStore.open(join(dir, `s${Math.abs(base.length + Object.keys({}).length)}.sqlite`));
+  fixtureStores.push(store);
   try { store.createAssessment({ id: "a-1", target: { kind: "single_url", url: base, followLinks: true, maxDepth: 2 }, scope: deriveScopeFromSingleUrl(base) }); } catch { /* exists */ }
   return {
     http: new FetchHttpClient({ allow: (url: string) => url.startsWith(base.replace(/\/$/, "")) }),

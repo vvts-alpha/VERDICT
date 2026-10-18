@@ -15,6 +15,8 @@ function sess(over: Partial<Parameters<typeof frontierLinks>[1]> = {}) {
     visited: new Set<string>(),
     ignorePaths: [] as string[],
     targetUrl: "https://app.example.com/",
+    currentRole: "",
+    navigatedByRole: new Map<string, Set<string>>(),
     refererGated: new Set<string>(),
     ...over,
   };

@@ -13,14 +13,22 @@ import { FakeLlmClient } from "@veritas/llm";
 import { judgeConfirmedFinding, triagePilotFindings, categoryOfFinding } from "./findings-qa.js";
 
 const BASE = "https://app.test/";
+const fixtureStores = new Map<string, AssessmentStore>();
 
-function withDir(fn: (dir: string) => Promise<void> | void): Promise<void> {
+async function withDir(fn: (dir: string) => Promise<void> | void): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), "veritas-qa-"));
-  return Promise.resolve(fn(dir)).finally(() => rmSync(dir, { recursive: true, force: true }));
+  try {
+    await fn(dir);
+  } finally {
+    fixtureStores.get(dir)?.close();
+    fixtureStores.delete(dir);
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 function setup(dir: string): { store: AssessmentStore; evidence: EvidenceStore } {
   const store = AssessmentStore.open(join(dir, "state.sqlite"));
+  fixtureStores.set(dir, store);
   store.createAssessment({ id: "a-1", target: { kind: "single_url", url: BASE, followLinks: true, maxDepth: 2 }, scope: deriveScopeFromSingleUrl(BASE) });
   return { store, evidence: new EvidenceStore(join(dir, "artifacts")) };
 }
@@ -296,7 +304,6 @@ test("triagePilotFindings: demotes Valero SQLi in the store without calling the 
     assert.equal(findingVerdict(f), "suspected");
     assert.equal(f.severity, "info");
     assert.match(f.title, /^\[qa\?\]/);
-    store.close();
   });
 });
 
@@ -319,7 +326,6 @@ test("triagePilotFindings: demotes versionless BigIP A06 without calling the LLM
     assert.equal(llm.calls.length, 0);
     assert.equal(f.severity, "info");
     assert.match(f.title, /^\[qa\?\]/);
-    store.close();
   });
 });
 
@@ -339,7 +345,6 @@ test("triagePilotFindings: AI can still demote a High the mechanical oracle kept
     assert.equal(findingVerdict(f), "suspected");
     assert.doesNotMatch(llm.calls[0]!.prompt, /\btitle:/);
     assert.doesNotMatch(llm.calls[0]!.prompt, /maybe/);
-    store.close();
   });
 });
 
@@ -364,7 +369,6 @@ test("triagePilotFindings: AI sees leftover suspected High A06 with version bann
     assert.doesNotMatch(llm.calls[0]!.prompt, /do not show this title/);
     assert.equal(findingVerdict(f), "suspected");
     assert.equal(f.severity, "high");
-    store.close();
   });
 });
 
@@ -398,7 +402,6 @@ test("adversarial panel: a MAJORITY (2/3) demotes — a medium IDOR is reviewed 
     assert.equal(findingVerdict(f), "suspected");
     assert.ok(f.title.startsWith("[qa?]"));
     assert.match(f.anomaly ?? "", /2\/3 skeptics/);
-    store.close();
   });
 });
 
@@ -412,7 +415,6 @@ test("adversarial panel: a MINORITY (1/3) does NOT demote", async () => {
     assert.equal(r.demoted, 0);
     assert.equal(findingVerdict(f), "confirmed");
     assert.ok(!f.title.startsWith("[qa?]"));
-    store.close();
   });
 });
 
@@ -421,14 +423,13 @@ test("adversarial panel: a MINORITY (1/3) does NOT demote", async () => {
 // The old rule required control+positives to ALL be structured; the effect lives in the positives, so judge those.
 test("judgeConfirmedFinding: JSON auth-bypass with a plain-text 401 control is kept (not an HTML-length FP)", () =>
   withDir((dir) => {
-    const { store, evidence } = setup(dir);
+    const { evidence } = setup(dir);
     const c = ev(evidence, "negative_control", "Invalid email or password", 401);
     const tok = JSON.stringify({ authentication: { token: "eyJhbGciOi...", umail: "admin@juice-sh.op" } });
     const p1 = ev(evidence, "positive_replay", tok, 200);
     const p2 = ev(evidence, "positive_replay", tok, 200);
     const f = finding({ id: "f-authbypass", title: "[sqli] auth-bypass ' OR 1=1--", severity: "critical", evidenceIds: [c.id, p1.id, p2.id] });
     assert.equal(judgeConfirmedFinding(f, evidence).demote, false);
-    store.close();
   }));
 
 test("final QA retains duplicate audit rows while exports and reloads count one canonical finding", async () => {
@@ -452,6 +453,5 @@ test("final QA retains duplicate audit rows while exports and reloads count one 
     const { buildReportModel } = await import("@veritas/core");
     assert.equal(buildReportModel(audit).stats.findings.total, 1);
     assert.equal((await triagePilotFindings({ store, assessmentId: "a-1", evidence })).merged, 0);
-    store.close();
   });
 });

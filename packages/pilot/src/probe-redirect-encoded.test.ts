@@ -26,13 +26,16 @@ function fakeSession(dir: string, send: (req: Req) => Promise<Res>): PilotSessio
 }
 async function callTool(dir: string, name: string, args: Record<string, unknown>, send: (req: Req) => Promise<Res>): Promise<Record<string, unknown>> {
   const s = fakeSession(dir, send);
-  const t = buildTools(s).find((x) => (x as { name: string }).name === name) as { handler: (a: unknown, e: unknown) => Promise<{ content: { text: string }[] }> };
-  const out = await t.handler(args, {});
-  (s as unknown as { store: AssessmentStore }).store.close();
-  return JSON.parse(out.content[0]!.text);
+  try {
+    const t = buildTools(s).find((x) => (x as { name: string }).name === name) as { handler: (a: unknown, e: unknown) => Promise<{ content: { text: string }[] }> };
+    const out = await t.handler(args, {});
+    return JSON.parse(out.content[0]!.text);
+  } finally {
+    (s as unknown as { store: AssessmentStore }).store.close();
+  }
 }
 
-test("probe_redirect confirms an open redirect hidden behind a base64-wrapped SSO_ORIG_URI param", () => {
+test("probe_redirect confirms an open redirect hidden behind a base64-wrapped SSO_ORIG_URI param", async () => {
   const dir = mkdtempSync(join(tmpdir(), "veritas-redir-"));
   try {
     // The app base64-DECODES the return-URL param and 302s there — so only a base64-wrapped payload reaches the sink.
@@ -47,7 +50,7 @@ test("probe_redirect confirms an open redirect hidden behind a base64-wrapped SS
     // the param already carries a base64 return URL (as on a real F5/SSO login)
     const seed = Buffer.from("https://app.test/home", "utf8").toString("base64");
     const url = `${BASE}F5Networks-SSO-Req?SSO_ORIG_URI=${encodeURIComponent(seed)}`;
-    return callTool(dir, "probe_redirect", { url, param: "SSO_ORIG_URI" }, send).then((r) => {
+    await callTool(dir, "probe_redirect", { url, param: "SSO_ORIG_URI" }, send).then((r) => {
       assert.ok(r.negativeControl && Array.isArray(r.positiveReplays) && (r.positiveReplays as unknown[]).length === 2, "confirmed the wrapped open redirect");
       assert.match(String(r.effectMarker ?? r.verdict ?? ""), /veritas-oob\.example/);
     });

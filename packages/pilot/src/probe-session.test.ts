@@ -16,6 +16,7 @@ import { AssessmentStore, deriveScopeFromSingleUrl } from "@veritas/core";
 type Req = { url: string; method?: string; headers?: Record<string, string>; body?: string | null };
 type Res = { status: number; finalUrl: string; durationMs: number; headers: Record<string, string>; body: string; truncated?: boolean };
 type Tool = { name: string; handler: (a: unknown, e: unknown) => Promise<{ content: { text: string }[] }> };
+const fixtureStores = new Map<string, AssessmentStore>();
 
 function fakeSession(
   dir: string,
@@ -24,6 +25,7 @@ function fakeSession(
 ): PilotSession {
   const base = opts.base ?? "https://app.test/";
   const store = AssessmentStore.open(join(dir, "state.sqlite"));
+  fixtureStores.set(dir, store);
   store.createAssessment({ id: "a-1", target: { kind: "single_url", url: base, followLinks: true, maxDepth: 2 }, scope: deriveScopeFromSingleUrl(base) });
   return {
     http: { send, effectiveHeaders: (h: Record<string, string>) => h },
@@ -37,6 +39,8 @@ function fakeSession(
     currentBearer: "",
     currentRole: "alice",
     roleCreds: new Map([["alice", { username: "alice", password: "x" }]]),
+    roleCookieFiles: new Map(),
+    roleDescriptions: new Map(),
     httpProbes: 0,
     screenProbes: 0,
     httpAuthWall: 0,
@@ -59,17 +63,27 @@ async function runRaw(s: PilotSession, name: string, args: Record<string, unknow
   return (await t.handler(args, {})).content[0]!.text;
 }
 
-function withDir(fn: (dir: string) => Promise<void>): Promise<void> {
+async function withDir(fn: (dir: string) => Promise<void>): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), "verdict-session-"));
-  return Promise.resolve(fn(dir)).finally(() => rmSync(dir, { recursive: true, force: true }));
+  try {
+    await fn(dir);
+  } finally {
+    fixtureStores.get(dir)?.close();
+    fixtureStores.delete(dir);
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 const SID = "sid=a1b2c3d4e5f6789012345678";
 
-/** Static fake: every GET returns the same status/body/set-cookie. */
+const isAuthed = (req: Req) => Boolean(req.headers?.cookie ?? req.headers?.Cookie ?? req.headers?.authorization ?? req.headers?.Authorization);
+
+/** Static fake: the same status/body/set-cookie for AUTHENTICATED requests; a request carrying no
+ *  session headers is refused 401 — analyze_session's independent negative control needs a real denial. */
 function staticServer(status: number, setCookie: string, log: Req[] = []): (req: Req) => Promise<Res> {
   return async (req: Req): Promise<Res> => {
     log.push(req);
+    if (!isAuthed(req)) return { status: 401, finalUrl: req.url, durationMs: 2, headers: {}, body: "<html>sign in</html>" };
     return { status, finalUrl: req.url, durationMs: 2, headers: setCookie ? { "set-cookie": setCookie } : {}, body: "<html><body>me</body></html>" };
   };
 }
@@ -94,11 +108,12 @@ test("analyze_session confirms missing Secure/HttpOnly/SameSite on a bare https 
     const pr = out.positiveReplays as string[];
     assert.ok(nc);
     assert.equal(pr.length, 2);
-    assert.equal(pr[0], nc); // absence class: the control response is legitimately reused as positive #1
-    assert.notEqual(pr[1], nc);
-    assert.ok(det.every((f) => f.evidenceIds.includes(nc) && f.evidenceIds.includes(pr[1]!)));
+    // The control is an INDEPENDENT unauthenticated request the app refused — never one of the
+    // two authed positives; all three are distinct recorded executions.
+    assert.equal(new Set([nc, ...pr]).size, 3);
+    assert.ok(det.every((f) => f.evidenceIds.includes(pr[0]!) && f.evidenceIds.includes(pr[1]!)));
     assert.match(String(out.deterministicVerdict), /SESSION COOKIE FLAG FINDINGS/);
-    assert.equal((s as unknown as { httpProbes: number }).httpProbes, 2, "two authed GETs fired");
+    assert.equal((s as unknown as { httpProbes: number }).httpProbes, 3, "two authed GETs + one unauthenticated control fired");
     // end-to-end: record_finding(category session, param secure) accepts the probe's evidence.
     assert.match(
       await runRaw(s, "record_finding", {
@@ -151,10 +166,11 @@ test("SameSite=None without Secure trips samesite AND secure; with Secure only s
     }),
   ));
 
-test("unstable replays (status flip between the two GETs) confirm nothing", () =>
+test("unstable replays (status flip between the two authed GETs) confirm nothing", () =>
   withDir(async (dir) => {
     let n = 0;
-    const s = fakeSession(dir, async (req: Req) => {
+    const s = fakeSession(dir, async (req: Req): Promise<Res> => {
+      if (!isAuthed(req)) return { status: 401, finalUrl: req.url, durationMs: 2, headers: {}, body: "<html>sign in</html>" };
       n += 1;
       return { status: n === 1 ? 200 : 500, finalUrl: req.url, durationMs: 2, headers: { "set-cookie": `${SID}; Path=/` }, body: "<html>x</html>" };
     }, { currentCookie: SID });
@@ -202,6 +218,50 @@ test("record_finding refuses these absence findings as verdict:suspected (no ses
         observation: out.evidenceId,
       }),
       /REJECTED/,
+    );
+  }));
+
+test("unverified flag observation (unauthenticated control also reaches the page): confirmed rejected, suspected fileable", () =>
+  withDir(async (dir) => {
+    // A PUBLIC page: the unauthenticated control gets the same 200+Set-Cookie as the authed GETs —
+    // no independent denial can be established, so the missing-flag observation is below the bar.
+    const s = fakeSession(dir, async (req: Req): Promise<Res> => ({
+      status: 200, finalUrl: req.url, durationMs: 2, headers: { "set-cookie": `${SID}; Path=/` }, body: "<html>public</html>",
+    }), { currentCookie: SID });
+    const out = await run(s, "analyze_session", { url: "https://app.test/me" });
+    assert.ok((out.deterministic as Det[]).length > 0);
+    assert.match(String(out.deterministicVerdict), /UNVERIFIED cookie-flag observation/);
+    assert.equal(out.negativeControl, undefined); // no confirmable handoff
+    // A confirmed filing citing the non-denied control must still be rejected ...
+    assert.match(
+      await runRaw(s, "record_finding", {
+        title: "Session cookie without Secure",
+        severity: "medium",
+        category: "session",
+        endpoint: "/me",
+        param: "secure",
+        description: "x",
+        reproSteps: "x",
+        negativeControl: out.unauthControl,
+        positiveReplays: out.flagEvidenceIds,
+      }),
+      /REJECTED: the cited negativeControl is not a denied unauthenticated request/,
+    );
+    // ... but the retained observation is fileable as suspected.
+    assert.match(
+      await runRaw(s, "record_finding", {
+        title: "Session cookie without Secure",
+        severity: "medium",
+        category: "session",
+        endpoint: "/me",
+        param: "secure",
+        description: "x",
+        reproSteps: "x",
+        verdict: "suspected",
+        anomaly: "The sid session cookie observed on the authed GET of /me carries no Secure attribute over https, and no unauthenticated denial could be established.",
+        observation: out.observation,
+      }),
+      /recorded|merged/,
     );
   }));
 

@@ -34,7 +34,7 @@ test("methodology tools persist full plans and refuse premature completion", asy
   const store = AssessmentStore.open(join(dir, "state.sqlite"));
   try {
     store.createAssessment({ id: "a-1", target: { kind: "single_url", url: "https://app.test/", followLinks: true, maxDepth: 2 }, scope: deriveScopeFromSingleUrl("https://app.test/") });
-    const screens = [{ screenId: "s-0001" }, { screenId: "s-0002" }];
+    const screens = [{ screenId: "s-0001", params: [], apis: [] }, { screenId: "s-0002", params: [], apis: [] }];
     const session = { store, assessmentId: "a-1", inv: { screens: () => screens }, plans: new Map(), methodologyDone: false } as unknown as PilotSession;
     const invoke = async (name: string, args: unknown) => {
       const tool = buildTools(session).find((t) => t.name === name)!;

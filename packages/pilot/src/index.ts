@@ -4,6 +4,7 @@ export { LiveControl } from "./live-control.js";
 export type { RunPilotOptions, PilotResult } from "./run.js";
 export { buildTools, STAGE_TOOLS } from "./tools.js";
 export type { PilotSession } from "./tools.js";
+export { recordCheck, checkTargetOf, extractProbeOutcome, sessionRefOf, subjectCtx } from "./checks.js";
 export { SURVEY_PROMPT, METHODOLOGY_PROMPT, DIAGNOSE_PROMPT } from "./system.js";
 export { verifyBurpFindings, triageAndDeepDiveBurp } from "./verify.js";
 export { triagePilotFindings, judgeConfirmedFinding } from "./findings-qa.js";

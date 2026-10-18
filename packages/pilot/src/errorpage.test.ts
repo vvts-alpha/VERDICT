@@ -49,6 +49,8 @@ test("frontierLinks skips referer-gated routes (won't re-queue a route that boun
     visited: new Set<string>(),
     ignorePaths: [] as string[],
     targetUrl: "https://app.example.com/",
+    currentRole: "",
+    navigatedByRole: new Map<string, Set<string>>(),
     refererGated: new Set<string>(["https://app.example.com/CupEntry/EntryCupList"]),
   };
   const o = { finalUrl: "https://app.example.com/menu", links: ["https://app.example.com/CupEntry/EntryCupList", "https://app.example.com/ok"] };

@@ -91,6 +91,92 @@ function setJsonField(obj: Record<string, unknown>, pointer: string, value: stri
   return true;
 }
 
+/** Same pointer grammar as setJsonField ("/a/b", "a.b", "a"), PLUS numeric segments traversing arrays
+ *  ("items.0.id"). Returns the key list or null on an empty key / prototype-chain key. */
+export function jsonPathKeys(pointer: string): string[] | null {
+  const keys = pointer.startsWith("/")
+    ? pointer.slice(1).split("/").map((k) => k.replace(/~1/g, "/").replace(/~0/g, "~"))
+    : pointer.split(".");
+  if (keys.length === 0 || keys.some((k) => k === "")) return null;
+  if (keys.some((k) => k === "__proto__" || k === "prototype" || k === "constructor")) return null;
+  return keys;
+}
+
+/** Read a value at a JSON path through objects AND arrays ("variables.input.ownerId", "items.0.id").
+ *  {found:false} when any step is missing — the caller distinguishes "absent" from "null". */
+export function readJsonPath(root: unknown, pointer: string): { found: boolean; value?: unknown } {
+  const keys = jsonPathKeys(pointer);
+  if (!keys) return { found: false };
+  let cur: unknown = root;
+  for (const k of keys) {
+    if (Array.isArray(cur)) {
+      if (!/^\d+$/.test(k)) return { found: false };
+      cur = cur[Number(k)];
+    } else if (cur && typeof cur === "object") {
+      if (!Object.hasOwn(cur, k)) return { found: false };
+      cur = (cur as Record<string, unknown>)[k];
+    } else {
+      return { found: false };
+    }
+  }
+  return { found: true, value: cur };
+}
+
+/** Write a TYPED value at a JSON path (objects AND arrays). opts.create=false (default) requires every step to
+ *  already exist — the "replace exactly this value" mode for IDOR/baseline replays. opts.create=true adds missing
+ *  object steps (mass-assignment field insertion). Never touches the prototype chain; refuses to descend through
+ *  a scalar. Returns false when the path can't be honored under the chosen mode. */
+export function writeJsonPath(root: Record<string, unknown> | unknown[], pointer: string, value: unknown, opts: { create?: boolean } = {}): boolean {
+  const keys = jsonPathKeys(pointer);
+  if (!keys) return false;
+  let cur: Record<string, unknown> | unknown[] = root;
+  for (let i = 0; i < keys.length - 1; i++) {
+    const k = keys[i]!;
+    const nextKey = keys[i + 1]!;
+    if (Array.isArray(cur)) {
+      if (!/^\d+$/.test(k)) return false;
+      const idx = Number(k);
+      if (cur[idx] === undefined || cur[idx] === null) {
+        if (!opts.create) return false;
+        cur[idx] = /^\d+$/.test(nextKey) ? [] : {};
+      }
+      const n = cur[idx];
+      if (typeof n !== "object" || n === null) return false;
+      cur = n as Record<string, unknown> | unknown[];
+    } else {
+      if (!Object.hasOwn(cur, k) || cur[k] === null) {
+        if (!opts.create) return false;
+        cur[k] = /^\d+$/.test(nextKey) ? [] : {};
+      }
+      const n = cur[k];
+      if (typeof n !== "object" || n === null) return false;
+      cur = n as Record<string, unknown> | unknown[];
+    }
+  }
+  const last = keys[keys.length - 1]!;
+  if (Array.isArray(cur)) {
+    if (!/^\d+$/.test(last)) return false;
+    const idx = Number(last);
+    if (idx >= cur.length && !opts.create) return false;
+    cur[idx] = value;
+  } else {
+    if (!opts.create && !Object.hasOwn(cur, last)) return false; // replace-only: don't invent the field
+    cur[last] = value;
+  }
+  return true;
+}
+
+/** Coerce a raw string payload to the JSON kind of the value it replaces, so a numeric id field stays numeric
+ *  (GraphQL input types reject "42" where Int is expected — a type-mismatched input is not vuln evidence). */
+export function coerceJsonLike(sample: unknown, raw: string): unknown {
+  if (typeof sample === "number") {
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : raw;
+  }
+  if (typeof sample === "boolean") return raw === "true" ? true : raw === "false" ? false : raw;
+  return raw;
+}
+
 /**
  * Place `payload` into `base` at `loc`, returning a NEW request (base is untouched). Returns null when the location
  * can't be built: an unparseable url, a JSON body that won't parse (or isn't an object), or a path with no segment to

@@ -12,16 +12,19 @@ import { EvidenceStore } from "@veritas/scanner";
 import { AssessmentStore, deriveScopeFromSingleUrl } from "@veritas/core";
 
 const BASE = "https://app.test/";
+const fixtureStores = new Map<string, AssessmentStore>();
 type Req = { url: string; method?: string; headers?: Record<string, string>; body?: string | null };
 type Res = { status: number; finalUrl: string; durationMs: number; headers: Record<string, string>; body: string; truncated?: boolean };
 
 function fakeSession(dir: string, send: (req: Req) => Promise<Res>): PilotSession {
   const store = AssessmentStore.open(join(dir, "state.sqlite"));
+  fixtureStores.set(dir, store);
   store.createAssessment({ id: "a-1", target: { kind: "single_url", url: BASE, followLinks: true, maxDepth: 2 }, scope: deriveScopeFromSingleUrl(BASE) });
   return {
     http: { send, effectiveHeaders: (h: Record<string, string>) => h },
     store, assessmentId: "a-1", evidence: new EvidenceStore(join(dir, "artifacts")),
-    scope: deriveScopeFromSingleUrl(BASE), targetUrl: BASE, currentScreenId: "s-1", currentCookie: "", currentBearer: "",
+    scope: deriveScopeFromSingleUrl(BASE), targetUrl: BASE, currentScreenId: "s-1", currentCookie: "", currentBearer: "", currentRole: "",
+    roleCreds: new Map(), roleCookieFiles: new Map(), roleDescriptions: new Map(),
     httpProbes: 0, screenProbes: 0, httpAuthWall: 0, httpThrough: 0,
     findings: [], findingsByKey: new Map(), recordCalls: 0, findCounter: 0,
   } as unknown as PilotSession;
@@ -32,9 +35,15 @@ async function callTool(dir: string, name: string, args: Record<string, unknown>
   const out = JSON.parse((await t.handler(args, {})).content[0]!.text) as Record<string, unknown>;
   return { out, s };
 }
-function withDir(fn: (dir: string) => Promise<void>): Promise<void> {
+async function withDir(fn: (dir: string) => Promise<void>): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), "verdict-graphql-"));
-  return Promise.resolve(fn(dir)).finally(() => rmSync(dir, { recursive: true, force: true }));
+  try {
+    await fn(dir);
+  } finally {
+    fixtureStores.get(dir)?.close();
+    fixtureStores.delete(dir);
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 /** A GraphQL-ish fake. Validation errors return 400 (express-graphql style) so markers must be provable on non-2xx bodies. */
@@ -57,12 +66,34 @@ function gqlServer(opts: { introspection: boolean; suggestions: boolean; batchin
       return { status: 400, finalUrl: req.url, durationMs: 2, headers: {}, body: '{"errors":[{"message":"Cannot query field \\"__schemaX\\" on type \\"Query\\"."}]}' };
     if (q.includes("__schema"))
       return opts.introspection
-        ? { status: 200, finalUrl: req.url, durationMs: 2, headers: {}, body: '{"data":{"__schema":{"queryType":{"name":"Query"}}}}' }
+        ? {
+            status: 200,
+            finalUrl: req.url,
+            durationMs: 2,
+            headers: {},
+            // A REAL bounded catalog: queryType + types[] with field/arg names — the probe's marker is "types",
+            // a bare queryType name alone is NOT confirmable evidence.
+            body: JSON.stringify({
+              data: {
+                __schema: {
+                  queryType: { name: "Query" },
+                  mutationType: { name: "Mutation" },
+                  types: [
+                    { kind: "OBJECT", name: "Query", fields: [{ name: "user", args: [{ name: "id" }] }, { name: "orders", args: [] }], inputFields: null, enumValues: null },
+                    { kind: "OBJECT", name: "Mutation", fields: [{ name: "setFlag", args: [] }], inputFields: null, enumValues: null },
+                    { kind: "OBJECT", name: "User", fields: [{ name: "id", args: [] }], inputFields: null, enumValues: null },
+                  ],
+                },
+              },
+            }),
+          }
         : { status: 400, finalUrl: req.url, durationMs: 2, headers: {}, body: '{"errors":[{"message":"GraphQL introspection is not allowed, but the query contained __schema."}]}' };
-    if (q.includes("__typenme"))
+    // The probe typos a REAL harvested root field when the catalog is available ("user" → "usr" — the third
+    // char dropped); "__typenme" is only the no-schema fallback.
+    if (q.includes("usr") || q.includes("__typenme"))
       return opts.suggestions
-        ? { status: 400, finalUrl: req.url, durationMs: 2, headers: {}, body: '{"errors":[{"message":"Cannot query field \\"__typenme\\" on type \\"Query\\". Did you mean \\"__typename\\"?"}]}' }
-        : { status: 400, finalUrl: req.url, durationMs: 2, headers: {}, body: '{"errors":[{"message":"Cannot query field \\"__typenme\\" on type \\"Query\\"."}]}' };
+        ? { status: 400, finalUrl: req.url, durationMs: 2, headers: {}, body: '{"errors":[{"message":"Cannot query field \\"usee\\" on type \\"Query\\". Did you mean \\"user\\"?"}]}' }
+        : { status: 400, finalUrl: req.url, durationMs: 2, headers: {}, body: '{"errors":[{"message":"Cannot query field \\"usee\\" on type \\"Query\\"."}]}' };
     if (q.includes("__typename"))
       return { status: 200, finalUrl: req.url, durationMs: 2, headers: {}, body: '{"data":{"__typename":"Query"}}' };
     return { status: 400, finalUrl: req.url, durationMs: 2, headers: {}, body: '{"errors":[{"message":"Unknown query"}]}' };
@@ -84,7 +115,9 @@ test("probe_graphql confirms introspection + field suggestions + batching on an 
       assert.ok(c.negativeControl);
       assert.ok(c.effectMarker);
     }
-    assert.match(String(out.verdict), /GRAPHQL WEAKNESS CONFIRMED/);
+    const schemaOps = out.schemaOps as { queries: Array<{ name: string }>; mutations: Array<{ name: string }> } | undefined;
+    assert.ok(schemaOps?.queries.some((f) => f.name === "user"), "harvested op names must reach schemaOps");
+    assert.match(String(out.verdict), /GRAPHQL OBSERVATIONS/);
     assert.ok((s as unknown as { httpProbes: number }).httpProbes > 0, "probe_graphql must count as an ACTIVE probe for the coverage gate");
     assert.equal(reqs.every((r) => (r.method ?? "GET").toUpperCase() === "POST" && r.headers?.["content-type"] === "application/json"), true);
   }));
@@ -128,7 +161,7 @@ test("probe_graphql confirms nothing on an echo/catch-all server that satisfies 
     assert.equal((out.batching as { accepted: boolean }).accepted, false);
   }));
 
-test("record_finding accepts batching evidence structurally and rejects non-array citations", () =>
+test("record_finding: batching acceptance is info-disclosure at most — a rate-limit claim is rejected", () =>
   withDir(async (dir) => {
     const s = fakeSession(dir, gqlServer({ introspection: true, suggestions: true, batching: true }));
     const tools = buildTools(s);
@@ -140,6 +173,7 @@ test("record_finding accepts batching evidence structurally and rejects non-arra
     const record = tools.find((x) => x.name === "record_finding")!;
     const rec = (args: Record<string, unknown>): Promise<{ content: { text: string }[] }> =>
       (record.handler as (a: unknown, e: unknown) => Promise<{ content: { text: string }[] }>)(args, {});
+    // Structural acceptance alone is a CAPABILITY observation — never a demonstrated rate-limit bypass.
     assert.match(
       (
         await rec({
@@ -154,16 +188,50 @@ test("record_finding accepts batching evidence structurally and rejects non-arra
           positiveReplays: probeOut.batching.positiveReplays,
         })
       ).content[0]!.text,
+      /REJECTED.*rate limit|rate limit.*REJECTED|REJECTED/s,
+    );
+    // A parameter named batching must not bypass marker requirements for other vulnerability classes.
+    assert.match(
+      (
+        await rec({
+          title: "Unproven reflected XSS",
+          severity: "medium",
+          category: "xss-reflected",
+          endpoint: "/graphql",
+          param: "batching",
+          description: "No reflection or execution marker was observed.",
+          reproSteps: "Replay the two GraphQL queries.",
+          negativeControl: probeOut.batching.negativeControl,
+          positiveReplays: probeOut.batching.positiveReplays,
+        })
+      ).content[0]!.text,
+      /REJECTED: xss-reflected requires effectMarker/,
+    );
+    // The same evidence under the honest category is accepted.
+    assert.match(
+      (
+        await rec({
+          title: "GraphQL request batching accepted",
+          severity: "info",
+          category: "info-disclosure",
+          endpoint: "/graphql",
+          param: "batching",
+          description: "The endpoint executes a JSON array of queries — a capability observation.",
+          reproSteps: 'POST /graphql [{"query":"{__typename}"},{"query":"{__typename}"}]',
+          negativeControl: probeOut.batching.negativeControl,
+          positiveReplays: probeOut.batching.positiveReplays,
+        })
+      ).content[0]!.text,
       /recorded|merged/,
     );
-    // Citing the single-object control as a positive must be REJECTED (structural gate works both ways).
+    // Citing the single-object control as a positive must still be REJECTED (structural gate works both ways).
     (s as unknown as { findingsByKey: Map<string, unknown> }).findingsByKey.clear();
     assert.match(
       (
         await rec({
           title: "Not batching",
-          severity: "low",
-          category: "rate-limit",
+          severity: "info",
+          category: "info-disclosure",
           endpoint: "/graphql",
           param: "batching",
           description: "x",
@@ -197,7 +265,7 @@ test("probe_graphql is scope-gated, and record_finding accepts the introspection
         category: "info-disclosure",
         endpoint: "/graphql",
         param: "introspection",
-        description: "The __schema meta-field returns the full schema to an unauthenticated caller.",
+        description: "The __schema meta-field returns the bounded schema catalog to an unauthenticated caller.",
         reproSteps: 'POST /graphql {"query":"{__schema{queryType{name}}}")',
         negativeControl: intro.negativeControl,
         positiveReplays: intro.positiveReplays,
