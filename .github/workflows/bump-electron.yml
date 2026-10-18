@@ -1,0 +1,82 @@
+name: Bump Electron
+
+# Weekly pin bump for the packaged Electron runtime. Picks the newest stable
+# release at least 7 days old (supply-chain soak time), updates
+# apps/desktop/package.json + pnpm-lock.yaml, and opens a PR. CI and the
+# Windows-build workflow gate the merge; promote-release.cjs reads the pin.
+
+on:
+  schedule:
+    - cron: "0 0 * * 1" # Mondays 09:00 JST
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: bump-electron
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Node >= 24 is mandatory — the state store uses the builtin node:sqlite.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Enable pnpm (corepack)
+        run: corepack enable
+
+      - name: Pick and apply the newest ≥7-day-old Electron
+        id: bump
+        run: node tools/bump-electron.mjs >> "$GITHUB_OUTPUT"
+
+      - name: Update the lockfile
+        if: steps.bump.outputs.changed == 'true'
+        run: pnpm install --lockfile-only
+
+      - name: Commit and open the PR
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.bump.outputs.version }}
+          CURRENT: ${{ steps.bump.outputs.current }}
+          RELEASED: ${{ steps.bump.outputs.released }}
+          KIND: ${{ steps.bump.outputs.kind }}
+        run: |
+          set -euo pipefail
+          BRANCH="deps/electron-${VERSION}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add apps/desktop/package.json pnpm-lock.yaml
+          git commit -m "build(desktop): bump Electron ${CURRENT} → ${VERSION}"
+          git push -u origin "$BRANCH"
+
+          if gh pr list --head "$BRANCH" --json number --jq '.[0].number' | grep -q .; then
+            echo "a PR for $BRANCH is already open"
+            exit 0
+          fi
+
+          NOTE=""
+          if [ "$KIND" = "major" ]; then
+            NOTE="> ⚠️ **Major bump** — review the Electron breaking-changes notes before merging."
+          fi
+
+          gh pr create \
+            --title "build(desktop): bump Electron to ${VERSION}" \
+            --body "$(cat <<EOF
+Bumps the packaged Electron pin from \`${CURRENT}\` to \`${VERSION}\` (released ${RELEASED}, at least 7 days old).
+
+${NOTE}
+
+Release notes: https://github.com/electron/electron/releases/tag/v${VERSION}
+
+- [ ] CI green
+- [ ] Windows build + packaged checks pass
+- [ ] Release notes reviewed
+EOF
+          )"
