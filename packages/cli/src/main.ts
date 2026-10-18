@@ -14,6 +14,9 @@ import {
   buildReport,
   buildReportModel,
   buildOpenApi,
+  buildStateView,
+  diffStateViews,
+  renderDiffMarkdown,
   renderMarkdown,
   renderReportHtml,
   renderFindingsCsv,
@@ -56,7 +59,7 @@ commands:
             interactive scope-manifest generator: answer the prompts to produce the JSON pilot/assess read
             (target / in·out-of-scope hosts·path / rate / crawl / model / auth roles. password echo is masked)
   pilot   --manifest <file.json> | --url <url> [--model <m>] [--fast-model <m>] [--max-turns <n>] [--max-screens <n>] [--max-survey-screens <n>] [--rate <ms>] [--headed] [--focus "<text>"] [--context "<text>"] [--browser-path <bin>] [--browser-channel <name>] [--no-sandbox] [--out <dir>]
-            --max-screens caps how many screens get diagnosed (default 40); --max-survey-screens caps how many the survey maps (default unlimited — stops exploring once reached)
+            --max-screens caps how many screens get diagnosed (default 120); --max-survey-screens caps how many the survey maps (default unlimited — stops exploring once reached)
             ★Claude-led: Claude drives the tools (browser/http/login/record) to autonomously explore, verify, and record
             --focus "<text>": operator emphasis injected as the TOP priority of the A04 scenario stage (not per-screen diagnosis). e.g. "focus on the payment flow and IDOR in /api/orders"
             --context "<text>": standing target FACTS appended to EVERY stage's system prompt (survey→diagnosis→scenario), so they inform the whole run — unlike --focus (scenario-only). e.g. "auth = JWT in X-Auth header; tenant id = last path segment; API is GraphQL at /graphql". Additive only — cannot override the safety/scope/evidence rules.
@@ -129,6 +132,8 @@ commands:
             Info-level: audit each screen's response headers and record a finding per missing header (deterministic / toggle = run it or not)
   status  --id <assessment-id> [--out <dir>]
             show phase, coverage, and findings
+  diff    --a <assessment-id> --b <assessment-id> [--format md|json] [--out <dir>] [--file <path>]
+            offline delta of two runs: new/resolved findings, screen status changes, check-outcome transitions, role progress (retest aid)
   list    [--out <dir>]
             list the assessments under runs/
 
@@ -226,6 +231,35 @@ function cmdStatus(args: string[]): void {
   console.log(`  events:   ${state.events.length}`);
   const stop = evaluateStop(state);
   console.log(`  stop:     ${stop.stop ? `${stop.reason} (${stop.detail})` : "continue"}`);
+}
+
+/** Offline diff of two runs: screens/findings/check-outcomes/roles — for retest workflows. */
+function cmdDiff(args: string[]): void {
+  const { values } = parseArgs({
+    args,
+    options: { a: { type: "string" }, b: { type: "string" }, out: { type: "string" }, file: { type: "string" }, format: { type: "string" } },
+  });
+  if (!values.a || !values.b) fail("diff requires --a <assessment-id> --b <assessment-id>");
+  if (values.format && values.format !== "md" && values.format !== "json") fail(`diff --format must be md|json, got '${values.format}'`);
+  const runsDir = values.out ?? RUNS_DIR_DEFAULT;
+
+  const load = (id: string) => {
+    const dbPath = dbPathFor(runsDir, id);
+    if (!existsSync(dbPath)) fail(`no state.sqlite at ${dbPath}`);
+    const store = AssessmentStore.open(dbPath);
+    const state = store.loadAssessment(id);
+    store.close();
+    if (!state) fail(`assessment ${id} not found in ${dbPath}`);
+    return buildStateView(state);
+  };
+  const diff = diffStateViews(load(values.a), load(values.b));
+  const out = values.format === "json" ? `${JSON.stringify(diff, null, 2)}\n` : renderDiffMarkdown(diff);
+  if (values.file) {
+    writeFileSync(values.file, out);
+    console.log(`diff written: ${values.file}`);
+  } else {
+    process.stdout.write(out);
+  }
 }
 
 /** Loader that reads evidence req/resp from runs/<id>/artifacts (for embedding into the report). */
@@ -624,7 +658,22 @@ interface AssessManifest {
       loginUrl?: string;
       login_url?: string;
       headers?: Record<string, string>;
+      /** Operator-declared principal for this role (account id / subject). Launch-time identity config —
+       *  used by probe_authz to establish ownership without a whoami endpoint. */
+      principal?: string;
+      /** Operator-declared tenant this role belongs to — tenant boundaries are only claimed across
+       *  two roles whose tenants are BOTH declared and differ. */
+      tenant?: string;
+      /** A /me-style URL the role's OWN session can GET to establish its principal at runtime
+       *  (identity-binding ownership). The response must carry an id/sub/userId/email field. */
+      identityUrl?: string;
+      identity_url?: string;
     }>;
+    /** Operator-declared expected-access table: [{object?, endpoint?, role, allow}]. The ONLY way a
+     *  "should be denied/allowed" expectation enters the system — the model cannot assert one.
+     *  {object:"o-2", role:"userB", allow:false} = B must not reach object o-2;
+     *  {endpoint:"/api/public/{id}", allow:true, role:"userB"} = shared access is not a finding. */
+    expectedAccess?: Array<{ object?: string; endpoint?: string; role: string; allow: boolean; tenant?: string; note?: string }>;
   };
 }
 
@@ -702,6 +751,38 @@ function manifestRoleLoginUrls(m: AssessManifest | null): Array<{ name: string; 
   const out: Array<{ name: string; url: string }> = [];
   for (const role of m?.auth?.roles ?? []) {
     const url = role.loginUrl ?? role.login_url;
+    if (url) out.push({ name: role.name, url });
+  }
+  return out;
+}
+
+/** Role name -> operator-declared principal (account/subject id). Launch-time identity config. */
+function manifestRolePrincipals(m: AssessManifest | null): Array<{ name: string; principal: string }> {
+  const out: Array<{ name: string; principal: string }> = [];
+  for (const role of m?.auth?.roles ?? []) {
+    const p = (role.principal ?? "").trim();
+    if (p) out.push({ name: role.name, principal: p });
+  }
+  return out;
+}
+
+/** Role name -> operator-declared tenant. Tenant boundaries are only claimed between two roles whose
+ *  tenants are BOTH declared and differ. */
+function manifestRoleTenants(m: AssessManifest | null): Array<{ name: string; tenant: string }> {
+  const out: Array<{ name: string; tenant: string }> = [];
+  for (const role of m?.auth?.roles ?? []) {
+    const t = (role.tenant ?? "").trim();
+    if (t) out.push({ name: role.name, tenant: t });
+  }
+  return out;
+}
+
+/** Role name -> operator-provided identity endpoint (a /me-style URL the role's own session GETs to
+ *  establish its principal at runtime). */
+function manifestRoleIdentityUrls(m: AssessManifest | null): Array<{ name: string; url: string }> {
+  const out: Array<{ name: string; url: string }> = [];
+  for (const role of m?.auth?.roles ?? []) {
+    const url = role.identityUrl ?? role.identity_url;
     if (url) out.push({ name: role.name, url });
   }
   return out;
@@ -1128,6 +1209,13 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
   for (const rc of manifestRoleLoginUrls(manifest)) roleLoginUrls.set(rc.name, rc.url);
   const roleDescriptions = new Map<string, string>();
   for (const rc of manifestRoleDescriptions(manifest)) roleDescriptions.set(rc.name, rc.description);
+  const rolePrincipals = new Map<string, string>();
+  for (const rc of manifestRolePrincipals(manifest)) rolePrincipals.set(rc.name, rc.principal);
+  const roleTenants = new Map<string, string>();
+  for (const rc of manifestRoleTenants(manifest)) roleTenants.set(rc.name, rc.tenant);
+  const roleIdentityUrls = new Map<string, string>();
+  for (const rc of manifestRoleIdentityUrls(manifest)) roleIdentityUrls.set(rc.name, rc.url);
+  const expectedAccess = manifest?.auth?.expectedAccess ?? [];
   const httpBasic = manifestHttpBasic(manifest); // site-wide Basic/Digest (if any)
   const customHeaders = manifestCustomHeaders(manifest); // custom headers (WAF evasion, etc.; if any)
   if (resume)
@@ -1217,6 +1305,10 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       ...(roleCookieFiles.size ? { roleCookieFiles } : {}),
       ...(roleLoginUrls.size ? { roleLoginUrls } : {}),
       ...(roleDescriptions.size ? { roleDescriptions } : {}),
+      ...(rolePrincipals.size ? { rolePrincipals } : {}),
+      ...(roleTenants.size ? { roleTenants } : {}),
+      ...(roleIdentityUrls.size ? { roleIdentityUrls } : {}),
+      ...(expectedAccess.length ? { expectedAccess } : {}),
       fastModel: values["fast-model"] ?? "claude-sonnet-5", // fast model default = Sonnet (survey/methodology/low-value screens -> model tiering ON by default)
       ...(values["no-scenario"] ? { scenarioPass: false } : {}), // ON by default. Set to drop the A04 scenario
       ...(values["no-default-scenarios"] ? { defaultScenarios: false } : {}), // ON by default. Set to drop only the built-in scenarios
@@ -2555,6 +2647,9 @@ async function main(): Promise<void> {
       return;
     case "status":
       cmdStatus(rest);
+      return;
+    case "diff":
+      cmdDiff(rest);
       return;
     case "list":
       cmdList(rest);
