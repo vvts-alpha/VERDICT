@@ -4,6 +4,7 @@ import type { ApiCall } from "@veritas/core";
 import type { CapturedExchange } from "./types.js";
 import { normalizePath } from "./url.js";
 import { inferJsonShape } from "./json.js";
+import { describeGraphqlOperation } from "./graphql.js";
 
 function detectAuth(ex: CapturedExchange): ApiCall["auth"] {
   if (ex.hasAuthorizationHeader) return "bearer";
@@ -25,17 +26,21 @@ export function inferApiCall(ex: CapturedExchange): ApiCall {
     // keep the raw URL if it can't be parsed
   }
   const isJsonResp = ex.responseContentType?.includes("json") ?? false;
+  const graphql = ex.method.toUpperCase() === "POST" ? describeGraphqlOperation(ex.requestBody) : null;
   return {
     method: ex.method.toUpperCase(),
     urlTemplate,
     auth: detectAuth(ex),
     reqSchema: inferJsonShape(ex.requestBody),
     resSchema: isJsonResp ? inferJsonShape(ex.responseBodySample) : null,
+    ...(graphql ? { graphql } : {}),
   };
 }
 
 export function apiKey(a: ApiCall): string {
-  return `${a.method} ${a.urlTemplate}`;
+  // GraphQL: the endpoint path alone is not the operation — POST /graphql carries many. The operationKey
+  // (operationName, else a value-stripped doc-structure hash) distinguishes them so each stays its own target.
+  return a.graphql ? `${a.method} ${a.urlTemplate} ${a.graphql.operationKey}` : `${a.method} ${a.urlTemplate}`;
 }
 
 interface ScriptPattern {

@@ -61,6 +61,29 @@ export interface BuiltScreen {
   screen: Omit<Screen, "screenId">;
 }
 
+/** Merge a re-observed ApiCall into the kept one: fill null schemas, and for GraphQL union the variable
+ *  name→kind shape + refresh the replay example (newest values are the most likely to still resolve). */
+function mergeApiCall(cur: ApiCall | undefined, next: ApiCall): void {
+  if (!cur) return;
+  if (!cur.reqSchema && next.reqSchema) cur.reqSchema = next.reqSchema;
+  if (!cur.resSchema && next.resSchema) cur.resSchema = next.resSchema;
+  if (next.graphql) {
+    if (cur.graphql) {
+      cur.graphql.variablesShape = { ...cur.graphql.variablesShape, ...next.graphql.variablesShape };
+      if (next.graphql.variablesExample) cur.graphql.variablesExample = next.graphql.variablesExample;
+      // Backfill metadata a stored/older observation may lack. Fill-only, never union: responseKeys must match
+      // the STORED document (`first:user` vs `second:user` are now different operationKeys, so a merge always
+      // carries the same alias set — but a legacy entry may simply lack the field).
+      if (!cur.graphql.responseKeys && next.graphql.responseKeys) cur.graphql.responseKeys = next.graphql.responseKeys;
+      if (cur.graphql.rootFields.length === 0 && next.graphql.rootFields.length) cur.graphql.rootFields = next.graphql.rootFields;
+      if (!cur.graphql.operationName && next.graphql.operationName) cur.graphql.operationName = next.graphql.operationName;
+      if (!cur.graphql.document && next.graphql.document) cur.graphql.document = next.graphql.document;
+    } else {
+      cur.graphql = next.graphql;
+    }
+  }
+}
+
 /** 観測 1 件 → dedup_key と (id 未割当の) Screen 素材。 */
 export function buildScreenFromObservation(o: Observation, authState: AuthState = "unauth"): BuiltScreen {
   const u = new URL(o.finalUrl);
@@ -89,7 +112,9 @@ export function buildScreenFromObservation(o: Observation, authState: AuthState 
     if (!seen.has(k)) {
       seen.add(k);
       apis.push(api);
+      return;
     }
+    mergeApiCall(apis.find((x) => apiKey(x) === k), api);
   };
   // 1) 傍受した XHR/fetch
   for (const ex of o.apiCalls) {
@@ -216,13 +241,9 @@ export class InventoryBuilder {
       if (!haveApis.has(k)) {
         existing.apis.push(a);
         haveApis.add(k);
-      } else if (a.reqSchema || a.resSchema) {
+      } else {
         // 同一エンドポイントを後から観測してスキーマが付いたら、空だった方を埋める(情報を捨てない)。
-        const cur = existing.apis.find((x) => apiKey(x) === k);
-        if (cur) {
-          if (!cur.reqSchema && a.reqSchema) cur.reqSchema = a.reqSchema;
-          if (!cur.resSchema && a.resSchema) cur.resSchema = a.resSchema;
-        }
+        mergeApiCall(existing.apis.find((x) => apiKey(x) === k), a);
       }
     }
     const paramKey = (p: Param): string => `${p.in}:${p.name}`;

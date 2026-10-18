@@ -34,6 +34,10 @@ export { inferJsonShape, inferJsonShapeFromValue } from "./json.js";
 // API inference / static extraction
 export { apiKey, extractApiRefs, inferApiCall, isApiExchange } from "./api.js";
 
+// GraphQL request/operation parsing (identity, root fields, variable shape)
+export { describeGraphqlOperation, parseGraphqlRequestBody, parseGraphqlDocument, graphqlOperationKey, variablesShape, maskVariables } from "./graphql.js";
+export type { GraphqlRequestParts, ParsedGraphqlDocument, ParsedOperation } from "./graphql.js";
+
 // DOM skeleton hash
 export { hashDomSkeleton } from "./dom.js";
 
