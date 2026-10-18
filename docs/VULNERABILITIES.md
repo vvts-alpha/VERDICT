@@ -42,6 +42,16 @@ Burp 取り込みは下の「外部」を参照。
 
 `probe_params` はリード生成。確認は上のプローブへ。
 
+### GraphQL
+
+GraphQL エンドポイントは専用プローブで診断される（同一 `POST /graphql` の別操作は inventory で `operationName`／文書構造ハッシュにより個別の ApiCall として保持される）。
+
+- **`probe_graphql`（メタ面）** — 型名・field 名・引数などの範囲を限定したスキーマカタログを収集する。field の戻り型や input field の型を網羅した完全なスキーマ取得ではなく、root 型名だけの応答もカタログ取得成功にはしない。public と言えるのは**認証なし再送でもカタログが返る**ときだけ。フィールド候補漏洩（`Did you mean`）と batching 受理も見る。**batching 受理は機能の観測**として記録可能だが、受付の証拠だけを用いた rate-limit／lockout bypass の Finding は拒否する。
+- **`probe_graphql_op`（操作面）** — 観測済みまたは introspection で採れた 1 操作を、保存された変数でリプレイ。**baseline が成立しない応答（構文・型・認証失敗・データ不在）は未検証**として報告し、clean には数えない。`compareRole` で同一操作を別ロールで再生し、フィールド単位の認可差分（denied/extra fields、部分応答）を出す。mutation は**フェイルクローズ**:デフォルトの sweep では一切実行されず、明示リプレイも `mutationAck`（その操作への opt-in）+ `verifyQuery`/`verifyPath`（許可されたテストリソース上の状態パス）を必須とし、削除・移譲系の名前はコード上で拒否する。実効の帰属は replay ごとの pre→post 読取で行い、冪等・非冪等を問わず両 replay が独立に状態を動かさなければ未検証になる。
+- **IDOR / mass-assignment への接続** — `probe_idor` のスイープは `variables.input.ownerId` のようなネストした変数リーフを自前のリクエストテンプレートで辿る（型を保持した置換のみ）。`probe_logic` 系の raw body 指定で mass-assignment 変数を追加する経路もある。
+
+**GraphQL で残る制限:** 値の契約（Int型・input object のスキーマ整合）は観測値の型を保持するまでで、スキーマからの厳密な型検査はしない。深さ・複雑度制限、クエリコスト、サブスクリプション、フェデレーション固有の問題、batching の実害確認は対象外。credentials-only ロールは帯域外リプレイ不可（`login(role)` で切替が必要）。
+
 ---
 
 ## 2. カテゴリはあるが、専用プローブがない
@@ -98,7 +108,7 @@ Cookie の予測可能性は `analyze_session` がライブの 1 リクエスト
 
 ## 7. 検出対象にしていないもの（明示）
 
-- GraphQL 固有
+- GraphQL の残る制限は §1 の「GraphQL」節を参照（メタ面・操作認可・変数置換は対象内、深度/コスト/subscription/フェデレーション/batching実害は対象外）
 - HTTP リクエストスマグリング / キャッシュポイズニング
 - 本格デシリアライズ
 - デフォルト認証情報の辞書ログイン
