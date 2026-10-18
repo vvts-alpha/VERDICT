@@ -187,8 +187,10 @@ test("excluded screens are not reported as tested in HTML or Markdown", () => {
     }
     const state = store.loadAssessment("coverage")!;
     const model = buildReportModel(state);
-    assert.deepEqual(model.stats.screens, { total: 4, scanned: 2, excluded: 1, remaining: 1 });
-    assert.match(buildReport(state), /2 tested · 1 excluded · 1 unfinished/);
-    assert.match(renderReportHtml(model), /2 tested · 1 excluded · 1 unfinished/);
+    // Ledgerless conclusive statuses are status-claims, not tested evidence: the clean/suspected
+    // screens carry no check rows, so they headline as claimed-unknown — never inflate "tested".
+    assert.deepEqual(model.stats.screens, { total: 4, scanned: 0, claimed: 2, excluded: 1, remaining: 1 });
+    assert.match(buildReport(state), /0 tested · 2 status-claimed \(no check records\) · 1 excluded · 1 unfinished/);
+    assert.match(renderReportHtml(model), /0 tested · 2 status-claimed \(no check records\) · 1 excluded · 1 unfinished/);
   } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
 });

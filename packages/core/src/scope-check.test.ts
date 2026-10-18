@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { parseTargetUrl, deriveScopeFromUrls } from "./index.js";
+import { parseTargetUrl, deriveScopeFromUrls, isInScope } from "./index.js";
 
 test("parseTargetUrl accepts explicit http(s) targets", () => {
   assert.equal(parseTargetUrl("https://app.example.com/x").host, "app.example.com");
@@ -29,4 +29,30 @@ test("deriveScopeFromUrls now fails clearly on a schemeless target instead of cr
   assert.throws(() => deriveScopeFromUrls(["juice.shop:3000"]), /target URL/); // previously → inScopeHosts:[""] silently
   // a valid target still derives scope as before
   assert.deepEqual(deriveScopeFromUrls(["https://x.test/a"]).inScopeHosts, ["x.test"]);
+});
+
+test("path prefixes: trailing `*` is a wildcard, allow wins over block, block wins over the default", () => {
+  const base = { inScopeHosts: ["x.test"], outOfScopeHosts: [], inScopePathPrefixes: [], outOfScopePathPrefixes: [] };
+  const inScope = (u: string) => isInScope(u, base);
+
+  // trailing `*` behaves like a prefix glob — `/*` matches every path
+  const wild = { ...base, inScopePathPrefixes: ["/*"] };
+  assert.equal(isInScope("https://x.test/a", wild), true);
+  assert.equal(isInScope("https://x.test/", wild), true);
+  assert.equal(isInScope("https://x.test/admin/x", { ...base, outOfScopePathPrefixes: ["/admin*"] }), false);
+
+  // an explicit allow-prefix overrides a block (exception carving)
+  const except = { ...base, inScopePathPrefixes: ["/admin/public*"], outOfScopePathPrefixes: ["/admin"] };
+  assert.equal(isInScope("https://x.test/admin/public/view", except), true);
+  assert.equal(isInScope("https://x.test/admin/delete", except), false);
+
+  // block applies when nothing is allowed; an allow-list narrows the default
+  assert.equal(inScope("https://x.test/logout") && inScope("https://x.test/"), true);
+  assert.equal(isInScope("https://x.test/logout", { ...base, outOfScopePathPrefixes: ["/logout"] }), false);
+  assert.equal(isInScope("https://x.test/other", { ...base, inScopePathPrefixes: ["/app"] }), false);
+
+  // a catch-all allow (the derived default "/") means "no narrowing" — blocks still apply under it
+  const derived = { ...base, inScopePathPrefixes: ["/"], outOfScopePathPrefixes: ["/admin"] };
+  assert.equal(isInScope("https://x.test/admin", derived), false);
+  assert.equal(isInScope("https://x.test/orders", derived), true);
 });

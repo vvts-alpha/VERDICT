@@ -12,7 +12,10 @@ import { DatabaseSync } from "node:sqlite";
 import type {
   AssessmentState,
   AssessmentSummary,
+  AuthzComparison,
+  AuthzObject,
   BudgetState,
+  CheckExecution,
   Finding,
   HumanHandoff,
   Hypothesis,
@@ -112,7 +115,46 @@ CREATE TABLE IF NOT EXISTS screen_scans (
   FOREIGN KEY (assessment_id) REFERENCES assessments(id) ON DELETE CASCADE
 );
 
+-- Per-check execution ledger: one row per (screen × target × param × subject × checkClass).
+-- Written ONLY via upsertCheck (which also appends a check_recorded event in the same tx).
+CREATE TABLE IF NOT EXISTS check_executions (
+  assessment_id TEXT NOT NULL,
+  id            TEXT NOT NULL, -- checkKey(screenId|target|param|subject|class)
+  screen_id     TEXT NOT NULL,
+  class         TEXT NOT NULL,
+  subject       TEXT NOT NULL,
+  status        TEXT NOT NULL,
+  data          TEXT NOT NULL, -- JSON CheckExecution
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL,
+  PRIMARY KEY (assessment_id, id),
+  FOREIGN KEY (assessment_id) REFERENCES assessments(id) ON DELETE CASCADE
+);
+
+-- Observed object references for authorization testing (discovery ≠ verified ownership).
+CREATE TABLE IF NOT EXISTS authz_objects (
+  assessment_id TEXT NOT NULL,
+  key           TEXT NOT NULL, -- resourceType|endpoint|opKey|tenant|objectId
+  data          TEXT NOT NULL, -- JSON AuthzObject
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL,
+  PRIMARY KEY (assessment_id, key),
+  FOREIGN KEY (assessment_id) REFERENCES assessments(id) ON DELETE CASCADE
+);
+
+-- Bounded A/B authorization comparisons with their evidence ids.
+CREATE TABLE IF NOT EXISTS authz_comparisons (
+  assessment_id TEXT NOT NULL,
+  id            TEXT NOT NULL,
+  data          TEXT NOT NULL, -- JSON AuthzComparison
+  created_at    TEXT NOT NULL,
+  PRIMARY KEY (assessment_id, id),
+  FOREIGN KEY (assessment_id) REFERENCES assessments(id) ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS idx_screens_assessment ON screens(assessment_id);
+CREATE INDEX IF NOT EXISTS idx_checks_screen ON check_executions(assessment_id, screen_id);
+CREATE INDEX IF NOT EXISTS idx_authz_objects ON authz_objects(assessment_id);
 CREATE INDEX IF NOT EXISTS idx_screen_scans ON screen_scans(assessment_id, status);
 CREATE INDEX IF NOT EXISTS idx_hypotheses_screen ON hypotheses(assessment_id, screen_id);
 CREATE INDEX IF NOT EXISTS idx_findings_assessment ON findings(assessment_id);
@@ -202,6 +244,9 @@ export class AssessmentStore {
         hypotheses: [],
         findings: [],
         handoffs: [],
+        checkExecutions: [],
+        authzObjects: [],
+        authzComparisons: [],
         events: this.readEvents(id),
       };
     });
@@ -548,6 +593,84 @@ export class AssessmentStore {
     });
   }
 
+  /** Persist one check-ledger row. Writes the table row AND appends check_recorded in the same tx —
+   *  the appended event is what moves lastSeq (WS diff cursor); a table-only write would never reach clients. */
+  upsertCheck(assessmentId: string, check: CheckExecution): void {
+    this.tx(() => {
+      const now = new Date().toISOString();
+      this.db
+        .prepare(
+          `INSERT INTO check_executions(assessment_id, id, screen_id, class, subject, status, data, created_at, updated_at)
+           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(assessment_id, id) DO UPDATE SET
+             status = excluded.status,
+             data = excluded.data,
+             updated_at = excluded.updated_at`,
+        )
+        .run(assessmentId, check.id, check.screenId, check.checkClass, check.subject, check.status, JSON.stringify(check), now, now);
+      this.insertEvent(assessmentId, { type: "check_recorded", payload: { check } });
+      this.touch(assessmentId, now);
+    });
+  }
+
+  /** Record/merge an observed object reference (an authz CANDIDATE — ownership stays unset until
+   *  an establishing mechanism runs). observedBy/deniedFor/evidenceIds union into the stored row. */
+  recordAuthzObject(assessmentId: string, obj: AuthzObject): void {
+    this.tx(() => {
+      const now = new Date().toISOString();
+      const prev = this.db
+        .prepare("SELECT data FROM authz_objects WHERE assessment_id = ? AND key = ?")
+        .get(assessmentId, obj.key) as { data: string } | undefined;
+      const old: AuthzObject | null = prev ? (JSON.parse(prev.data) as AuthzObject) : null;
+      // Ownership is an ATOMIC TUPLE — (owner, ownerBasis, ownerEvidenceIds) move together or not at
+      // all. A bare `owner` (or owner+basis without the establishing evidence) is DROPPED: it must not
+      // inherit an old basis (a stale "operator" basis would then vouch for an owner it never
+      // established) nor the previous owner's establishing evidence. The writer that establishes
+      // ownership passes all three fields in one call.
+      const ownership =
+        obj.owner && obj.ownerBasis && obj.ownerEvidenceIds && obj.ownerEvidenceIds.length > 0
+          ? { owner: obj.owner, ownerBasis: obj.ownerBasis, ownerEvidenceIds: obj.ownerEvidenceIds }
+          : old
+            ? { owner: old.owner, ownerBasis: old.ownerBasis, ownerEvidenceIds: old.ownerEvidenceIds }
+            : {};
+      const merged: AuthzObject = old
+        ? {
+            ...old,
+            observedBy: unionIds(old.observedBy, obj.observedBy),
+            deniedFor: unionIds(old.deniedFor, obj.deniedFor),
+            evidenceIds: unionIds(old.evidenceIds, obj.evidenceIds),
+            ...ownership,
+            // tenant is part of the object key — identical on a merged row; keep whichever is set.
+            tenant: obj.tenant ?? old.tenant,
+            updatedAt: now,
+          }
+        : { ...obj, ...ownership, updatedAt: now };
+      this.db
+        .prepare(
+          `INSERT INTO authz_objects(assessment_id, key, data, created_at, updated_at)
+           VALUES(?, ?, ?, ?, ?)
+           ON CONFLICT(assessment_id, key) DO UPDATE SET
+             data = excluded.data,
+             updated_at = excluded.updated_at`,
+        )
+        .run(assessmentId, merged.key, JSON.stringify(merged), now, now);
+      this.insertEvent(assessmentId, { type: "authz_object_recorded", payload: { object: merged } });
+      this.touch(assessmentId, now);
+    });
+  }
+
+  /** Persist one A/B authorization comparison (append — each test is its own record). */
+  recordAuthzComparison(assessmentId: string, cmp: AuthzComparison): void {
+    this.tx(() => {
+      const now = new Date().toISOString();
+      this.db
+        .prepare("INSERT INTO authz_comparisons(assessment_id, id, data, created_at) VALUES(?, ?, ?, ?)")
+        .run(assessmentId, cmp.id, JSON.stringify(cmp), now);
+      this.insertEvent(assessmentId, { type: "authz_comparison_recorded", payload: { comparison: cmp } });
+      this.touch(assessmentId, now);
+    });
+  }
+
   // ───────────────────────── reads ─────────────────────────
 
   loadAssessment(id: string, opts: { includeDuplicates?: boolean } = {}): AssessmentState | null {
@@ -566,6 +689,9 @@ export class AssessmentStore {
       hypotheses: this.readHypotheses(id),
       findings: this.readFindings(id).filter((f) => opts.includeDuplicates || !f.duplicateOf),
       handoffs: this.readHandoffs(id),
+      checkExecutions: this.readChecks(id),
+      authzObjects: this.readAuthzObjects(id),
+      authzComparisons: this.readAuthzComparisons(id),
       events: this.readEvents(id),
     };
   }
@@ -680,5 +806,41 @@ export class AssessmentStore {
       .prepare("SELECT data FROM handoffs WHERE assessment_id = ? ORDER BY created_at ASC, id ASC")
       .all(id) as Array<{ data: string }>;
     return rows.map((r) => JSON.parse(r.data) as HumanHandoff);
+  }
+
+  private readChecks(id: string): CheckExecution[] {
+    const rows = this.db
+      .prepare("SELECT data FROM check_executions WHERE assessment_id = ? ORDER BY created_at ASC, id ASC")
+      .all(id) as Array<{ data: string }>;
+    return rows.map((r) => JSON.parse(r.data) as CheckExecution);
+  }
+
+  private readAuthzObjects(id: string): AuthzObject[] {
+    const rows = this.db
+      .prepare("SELECT data FROM authz_objects WHERE assessment_id = ? ORDER BY created_at ASC, key ASC")
+      .all(id) as Array<{ data: string }>;
+    return rows.map((r) => JSON.parse(r.data) as AuthzObject);
+  }
+
+  private readAuthzComparisons(id: string): AuthzComparison[] {
+    const rows = this.db
+      .prepare("SELECT data FROM authz_comparisons WHERE assessment_id = ? ORDER BY created_at ASC, id ASC")
+      .all(id) as Array<{ data: string }>;
+    return rows.map((r) => JSON.parse(r.data) as AuthzComparison);
+  }
+
+  /** Live read of the check ledger (the screen_done gate / probe_authz read rows mid-run without a full reload). */
+  checks(assessmentId: string): CheckExecution[] {
+    return this.readChecks(assessmentId);
+  }
+
+  /** Live read of observed/candidate authorization objects. */
+  authzObjects(assessmentId: string): AuthzObject[] {
+    return this.readAuthzObjects(assessmentId);
+  }
+
+  /** Live read of recorded A/B authorization comparisons. */
+  authzComparisons(assessmentId: string): AuthzComparison[] {
+    return this.readAuthzComparisons(assessmentId);
   }
 }

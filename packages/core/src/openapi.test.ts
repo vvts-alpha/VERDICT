@@ -72,6 +72,76 @@ test("buildOpenApi dedups the same (method, path) across screens", () => {
   assert.deepEqual(Object.keys((doc as any).paths), ["/api/me"]); // 1 path, not duplicated
 });
 
+test("buildOpenApi keeps DISTINCT GraphQL operations on one endpoint (operationKey in the dedup key + x-graphql metadata)", () => {
+  const gql = (name: string, fields: string[]): ApiCall => ({
+    method: "POST",
+    urlTemplate: "/graphql",
+    auth: "cookie",
+    reqSchema: null,
+    resSchema: null,
+    graphql: {
+      operationType: "query",
+      operationName: name,
+      operationKey: `name:${name}`,
+      rootFields: fields,
+      variablesShape: { id: "string" },
+      document: `query ${name}($id: ID!){${fields[0]}(id:$id){id}}`,
+      variablesExample: { id: "1" },
+    },
+  });
+  const doc = buildOpenApi(
+    [screen({ urlTemplate: "/app", apis: [gql("GetOrder", ["order"]), gql("GetCart", ["cart"])] })],
+    { baseUrl: "https://x.test" },
+  ) as any;
+  const post = doc.paths["/graphql"].post;
+  // The first op owns the path entry; EVERY distinct op (primary included) survives as structured metadata
+  // under x-graphql-operations — identity + shape + sanitized document, not just a name string.
+  assert.equal(post.operationId, "GetOrder");
+  assert.equal(post["x-graphql"].operationName, "GetOrder");
+  const ops = post["x-graphql-operations"] as Array<Record<string, unknown>>;
+  assert.equal(ops.length, 2);
+  assert.equal(ops[0]!.operationKey, "name:GetOrder");
+  assert.equal(ops[1]!.operationKey, "name:GetCart");
+  assert.deepEqual(ops[1]!.rootFields, ["cart"]);
+  assert.match(String(ops[1]!.document), /GetCart/);
+  assert.match(post.summary, /GetOrder/);
+});
+
+test("buildOpenApi: two ANONYMOUS GraphQL ops sharing a root field keep distinct identities in the export", () => {
+  const anon = (key: string, doc: string): ApiCall => ({
+    method: "POST",
+    urlTemplate: "/graphql",
+    auth: "cookie",
+    reqSchema: null,
+    resSchema: null,
+    graphql: {
+      operationType: "query",
+      operationName: null,
+      operationKey: key, // doc:<hash> — the ONLY identity an anonymous op has
+      rootFields: ["order"],
+      responseKeys: ["order"],
+      variablesShape: {},
+      document: doc,
+    },
+  });
+  const doc = buildOpenApi(
+    [screen({
+      urlTemplate: "/app",
+      apis: [
+        anon("doc:h1", "{order{id}}"),
+        anon("doc:h2", "{order{id total phone}}"),
+      ],
+    })],
+    { baseUrl: "https://x.test" },
+  ) as any;
+  const post = doc.paths["/graphql"].post;
+  const ops = post["x-graphql-operations"] as Array<Record<string, unknown>>;
+  assert.equal(ops.length, 2); // same root field, different selections → BOTH preserved
+  assert.equal(ops[0]!.operationKey, "doc:h1");
+  assert.equal(ops[1]!.operationKey, "doc:h2");
+  assert.notEqual(ops[0]!.document, ops[1]!.document);
+});
+
 // ── ingest side: schemaToJsonShape (the inverse used to read a swagger.json) ──
 test("schemaToJsonShape round-trips jsonShapeToSchema (object/array/primitive/unknown)", () => {
   const shapes: JsonShape[] = [

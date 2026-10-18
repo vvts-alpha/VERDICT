@@ -2,7 +2,7 @@
 // and full-request/response evidence). Renders markdown from the structured model (report-model.ts). Pure.
 
 import type { AssessmentState, Severity } from "./types/index.js";
-import type { BuildReportOptions, ReportEvidence, ReportModel } from "./report-model.js";
+import type { BuildReportOptions, ReportCheckRow, ReportEvidence, ReportModel } from "./report-model.js";
 import { buildReportModel } from "./report-model.js";
 
 function evidenceMd(e: ReportEvidence): string[] {
@@ -37,6 +37,7 @@ export function renderMarkdown(m: ReportModel): string {
   out.push("- [Assessment Information](#assessment-information)");
   out.push("- [Scope](#scope)");
   out.push("- [Summary](#summary)");
+  if (m.checks.length > 0 || m.legacyScreens.length > 0 || m.roleProgress.length > 0) out.push("- [Check coverage](#check-coverage)");
   if (confirmed.length > 0) {
     out.push("- [Findings](#findings)");
     for (const f of confirmed) out.push(tocRow(f));
@@ -56,7 +57,11 @@ export function renderMarkdown(m: ReportModel): string {
   out.push(`| Started | ${m.startedAt} |`);
   out.push(`| Generated | ${m.generatedAt} |`);
   out.push(`| Phase | ${m.phase} |`);
-  out.push(`| Screens | ${m.stats.screens.total} mapped · ${m.stats.screens.scanned} tested · ${m.stats.screens.excluded} excluded · ${m.stats.screens.remaining} unfinished |`);
+  out.push(
+    `| Screens | ${m.stats.screens.total} mapped · ${m.stats.screens.scanned} tested` +
+      `${m.stats.screens.claimed > 0 ? ` · ${m.stats.screens.claimed} status-claimed (no check records)` : ""}` +
+      ` · ${m.stats.screens.excluded} excluded · ${m.stats.screens.remaining} unfinished |`,
+  );
   out.push(`| Hypotheses | ${m.stats.hypotheses.total} (${m.stats.hypotheses.confirmed} confirmed) |`);
   out.push(`| Findings | ${m.stats.findings.total} |`);
   out.push(`| Tooling | ${m.brand} |`, "");
@@ -80,6 +85,60 @@ export function renderMarkdown(m: ReportModel): string {
     out.push(`_Plus ${suspected.length} suspected lead(s) (medium+) needing manual verification — listed separately below, NOT counted above._`, "");
   if (lowSignal.length > 0)
     out.push(`_And ${lowSignal.length} low-signal note(s) (info/low inconclusive) — see Low-signal notes; NOT counted above._`, "");
+
+  // ── Check coverage — the structured execution ledger. Every recorded check keeps its real context
+  //    (target, input, subject/principal/tenant, reason, evidence reference); gap states (unverified /
+  //    blocked / running / unfulfilled plans) stay visible instead of silently reading as "clean". ──
+  if (m.checks.length > 0 || m.legacyScreens.length > 0 || m.roleProgress.length > 0) {
+    out.push("## Check coverage", "");
+    const cs = m.stats.checks;
+    const counts = (["found", "suspected", "tested-clean", "not-applicable", "unverified", "blocked", "planned", "running"] as const)
+      .filter((s) => cs.byStatus[s] > 0)
+      .map((s) => `${cs.byStatus[s]} ${s}`)
+      .join(" · ");
+    out.push(
+      `_${cs.total} instrumented check execution(s)${counts ? `: ${counts}` : ""}` +
+        `${cs.unfulfilledPlans > 0 ? ` · ${cs.unfulfilledPlans} unfulfilled plan slot(s)` : ""}` +
+        `${cs.legacyCleanScreens > 0 ? ` · ${cs.legacyCleanScreens} screen(s) without check records` : ""}._`,
+      "",
+    );
+    // Surveyed roles are coverage context: a role blocked before any check ran is a coverage gap with
+    // a concrete reason — it must stay visible even though it owns no check execution rows.
+    if (m.roleProgress.length > 0) {
+      out.push("_Surveyed roles (latest outcome per role):_", "");
+      for (const r of m.roleProgress)
+        out.push(
+          `- \`${r.role}\` — **${r.state}** (${r.visited} visited${r.pending > 0 ? `, ${r.pending} pending` : ""}${r.gated > 0 ? `, ${r.gated} gated` : ""})${r.reason ? ` — ${r.reason}` : ""}`,
+        );
+      out.push("");
+    }
+    const subjectOf = (c: ReportCheckRow): string =>
+      c.principal ? `${c.subject || "?"} (principal \`${c.principal}\`)` : c.subject ? `\`${c.subject}\`` : "(no subject)";
+    const ctxOf = (c: ReportCheckRow): string => {
+      const parts: string[] = [subjectOf(c)];
+      if (c.tenant) parts.push(`tenant \`${c.tenant}\``);
+      if (c.origin) parts.push(`origin \`${c.origin}\``);
+      if (c.resource) parts.push(`resource \`${c.resource}\``);
+      if (c.baselineOk === false) parts.push("no valid baseline");
+      return parts.join(" · ");
+    };
+    for (const c of m.checks) {
+      const input = c.param ? ` · input \`${c.param}\`` : "";
+      const tool = c.tool ? ` · tool \`${c.tool}\`` : "";
+      const reason = c.reason ? ` — ${c.reason}` : "";
+      out.push(`- **[${c.status}]** \`${c.target}\` — \`${c.checkClass}\` — ${ctxOf(c)}${input}${tool}${reason}`);
+      const evs = c.evidence.map((e) => `\`${e.evidenceId}\` (\`${e.path}\`)`).join(", ");
+      if (evs || c.findingIds.length > 0)
+        out.push(`  - ${[evs ? `evidence: ${evs}` : "", c.findingIds.length > 0 ? `findings: ${c.findingIds.map((f) => `\`${f}\``).join(", ")}` : ""].filter(Boolean).join(" · ")}`);
+    }
+    if (m.legacyScreens.length > 0) {
+      out.push("", "### Screens reported without structured check records", "");
+      out.push("_These screens carry a conclusive scan status from a legacy run or a log note, but zero recorded check executions — coverage detail is **unknown**, not verified clean._", "");
+      for (const s of m.legacyScreens)
+        out.push(`- \`${s.screenId}\` (\`${s.url}\`) — status \`${s.scanStatus}\`, no evidence/detail records (legacy coverage claim)`);
+    }
+    out.push("");
+  }
 
   // Render one finding (shared by confirmed / suspected; suspected adds [SUSPECTED] + anomaly to the heading).
   const renderFinding = (f: ReportModel["findings"][number]): void => {

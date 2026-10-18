@@ -10,6 +10,7 @@ export type ScreenScanStatus =
   | "clean" // scanned, no findings (terminal)
   | "finding" // scanned, confirmed findings present (terminal)
   | "suspected" // scanned, only suspected leads (no confirmed). Diagnosis is done = terminal, awaiting manual verification
+  | "unverified" // scanned but the check ledger still shows unverified/blocked/unfulfilled gaps — terminal, honest incomplete (not clean)
   | "blocked" // can't proceed, waiting on auth/scope/handoff (non-terminal)
   | "excluded" // excluded from scanning by a human (terminal)
   | "error"; // failed; can be retried while retry budget remains
@@ -30,7 +31,7 @@ export interface ScreenScan {
 export interface Coverage {
   total: number;
   byStatus: Record<ScreenScanStatus, number>;
-  /** clean + finding + suspected + excluded */
+  /** clean + finding + suspected + unverified + excluded */
   terminal: number;
   /** total - terminal (sum of queued / scanning / error / blocked) */
   remaining: number;

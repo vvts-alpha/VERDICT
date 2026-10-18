@@ -1,8 +1,8 @@
 // Pure report renderers: HTML (self-contained) / CSV (findings, screens) / screen-inventory HTML.
 // PDF prints the HTML with Chromium (crawler-side htmlToPdf), so here we purely produce up to the HTML.
 
-import type { Severity } from "./types/index.js";
-import type { ReportModel, ReportScreenRow } from "./report-model.js";
+import type { CheckStatus, Severity } from "./types/index.js";
+import type { ReportCheckRow, ReportModel, ReportScreenRow } from "./report-model.js";
 
 const SEV_COLOR: Record<Severity, string> = {
   critical: "#b00020",
@@ -25,6 +25,17 @@ function csvCell(v: string | number): string {
 function csvRows(rows: Array<Array<string | number>>): string {
   return rows.map((r) => r.map(csvCell).join(",")).join("\r\n") + "\r\n";
 }
+
+const CHECK_COLOR: Record<CheckStatus, string> = {
+  found: "#b00020",
+  suspected: "#8a6d00",
+  "tested-clean": "#2e7d32",
+  "not-applicable": "#5f7d8c",
+  unverified: "#b26a00",
+  blocked: "#b00020",
+  planned: "#5f7d8c",
+  running: "#0366d6",
+};
 
 const BASE_CSS = `
 *{box-sizing:border-box}
@@ -95,6 +106,7 @@ export function renderReportHtml(m: ReportModel): string {
   out.push(`<li><a href="#assessment-information">Assessment Information</a></li>`);
   out.push(`<li><a href="#scope">Scope</a></li>`);
   out.push(`<li><a href="#summary">Summary</a></li>`);
+  if (m.checks.length > 0 || m.legacyScreens.length > 0 || m.roleProgress.length > 0) out.push(`<li><a href="#check-coverage">Check coverage</a></li>`);
   if (confirmed.length > 0) {
     out.push(`<li><a href="#findings">Findings</a><ul>`);
     for (const f of confirmed) out.push(tocLi(f));
@@ -114,7 +126,14 @@ export function renderReportHtml(m: ReportModel): string {
   out.push(row("Started", esc(m.startedAt)));
   out.push(row("Generated", esc(m.generatedAt)));
   out.push(row("Phase", esc(m.phase)));
-  out.push(row("Screens", `${m.stats.screens.total} mapped · ${m.stats.screens.scanned} tested · ${m.stats.screens.excluded} excluded · ${m.stats.screens.remaining} unfinished`));
+  out.push(
+    row(
+      "Screens",
+      `${m.stats.screens.total} mapped · ${m.stats.screens.scanned} tested` +
+        `${m.stats.screens.claimed > 0 ? ` · ${m.stats.screens.claimed} status-claimed (no check records)` : ""}` +
+        ` · ${m.stats.screens.excluded} excluded · ${m.stats.screens.remaining} unfinished`,
+    ),
+  );
   out.push(row("Hypotheses", `${m.stats.hypotheses.total} (${m.stats.hypotheses.confirmed} confirmed)`));
   out.push(row("Findings", String(m.stats.findings.total)));
   out.push(row("Tooling", esc(m.brand)));
@@ -144,6 +163,67 @@ export function renderReportHtml(m: ReportModel): string {
   }
   if (suspected.length > 0)
     out.push(`<p class="muted">Plus <b>${suspected.length}</b> suspected lead(s) needing manual verification (listed separately, not counted above).</p>`);
+
+  // ── Check coverage — the structured execution ledger. Same content as the Markdown "Check coverage"
+  //    section: every recorded check keeps target, input, subject/principal/tenant, reason and evidence
+  //    references; gap states and ledgerless "clean" screens stay visible. All values are esc()'d. ──
+  if (m.checks.length > 0 || m.legacyScreens.length > 0 || m.roleProgress.length > 0) {
+    const cs = m.stats.checks;
+    const counts = (["found", "suspected", "tested-clean", "not-applicable", "unverified", "blocked", "planned", "running"] as CheckStatus[])
+      .filter((st) => cs.byStatus[st] > 0)
+      .map((st) => `<b style="color:${CHECK_COLOR[st]}">${cs.byStatus[st]}</b> ${esc(st)}`)
+      .join(" · ");
+    out.push(`<h2 id="check-coverage">Check coverage</h2>`);
+    out.push(
+      `<p class="meta">${cs.total} instrumented check execution(s)${counts ? `: ${counts}` : ""}` +
+        `${cs.unfulfilledPlans > 0 ? ` · ${cs.unfulfilledPlans} unfulfilled plan slot(s)` : ""}` +
+        `${cs.legacyCleanScreens > 0 ? ` · ${cs.legacyCleanScreens} screen(s) without check records` : ""}.</p>`,
+    );
+    // Surveyed roles are coverage context: a role blocked before any check ran is a coverage gap with
+    // a concrete reason — it must stay visible even though it owns no check execution rows.
+    if (m.roleProgress.length > 0) {
+      out.push(`<p class="meta"><em>Surveyed roles (latest outcome per role):</em></p><ul>`);
+      for (const r of m.roleProgress)
+        out.push(
+          `<li><code>${esc(r.role)}</code> — <b>${esc(r.state)}</b> (${r.visited} visited${r.pending > 0 ? `, ${r.pending} pending` : ""}${r.gated > 0 ? `, ${r.gated} gated` : ""})${r.reason ? ` — ${esc(r.reason)}` : ""}</li>`,
+        );
+      out.push(`</ul>`);
+    }
+    const subjectOf = (c: ReportCheckRow): string =>
+      c.principal ? `${esc(c.subject || "?")} (principal <code>${esc(c.principal)}</code>)` : c.subject ? `<code>${esc(c.subject)}</code>` : "(no subject)";
+    if (m.checks.length > 0) {
+      out.push(`<table><thead><tr><th>Status</th><th>Target</th><th>Class</th><th>Input</th><th>Subject / context</th><th>Reason</th><th>Evidence / findings</th></tr></thead><tbody>`);
+      for (const c of m.checks) {
+        const ctx: string[] = [subjectOf(c)];
+        if (c.tenant) ctx.push(`tenant <code>${esc(c.tenant)}</code>`);
+        if (c.origin) ctx.push(`origin <code>${esc(c.origin)}</code>`);
+        if (c.resource) ctx.push(`resource <code>${esc(c.resource)}</code>`);
+        if (c.baselineOk === false) ctx.push("no valid baseline");
+        if (c.tool) ctx.push(`tool <code>${esc(c.tool)}</code>`);
+        const refs: string[] = [];
+        for (const e of c.evidence) refs.push(`<code>${esc(e.evidenceId)}</code> (<code>${esc(e.path)}</code>)`);
+        for (const f of c.findingIds) refs.push(`finding <code>${esc(f)}</code>`);
+        out.push(
+          `<tr><td><span class="badge" style="background:${CHECK_COLOR[c.status]}">${esc(c.status)}</span></td>` +
+            `<td><code>${esc(c.target)}</code><div class="muted">${esc(c.screenId)}</div></td>` +
+            `<td><code>${esc(c.checkClass)}</code></td>` +
+            `<td>${c.param ? `<code>${esc(c.param)}</code>` : "&mdash;"}</td>` +
+            `<td>${ctx.join(" · ")}</td>` +
+            `<td>${c.reason ? esc(c.reason) : "&mdash;"}</td>` +
+            `<td>${refs.length ? refs.join("<br>") : "&mdash;"}</td></tr>`,
+        );
+      }
+      out.push(`</tbody></table>`);
+    }
+    if (m.legacyScreens.length > 0) {
+      out.push(`<h3>Screens reported without structured check records</h3>`);
+      out.push(`<p class="muted">These screens carry a conclusive scan status from a legacy run or a log note, but zero recorded check executions — coverage detail is <b>unknown</b>, not verified clean.</p>`);
+      out.push(`<table><thead><tr><th>Screen</th><th>URL</th><th>Claimed status</th></tr></thead><tbody>`);
+      for (const s of m.legacyScreens)
+        out.push(`<tr><td><code>${esc(s.screenId)}</code></td><td><code>${esc(s.url)}</code></td><td>${esc(s.scanStatus)} — no evidence/detail records (legacy coverage claim)</td></tr>`);
+      out.push(`</tbody></table>`);
+    }
+  }
 
   // One finding (shared by confirmed / suspected; suspected gets a [SUSPECTED] badge + anomaly).
   const renderF = (f: ReportModel["findings"][number]): void => {

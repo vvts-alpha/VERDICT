@@ -121,11 +121,15 @@ export function buildOpenApi(screens: ReadonlyArray<Screen>, opts: BuildOpenApiO
   let opCount = 0;
   for (const sc of screens) {
     for (const api of sc.apis) {
-      const key = `${api.method} ${api.urlTemplate}`;
+      const key = api.graphql ? `${api.method} ${api.urlTemplate} ${api.graphql.operationKey}` : `${api.method} ${api.urlTemplate}`;
       if (seen.has(key)) continue;
       seen.add(key);
       const method = api.method.toLowerCase();
-      const op: Record<string, unknown> = { summary: `${api.method} ${api.urlTemplate}` };
+      const op: Record<string, unknown> = {
+        summary: api.graphql
+          ? `${api.method} ${api.urlTemplate} · ${api.graphql.operationName ?? (api.graphql.rootFields.join("/") || api.graphql.operationKey)}`
+          : `${api.method} ${api.urlTemplate}`,
+      };
       const parameters: OASchema[] = [];
       for (const name of pathParamsOf(api.urlTemplate)) {
         parameters.push({ name, in: "path", required: true, schema: { type: "string" } });
@@ -143,7 +147,30 @@ export function buildOpenApi(screens: ReadonlyArray<Screen>, opts: BuildOpenApiO
       op.responses = api.resSchema
         ? { "200": { description: "observed", content: { "application/json": { schema: jsonShapeToSchema(api.resSchema) } } } }
         : { "200": { description: "observed" } };
-      (paths[api.urlTemplate] ??= {})[method] = op;
+      const pathItem = (paths[api.urlTemplate] ??= {});
+      if (api.graphql) {
+        // GraphQL: one endpoint carries many operations. The path method entry names the first observed op;
+        // EVERY distinct op is preserved under x-graphql-operations as structured metadata (identity + shape +
+        // sanitized document) so none are lost to path+method collision.
+        op.operationId = api.graphql.operationName ?? api.graphql.operationKey.replace(/[^a-zA-Z0-9_-]/g, "_");
+        const meta = {
+          operationId: op.operationId,
+          operationType: api.graphql.operationType,
+          operationName: api.graphql.operationName,
+          operationKey: api.graphql.operationKey,
+          rootFields: api.graphql.rootFields,
+          responseKeys: api.graphql.responseKeys ?? api.graphql.rootFields,
+          variablesShape: api.graphql.variablesShape,
+          document: api.graphql.document,
+        };
+        op["x-graphql"] = meta;
+        if (pathItem[method] === undefined) pathItem[method] = op;
+        const primary = pathItem[method] as Record<string, unknown>;
+        const extra = (primary["x-graphql-operations"] ??= []);
+        (extra as unknown[]).push(meta);
+      } else {
+        if (pathItem[method] === undefined) pathItem[method] = op;
+      }
       opCount += 1;
     }
   }

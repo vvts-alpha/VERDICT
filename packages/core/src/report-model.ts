@@ -2,8 +2,10 @@
 // renderer (markdown / html / csv / inventory) handles "how to present it". PDF prints the html with
 // Chromium (crawler-side). screens[] is the survey-result screen inventory (for standalone export).
 
-import type { AssessmentState, AuthState, Finding, FindingVerdict, Phase, ScopePolicy, ScreenScanStatus, ScreenType, Severity } from "./types/index.js";
+import type { AssessmentState, AuthState, CheckExecution, CheckStatus, Finding, FindingVerdict, Phase, ScopePolicy, ScreenScanStatus, ScreenType, Severity } from "./types/index.js";
 import { coverage } from "./coverage.js";
+import { rollupChecks } from "./checks.js";
+import { deriveRoleProgress, type RoleProgress } from "./view.js";
 
 export const SEVERITY_ORDER: Record<Severity, number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
 const VERDICT_ORDER: Record<FindingVerdict, number> = { confirmed: 0, suspected: 1 };
@@ -56,6 +58,43 @@ export interface ReportScreenRow {
   screenshot: string; // relative to the artifacts directory (e.g. "screens/s-0001.png"); "" if not captured
 }
 
+/** One recorded check execution — the coverage row a finding (or its absence) actually rests on.
+ *  Evidence is referenced by id + artifact path only; bodies stay in finding evidence / the evidence
+ *  viewer so a long ledger can't balloon the report. */
+export interface ReportCheckRow {
+  screenId: string;
+  /** "GET /orders/{id}" or "POST /graphql#name:Op:hash". */
+  target: string;
+  /** Parameter / JSON pointer the check targeted, when applicable. */
+  param?: string;
+  /** Concrete object the check exercised, when object-scoped. */
+  resource?: string;
+  /** Subject label the check ran as (configured role, "unauth", or "" for plan rows). */
+  subject: string;
+  /** Established principal for the subject, when known. */
+  principal?: string;
+  tenant?: string;
+  origin?: string;
+  checkClass: string;
+  status: CheckStatus;
+  tool?: string;
+  baselineOk?: boolean;
+  /** Concrete gap reason — required on unverified/blocked/not-applicable rows by the ledger contract. */
+  reason?: string;
+  /** Evidence the outcome rests on (id + artifact path). */
+  evidence: ReportEvidence[];
+  /** Findings this check produced. */
+  findingIds: string[];
+}
+
+/** A screen whose terminal scan status claims it was tested but that has ZERO structured check rows —
+ *  the clean verdict came from a legacy run or a log note, so the actual coverage detail is unknown. */
+export interface ReportLegacyScreen {
+  screenId: string;
+  url: string;
+  scanStatus: ScreenScanStatus;
+}
+
 export interface ReportModel {
   id: string;
   brand: string;
@@ -65,12 +104,39 @@ export interface ReportModel {
   generatedAt: string; // ISO
   scope: ScopePolicy;
   stats: {
-    screens: { total: number; scanned: number; excluded: number; remaining: number };
+    screens: {
+      total: number;
+      /** Screens that reached a conclusive scan status WITH structured backing (check rows or a
+       *  recorded finding) — the "tested" headline. */
+      scanned: number;
+      /** Screens claiming a conclusive status with ZERO structured records (legacy run or log note).
+       *  Reported separately so an unbacked claim can never masquerade as a tested count. */
+      claimed: number;
+      excluded: number;
+      remaining: number;
+    };
     hypotheses: { total: number; confirmed: number };
     findings: { total: number; bySeverity: Record<Severity, number>; suspected: number };
+    checks: {
+      total: number;
+      byStatus: Record<CheckStatus, number>;
+      /** planned slots still waiting for a satisfying execution. */
+      unfulfilledPlans: number;
+      /** outcome rows without a conclusive answer (unverified + blocked + still running). */
+      gaps: number;
+      /** screens claiming a conclusive clean scan with zero ledger rows (legacy/log-derived coverage). */
+      legacyCleanScreens: number;
+    };
   };
   findings: ReportFindingRow[]; // ascending severity (critical→info)
   screens: ReportScreenRow[]; // ascending screenId
+  /** The structured check ledger — every executed check with its real context (ledger order). */
+  checks: ReportCheckRow[];
+  /** Conclusive-looking screens with no ledger rows — coverage detail unknown, not "verified clean". */
+  legacyScreens: ReportLegacyScreen[];
+  /** Latest survey outcome per authenticated role (full-log projection — a role blocked before any
+   *  check row exists keeps its reason here even when it owns zero ledger rows). */
+  roleProgress: RoleProgress[];
 }
 
 /** AssessmentState → ReportModel (pure). The single input to every renderer.
@@ -144,6 +210,61 @@ export function buildReportModel(state: AssessmentState, now: Date = new Date(),
       screenshot: s.screenshot,
     }));
 
+  // ── Check-execution ledger → report coverage. Rows keep the store's deterministic (created_at, id)
+  //    order so two model builds over the same state are deep-equal. Evidence is referenced by
+  //    id + artifact path (bodies stay in finding evidence / the evidence viewer). ──
+  const checks: ReportCheckRow[] = state.checkExecutions.map((c: CheckExecution): ReportCheckRow => ({
+    screenId: c.screenId,
+    target: c.target,
+    ...(c.param !== undefined ? { param: c.param } : {}),
+    ...(c.resource !== undefined ? { resource: c.resource } : {}),
+    subject: c.subject,
+    ...(c.principal !== undefined ? { principal: c.principal } : {}),
+    ...(c.tenant !== undefined ? { tenant: c.tenant } : {}),
+    ...(c.origin !== undefined ? { origin: c.origin } : {}),
+    checkClass: c.checkClass,
+    status: c.status,
+    ...(c.tool !== undefined ? { tool: c.tool } : {}),
+    ...(c.baselineOk !== undefined ? { baselineOk: c.baselineOk } : {}),
+    ...(c.reason !== undefined ? { reason: c.reason } : {}),
+    evidence: c.evidenceIds.map((e): ReportEvidence => ({
+      evidenceId: e,
+      path: `artifacts/${c.screenId}/${e}/`,
+      request: null,
+      response: null,
+      truncated: false,
+    })),
+    findingIds: c.findingIds,
+  }));
+
+  const byStatus = Object.fromEntries(
+    (["planned", "running", "found", "suspected", "tested-clean", "not-applicable", "unverified", "blocked"] as CheckStatus[])
+      .map((s) => [s, 0]),
+  ) as Record<CheckStatus, number>;
+  for (const c of state.checkExecutions) byStatus[c.status] += 1;
+  const unfulfilledPlans = rollupChecks(state.checkExecutions).reduce((n, cell) => n + cell.unfulfilled.length, 0);
+
+  const checkedScreens = new Set(state.checkExecutions.map((c) => c.screenId));
+  const findingScreens = new Set(sorted.map((f) => f.screenId).filter((x): x is string => x != null));
+  const legacyScreens: ReportLegacyScreen[] = screens
+    // A conclusive scan status asserts a finished diagnosis; with zero ledger rows the claim traces to
+    // a legacy run or a log note — coverage detail unknown, not verified. A "finding"/"suspected"
+    // screen whose recorded finding carries its own evidence stays backed by it; a "clean" claim
+    // (nothing found) has no such carrier, so ledgerless clean is always disclosed.
+    .filter((s) => {
+      if (checkedScreens.has(s.screenId)) return false;
+      if (s.scanStatus === "clean") return true;
+      return (s.scanStatus === "finding" || s.scanStatus === "suspected") && !findingScreens.has(s.screenId);
+    })
+    .map((s) => ({ screenId: s.screenId, url: s.url, scanStatus: s.scanStatus as ScreenScanStatus }));
+
+  // "Tested" counts only conclusive statuses that carry structured backing. A legacy/log-claimed
+  // clean or finding with zero check rows (and no recorded finding) is disclosed as `claimed` —
+  // an unknown-detail status, never folded into the tested headline.
+  const statusClaims = cov.byStatus.clean + cov.byStatus.finding + cov.byStatus.suspected;
+  const backedScanned = statusClaims - legacyScreens.length;
+  const roleProgress = deriveRoleProgress(state.events);
+
   return {
     id: state.id,
     brand: "VERDICT",
@@ -153,11 +274,21 @@ export function buildReportModel(state: AssessmentState, now: Date = new Date(),
     generatedAt: now.toISOString(),
     scope: state.scope,
     stats: {
-      screens: { total: cov.total, scanned: cov.byStatus.clean + cov.byStatus.finding + cov.byStatus.suspected, excluded: cov.byStatus.excluded, remaining: cov.remaining },
+      screens: { total: cov.total, scanned: backedScanned, claimed: legacyScreens.length, excluded: cov.byStatus.excluded, remaining: cov.remaining },
       hypotheses: { total: state.hypotheses.length, confirmed: confirmedHypotheses },
       findings: { total: confirmedCount, bySeverity, suspected: suspectedCount },
+      checks: {
+        total: checks.length,
+        byStatus,
+        unfulfilledPlans,
+        gaps: byStatus.unverified + byStatus.blocked + byStatus.running,
+        legacyCleanScreens: legacyScreens.length,
+      },
     },
     findings,
     screens,
+    checks,
+    legacyScreens,
+    roleProgress,
   };
 }

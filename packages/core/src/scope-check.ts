@@ -31,15 +31,20 @@ export function isInScope(rawUrl: string, scope: ScopePolicy): boolean {
   if (u.protocol !== "http:" && u.protocol !== "https:") return false;
   if (hostMatches(u.host, scope.outOfScopeHosts)) return false;
   if (!hostMatches(u.host, scope.inScopeHosts)) return false;
+  // Paths: a trailing `*` is a wildcard marker (`/*` = every path). A catch-all allow ("/", "/*", "*") means
+  // "no narrowing" — derived scopes set it implicitly — so blocks still apply under it. A non-catch-all
+  // allow-prefix wins over a block, so the operator can carve exceptions (block /admin/*, allow /admin/public).
   const path = u.pathname;
-  if (scope.outOfScopePathPrefixes.some((p) => path.startsWith(p))) return false;
-  if (
-    scope.inScopePathPrefixes.length > 0 &&
-    !scope.inScopePathPrefixes.some((p) => path.startsWith(p))
-  ) {
-    return false;
-  }
-  return true;
+  const pathMatch = (prefix: string): boolean =>
+    path.startsWith(prefix.endsWith("*") ? prefix.slice(0, -1) : prefix);
+  const isCatchAll = (prefix: string): boolean => {
+    const n = prefix.endsWith("*") ? prefix.slice(0, -1) : prefix;
+    return n === "" || n === "/" || n === "*";
+  };
+  const explicit = scope.inScopePathPrefixes.filter((p) => !isCatchAll(p));
+  if (explicit.some(pathMatch)) return true;
+  if (scope.outOfScopePathPrefixes.some(pathMatch)) return false;
+  return scope.inScopePathPrefixes.length === 0 || scope.inScopePathPrefixes.some(isCatchAll);
 }
 
 /**

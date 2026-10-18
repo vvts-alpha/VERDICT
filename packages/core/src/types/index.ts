@@ -9,6 +9,7 @@ export type {
   ScreenType,
   ParamLoc,
   JsonShape,
+  GraphQLOperation,
   ApiCall,
   GuessedType,
   Param,
@@ -21,3 +22,13 @@ export type { HandoffReason, HandoffStatus, HumanHandoff } from "./handoff.js";
 export type { StateEvent, StateEventType, StateEventInput, ControlCommand } from "./event.js";
 export type { AssessmentState, AssessmentSummary } from "./state.js";
 export type { JsAsset, JsSecret, JsSink } from "./js-asset.js";
+export type { CheckExecution, CheckStatus } from "./check.js";
+export type {
+  AuthzAction,
+  AuthzComparison,
+  AuthzObject,
+  AuthzOutcome,
+  ExpectationBasis,
+  ExpectedAccessRule,
+  OwnershipBasis,
+} from "./authz.js";

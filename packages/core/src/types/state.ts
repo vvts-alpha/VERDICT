@@ -10,6 +10,8 @@ import type { Hypothesis } from "./hypothesis.js";
 import type { Finding } from "./finding.js";
 import type { HumanHandoff } from "./handoff.js";
 import type { StateEvent } from "./event.js";
+import type { CheckExecution } from "./check.js";
+import type { AuthzComparison, AuthzObject } from "./authz.js";
 
 export interface AssessmentState {
   id: string;
@@ -23,6 +25,13 @@ export interface AssessmentState {
   hypotheses: Hypothesis[];
   findings: Finding[];
   handoffs: HumanHandoff[];
+  /** Per-check execution ledger (one row per bounded check). Persisted in its own table —
+   *  never derived from the capped recent-events window. */
+  checkExecutions: CheckExecution[];
+  /** Observed object references + verified ownership state (discovery vs proven relationship). */
+  authzObjects: AuthzObject[];
+  /** Bounded A/B authorization comparisons with their evidence ids. */
+  authzComparisons: AuthzComparison[];
   /** append-only (replayable) */
   events: StateEvent[];
 }

@@ -15,6 +15,7 @@ export type {
   ScreenType,
   ParamLoc,
   JsonShape,
+  GraphQLOperation,
   ApiCall,
   GuessedType,
   Param,
@@ -41,6 +42,15 @@ export type {
   JsAsset,
   JsSecret,
   JsSink,
+  CheckExecution,
+  CheckStatus,
+  AuthzAction,
+  AuthzComparison,
+  AuthzObject,
+  AuthzOutcome,
+  ExpectationBasis,
+  ExpectedAccessRule,
+  OwnershipBasis,
 } from "./types/index.js";
 
 // SQLite state store
@@ -63,23 +73,36 @@ export {
 } from "./coverage.js";
 export type { PrioritizedScreen } from "./coverage.js";
 
+// Per-check execution ledger selectors (pure)
+export {
+  checkKey,
+  planSatisfiedBy,
+  rollupChecks,
+  screenChecks,
+  TERMINAL_CHECK_STATUSES,
+  EXECUTION_CHECK_STATUSES,
+} from "./checks.js";
+export type { ClassRollup, ScreenCheckView } from "./checks.js";
+
 // Scope decisions (shared by crawler / scanner)
 export { hostMatches, isInScope, parseTargetUrl } from "./scope-check.js";
 
 // Site tree / state projection (M3 WebUI contract)
 export { buildSiteTree } from "./tree.js";
 export type { TreeNode } from "./tree.js";
-export { buildStateView } from "./view.js";
-export type { StateView, WsMessage } from "./view.js";
+export { buildStateView, deriveRoleProgress } from "./view.js";
+export type { StateView, WsMessage, RoleProgress } from "./view.js";
 
 // Budget / stop conditions / report (M7)
 export { recordRequests, recordTokens, elapsedMs, evaluateStop, evaluateBudget } from "./budget-guard.js";
 export type { StopDecision, StopOptions } from "./budget-guard.js";
 export { buildReport, renderMarkdown } from "./report.js";
 export { buildReportModel, SEVERITY_ORDER, findingVerdict } from "./report-model.js";
-export type { ReportModel, ReportFindingRow, ReportScreenRow, ReportEvidence, EvidenceLoader, BuildReportOptions } from "./report-model.js";
+export type { ReportModel, ReportFindingRow, ReportScreenRow, ReportCheckRow, ReportLegacyScreen, ReportEvidence, EvidenceLoader, BuildReportOptions } from "./report-model.js";
 export { renderReportHtml, renderFindingsCsv, renderScreensCsv, renderInventoryHtml } from "./report-formats.js";
 export { buildOpenApi, jsonShapeToSchema, schemaToJsonShape } from "./openapi.js";
 export type { BuildOpenApiOptions } from "./openapi.js";
 export type { ReadinessCheck } from "./types/readiness.js";
 export type { ModelContextSettings } from "./llm-context.js";
+export { diffStateViews, renderDiffMarkdown } from "./diff.js";
+export type { DiffReport, StatusChange } from "./diff.js";

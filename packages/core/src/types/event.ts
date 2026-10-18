@@ -9,6 +9,8 @@ import type { HypoStatus } from "./hypothesis.js";
 import type { HandoffReason } from "./handoff.js";
 import type { ScreenScanStatus } from "./screen-scan.js";
 import type { JsAsset } from "./js-asset.js";
+import type { CheckExecution } from "./check.js";
+import type { AuthzComparison, AuthzObject } from "./authz.js";
 
 interface EventEnvelope<TType extends string, TPayload> {
   /** Monotonically increasing within an assessment, starting at 1 */
@@ -46,6 +48,13 @@ export type StateEvent =
   | EventEnvelope<"methodology_recorded", { screenId: string; vulnClasses: string[]; plan: string }>
   | EventEnvelope<"methodology_completed", { screenIds: string[]; summary: string }>
   | EventEnvelope<"recon_completed", { screenIds: string[] }>
+  | EventEnvelope<"check_recorded", { check: CheckExecution }>
+  | EventEnvelope<"authz_object_recorded", { object: AuthzObject }>
+  | EventEnvelope<"authz_comparison_recorded", { comparison: AuthzComparison }>
+  | EventEnvelope<
+      "survey_role_progress",
+      { role: string; visited: number; urls?: string[]; pending?: string[]; gated?: string[]; seen?: string[]; state: "mapped" | "blocked"; reason?: string }
+    >
   | EventEnvelope<"note", { message: string }>;
 
 /** A live reconfigure command for a running scan, applied by the pilot at its next between-screens checkpoint.
