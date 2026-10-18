@@ -99,6 +99,10 @@ pre, code { font-family: var(--font-mono); }
 :focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; border-radius: 3px; }
 input:focus-visible, textarea:focus-visible, select:focus-visible { outline-offset: 0; }
 
+/* Native <select> popups paint in OS colors (white on Windows) even with color-scheme:dark —
+   pin options/groups to the theme so opened lists stay on the zinc palette. */
+select option, select optgroup { background: var(--elev); color: var(--fg); }
+
 /* Match the scrollbar to the dark theme (the default light bar stands out) */
 * { scrollbar-width: thin; scrollbar-color: var(--line) transparent; } /* Firefox */
 ::-webkit-scrollbar { width: 10px; height: 10px; }

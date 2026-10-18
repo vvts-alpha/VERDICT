@@ -7,6 +7,7 @@ import { StatusBar, StatusBarShell } from "./components/StatusBar";
 import { HandoffBar } from "./components/HandoffBar";
 import { Progress } from "./components/Progress";
 import { SiteTree } from "./components/SiteTree";
+import { screenHonestyMap, type ScreenHonesty } from "./components/screen-status";
 import { Findings } from "./components/Findings";
 import { ScreenView } from "./components/ScreenView";
 import { ApiList } from "./components/ApiList";
@@ -115,6 +116,9 @@ export function App() {
   }, [id]);
 
   const selectedScreen = view?.screens.find((s) => s.screenId === selected) ?? view?.screens[0];
+  // One honesty pass per view — the tree dot, progress bar, and run stats all read the same map so
+  // a legacy "clean" claim or an unfulfilled plan can never look tested in one place but not another.
+  const honesty = view ? screenHonestyMap(view) : new Map<string, ScreenHonesty>();
   const control = (path: string, label = "control") => () => ctl(label, postControl(`/api/assessments/${view!.id}/${path}`));
   // Leaving a desktop view goes through the shell — it can veto (e.g. unsaved Settings edits).
   const goMain = (): boolean => !desktop || desktop.view === "main" || desktop.onNavigate("main");
@@ -215,6 +219,7 @@ export function App() {
                     selected={selectedScreen?.screenId ?? null}
                     onSelect={onSelect}
                     onExclude={(ids) => ctl("exclude screens", postControlBody(`/api/assessments/${view.id}/exclude-screens`, { screenIds: ids }))}
+                    honesty={honesty}
                   />
                 </aside>
               </ResizablePanel>

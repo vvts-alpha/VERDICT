@@ -23,6 +23,12 @@ export function eventLine(e: StateEvent): string {
       return `■ halted: ${e.payload.reason}`;
     case "assessment_created":
       return `● assessment created`;
+    case "check_recorded":
+      return `check ${e.payload.check.checkClass} → ${e.payload.check.status} (${e.payload.check.target}${e.payload.check.subject ? `, ${e.payload.check.subject}` : ""})`;
+    case "authz_comparison_recorded":
+      return `authz comparison ${e.payload.comparison.id} → ${e.payload.comparison.outcome}`;
+    case "survey_role_progress":
+      return `survey role ${e.payload.role}: ${e.payload.state}${e.payload.reason ? ` — ${e.payload.reason}` : ""}`;
     default:
       return e.type;
   }

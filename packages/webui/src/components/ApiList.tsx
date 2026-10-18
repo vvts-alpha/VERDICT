@@ -2,13 +2,19 @@ import type { StateView } from "@veritas/core";
 import { Button } from "./ui/button";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "./ui/table";
 
-// Aggregate APIs across all screens (method+endpoint+auth → referencing screens). Tab for API-centric review.
+// Aggregate APIs across all screens (method+endpoint+operation+auth → referencing screens). Tab for API-centric review.
+// GraphQL: one endpoint carries many operations — they are DISTINCT rows keyed by operationKey, shown as the op name.
 export function ApiList({ view, onJump }: { view: StateView; onJump: (screenId: string) => void }) {
-  const map = new Map<string, { method: string; url: string; auth: string; screens: string[] }>();
+  const map = new Map<string, { k: string; method: string; url: string; op?: string; opType?: string; auth: string; screens: string[] }>();
   for (const sc of view.screens) {
     for (const a of sc.apis) {
-      const key = `${a.method} ${a.urlTemplate}`;
-      const e = map.get(key) ?? { method: a.method, url: a.urlTemplate, auth: a.auth, screens: [] };
+      const g = a.graphql;
+      const key = g ? `${a.method} ${a.urlTemplate} ${g.operationKey}` : `${a.method} ${a.urlTemplate}`;
+      const e = map.get(key) ?? { k: key, method: a.method, url: a.urlTemplate, auth: a.auth, screens: [] };
+      if (g) {
+        e.op = g.operationName ?? g.rootFields.join(",") ?? g.operationKey;
+        e.opType = g.operationType;
+      }
       if (!e.screens.includes(sc.screenId)) e.screens.push(sc.screenId);
       map.set(key, e);
     }
@@ -25,15 +31,17 @@ export function ApiList({ view, onJump }: { view: StateView; onJump: (screenId: 
           <TableRow>
             <TableHead>method</TableHead>
             <TableHead>endpoint</TableHead>
+            <TableHead>operation</TableHead>
             <TableHead>auth</TableHead>
             <TableHead>screens</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
           {rows.map((r) => (
-            <TableRow key={`${r.method} ${r.url}`}>
+            <TableRow key={r.k}>
               <TableCell className="font-mono"><b>{r.method}</b></TableCell>
               <TableCell className="font-mono">{r.url}</TableCell>
+              <TableCell className="font-mono text-muted-foreground">{r.op ? `${r.opType === "mutation" ? "mut" : r.opType === "subscription" ? "sub" : "qry"}:${r.op}` : "—"}</TableCell>
               <TableCell className="text-muted-foreground">{r.auth}</TableCell>
               <TableCell>
                 {r.screens.map((s) => <Button key={s} type="button" variant="link" size="xs" onClick={() => onJump(s)}>{s}</Button>)}

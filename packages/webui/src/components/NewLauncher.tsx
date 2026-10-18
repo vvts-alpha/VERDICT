@@ -59,7 +59,6 @@ export function NewLauncher({ onCancel, initial }: { onCancel: () => void; initi
         <h2 className="text-base font-semibold">New assessment</h2>
         <Button type="button" variant="ghost" onClick={onCancel}><ArrowLeft /> Cancel</Button>
       </div>
-      <p className="text-xs text-muted-foreground">What are you assessing?</p>
       <div className="grid grid-cols-[repeat(auto-fit,minmax(190px,1fr))] gap-3">
         <Card
           icon={<GlobeIcon />}

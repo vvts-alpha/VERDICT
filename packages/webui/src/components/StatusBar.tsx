@@ -3,6 +3,7 @@ import type { ReactNode } from "react";
 import type { StateView } from "@veritas/core";
 import type { ConnState } from "../api";
 import { useRole } from "../api";
+import { screenHonestyMap } from "./screen-status";
 import { Download, Pause, Play, Upload } from "lucide-react";
 import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
@@ -187,13 +188,24 @@ export function StatusBar({
     so truncation at narrow widths drops only the least important numbers. Each item carries a tooltip. */
 export function RunStats({ view }: { view: StateView }) {
   const c = view.coverage;
-  const tested = c.byStatus.clean + c.byStatus.finding + c.byStatus.suspected;
+  // Ledger-honest counts: a conclusive claim with no check records is "claimed", not tested; a
+  // clean screen whose ledger still holds gaps/unfulfilled plans counts under unverified.
+  let tested = 0;
+  let unverified = 0;
+  let claimed = 0;
+  for (const h of screenHonestyMap(view).values()) {
+    if (h.status === "clean" || h.status === "finding" || h.status === "suspected") tested += 1;
+    else if (h.status === "unverified") unverified += 1;
+    else if (h.status === "unknown-records") claimed += 1;
+  }
   const pending = view.handoffs.filter((h) => h.status === "pending").length;
   const items: { label: string; value: ReactNode; title?: string; warn?: boolean }[] = [
     { label: "phase", value: view.phase },
-    { label: "tested", value: `${tested}/${c.total}`, title: "Screens whose diagnosis finished; excludes omitted screens" },
+    { label: "tested", value: `${tested}/${c.total}`, title: "Screens whose diagnosis finished WITH recorded check executions; excludes omitted screens" },
     { label: "findings", value: view.findings.length, warn: view.findings.length > 0 },
     { label: "unfinished", value: c.remaining, title: "Queued, in progress, blocked, or failed; diagnosis is not complete", warn: c.remaining > 0 },
+    { label: "unverified", value: unverified, title: "Screens whose diagnosis ended inconclusive — check-execution gaps or unfulfilled plans remain", warn: unverified > 0 },
+    { label: "claimed", value: claimed, title: "Screens marked conclusive with no check records — a legacy/log claim, detail unknown" },
     { label: "screens", value: c.total },
     { label: "excluded", value: c.byStatus.excluded, title: "Screens omitted from diagnosis", warn: c.byStatus.excluded > 0 },
     { label: "tokens", value: fmtTokens(view.budget.tokensUsed) },

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState, type KeyboardEvent } from "react";
 import type { TreeNode } from "@veritas/core";
 import { useRole } from "../api";
+import type { ScreenHonesty } from "./screen-status";
 import { Button } from "./ui/button";
 import { Badge } from "./ui/badge";
 
@@ -14,6 +15,8 @@ const STATUS_LABEL: Record<string, string> = {
   clean: "clean",
   finding: "finding",
   suspected: "suspected (needs manual verification)",
+  unverified: "unverified (inconclusive — check gaps remain)",
+  "unknown-records": "status claim — no check records (detail unknown)",
   blocked: "blocked",
   excluded: "excluded",
   error: "error",
@@ -25,6 +28,8 @@ const DOT_STATUS: Record<string, string> = {
   clean: "bg-success",
   finding: "bg-warning",
   suspected: "bg-suspected",
+  unverified: "bg-warning/60",
+  "unknown-records": "border border-muted-foreground/60 bg-transparent",
   blocked: "bg-destructive",
   excluded: "border border-muted-foreground bg-transparent",
   error: "bg-destructive",
@@ -63,6 +68,7 @@ function Node({
   focusPath,
   defaultPath,
   onFocusRow,
+  honesty,
 }: {
   node: TreeNode;
   selected: string | null;
@@ -75,9 +81,12 @@ function Node({
   focusPath: string | null;
   defaultPath: string | undefined;
   onFocusRow: (path: string) => void;
+  honesty: Map<string, ScreenHonesty>;
 }) {
   const isSelected = node.screenId !== null && node.screenId === selected;
-  const status = node.scanStatus ?? "";
+  // Ledger-honest status: a raw "clean" with unfulfilled plans/gaps shows unverified; a conclusive
+  // claim with no check records shows the neutral unknown-records dot — never green.
+  const status = (node.screenId ? honesty.get(node.screenId)?.status : undefined) ?? node.scanStatus ?? "";
   const hasChildren = node.children.length > 0;
   const isCollapsed = collapsed.has(node.path);
   // If a collapsed branch has findings, show a count badge (when expanded, each child shows its own).
@@ -195,6 +204,7 @@ function Node({
               focusPath={focusPath}
               defaultPath={defaultPath}
               onFocusRow={onFocusRow}
+              honesty={honesty}
             />
           ))}
         </ul>
@@ -208,11 +218,13 @@ export function SiteTree({
   selected,
   onSelect,
   onExclude,
+  honesty,
 }: {
   tree: TreeNode[];
   selected: string | null;
   onSelect: (id: string) => void;
   onExclude: (screenIds: string[]) => void;
+  honesty: Map<string, ScreenHonesty>;
 }) {
   const { canWrite } = useRole();
   const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
@@ -249,6 +261,7 @@ export function SiteTree({
               focusPath={focusPath}
               defaultPath={tree[0]?.path}
               onFocusRow={setFocusPath}
+              honesty={honesty}
             />
           ))}
         </ul>
