@@ -276,6 +276,7 @@ export function Settings({ onClose, registerLeaveGuard }: { onClose: () => void;
 
                         {section === "About" ? (
                             <>
+                                <img src="/verdict-main.png" alt="VERDICT" className="mt-2 w-full rounded-md border border-border" />
                                 <p className="my-2 text-xs leading-relaxed text-muted-foreground"><b>VERDICT</b> — autonomous web / API pentest agent. AI drives · evidence proves · scans behind login.</p>
                                 <div className="mt-3 text-sm [&>div]:flex [&>div]:justify-between [&>div]:border-b [&>div]:border-border [&>div]:py-2 [&_span]:text-muted-foreground">
                                     <div><span>Version</span><b>{info?.version ?? "…"}</b></div>
@@ -289,7 +290,7 @@ export function Settings({ onClose, registerLeaveGuard }: { onClose: () => void;
                 </div>
 
                 <div className="max-h-44 overflow-y-auto text-xs" aria-live="polite">
-                    {checks.map((c) => <p key={c.name} className={c.status === "error" ? "text-destructive" : c.status === "ok" ? "text-success" : "text-muted-foreground"}><b>{c.name}: {c.status}</b> — {c.message}</p>)}
+                    {checks.map((c) => <p key={c.name} className={c.status === "error" ? "text-destructive" : c.status === "warn" ? "text-warning" : c.status === "ok" ? "text-success" : "text-muted-foreground"}><b>{c.name}: {c.status}</b> — {c.message}</p>)}
                     {error ? <p role="alert" className="text-destructive">{error}</p> : null}
                 </div>
                 <div className="mt-5 flex flex-wrap items-center gap-3">

@@ -74,6 +74,8 @@ declare global {
         browser: AttendedBrowserBridge;
         settings: SettingsBridge;
         app: { info(): Promise<AppInfo> };
+        /** Native file-open dialog → absolute path, or null when cancelled. */
+        pickFile(): Promise<string | null>;
     }
     interface Window {
         verdictDesktop?: VerdictDesktop;

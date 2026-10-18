@@ -5,7 +5,7 @@
 // The store, WS projection, and evidence contracts are unchanged — this is the same server the `serve` command
 // runs, just hosted by Electron instead of a bare Node process with the same backend.
 
-import { app, BrowserWindow, ipcMain, Menu, session, shell, type WebContents } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu, session, shell, type WebContents } from "electron";
 import { randomBytes } from "node:crypto";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
@@ -199,6 +199,12 @@ async function boot(): Promise<void> {
     ipcMain.on("win:focus-chrome", () => win?.webContents.focus());
     ipcMain.handle("win:is-maximized", () => !!win?.isMaximized());
     ipcMain.handle("app:info", () => ({ version: app.getVersion(), electron: process.versions.electron, node: process.versions.node, chrome: process.versions.chrome }));
+    // Native file picker — returns the absolute path (cookie-file role, browser path, …) or null when cancelled.
+    ipcMain.handle("dialog:pick-file", async () => {
+        if (!win) return null;
+        const r = await dialog.showOpenDialog(win, { properties: ["openFile"] });
+        return r.canceled ? null : (r.filePaths[0] ?? null);
+    });
     win.on("maximize", () => win?.webContents.send("win:maximize-changed", true));
     win.on("unmaximize", () => win?.webContents.send("win:maximize-changed", false));
 

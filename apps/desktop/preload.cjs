@@ -47,4 +47,7 @@ contextBridge.exposeInMainWorld("verdictDesktop", {
     app: {
         info: () => ipcRenderer.invoke("app:info"),
     },
+
+    // Native file dialog — resolves to the absolute path, or null when cancelled.
+    pickFile: () => ipcRenderer.invoke("dialog:pick-file"),
 });
