@@ -1,7 +1,7 @@
 // fingerprintTech: test of the pure function that structurally extracts the tech stack from the response's headers/Cookie/meta/script-src.
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { fingerprintTech, formatTechInventory, stackAttackHints, hasVersionedComponent, isVersionlessComponentLead } from "./fingerprint.js";
+import { fingerprintTech, formatTechInventory, stackAttackHints, hasVersionedComponent, isVersionlessComponentLead, extractBackendLibs } from "./fingerprint.js";
 
 test("stackAttackHints maps detected stack to attack classes (Flask/Jinja → SSTI, PHP → LFI/deser)", () => {
   const flask = stackAttackHints([
@@ -128,4 +128,63 @@ test("formatTechInventory renders one line per component, marking known vulns", 
   const lines = formatTechInventory(fingerprintTech([{ url: "https://app.test/", headers: { server: "nginx/1.18.0" }, body: `<script src="/jquery-1.12.4.min.js"></script>` }]));
   assert.ok(lines.some((l) => /\[server\] nginx 1\.18\.0/.test(l)));
   assert.ok(lines.some((l) => /jQuery 1\.12\.4.*⚠ KNOWN/.test(l)));
+});
+
+test("extractBackendLibs names backend libraries from stack traces and error pages", () => {
+  // Node stack trace leaks the image library path (both / and \ separators).
+  const sharp = extractBackendLibs(
+    `Error: Input file is missing
+    at Sharp.metadata (C:/app/node_modules/sharp/lib/input.js:42:11)
+    at Sharp.input (${"C:\\app\\node_modules\\sharp\\lib\\sharp.js"}:9:3)`,
+  );
+  assert.ok(sharp.some((c) => c.kind === "backend-lib" && c.name === "sharp"), `expected sharp, got ${sharp.map((c) => c.name)}`);
+  // Python error names the parser explicitly.
+  const pil = extractBackendLibs(`{"detail":"PIL.UnidentifiedImageError: cannot identify image file 'upload.jpg'"}`);
+  assert.ok(pil.some((c) => c.name === "Pillow (PIL)"), `expected Pillow, got ${pil.map((c) => c.name)}`);
+  // Java stack names the PDF parser.
+  const pdfbox = extractBackendLibs(`java.io.IOException: Error: End-of-File
+    at org.apache.pdfbox.pdmodel.PDDocument.load(PDDocument.java:1045)`);
+  assert.ok(pdfbox.some((c) => c.name === "Apache PDFBox"), `expected PDFBox, got ${pdfbox.map((c) => c.name)}`);
+  // Django debug page → framework + exact version (error-page is the strong signal).
+  const django = extractBackendLibs(`<html><head><title>ImportError at /upload</title></head><body><div id="summary"><h1>ImportError at /upload</h1><pre>No module named 'pymagic'</pre></div><footer>Django Version: 4.2.11</footer></body></html>`);
+  const dj = django.find((c) => c.name === "Django");
+  assert.equal(dj?.version, "4.2.11", `expected Django 4.2.11, got ${JSON.stringify(dj)}`);
+});
+
+test("extractBackendLibs pulls versions from jar paths and lockfile fragments", () => {
+  const jar = extractBackendLibs(`Caused by: org.yaml.snakeyaml.error.YAMLException
+    at org.yaml.snakeyaml-1.33.jar!/org/yaml/snakeyaml/constructor/SafeConstructor.java:321`);
+  assert.ok(jar.some((c) => c.name.toLowerCase() === "snakeyaml" && c.version === "1.33"), `expected snakeyaml 1.33, got ${jar.map((c) => `${c.name}@${c.version}`)}`);
+  // Leaked package-lock gives exact versions — the OSV-matchable form.
+  const lock = extractBackendLibs(`{"name":"app","lockfileVersion":3,"packages":{"":{"version":"1.0.0"},"node_modules/sharp":{"version":"0.32.1"},"node_modules/multer":{"version":"1.4.5"}}}`);
+  assert.ok(lock.some((c) => c.name === "sharp" && c.version === "0.32.1"), `expected sharp@0.32.1, got ${lock.map((c) => `${c.name}@${c.version}`)}`);
+  // requirements.txt fragment.
+  const reqs = extractBackendLibs(`flask==3.0.0\ngunicorn==21.2.0\npillow==10.1.0\nrequests==2.31.0\n`);
+  assert.ok(reqs.some((c) => c.name.toLowerCase() === "pillow" && c.version === "10.1.0"), `expected pillow==10.1.0, got ${reqs.map((c) => `${c.name}@${c.version}`)}`);
+});
+
+test("extractBackendLibs is a guess feed — empty on unremarkable bodies, no flood of deps", () => {
+  assert.deepEqual(extractBackendLibs(`<html><body><h1>OK</h1></body></html>`), []);
+  // A plain npm stack only surfaces allow-listed names, not every transitive dep.
+  const trace = extractBackendLibs(`Error: x
+    at h (/app/node_modules/lodash/index.js:1:1)
+    at h (/app/node_modules/multer/lib/multer.js:1:1)
+    at h (/app/node_modules/bluebird/js/release/util.js:1:1)`);
+  const names = trace.map((c) => c.name);
+  assert.ok(names.includes("multer"), `multer expected, got ${names}`);
+  assert.ok(!names.includes("lodash") && !names.includes("bluebird"), `dep flood: ${names}`);
+});
+
+test("stackAttackHints maps backend-lib guesses to n-day attack classes", () => {
+  const hints = stackAttackHints([
+    { kind: "backend-lib", name: "ImageMagick", version: null, source: "error-message", evidence: "" },
+    { kind: "backend-lib", name: "SnakeYAML", version: "1.33", source: "stack-trace", evidence: "" },
+    { kind: "backend-lib", name: "Log4j", version: null, source: "stack-trace", evidence: "" },
+  ]);
+  assert.ok(hints.some((h) => /polyglot|MVG/i.test(h)), "ImageMagick → polyglot/MVG hint");
+  assert.ok(hints.some((h) => /YAML|yaml\.load/i.test(h)), "SnakeYAML → unsafe-load hint");
+  assert.ok(hints.some((h) => /JNDI|Log4Shell/i.test(h)), "Log4j → JNDI hint");
+  // Backend-lib kind flows through the inventory formatter for the LLM prompt.
+  const inv = formatTechInventory([{ kind: "backend-lib", name: "SnakeYAML", version: "1.33", source: "stack-trace", evidence: "" }]);
+  assert.ok(inv[0]?.includes("[backend-lib] SnakeYAML 1.33"), inv[0]);
 });

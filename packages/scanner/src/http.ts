@@ -18,6 +18,13 @@ export interface HttpRequest {
   multipart?: MultipartSpec;
   /** Bounded read override for asset analysis; ordinary probes use the client default. */
   maxBodyBytes?: number;
+  /** Set false to NOT merge the client's constructor-supplied default headers (site-wide Basic auth, operator custom
+   *  headers carrying cookies/API keys, ...) into THIS request. Anonymous and alternate-identity replays must not
+   *  silently inherit the baseline session — an unauth check that inherits the session's Authorization/Cookie would
+   *  still be authed, and a role replay would carry both identities. Only `headers` plus the default user-agent go
+   *  on the wire; scope, proxy, rate and budget handling are unchanged. Note: an AMBIENT identity that isn't a header
+   *  (IP allowlist, mTLS, NTLM) cannot be excluded this way — treat such results as inconclusive for "public". */
+  inheritDefaultHeaders?: boolean;
 }
 
 export interface HttpResponse {
@@ -94,9 +101,15 @@ export class FetchHttpClient implements HttpClient {
     return this.dispatcher ?? undefined;
   }
 
-  /** The headers actually sent (default user-agent + opts.headers + per-call). Used to record the "whole request" in evidence. */
-  effectiveHeaders(reqHeaders?: Record<string, string>): Record<string, string> {
-    return foldHeaders({ "user-agent": this.opts.userAgent ?? DEFAULT_BROWSER_UA }, this.opts.headers, reqHeaders);
+  /** The headers actually sent for a given request (default user-agent + opts.headers + per-call, unless the request
+   *  opted out of inherited defaults). Used to record the "whole request" in evidence — pass the same request flags
+   *  so evidence matches the wire exactly. */
+  effectiveHeaders(reqHeaders?: Record<string, string>, inheritDefaultHeaders = true): Record<string, string> {
+    return foldHeaders(
+      { "user-agent": this.opts.userAgent ?? DEFAULT_BROWSER_UA },
+      inheritDefaultHeaders ? this.opts.headers : undefined,
+      reqHeaders,
+    );
   }
 
   async send(req: HttpRequest): Promise<HttpResponse> {
@@ -116,7 +129,7 @@ export class FetchHttpClient implements HttpClient {
       const dispatcher = await this.getDispatcher();
       // Fold case-insensitively so a caller's e.g. "User-Agent" REPLACES the default "user-agent" rather than colliding
       // into two keys that undici would comma-combine (which silently neutered header-injection probes + garbled evidence).
-      const reqHeaders: Record<string, string> = foldHeaders({ "user-agent": this.opts.userAgent ?? DEFAULT_BROWSER_UA }, this.opts.headers, req.headers);
+      const reqHeaders: Record<string, string> = this.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false);
       let bodyInit: unknown = req.body ?? undefined;
       if (req.multipart) {
         // Generate correct multipart via undici's FormData (boundary/CRLF/Content-Type are automatic). Don't let the caller's

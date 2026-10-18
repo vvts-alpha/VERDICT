@@ -46,7 +46,7 @@ export type { OobInteraction, OobPayload, OobPollOpts, OobProvider } from "./oob
 export { FakeOobProvider } from "./oob.js";
 export { InteractshOobProvider, parseInteractshServer, DEFAULT_INTERACTSH_SERVER } from "./oob-interactsh.js";
 export { resolveOobProvider } from "./oob-resolve.js";
-export { fingerprintTech, formatTechInventory, stackAttackHints, hasVersionedComponent, isVersionlessComponentLead } from "./fingerprint.js";
+export { fingerprintTech, formatTechInventory, stackAttackHints, hasVersionedComponent, isVersionlessComponentLead, extractBackendLibs } from "./fingerprint.js";
 export type { TechComponent, TechKind, TechSample } from "./fingerprint.js";
 export { lookupCves, formatCveResults } from "./cve-lookup.js";
 export type { CveMatch, CveLookupResult, CveLookupOptions, FetchLike } from "./cve-lookup.js";
