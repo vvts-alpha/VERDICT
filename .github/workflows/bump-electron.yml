@@ -61,22 +61,12 @@ jobs:
             exit 0
           fi
 
-          NOTE=""
+          BODY="Bumps the packaged Electron pin from \`${CURRENT}\` to \`${VERSION}\` (released ${RELEASED}, at least 7 days old)."
           if [ "$KIND" = "major" ]; then
-            NOTE="> ⚠️ **Major bump** — review the Electron breaking-changes notes before merging."
+            BODY="${BODY}"$'\n\n'"> ⚠️ **Major bump** — review the Electron breaking-changes notes before merging."
           fi
+          BODY="${BODY}"$'\n\n'"Release notes: https://github.com/electron/electron/releases/tag/v${VERSION}"$'\n\n'"- [ ] CI green"$'\n'"- [ ] Windows build + packaged checks pass"$'\n'"- [ ] Release notes reviewed"
 
           gh pr create \
             --title "build(desktop): bump Electron to ${VERSION}" \
-            --body "$(cat <<EOF
-Bumps the packaged Electron pin from \`${CURRENT}\` to \`${VERSION}\` (released ${RELEASED}, at least 7 days old).
-
-${NOTE}
-
-Release notes: https://github.com/electron/electron/releases/tag/v${VERSION}
-
-- [ ] CI green
-- [ ] Windows build + packaged checks pass
-- [ ] Release notes reviewed
-EOF
-          )"
+            --body "$BODY"
