@@ -68,7 +68,16 @@ async function check() {
     let matched = 0;
     for (const block of listing.replaceAll("\r\n", "\n").split("\n\n")) {
       const data = Object.fromEntries(block.split("\n").filter(line => line.includes(" = ")).map(line => { const split = line.indexOf(" = "); return [line.slice(0, split), line.slice(split + 3)]; }));
-      if (!data.CRC) continue;
+      if (!data.CRC) {
+        // 7z reports an empty CRC for zero-byte payloads; verify presence and zero size instead of a checksum.
+        if (!data.Path || data.Size !== "0" || (data.Attributes || "").startsWith("D")) continue;
+        const relative = data.Path.replaceAll("\\", "/");
+        const entry = files.get(relative);
+        assert.ok(entry, `Installer contains an untested file: ${relative}`);
+        assert.equal(entry.bytes, 0, `Installer file size differs: ${relative}`);
+        matched++;
+        continue;
+      }
       const relative = data.Path.replaceAll("\\", "/");
       const entry = files.get(relative);
       assert.ok(entry, `Installer contains an untested file: ${relative}`);
