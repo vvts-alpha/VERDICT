@@ -32,7 +32,7 @@ test("deriveScopeFromUrls now fails clearly on a schemeless target instead of cr
 });
 
 test("path prefixes: trailing `*` is a wildcard, allow wins over block, block wins over the default", () => {
-  const base = { inScopeHosts: ["x.test"], outOfScopeHosts: [], inScopePathPrefixes: [], outOfScopePathPrefixes: [] };
+  const base = { ...deriveScopeFromUrls(["https://x.test"]), inScopePathPrefixes: [], outOfScopePathPrefixes: [] };
   const inScope = (u: string) => isInScope(u, base);
 
   // trailing `*` behaves like a prefix glob — `/*` matches every path
