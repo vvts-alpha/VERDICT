@@ -1,0 +1,117 @@
+name: Build macOS installer
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: macos-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build on macOS runner
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@9.15.4 --activate
+        shell: bash
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        shell: bash
+
+      - name: Build packages
+        run: pnpm -r build
+        shell: bash
+
+      - name: Stage production workspace
+        run: |
+          node tools/package-desktop.cjs prepare "$RUNNER_TEMP/verdict-production" ./bundle
+        shell: bash
+
+      - name: Install locked production dependencies for macOS
+        run: pnpm --dir "$RUNNER_TEMP/verdict-production" install --frozen-lockfile --prod --node-linker=hoisted --ignore-scripts
+        shell: bash
+
+      - name: Materialize self-contained desktop bundle
+        run: node tools/package-desktop.cjs materialize "$RUNNER_TEMP/verdict-production" ./bundle
+        shell: bash
+
+      - name: Package macOS dmg (electron-builder)
+        working-directory: bundle
+        run: npx --yes electron-builder@26.15.3 --config electron-builder.yml --mac --arm64 --publish never
+        shell: bash
+
+      - name: Verify packaged macOS application
+        working-directory: bundle/dist-installer
+        run: |
+          set -euo pipefail
+          APP="mac-arm64/VERDICT.app"
+          BIN="$APP/Contents/MacOS/VERDICT"
+          RES="$APP/Contents/Resources/app"
+          test -f VERDICT-*-arm64.dmg
+          test -x "$BIN"
+          test -f "$RES/dist/main.js"
+          test -f "$RES/dist-renderer/index.html"
+          # CLI must be spawnable through the packaged Electron binary (ELECTRON_RUN_AS_NODE).
+          ELECTRON_RUN_AS_NODE=1 "$BIN" "$RES/node_modules/@veritas/cli/dist/main.js" --help | grep -q pilot
+          # GUI smoke: VERDICT_SHOT boots the app, captures the rendered window, and exits.
+          VERDICT_SHOT="$PWD/smoke.png" "$BIN"
+          test -s smoke.png
+          shasum -a 256 VERDICT-*-arm64.dmg > SHA256SUMS.txt
+          ditto -c -k --keepParent "$APP" VERDICT-app-arm64.zip
+        shell: bash
+        timeout-minutes: 10
+
+      - name: Upload VERDICT macOS dmg
+        uses: actions/upload-artifact@v4
+        with:
+          name: verdict-macos-installer
+          path: |
+            bundle/dist-installer/*.dmg
+            bundle/dist-installer/SHA256SUMS.txt
+            bundle/dist-installer/smoke.png
+          if-no-files-found: error
+
+      - name: Upload macOS unpacked app
+        uses: actions/upload-artifact@v4
+        with:
+          name: verdict-macos-unpacked
+          path: bundle/dist-installer/VERDICT-app-arm64.zip
+          if-no-files-found: error
+
+      - name: Download dmg for artifact roundtrip verification
+        uses: actions/download-artifact@v4
+        with:
+          name: verdict-macos-installer
+          path: artifact-check
+
+      - name: Download application for artifact roundtrip verification
+        uses: actions/download-artifact@v4
+        with:
+          name: verdict-macos-unpacked
+          path: artifact-check
+
+      - name: Verify downloaded artifacts preserve the tested application
+        working-directory: artifact-check
+        run: |
+          set -euo pipefail
+          shasum -a 256 -c SHA256SUMS.txt
+          ditto -x -k VERDICT-app-arm64.zip unpacked
+          BIN="unpacked/VERDICT.app/Contents/MacOS/VERDICT"
+          RES="unpacked/VERDICT.app/Contents/Resources/app"
+          ELECTRON_RUN_AS_NODE=1 "$BIN" "$RES/node_modules/@veritas/cli/dist/main.js" --help | grep -q pilot
+        shell: bash
