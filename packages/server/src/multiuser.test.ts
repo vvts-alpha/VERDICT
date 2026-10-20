@@ -116,6 +116,15 @@ test("users-db: users, sessions, run owners, audit", () => {
     db.updateUser(u.id, { status: "disabled" });
     assert.equal(db.getSession(s3.id, Date.now()), null);
 
+    // the last-admin guard lives in updateUser so the CLI path cannot bypass it either
+    assert.equal(db.countActiveAdmins(), 1);
+    assert.throws(() => db.updateUser(admin.id, { role: "user" }), /last_admin/);
+    assert.throws(() => db.updateUser(admin.id, { status: "disabled" }), /last_admin/);
+    const admin2 = db.createUser({ username: "ops2", passwordHash: hashPassword("ops2-password-1"), role: "admin" });
+    db.updateUser(admin.id, { role: "user" }); // allowed now — ops2 keeps admin rights
+    assert.equal(db.getUserById(admin.id)!.role, "user");
+    assert.throws(() => db.updateUser(admin2.id, { role: "user" }), /last_admin/); // ops2 is last again
+
     db.setRunOwner("run-1", admin.id);
     assert.equal(db.getRunOwner("run-1"), admin.id);
     assert.ok(db.ownedRunIds(admin.id).has("run-1"));
@@ -262,7 +271,7 @@ test("run creation records the owner (spawned via a fake CLI)", async () => {
   }
 });
 
-test("admin user CRUD; last-admin guard; non-admin forbidden", async () => {
+test("admin API: list + create only; management mutations stay host-local (CLI)", async () => {
   const r = await rig();
   try {
     const admin = (await login(r.url, "admin", PW.admin)).cookie;
@@ -285,38 +294,16 @@ test("admin user CRUD; last-admin guard; non-admin forbidden", async () => {
       body: JSON.stringify({ username: "CAROL", role: "user", password: "carol-password-1" }),
     });
     assert.equal(dup.status, 409);
+    assert.equal((await login(r.url, "carol", "carol-password-1")).status, 200);
 
-    const carol = (await login(r.url, "carol", "carol-password-1"));
-    assert.equal(carol.status, 200);
-
-    // demote the only admin → 409 (would brick management)
+    // The mutation routes do not exist over HTTP — role/status/resets are `veritas user …` on the host.
     const adminId = r.db.getUserByUsername("admin")!.id;
-    const demote = await authed(r.url, admin, `/api/admin/users/${adminId}`, {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ role: "user" }),
-    });
-    assert.equal(demote.status, 409);
-
-    // disable carol → her session dies
-    const carolId = r.db.getUserByUsername("carol")!.id;
-    const disable = await authed(r.url, admin, `/api/admin/users/${carolId}`, {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ status: "disabled" }),
-    });
-    assert.equal(disable.status, 200);
-    assert.equal((await fetch(`${r.url}/api/me`, { headers: { cookie: carol.cookie } })).status, 401);
-
-    // reset-password returns a temporary secret that works
-    const reset = await authed(r.url, admin, `/api/admin/users/${carolId}/reset-password`, { method: "POST" });
-    const { temporaryPassword } = (await reset.json()) as { temporaryPassword: string };
-    await authed(r.url, admin, `/api/admin/users/${carolId}`, {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ status: "active" }),
-    });
-    assert.equal((await login(r.url, "carol", temporaryPassword)).status, 200);
+    assert.equal(
+      (await authed(r.url, admin, `/api/admin/users/${adminId}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ role: "user" }) })).status,
+      404,
+    );
+    assert.equal((await authed(r.url, admin, `/api/admin/users/${adminId}/reset-password`, { method: "POST" })).status, 404);
+    assert.equal((await authed(r.url, admin, "/api/admin/audit")).status, 404);
   } finally {
     await r.close();
   }

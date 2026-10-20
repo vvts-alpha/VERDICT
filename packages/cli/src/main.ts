@@ -5,6 +5,7 @@ import { seedSpecInventory } from "./spec-inventory.js";
 // The crawl/scan bodies are later milestones. This is a thin front over the state store.
 
 import { parseArgs } from "node:util";
+import { randomBytes } from "node:crypto";
 import { createRequire } from "node:module";
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -120,8 +121,11 @@ commands:
             viewer = env VERDICT_WEB_PASSWORD_VIEWER / --viewer-password (read-only). ENV preferred over args. --no-auth disables the gate
             --multi-user enables per-account auth (admin/user roles; verdict-server.db beside the runs dir) — bootstrap via 'veritas user bootstrap'
             the WebUI "+ New" launches pilot/assess by spawning the CLI as a child; --no-launch disables run launching
-  user    bootstrap --username <name> [--password <pw>] | list | reassign --run <id> --user <name>
-            multi-user account management for serve (verdict-server.db). bootstrap creates the first admin
+  user    bootstrap --username <name> [--password <pw>] | create --username <n> [--role user] [--password <pw>]
+            list | disable|enable --user <name> | set-role --user <name> --role admin|user
+            reset-password --user <name> | audit [--limit <n>] | reassign --run <id> --user <name>
+            multi-user account management for serve (verdict-server.db) — the web admin UI only creates
+            accounts; role/status/password/audit management stays host-local on purpose
             (env VERDICT_ADMIN_PASSWORD accepted); reassign transfers an ownerless/other run to a user
   report  --id <id> [--format md,html,pdf,csv] [--browser-path <bin>] [--no-sandbox] [--out <dir>]
             generate the diagnosis report from findings (by severity + repro + evidence + scope basis).
@@ -2621,18 +2625,34 @@ async function cmdUser(args: string[]): Promise<void> {
     options: {
       out: { type: "string" },
       username: { type: "string" },
+      "display-name": { type: "string" },
       password: { type: "string" },
       role: { type: "string" },
       run: { type: "string" },
       user: { type: "string" },
+      limit: { type: "string" },
       force: { type: "boolean" },
     },
   });
   const db = UsersDb.open(usersDbPath(values.out ?? RUNS_DIR_DEFAULT));
+  // CLI-side management shares the last-admin guard via UsersDb.updateUser (it throws "last_admin").
+  const cliUpdate = (userId: string, patch: Parameters<UsersDb["updateUser"]>[1]): void => {
+    try {
+      db.updateUser(userId, patch);
+    } catch (e) {
+      if (e instanceof Error && e.message === "last_admin") fail("cannot demote or disable the last active admin");
+      throw e;
+    }
+  };
+  const findUser = (name: string | undefined) => {
+    const u = name?.trim() ? db.getUserByUsername(name.trim()) : null;
+    if (!u) fail(`user '${name ?? ""}' not found`);
+    return u;
+  };
   try {
     if (sub === "bootstrap") {
       // Create the first admin. With --force also allowed when users exist (recovery path).
-      if (db.countUsers() > 0 && !values.force) fail("accounts already exist — use the admin UI or --force");
+      if (db.countUsers() > 0 && !values.force) fail("accounts already exist — use 'veritas user create' or --force");
       const username = values.username?.trim();
       if (!username || !/^[a-zA-Z0-9_.-]{2,64}$/.test(username)) fail("--username required (2-64 chars of [a-zA-Z0-9_.-])");
       const password = values.password ?? process.env.VERDICT_ADMIN_PASSWORD;
@@ -2647,23 +2667,68 @@ async function cmdUser(args: string[]): Promise<void> {
       console.log(`created ${role} account '${u.username}' (id ${u.id}) — multi-user auth is active on the next \`veritas serve\``);
       return;
     }
+    if (sub === "create") {
+      const username = values.username?.trim();
+      if (!username || !/^[a-zA-Z0-9_.-]{2,64}$/.test(username)) fail("--username required (2-64 chars of [a-zA-Z0-9_.-])");
+      const password = values.password ?? process.env.VERDICT_ADMIN_PASSWORD;
+      if (!password) fail("pass a password via --password or env VERDICT_ADMIN_PASSWORD");
+      const policy = passwordPolicyError(password);
+      if (policy) fail(policy);
+      if (db.getUserByUsername(username)) fail(`user '${username}' already exists`);
+      const role = values.role === "admin" ? "admin" : "user";
+      const u = db.createUser({ username, displayName: values["display-name"]?.trim() ?? "", passwordHash: hashPassword(password), role });
+      db.audit({ actorName: "cli", action: "user_created", target: `user:${u.id} ${u.username}`, detail: role });
+      console.log(`created ${role} account '${u.username}' (id ${u.id})`);
+      return;
+    }
     if (sub === "list") {
       for (const u of db.listUsers()) console.log(`${u.id}  ${u.username.padEnd(20)}  ${u.role.padEnd(6)}  ${u.status}  ${new Date(u.createdAt).toISOString()}`);
+      return;
+    }
+    if (sub === "disable" || sub === "enable") {
+      const u = findUser(values.user);
+      cliUpdate(u.id, { status: sub === "disable" ? "disabled" : "active" });
+      if (sub === "disable") db.revokeUserSessions(u.id);
+      db.audit({ actorName: "cli", action: "user_updated", target: `user:${u.id} ${u.username}`, detail: `status=${sub === "disable" ? "disabled" : "active"}` });
+      console.log(`${u.username}: ${sub === "disable" ? "disabled (all sessions signed out)" : "enabled"}`);
+      return;
+    }
+    if (sub === "set-role") {
+      const u = findUser(values.user);
+      const role = values.role;
+      if (role !== "admin" && role !== "user") fail("--role admin|user required");
+      cliUpdate(u.id, { role });
+      db.audit({ actorName: "cli", action: "user_updated", target: `user:${u.id} ${u.username}`, detail: `role=${role}` });
+      console.log(`${u.username}: role=${role}`);
+      return;
+    }
+    if (sub === "reset-password") {
+      const u = findUser(values.user);
+      const temp = `vdt_${randomBytes(12).toString("base64url")}`;
+      cliUpdate(u.id, { passwordHash: hashPassword(temp) });
+      db.revokeUserSessions(u.id);
+      db.audit({ actorName: "cli", action: "password_reset", target: `user:${u.id} ${u.username}` });
+      console.log(`${u.username}: temporary password (shown once — every session was signed out):\n  ${temp}`);
+      return;
+    }
+    if (sub === "audit") {
+      const n = values.limit ? Number.parseInt(values.limit, 10) : 50;
+      for (const e of db.listAudit(Number.isSafeInteger(n) && n > 0 ? n : 50)) {
+        console.log(`${new Date(e.ts).toISOString()}  ${(e.actorName ?? "-").padEnd(20)}  ${e.action.padEnd(18)}  ${e.target ?? ""}${e.ip ? `  (${e.ip})` : ""}`);
+      }
       return;
     }
     if (sub === "reassign") {
       // veritas user reassign --run <id> --user <username> — transfer an ownerless/other run to a user.
       const runId = values.run?.trim();
-      const target = values.user?.trim();
-      if (!runId || !target) fail("--run <id> and --user <username> required");
-      const user = db.getUserByUsername(target);
-      if (!user) fail(`user '${target}' not found`);
-      db.setRunOwner(runId, user.id);
-      db.audit({ actorName: "cli", action: "run_reassigned", target: `run:${runId} user:${user.id}` });
-      console.log(`run ${runId} is now owned by ${user.username}`);
+      const u = findUser(values.user);
+      if (!runId) fail("--run <id> and --user <username> required");
+      db.setRunOwner(runId, u.id);
+      db.audit({ actorName: "cli", action: "run_reassigned", target: `run:${runId} user:${u.id}` });
+      console.log(`run ${runId} is now owned by ${u.username}`);
       return;
     }
-    fail("usage: veritas user bootstrap --username <name> [--password <pw>] | list | reassign --run <id> --user <name>");
+    fail("usage: veritas user bootstrap|create|list|disable|enable|set-role|reset-password|audit|reassign …");
   } finally {
     db.close();
   }

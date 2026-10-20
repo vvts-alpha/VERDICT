@@ -4,7 +4,6 @@ import { hasLocalToken, isTrustedRequest, validateRequestPath } from "./request-
 // (crawler/labeler) writes, via events.seq, and push new events as diffs (since there are no in-process events).
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { extname, join, normalize, resolve, sep } from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
@@ -273,46 +272,9 @@ function handleUserApi(req: IncomingMessage, res: ServerResponse, db: UsersDb, p
       });
       return true;
     }
-    const um = url.match(/^\/api\/admin\/users\/([^/?]+)(\/reset-password)?$/);
-    if (um) {
-      const targetId = decodeURIComponent(um[1]!);
-      const target = db.getUserById(targetId);
-      if (!target) {
-        sendJson(res, 404, { error: "user not found" });
-        return true;
-      }
-      if (um[2] === "/reset-password" && req.method === "POST") {
-        const temp = `vdt_${randomBytes(12).toString("base64url")}`;
-        db.updateUser(targetId, { passwordHash: hashPassword(temp) });
-        db.revokeUserSessions(targetId);
-        db.audit({ actorId: principal.userId, actorName: principal.username, action: "password_reset", target: `user:${target.id} ${target.username}`, ip });
-        sendJson(res, 200, { temporaryPassword: temp });
-        return true;
-      }
-      if (!um[2] && req.method === "PATCH") {
-        readJsonBody(req, res, 8192, (b) => {
-          const input = b as { displayName?: unknown; role?: unknown; status?: unknown };
-          if (input.role !== undefined && input.role !== "admin" && input.role !== "user") return sendJson(res, 400, { error: "role must be admin or user" });
-          if (input.status !== undefined && input.status !== "active" && input.status !== "disabled") return sendJson(res, 400, { error: "status must be active or disabled" });
-          // The last active admin can never be demoted or disabled (that would brick management).
-          const removingAdmin = (input.role === "user" || input.status === "disabled") && target.role === "admin" && target.status === "active";
-          if (removingAdmin && db.countActiveAdmins() <= 1) return sendJson(res, 409, { error: "cannot demote or disable the last active admin" });
-          db.updateUser(targetId, {
-            ...(typeof input.displayName === "string" ? { displayName: input.displayName } : {}),
-            ...(input.role === "admin" || input.role === "user" ? { role: input.role } : {}),
-            ...(input.status === "active" || input.status === "disabled" ? { status: input.status } : {}),
-          });
-          if (input.status === "disabled") db.revokeUserSessions(targetId);
-          db.audit({ actorId: principal.userId, actorName: principal.username, action: "user_updated", target: `user:${target.id} ${target.username}`, ip, detail: JSON.stringify({ role: input.role, status: input.status }) });
-          sendJson(res, 200, publicUser(db.getUserById(targetId)!));
-        });
-        return true;
-      }
-    }
-    if (req.method === "GET" && url === "/api/admin/audit") {
-      sendJson(res, 200, db.listAudit());
-      return true;
-    }
+    // Role changes, disable/enable, password resets and the audit log are deliberately CLI-only
+    // (`veritas user …`) — management surface stays host-local, off the network. The web admin API
+    // only covers the operation that benefits from it: listing accounts and creating them.
     sendJson(res, 404, { error: "unknown endpoint" });
     return true;
   }

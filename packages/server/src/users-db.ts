@@ -163,7 +163,18 @@ export class UsersDb {
     return (this.db.prepare("SELECT COUNT(*) AS n FROM users WHERE role = 'admin' AND status = 'active'").get() as { n: number }).n;
   }
 
+  /**
+   * Patch a user. The last-active-admin guard lives here (not in the HTTP handler) so the CLI
+   * `veritas user` path cannot demote/disable the final admin either — that would brick management.
+   * Throws Error("last_admin") when the change would remove the last active admin.
+   */
   updateUser(id: string, patch: { displayName?: string; role?: UserRole; status?: UserStatus; passwordHash?: string }): void {
+    if (patch.role === "user" || patch.status === "disabled") {
+      const target = this.getUserById(id);
+      if (target && target.role === "admin" && target.status === "active" && this.countActiveAdmins() <= 1) {
+        throw new Error("last_admin");
+      }
+    }
     const sets: string[] = [];
     const args: unknown[] = [];
     if (patch.displayName !== undefined) { sets.push("display_name = ?"); args.push(patch.displayName); }
