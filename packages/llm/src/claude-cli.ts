@@ -63,7 +63,16 @@ export class ClaudeCliClient implements LlmClient {
             return;
           }
           const tokensUsed = env.usage ? ["input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"].reduce((n, key) => n + (env.usage?.[key] ?? 0), 0) : undefined;
-          resolve({ text: env.result, model, ...(tokensUsed !== undefined ? { tokensUsed } : {}) });
+          // All cache_* buckets are prompt-side usage — count them as input for the in/out split.
+          const inputTokens = env.usage ? (env.usage.input_tokens ?? 0) + (env.usage.cache_creation_input_tokens ?? 0) + (env.usage.cache_read_input_tokens ?? 0) : undefined;
+          const outputTokens = env.usage?.output_tokens;
+          resolve({
+            text: env.result,
+            model,
+            ...(tokensUsed !== undefined ? { tokensUsed } : {}),
+            ...(inputTokens !== undefined ? { inputTokens } : {}),
+            ...(outputTokens !== undefined ? { outputTokens } : {}),
+          });
         },
       );
       child.stdin?.end(req.prompt);

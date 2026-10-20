@@ -805,11 +805,11 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       opts.store.updateBudget(opts.assessmentId, budget);
     }
   };
-  const addTokens = (delta: number): void => {
+  const addTokens = (delta: number, usage?: { inputTokens?: number; outputTokens?: number }): void => {
     if (!Number.isFinite(delta) || delta <= 0) return;
     runTokens += delta;
     if (budget) {
-      budget = recordTokens(budget, delta);
+      budget = recordTokens(budget, delta, usage);
       opts.store.updateBudget(opts.assessmentId, budget);
     }
     checkBudget();
@@ -826,7 +826,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     session.loginLlm = { complete: async (req) => {
       if (checkBudget()) throw new Error("Assessment budget exhausted");
       const response = await client.complete(req);
-      addTokens(response.tokensUsed ?? 0);
+      addTokens(response.tokensUsed ?? 0, response);
       return response;
     } };
   }

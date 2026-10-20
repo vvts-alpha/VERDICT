@@ -21,11 +21,12 @@ import { Control } from "./components/Control";
 import { LiveView } from "./components/LiveView";
 import { Account } from "./components/Account";
 import { Users } from "./components/Users";
+import { Usage } from "./components/Usage";
 import { Badge } from "./components/ui/badge";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "./components/ui/resizable";
 import { useDefaultLayout } from "react-resizable-panels";
 import {
-  Bug, FileCode2, KeyRound, LayoutGrid, MessageSquare,
+  Bug, ChartColumn, FileCode2, KeyRound, LayoutGrid, MessageSquare,
   Monitor, Network, ScrollText, SlidersHorizontal, UserRound, UsersRound, Video, Workflow,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
@@ -77,7 +78,7 @@ export function App() {
   const desktopNode = desktop && desktop.view !== "main" ? desktop.views[desktop.view] : null;
   // Account / Users open as overlay panes (same pattern as desktop views) — the assessment DOM stays
   // mounted-but-hidden so tab/screen/tree state survives the round-trip.
-  const [pane, setPane] = useState<"account" | "users" | null>(null);
+  const [pane, setPane] = useState<"account" | "users" | "usage" | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>("screen");
   // Transient error toast for rejected/dropped control POSTs (they used to fail silently).
@@ -128,7 +129,7 @@ export function App() {
   const control = (path: string, label = "control") => () => ctl(label, postControl(`/api/assessments/${view!.id}/${path}`));
   // Leaving a desktop view goes through the shell — it can veto (e.g. unsaved Settings edits).
   const goMain = (): boolean => !desktop || desktop.view === "main" || desktop.onNavigate("main");
-  const openPane = (p: "account" | "users"): void => {
+  const openPane = (p: "account" | "users" | "usage"): void => {
     if (pane === p) {
       setPane(null);
       return;
@@ -186,6 +187,10 @@ export function App() {
           <LayoutGrid className="size-4" />
           Projects
         </a>
+        <button type="button" onClick={() => openPane("usage")} aria-current={pane === "usage" ? "page" : undefined} className={topNavCls(pane === "usage")}>
+          <ChartColumn className="size-4" />
+          Usage
+        </button>
         {desktop?.nav.map((n) => (
           <button
             key={n.key}
@@ -312,7 +317,7 @@ export function App() {
         {desktopNode ? <div className="absolute inset-0 z-10 flex flex-col bg-background">{desktopNode}</div> : null}
         {!desktopNode && pane ? (
           <div className="absolute inset-0 z-10 flex flex-col overflow-auto bg-background">
-            {pane === "users" ? <Users /> : <Account />}
+            {pane === "users" ? <Users /> : pane === "usage" ? <Usage /> : <Account />}
           </div>
         ) : null}
       </div>

@@ -12,6 +12,10 @@ export interface BudgetState {
   /** ISO-8601. Origin of the wall-clock budget */
   startedAt: string;
   tokensUsed: number;
+  /** Provider-reported prompt-side tokens (incl. Claude cache buckets). Absent on runs recorded before the split existed. */
+  inputTokens?: number;
+  /** Provider-reported completion-side tokens. Absent on older runs. */
+  outputTokens?: number;
   totalRequests: number;
   /** host -> number of requests sent to this target */
   requestsPerTarget: Record<string, number>;

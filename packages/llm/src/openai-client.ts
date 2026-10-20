@@ -78,7 +78,13 @@ export class OpenAiClient implements LlmClient {
                 throw new Error(`OpenAI-compatible response from ${url} had no choices[0].message.content: ${JSON.stringify(json).slice(0, 300)}`);
             }
             const tokensUsed = json.usage?.total_tokens ?? (json.usage ? (json.usage.prompt_tokens ?? 0) + (json.usage.completion_tokens ?? 0) : undefined);
-            return { text, model: json.model ?? model, ...(tokensUsed !== undefined ? { tokensUsed } : {}) };
+            return {
+                text,
+                model: json.model ?? model,
+                ...(tokensUsed !== undefined ? { tokensUsed } : {}),
+                ...(json.usage?.prompt_tokens !== undefined ? { inputTokens: json.usage.prompt_tokens } : {}),
+                ...(json.usage?.completion_tokens !== undefined ? { outputTokens: json.usage.completion_tokens } : {}),
+            };
         } catch (e) {
             if (ac.signal.aborted) throw new Error(`OpenAI-compatible request to ${url} timed out after ${timeout}ms`);
             throw e instanceof Error ? e : new Error(String(e));

@@ -11,8 +11,15 @@ export function recordRequests(budget: BudgetState, host: string, n = 1): Budget
   };
 }
 
-export function recordTokens(budget: BudgetState, n: number): BudgetState {
-  return { ...budget, tokensUsed: budget.tokensUsed + n };
+export function recordTokens(budget: BudgetState, n: number, usage?: { inputTokens?: number; outputTokens?: number }): BudgetState {
+  return {
+    ...budget,
+    tokensUsed: budget.tokensUsed + n,
+    // Only touch the split fields when the provider actually reported them — an estimate-only call
+    // (no usage) must not zero the accumulators of a pre-tracking run by writing 0s.
+    ...(usage?.inputTokens !== undefined ? { inputTokens: (budget.inputTokens ?? 0) + usage.inputTokens } : {}),
+    ...(usage?.outputTokens !== undefined ? { outputTokens: (budget.outputTokens ?? 0) + usage.outputTokens } : {}),
+  };
 }
 
 export function elapsedMs(budget: BudgetState, now: number = Date.now()): number {

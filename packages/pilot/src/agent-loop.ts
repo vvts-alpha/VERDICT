@@ -50,8 +50,9 @@ export interface OpenAiLoopParams {
     timeoutMs?: number;
     onText?: (t: string) => void;
     onToolUse?: (name: string, input: unknown) => void;
-    /** Called with each response's total_tokens (real per-call spend, context re-billed each turn). */
-    onTokens?: (delta: number) => void;
+    /** Called with each response's usage (real per-call spend, context re-billed each turn).
+     *  usage carries the provider's prompt/completion split when the endpoint reports it. */
+    onTokens?: (delta: number, usage?: { inputTokens?: number; outputTokens?: number }) => void;
     /** Stop after the current turn when this returns true (a done tool set its session flag). */
     shouldStop: () => boolean;
     /** Injectable fetch (tests). Defaults to global fetch. */
@@ -180,7 +181,11 @@ async function chatCompletion(
             const response = (await res.json()) as ChatResponse;
             if (response.error && isContextLimitError(JSON.stringify(response.error))) throw new ContextBudgetError(JSON.stringify(response.error).slice(0, 300));
             const tokens = response.usage?.total_tokens ?? (response.usage ? (response.usage.prompt_tokens ?? 0) + (response.usage.completion_tokens ?? 0) : 0);
-            if (tokens > 0) p.onTokens?.(tokens);
+            if (tokens > 0) {
+                p.onTokens?.(tokens, response.usage
+                    ? { inputTokens: response.usage.prompt_tokens, outputTokens: response.usage.completion_tokens }
+                    : undefined);
+            }
             return response;
         } catch (e) {
             if (e instanceof ContextBudgetError) throw e;

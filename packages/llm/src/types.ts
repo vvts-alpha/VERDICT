@@ -13,6 +13,10 @@ export interface LlmResponse {
   model: string;
   /** Actual provider-reported usage when available. */
   tokensUsed?: number;
+  /** Provider-reported input (prompt-side) tokens — includes cache reads/writes on Claude. */
+  inputTokens?: number;
+  /** Provider-reported output (completion-side) tokens. */
+  outputTokens?: number;
 }
 
 export interface LlmClient {
