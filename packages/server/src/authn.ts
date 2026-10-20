@@ -1,7 +1,6 @@
-// Multi-user request authentication for serve mode.
-// Precedence: Bearer API token (CLI) → session cookie (browser) → null.
+// Multi-user request authentication for serve mode — the session cookie only (no API tokens:
+// there is no programmatic client today, and cookie login works for any automation that appears).
 // Legacy shared-password cookies still resolve through auth.ts when authPasswords is set (compat gate).
-import { createHash, randomBytes } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import type { UsersDb, UserRow, UserRole } from "./users-db.js";
 
@@ -15,8 +14,7 @@ export interface Principal {
   userId: string;
   username: string;
   role: UserRole;
-  method: "session" | "token";
-  sessionId?: string;
+  sessionId: string;
 }
 
 function parseCookies(header: string | undefined): Record<string, string> {
@@ -38,25 +36,8 @@ export function clearedSessionCookie(): string {
   return `${SESSION_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0`;
 }
 
-export function tokenHash(secret: string): string {
-  return createHash("sha256").update(secret).digest("hex");
-}
-
-export function newApiTokenSecret(): string {
-  return `vdt_${randomBytes(24).toString("base64url")}`;
-}
-
-/** Resolve the caller's identity. Bearer token first (programmatic), then the session cookie. */
+/** Resolve the caller's identity from the session cookie. */
 export function principalForReq(req: IncomingMessage, db: UsersDb, now: number): Principal | null {
-  const auth = req.headers.authorization;
-  if (typeof auth === "string" && auth.startsWith("Bearer ")) {
-    const secret = auth.slice(7).trim();
-    if (secret) {
-      const user = db.getApiTokenUser(tokenHash(secret));
-      if (user) return { userId: user.id, username: user.username, role: user.role, method: "token" };
-    }
-    return null;
-  }
   const sessionId = parseCookies(req.headers.cookie)[SESSION_COOKIE];
   if (!sessionId) return null;
   const session = db.getSession(sessionId, now);
@@ -66,7 +47,7 @@ export function principalForReq(req: IncomingMessage, db: UsersDb, now: number):
     db.refreshSessionExpiry(sessionId, Math.min(now + SESSION_IDLE_MS, session.createdAt + SESSION_ABSOLUTE_MS));
   }
   const user = db.getUserById(session.userId) as UserRow;
-  return { userId: user.id, username: user.username, role: user.role, method: "session", sessionId };
+  return { userId: user.id, username: user.username, role: user.role, sessionId };
 }
 
 interface LoginFail {

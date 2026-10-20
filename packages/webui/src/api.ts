@@ -35,7 +35,6 @@ export interface MeUser {
   id: string;
   username: string;
   role: "admin" | "user";
-  method: "session" | "token";
 }
 
 export interface Me {

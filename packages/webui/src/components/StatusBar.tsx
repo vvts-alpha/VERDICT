@@ -122,7 +122,7 @@ export function StatusBarShell({
 }) {
   const { canWrite, authEnabled, role, multiUser, user } = useRole();
   const roleTitle = multiUser
-    ? `${user?.username ?? "account"} — ${role === "admin" ? "administrator" : "user"} (${user?.method ?? "session"})`
+    ? `${user?.username ?? "account"} — ${role === "admin" ? "administrator" : "user"}`
     : canWrite
       ? "operator — full access"
       : "viewer — read-only";

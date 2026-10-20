@@ -16,7 +16,7 @@ import { resolveLlmConfig, makeLlmClient } from "@veritas/llm";
 import type { AssessmentState } from "@veritas/core";
 import { handleAuthSubmit, handleLogout, roleForReq, loginPageHtml } from "./auth.js";
 import type { AuthConfig, Role } from "./auth.js";
-import { clearedSessionCookie, DUMMY_PASSWORD_HASH, LoginRateLimiter, newApiTokenSecret, principalForReq, sessionCookieValue, SESSION_IDLE_MS, tokenHash } from "./authn.js";
+import { clearedSessionCookie, DUMMY_PASSWORD_HASH, LoginRateLimiter, principalForReq, sessionCookieValue, SESSION_IDLE_MS } from "./authn.js";
 import type { Principal } from "./authn.js";
 import { hashPassword, passwordPolicyError, verifyPassword } from "./passwords.js";
 import { UsersDb } from "./users-db.js";
@@ -218,7 +218,7 @@ interface HttpContext {
 
 /**
  * Multi-user self-service and admin API. Returns true when the request was handled.
- * Self routes: logout, change-password, API tokens. Admin routes: user CRUD + audit.
+ * Self routes: logout, change-password. Admin routes: user CRUD + audit.
  */
 function handleUserApi(req: IncomingMessage, res: ServerResponse, db: UsersDb, principal: Principal): boolean {
   const url = req.url ?? "";
@@ -246,27 +246,6 @@ function handleUserApi(req: IncomingMessage, res: ServerResponse, db: UsersDb, p
       res.writeHead(200, { "content-type": "application/json; charset=utf-8", "set-cookie": clearedSessionCookie() });
       res.end('{"ok":true}');
     });
-    return true;
-  }
-  if (req.method === "GET" && url === "/api/tokens") {
-    sendJson(res, 200, db.listApiTokens(principal.userId).filter((t) => !t.revokedAt));
-    return true;
-  }
-  if (req.method === "POST" && url === "/api/tokens") {
-    readJsonBody(req, res, 8192, (b) => {
-      const name = typeof (b as { name?: unknown }).name === "string" ? ((b as { name: string }).name) : "cli";
-      const secret = newApiTokenSecret();
-      const row = db.createApiToken(principal.userId, name, tokenHash(secret));
-      db.audit({ actorId: principal.userId, actorName: principal.username, action: "token_created", target: `token:${row.id}`, ip });
-      sendJson(res, 201, { id: row.id, token: secret }); // the secret is returned once, only here
-    });
-    return true;
-  }
-  const tokenDel = url.match(/^\/api\/tokens\/([^/?]+)$/);
-  if (tokenDel && req.method === "DELETE") {
-    const ok = db.revokeApiToken(decodeURIComponent(tokenDel[1]!), principal.userId);
-    if (ok) db.audit({ actorId: principal.userId, actorName: principal.username, action: "token_revoked", target: `token:${tokenDel[1]}`, ip });
-    sendJson(res, ok ? 200 : 404, ok ? { ok: true } : { error: "token not found" });
     return true;
   }
   if (url.startsWith("/api/admin/")) {
@@ -895,7 +874,7 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptio
   // Own identity (so the WebUI can conditionally show operator-only/admin UI). If no auth, authEnabled:false.
   if (req.method === "GET" && (url === "/api/me" || url.startsWith("/api/me?"))) {
     sendJson(res, 200, principal
-      ? { role: principal.role, authEnabled: true, multiUser: true, user: { id: principal.userId, username: principal.username, role: principal.role, method: principal.method } }
+      ? { role: principal.role, authEnabled: true, multiUser: true, user: { id: principal.userId, username: principal.username, role: principal.role } }
       : { role, authEnabled: !!cfg });
     return;
   }

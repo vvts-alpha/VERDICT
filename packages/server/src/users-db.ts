@@ -1,5 +1,5 @@
 // Multi-user identity store for serve mode — server-global auth DB (verdict-server.db next to runs/).
-// Keeps accounts, server-side sessions, CLI API tokens, run ownership, and the append-only audit log.
+// Keeps accounts, server-side sessions, run ownership, and the append-only audit log.
 // Uses builtin node:sqlite like the per-run AssessmentStore; separate file so run stores stay untouched.
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -36,15 +36,6 @@ export interface SessionRow {
   revokedAt: number | null;
 }
 
-export interface ApiTokenRow {
-  id: string;
-  userId: string;
-  name: string;
-  createdAt: number;
-  lastUsedAt: number | null;
-  revokedAt: number | null;
-}
-
 export interface AuditRow {
   seq: number;
   ts: number;
@@ -78,16 +69,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   revoked_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id);
-CREATE TABLE IF NOT EXISTS api_tokens (
-  id TEXT PRIMARY KEY,
-  user_id TEXT NOT NULL REFERENCES users(id),
-  name TEXT NOT NULL DEFAULT '',
-  token_hash TEXT NOT NULL UNIQUE,
-  created_at INTEGER NOT NULL,
-  last_used_at INTEGER,
-  revoked_at INTEGER
-);
-CREATE INDEX IF NOT EXISTS api_tokens_user ON api_tokens(user_id);
+-- API tokens were removed (no programmatic consumer); drop any table left by an earlier schema.
+DROP TABLE IF EXISTS api_tokens;
 CREATE TABLE IF NOT EXISTS run_owners (
   run_id TEXT PRIMARY KEY,
   owner_id TEXT NOT NULL REFERENCES users(id),
@@ -223,34 +206,6 @@ export class UsersDb {
 
   revokeUserSessions(userIdValue: string): void {
     this.db.prepare("UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL").run(Date.now(), userIdValue);
-  }
-
-  // --- api tokens (CLI bearer; sha256 of the presented secret is stored, never the secret) ---
-  createApiToken(userIdValue: string, name: string, tokenHash: string): ApiTokenRow {
-    const row: ApiTokenRow = { id: randomId("t"), userId: userIdValue, name: name.trim(), createdAt: Date.now(), lastUsedAt: null, revokedAt: null };
-    this.db.prepare("INSERT INTO api_tokens (id, user_id, name, token_hash, created_at) VALUES (?,?,?,?,?)").run(row.id, row.userId, row.name, tokenHash, row.createdAt);
-    return row;
-  }
-
-  getApiTokenUser(tokenHash: string): UserRow | null {
-    const r = this.db.prepare("SELECT id, user_id, revoked_at FROM api_tokens WHERE token_hash = ?").get(tokenHash) as Record<string, unknown> | undefined;
-    if (!r || r.revoked_at !== null) return null;
-    const user = this.getUserById(r.user_id as string);
-    if (!user || user.status !== "active") return null;
-    this.db.prepare("UPDATE api_tokens SET last_used_at = ? WHERE id = ?").run(Date.now(), r.id as string);
-    return user;
-  }
-
-  listApiTokens(userIdValue: string): ApiTokenRow[] {
-    return (this.db.prepare("SELECT * FROM api_tokens WHERE user_id = ? ORDER BY created_at").all(userIdValue) as Record<string, unknown>[]).map((r) => ({
-      id: r.id as string, userId: r.user_id as string, name: r.name as string, createdAt: r.created_at as number,
-      lastUsedAt: (r.last_used_at as number | null) ?? null, revokedAt: (r.revoked_at as number | null) ?? null,
-    }));
-  }
-
-  revokeApiToken(id: string, userIdValue: string): boolean {
-    const res = this.db.prepare("UPDATE api_tokens SET revoked_at = ? WHERE id = ? AND user_id = ? AND revoked_at IS NULL").run(Date.now(), id, userIdValue);
-    return res.changes > 0;
   }
 
   // --- run ownership ---

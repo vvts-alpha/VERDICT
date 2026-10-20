@@ -1,9 +1,8 @@
 // Multi-user authN/authZ integration: real HTTP fixture (no mocks) exercising login,
-// session lifecycle, run ownership isolation, admin CRUD, API tokens, and rate limiting.
+// session lifecycle, run ownership isolation, admin CRUD, and rate limiting.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -96,7 +95,7 @@ test("scrypt hash/verify roundtrip; wrong password and malformed hashes rejected
 
 // ---------- users-db ----------
 
-test("users-db: users, sessions, tokens, run owners, audit", () => {
+test("users-db: users, sessions, run owners, audit", () => {
   const dir = mkdtempSync(join(tmpdir(), "veritas-udb-"));
   const db = UsersDb.open(join(dir, "s.db"));
   try {
@@ -116,16 +115,6 @@ test("users-db: users, sessions, tokens, run owners, audit", () => {
     const s3 = db.createSession(u.id, 60_000, "", "");
     db.updateUser(u.id, { status: "disabled" });
     assert.equal(db.getSession(s3.id, Date.now()), null);
-
-    // api tokens: hash-only lookup, revoked rejected
-    const th = createHash("sha256").update("secret-token").digest("hex");
-    const row = db.createApiToken(admin.id, "cli", th);
-    assert.equal(db.getApiTokenUser(th)?.id, admin.id);
-    assert.equal(db.getApiTokenUser("0".repeat(64)), null);
-    assert.equal(db.revokeApiToken(row.id, admin.id), true);
-    assert.equal(db.getApiTokenUser(th), null);
-    // someone else's token id cannot be revoked by this user
-    assert.equal(db.revokeApiToken(row.id, "u-other"), false);
 
     db.setRunOwner("run-1", admin.id);
     assert.equal(db.getRunOwner("run-1"), admin.id);
@@ -328,38 +317,6 @@ test("admin user CRUD; last-admin guard; non-admin forbidden", async () => {
       body: JSON.stringify({ status: "active" }),
     });
     assert.equal((await login(r.url, "carol", temporaryPassword)).status, 200);
-  } finally {
-    await r.close();
-  }
-});
-
-test("API tokens: bearer auth, revocation, per-user isolation", async () => {
-  const r = await rig();
-  try {
-    const alice = (await login(r.url, "alice", PW.alice)).cookie;
-    const created = await authed(r.url, alice, "/api/tokens", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ name: "ci" }),
-    });
-    assert.equal(created.status, 201);
-    const { id, token } = (await created.json()) as { id: string; token: string };
-    assert.match(token, /^vdt_/);
-
-    const me = await fetch(`${r.url}/api/me`, { headers: { authorization: `Bearer ${token}` } });
-    assert.equal(me.status, 200);
-    const meJson = (await me.json()) as { user: { username: string; method: string } };
-    assert.equal(meJson.user.username, "alice");
-    assert.equal(meJson.user.method, "token");
-
-    // tokens only see the owner's runs
-    seed(r.runsDir, "run-tok");
-    r.db.setRunOwner("run-tok", r.db.getUserByUsername("alice")!.id);
-    assert.equal((await fetch(`${r.url}/api/assessments/run-tok`, { headers: { authorization: `Bearer ${token}` } })).status, 200);
-
-    // revoke → 401
-    await authed(r.url, alice, `/api/tokens/${id}`, { method: "DELETE" });
-    assert.equal((await fetch(`${r.url}/api/me`, { headers: { authorization: `Bearer ${token}` } })).status, 401);
   } finally {
     await r.close();
   }
