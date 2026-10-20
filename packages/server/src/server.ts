@@ -4,6 +4,7 @@ import { hasLocalToken, isTrustedRequest, validateRequestPath } from "./request-
 // (crawler/labeler) writes, via events.seq, and push new events as diffs (since there are no in-process events).
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { extname, join, normalize, resolve, sep } from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
@@ -15,6 +16,11 @@ import { resolveLlmConfig, makeLlmClient } from "@veritas/llm";
 import type { AssessmentState } from "@veritas/core";
 import { handleAuthSubmit, handleLogout, roleForReq, loginPageHtml } from "./auth.js";
 import type { AuthConfig, Role } from "./auth.js";
+import { clearedSessionCookie, DUMMY_PASSWORD_HASH, LoginRateLimiter, newApiTokenSecret, principalForReq, sessionCookieValue, SESSION_IDLE_MS, tokenHash } from "./authn.js";
+import type { Principal } from "./authn.js";
+import { hashPassword, passwordPolicyError, verifyPassword } from "./passwords.js";
+import { UsersDb } from "./users-db.js";
+import type { UserRow } from "./users-db.js";
 import { Supervisor, isRunCommand, isSupportedRun, type RunLauncherConfig, type StartRunInput } from "./supervisor.js";
 import { Relay } from "./relay.js";
 import { continueSession, SessionContinuationError } from "./continue-session.js";
@@ -35,6 +41,8 @@ export interface ServerOptions {
    *  viewer is read-only (all POST and attended → 403). If unset, no auth as before.
    *  cmdServe passes it via --password / --viewer-password / env VERDICT_WEB_PASSWORD[_VIEWER]. */
   authPasswords?: AuthConfig;
+  /** Multi-user mode: per-account authN/RBAC from this store (verdict-server.db). Takes precedence over authPasswords. */
+  usersDb?: UsersDb;
   /** If set, runs can be started/stopped/resumed from the WebUI (server spawns the CLI as a child process).
    *  If unset, /api/run etc. are disabled. cmdServe injects the CLI path etc. */
   runLauncher?: RunLauncherConfig;
@@ -115,6 +123,49 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(payload);
 }
 
+/** Read and JSON-parse a bounded request body; parse failure → 400, oversize → connection destroyed. */
+function readJsonBody(req: IncomingMessage, res: ServerResponse, limit: number, handler: (body: unknown) => void): void {
+  let body = "";
+  let tooBig = false;
+  req.on("data", (c) => {
+    body += c;
+    if (body.length > limit) {
+      tooBig = true;
+      req.destroy();
+    }
+  });
+  onBodyEnd(req, res, () => {
+    if (tooBig) return;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      return sendJson(res, 400, { error: "invalid JSON body" });
+    }
+    handler(parsed);
+  });
+}
+
+function remoteIp(req: IncomingMessage): string {
+  return req.socket.remoteAddress ?? "";
+}
+
+/** `/api/{assessments,run}/<id>/…` → the run id. List/creation routes (no id segment) return null. */
+function runIdFromUrl(url: string): string | null {
+  const m = url.match(/^\/api\/(?:assessments|run)\/([^/?]+)/);
+  return m ? decodeURIComponent(m[1]!) : null;
+}
+
+/** Admins see every run; users only their own. Ownerless (pre-multi-user) runs are admin-only. */
+function canAccessRun(db: UsersDb, principal: Principal, runId: string): boolean {
+  return principal.role === "admin" || db.getRunOwner(runId) === principal.userId;
+}
+
+/** Public user shape — never serialize passwordHash. */
+function publicUser(u: UserRow): Record<string, unknown> {
+  return { id: u.id, username: u.username, displayName: u.displayName, role: u.role, status: u.status, createdAt: u.createdAt };
+}
+
 /** Contain failures in both route dispatch and delayed body/report handlers. */
 function requestFailure(res: ServerResponse, error: unknown): void {
   if (res.destroyed || res.writableEnded) return;
@@ -160,9 +211,138 @@ function serveStatic(res: ServerResponse, webRoot: string, urlPath: string): voi
   res.end("not found");
 }
 
+/** Per-server-instance login throttle (module state would leak lockouts across servers/tests). */
+interface HttpContext {
+  limiter: LoginRateLimiter;
+}
+
+/**
+ * Multi-user self-service and admin API. Returns true when the request was handled.
+ * Self routes: logout, change-password, API tokens. Admin routes: user CRUD + audit.
+ */
+function handleUserApi(req: IncomingMessage, res: ServerResponse, db: UsersDb, principal: Principal): boolean {
+  const url = req.url ?? "";
+  const ip = remoteIp(req);
+  if (req.method === "POST" && url === "/api/auth/logout") {
+    if (principal.sessionId) db.revokeSession(principal.sessionId);
+    db.audit({ actorId: principal.userId, actorName: principal.username, action: "logout", ip });
+    res.writeHead(200, { "content-type": "application/json; charset=utf-8", "set-cookie": clearedSessionCookie() });
+    res.end('{"ok":true}');
+    return true;
+  }
+  if (req.method === "POST" && url === "/api/auth/change-password") {
+    readJsonBody(req, res, 8192, (b) => {
+      const input = b as { currentPassword?: unknown; newPassword?: unknown };
+      const user = db.getUserById(principal.userId);
+      if (!user || !verifyPassword(typeof input.currentPassword === "string" ? input.currentPassword : "", user.passwordHash)) {
+        return sendJson(res, 403, { error: "current password is wrong" });
+      }
+      if (typeof input.newPassword !== "string") return sendJson(res, 400, { error: "newPassword required" });
+      const policy = passwordPolicyError(input.newPassword);
+      if (policy) return sendJson(res, 400, { error: policy });
+      db.updateUser(user.id, { passwordHash: hashPassword(input.newPassword) });
+      db.revokeUserSessions(user.id); // all sessions end — the client must sign in again
+      db.audit({ actorId: user.id, actorName: user.username, action: "password_changed", ip });
+      res.writeHead(200, { "content-type": "application/json; charset=utf-8", "set-cookie": clearedSessionCookie() });
+      res.end('{"ok":true}');
+    });
+    return true;
+  }
+  if (req.method === "GET" && url === "/api/tokens") {
+    sendJson(res, 200, db.listApiTokens(principal.userId).filter((t) => !t.revokedAt));
+    return true;
+  }
+  if (req.method === "POST" && url === "/api/tokens") {
+    readJsonBody(req, res, 8192, (b) => {
+      const name = typeof (b as { name?: unknown }).name === "string" ? ((b as { name: string }).name) : "cli";
+      const secret = newApiTokenSecret();
+      const row = db.createApiToken(principal.userId, name, tokenHash(secret));
+      db.audit({ actorId: principal.userId, actorName: principal.username, action: "token_created", target: `token:${row.id}`, ip });
+      sendJson(res, 201, { id: row.id, token: secret }); // the secret is returned once, only here
+    });
+    return true;
+  }
+  const tokenDel = url.match(/^\/api\/tokens\/([^/?]+)$/);
+  if (tokenDel && req.method === "DELETE") {
+    const ok = db.revokeApiToken(decodeURIComponent(tokenDel[1]!), principal.userId);
+    if (ok) db.audit({ actorId: principal.userId, actorName: principal.username, action: "token_revoked", target: `token:${tokenDel[1]}`, ip });
+    sendJson(res, ok ? 200 : 404, ok ? { ok: true } : { error: "token not found" });
+    return true;
+  }
+  if (url.startsWith("/api/admin/")) {
+    if (principal.role !== "admin") {
+      sendJson(res, 403, { error: "forbidden: admin only" });
+      return true;
+    }
+    if (req.method === "GET" && url === "/api/admin/users") {
+      sendJson(res, 200, db.listUsers().map(publicUser));
+      return true;
+    }
+    if (req.method === "POST" && url === "/api/admin/users") {
+      readJsonBody(req, res, 8192, (b) => {
+        const input = b as { username?: unknown; displayName?: unknown; role?: unknown; password?: unknown };
+        const username = typeof input.username === "string" ? input.username.trim() : "";
+        if (!/^[a-zA-Z0-9_.-]{2,64}$/.test(username)) return sendJson(res, 400, { error: "username must be 2-64 chars of [a-zA-Z0-9_.-]" });
+        if (input.role !== "admin" && input.role !== "user") return sendJson(res, 400, { error: "role must be admin or user" });
+        if (typeof input.password !== "string") return sendJson(res, 400, { error: "password required" });
+        const policy = passwordPolicyError(input.password);
+        if (policy) return sendJson(res, 400, { error: policy });
+        if (db.getUserByUsername(username)) return sendJson(res, 409, { error: "username already exists" });
+        const row = db.createUser({ username, displayName: typeof input.displayName === "string" ? input.displayName : "", passwordHash: hashPassword(input.password), role: input.role });
+        db.audit({ actorId: principal.userId, actorName: principal.username, action: "user_created", target: `user:${row.id} ${row.username}`, ip, detail: row.role });
+        sendJson(res, 201, publicUser(row));
+      });
+      return true;
+    }
+    const um = url.match(/^\/api\/admin\/users\/([^/?]+)(\/reset-password)?$/);
+    if (um) {
+      const targetId = decodeURIComponent(um[1]!);
+      const target = db.getUserById(targetId);
+      if (!target) {
+        sendJson(res, 404, { error: "user not found" });
+        return true;
+      }
+      if (um[2] === "/reset-password" && req.method === "POST") {
+        const temp = `vdt_${randomBytes(12).toString("base64url")}`;
+        db.updateUser(targetId, { passwordHash: hashPassword(temp) });
+        db.revokeUserSessions(targetId);
+        db.audit({ actorId: principal.userId, actorName: principal.username, action: "password_reset", target: `user:${target.id} ${target.username}`, ip });
+        sendJson(res, 200, { temporaryPassword: temp });
+        return true;
+      }
+      if (!um[2] && req.method === "PATCH") {
+        readJsonBody(req, res, 8192, (b) => {
+          const input = b as { displayName?: unknown; role?: unknown; status?: unknown };
+          if (input.role !== undefined && input.role !== "admin" && input.role !== "user") return sendJson(res, 400, { error: "role must be admin or user" });
+          if (input.status !== undefined && input.status !== "active" && input.status !== "disabled") return sendJson(res, 400, { error: "status must be active or disabled" });
+          // The last active admin can never be demoted or disabled (that would brick management).
+          const removingAdmin = (input.role === "user" || input.status === "disabled") && target.role === "admin" && target.status === "active";
+          if (removingAdmin && db.countActiveAdmins() <= 1) return sendJson(res, 409, { error: "cannot demote or disable the last active admin" });
+          db.updateUser(targetId, {
+            ...(typeof input.displayName === "string" ? { displayName: input.displayName } : {}),
+            ...(input.role === "admin" || input.role === "user" ? { role: input.role } : {}),
+            ...(input.status === "active" || input.status === "disabled" ? { status: input.status } : {}),
+          });
+          if (input.status === "disabled") db.revokeUserSessions(targetId);
+          db.audit({ actorId: principal.userId, actorName: principal.username, action: "user_updated", target: `user:${target.id} ${target.username}`, ip, detail: JSON.stringify({ role: input.role, status: input.status }) });
+          sendJson(res, 200, publicUser(db.getUserById(targetId)!));
+        });
+        return true;
+      }
+    }
+    if (req.method === "GET" && url === "/api/admin/audit") {
+      sendJson(res, 200, db.listAudit());
+      return true;
+    }
+    sendJson(res, 404, { error: "unknown endpoint" });
+    return true;
+  }
+  return false;
+}
+
 // DESIGN §8.3 — minimal WebUI operations: pause/resume / handoff resolve / screen exclude.
 // + Phase-1 control plane: start a run (/api/run) / stop / resume (via supervisor).
-function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOptions, supervisor?: Supervisor): void {
+function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOptions, supervisor?: Supervisor, principal?: Principal): void {
   const url = req.url ?? "";
 
   // Start a run: body = { command, manifest, options }. supervisor spawns the CLI and returns a new id.
@@ -205,6 +385,11 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
       }
       try {
         const { id } = supervisor.start(input);
+        if (opts.usersDb && principal) {
+          opts.usersDb.setRunOwner(id, principal.userId);
+          // Never log the manifest — it can carry credentials.
+          opts.usersDb.audit({ actorId: principal.userId, actorName: principal.username, action: "run_created", target: `run:${id}`, ip: remoteIp(req), detail: input.command });
+        }
         sendJson(res, 200, { id });
       } catch (e) {
         sendJson(res, 500, { error: `failed to launch: ${String(e).slice(0, 200)}` });
@@ -601,13 +786,77 @@ function widenScopeForUrl(scope: ScopePolicy, u: URL): ScopePolicy | null {
   return isInScope(u.href, s) ? s : null; // still blocked (e.g. an outOfScopePathPrefix) → refuse
 }
 
-function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptions, supervisor?: Supervisor, relay?: Relay): void {
+function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptions, supervisor?: Supervisor, relay?: Relay, ctx?: HttpContext): void {
   const url = req.url ?? "/";
-  // Auth gate (only when authPasswords is set). /login and POST /auth pass through; everything else requires the Cookie.
   const cfg = opts.authPasswords;
+  const usersDb = opts.usersDb;
+  const now = Date.now();
   let role: Role = "operator"; // when auth is off, treat as full rights (as before)
-  if (cfg) {
-    const now = Date.now();
+  let principal: Principal | null = null;
+  if (usersDb) {
+    // Multi-user mode: account-based auth. Public endpoints first.
+    if (req.method === "GET" && (url === "/login" || url.startsWith("/login?"))) {
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      res.end(loginPageHtml(url.includes("e=1"), { multiUser: true }));
+      return;
+    }
+    if (req.method === "POST" && url === "/api/auth/login") {
+      readJsonBody(req, res, 8192, (b) => {
+        const input = b as { username?: unknown; password?: unknown };
+        const name = typeof input.username === "string" ? input.username.trim() : "";
+        const ip = remoteIp(req);
+        if (!name || typeof input.password !== "string") return sendJson(res, 400, { error: "username and password required" });
+        const key = `${ip}|${name.toLowerCase()}`;
+        if (ctx!.limiter.locked(key, now)) {
+          usersDb.audit({ actorName: name, action: "login_locked", ip });
+          return sendJson(res, 429, { error: "too many failed attempts; try again later" });
+        }
+        const user = usersDb.getUserByUsername(name);
+        // Run scrypt on a real-format hash either way so timing does not reveal valid usernames.
+        const ok = verifyPassword(input.password, user?.passwordHash ?? DUMMY_PASSWORD_HASH) && user !== null && user.status === "active";
+        if (!ok) {
+          ctx!.limiter.fail(key, now);
+          usersDb.audit({ actorName: name, action: "login_failed", ip });
+          return sendJson(res, 401, { error: "invalid username or password" });
+        }
+        ctx!.limiter.reset(key);
+        const session = usersDb.createSession(user.id, SESSION_IDLE_MS, ip, String(req.headers["user-agent"] ?? ""));
+        usersDb.audit({ actorId: user.id, actorName: user.username, action: "login", ip });
+        res.writeHead(200, { "content-type": "application/json; charset=utf-8", "set-cookie": sessionCookieValue(session.id, session.expiresAt) });
+        res.end(JSON.stringify({ user: publicUser(user) }));
+      });
+      return;
+    }
+    if (req.method === "GET" && opts.webRoot && (url === "/verdict-title.png" || url === "/favicon.png")) {
+      serveStatic(res, opts.webRoot, url);
+      return;
+    }
+    principal = principalForReq(req, usersDb, now);
+    if (!principal) {
+      if (url.startsWith("/api/") || req.method === "POST") {
+        sendJson(res, 401, { error: "unauthorized" });
+      } else {
+        res.writeHead(302, { location: "/login" });
+        res.end();
+      }
+      return;
+    }
+    // Run-ownership gate — covers every /api/{assessments,run}/<id>/* route in one place.
+    const runId = runIdFromUrl(url);
+    if (runId && !canAccessRun(usersDb, principal, runId)) {
+      if (req.method === "POST") {
+        usersDb.audit({ actorId: principal.userId, actorName: principal.username, action: "access_denied", target: `run:${runId}`, ip: remoteIp(req) });
+      }
+      sendJson(res, 404, { error: "assessment not found" });
+      return;
+    }
+    if (req.method === "POST" && runId) {
+      const verb = url.split("/").filter(Boolean).at(-1) ?? "control";
+      usersDb.audit({ actorId: principal.userId, actorName: principal.username, action: `run_${verb.replaceAll("-", "_")}`, target: `run:${runId}`, ip: remoteIp(req) });
+    }
+    if (handleUserApi(req, res, usersDb, principal)) return;
+    role = "operator"; // authenticated principals have full rights on their own runs
+  } else if (cfg) {
     if (req.method === "POST" && (url === "/auth" || url.startsWith("/auth?"))) {
       handleAuthSubmit(req, res, cfg, now);
       return;
@@ -644,13 +893,15 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptio
       return;
     }
   }
-  // Own role (so the WebUI can conditionally show operator-only buttons). If no auth, authEnabled:false.
+  // Own identity (so the WebUI can conditionally show operator-only/admin UI). If no auth, authEnabled:false.
   if (req.method === "GET" && (url === "/api/me" || url.startsWith("/api/me?"))) {
-    sendJson(res, 200, { role, authEnabled: !!cfg });
+    sendJson(res, 200, principal
+      ? { role: principal.role, authEnabled: true, multiUser: true, user: { id: principal.userId, username: principal.username, role: principal.role, method: principal.method } }
+      : { role, authEnabled: !!cfg });
     return;
   }
   if (req.method === "POST") {
-    handleControl(req, res, opts, supervisor);
+    handleControl(req, res, opts, supervisor, principal ?? undefined);
     return;
   }
   if (req.method === "GET" && url.startsWith("/api/scope-preview?")) {
@@ -665,7 +916,8 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptio
   }
   if (url === "/api/assessments") {
     const rows = listAssessments(opts.runsDir).map((r) => ({ ...r, running: supervisor?.isRunning(r.id) ?? false }));
-    sendJson(res, 200, rows);
+    const visible = usersDb && principal && principal.role !== "admin" ? rows.filter((r) => usersDb.ownedRunIds(principal.userId).has(r.id)) : rows;
+    sendJson(res, 200, visible);
     return;
   }
   // Re-launch input for "Duplicate": the manifest + options + spec this run was started with, so the launcher can
@@ -1090,6 +1342,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
   const log = opts.onLog ?? ((): void => {});
   const relay = opts.runLauncher ? new Relay() : undefined;
   const supervisor = opts.runLauncher ? new Supervisor(opts.runLauncher, relay) : undefined;
+  const httpCtx: HttpContext = { limiter: new LoginRateLimiter() };
   const httpServer = createServer((req, res) => {
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
@@ -1098,7 +1351,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
       if (!validateRequestPath(req)) return sendJson(res, 400, { error: "invalid request path" });
       if (!isTrustedRequest(req, host)) return sendJson(res, 403, { error: "untrusted request origin or host" });
       if (!hasLocalToken(req, opts.localAuthToken)) return sendJson(res, 401, { error: "unauthorized" });
-      handleHttp(req, res, opts, supervisor, relay);
+      handleHttp(req, res, opts, supervisor, relay, httpCtx);
     } catch (error) { requestFailure(res, error); }
   });
 
@@ -1126,6 +1379,21 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
     const pathname = (req.url ?? "").split("?")[0] ?? "";
     if (pathname !== "/ws/agent" && !hasLocalToken(req, opts.localAuthToken)) return void socket.destroy();
     const cfg = opts.authPasswords;
+    if (opts.usersDb) {
+      const principal = principalForReq(req, opts.usersDb, Date.now());
+      if (!principal) return void socket.destroy();
+      if (pathname === "/ws" || (sessionWss && pathname === "/ws/session")) {
+        const id = new URL(req.url ?? "", "http://localhost").searchParams.get("id") ?? "";
+        if (!id || !canAccessRun(opts.usersDb, principal, id)) return void socket.destroy();
+        if (pathname === "/ws") wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+        else sessionWss!.handleUpgrade(req, socket, head, (ws) => sessionWss!.emit("connection", ws, req));
+      } else if (agentWss && pathname === "/ws/agent") {
+        agentWss.handleUpgrade(req, socket, head, (ws) => agentWss.emit("connection", ws, req));
+      } else {
+        socket.destroy();
+      }
+      return;
+    }
     const role = cfg ? roleForReq(req, cfg, Date.now()) : "operator"; // no-auth is treated as operator
     if (pathname === "/ws") {
       if (!role) return void socket.destroy(); // read projection is fine for either operator/viewer once authenticated

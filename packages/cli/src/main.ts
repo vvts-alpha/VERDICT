@@ -46,7 +46,7 @@ import { assessLogicInventory, assessScreenLogic, authDiffScreen } from "@verita
 import type { RoleContext } from "@veritas/agent";
 import { runPilot, verifyBurpFindings, triageAndDeepDiveBurp, LiveControl } from "@veritas/pilot";
 import { BrowserChatAdapter, runLlmRedteam, defaultInjectedContextProbes, generateCanary } from "@veritas/llm-attacks";
-import { isSupportedRun, startServer } from "@veritas/server";
+import { isSupportedRun, startServer, UsersDb, usersDbPath, hashPassword, passwordPolicyError } from "@veritas/server";
 import { loadDotEnv } from "./dotenv.js";
 import { resolveUpstreamProxy, proxyFlagGivenButEmpty } from "./proxy.js";
 
@@ -118,7 +118,11 @@ commands:
             start the observability WebUI + state API/WS (default 127.0.0.1:4317. expose to LAN with --host 0.0.0.0)
             two roles gate the WebUI/API/WS (/login + signed cookie): operator = env VERDICT_WEB_PASSWORD / --password (full: New/Resume/Stop/mutate);
             viewer = env VERDICT_WEB_PASSWORD_VIEWER / --viewer-password (read-only). ENV preferred over args. --no-auth disables the gate
+            --multi-user enables per-account auth (admin/user roles; verdict-server.db beside the runs dir) — bootstrap via 'veritas user bootstrap'
             the WebUI "+ New" launches pilot/assess by spawning the CLI as a child; --no-launch disables run launching
+  user    bootstrap --username <name> [--password <pw>] | list | reassign --run <id> --user <name>
+            multi-user account management for serve (verdict-server.db). bootstrap creates the first admin
+            (env VERDICT_ADMIN_PASSWORD accepted); reassign transfers an ownerless/other run to a user
   report  --id <id> [--format md,html,pdf,csv] [--browser-path <bin>] [--no-sandbox] [--out <dir>]
             generate the diagnosis report from findings (by severity + repro + evidence + scope basis).
             default md,html. pdf = HTML printed via Chromium (reuses the browser; needs a chromium binary). csv = findings.csv
@@ -1513,6 +1517,7 @@ async function cmdServe(args: string[]): Promise<void> {
       "viewer-password": { type: "string" },
       "no-auth": { type: "boolean" },
       "no-launch": { type: "boolean" },
+      "multi-user": { type: "boolean" },
     },
   });
   const runsDir = values.out ?? RUNS_DIR_DEFAULT;
@@ -1532,6 +1537,29 @@ async function cmdServe(args: string[]): Promise<void> {
     process.exit(1);
   }
   const authPasswords = operatorPw ? { operator: operatorPw, ...(viewerPw ? { viewer: viewerPw } : {}) } : undefined;
+  // Multi-user mode: explicit --multi-user, or a verdict-server.db already bootstrapped beside the runs dir.
+  // The auth DB takes precedence over the legacy shared-password gate.
+  const dbPath = usersDbPath(runsDir);
+  let usersDb: UsersDb | undefined;
+  if (!values["no-auth"] && (values["multi-user"] || existsSync(dbPath))) {
+    usersDb = UsersDb.open(dbPath);
+    if (usersDb.countUsers() === 0) {
+      // Migration: seed the first admin from VERDICT_ADMIN_PASSWORD, else fall back to the legacy operator password.
+      const seed = process.env.VERDICT_ADMIN_PASSWORD ?? operatorPw;
+      if (seed) {
+        const policy = passwordPolicyError(seed);
+        if (policy) {
+          console.error(`warning: bootstrap admin password rejected by policy (${policy}); run \`veritas user bootstrap\` with a stronger one`);
+        } else {
+          usersDb.createUser({ username: "admin", passwordHash: hashPassword(seed), role: "admin" });
+          console.error("multi-user: seeded the first admin account from the environment/legacy password");
+          if (viewerPw) console.error("note: the legacy viewer password has no multi-user equivalent — create a 'user' account instead");
+        }
+      } else {
+        console.error("warning: multi-user is on but no accounts exist — run `veritas user bootstrap --username <name> --password <pw>`");
+      }
+    }
+  }
   // Launch/stop/resume runs from the WebUI (the server spawns the CLI as a child process). --no-launch disables it.
   // Requires launching from the built CLI (dist/main.js); spawning isn't possible under tsx dev.
   const cliPath = process.argv[1] ?? "";
@@ -1546,16 +1574,17 @@ async function cmdServe(args: string[]): Promise<void> {
     host,
     ...(webRoot ? { webRoot } : {}),
     ...(authPasswords ? { authPasswords } : {}),
+    ...(usersDb ? { usersDb } : {}),
     ...(runLauncher ? { runLauncher } : {}),
     onLog: (m) => console.log(`  ${m}`),
   });
-  const authLabel = authPasswords ? (authPasswords.viewer ? ", 🔒 auth on (operator+viewer)" : ", 🔒 auth on (operator)") : "";
+  const authLabel = usersDb ? ", 🔒 multi-user auth" : authPasswords ? (authPasswords.viewer ? ", 🔒 auth on (operator+viewer)" : ", 🔒 auth on (operator)") : "";
   console.log(
     `veritas server: http://${host}:${srv.port}  (runs: ${runsDir}${webRoot ? "" : ", API/WS only"}${authLabel}${runLauncher ? ", ▶ launch on" : ""})`,
   );
   if (host === "0.0.0.0") {
     console.log("  ⚠ listening on all interfaces. from the LAN: http://<this-machine-ip>:" + srv.port + "/");
-    if (!authPasswords) console.log("  ⚠ exposed without auth. gate the WebUI with env VERDICT_WEB_PASSWORD (operator) [+ VERDICT_WEB_PASSWORD_VIEWER].");
+    if (!authPasswords && !usersDb) console.log("  ⚠ exposed without auth. gate the WebUI with env VERDICT_WEB_PASSWORD (operator) [+ VERDICT_WEB_PASSWORD_VIEWER], or enable --multi-user.");
   }
   console.log("Ctrl-C to stop");
   let stopping = false;
@@ -2583,6 +2612,63 @@ async function cmdRedteam(rawArgs: string[]): Promise<void> {
   }
 }
 
+// Multi-user account management for `serve`. All subcommands operate on the server-global
+// verdict-server.db beside the runs dir (--out selects which).
+async function cmdUser(args: string[]): Promise<void> {
+  const sub = args[0];
+  const { values } = parseArgs({
+    args: args.slice(1),
+    options: {
+      out: { type: "string" },
+      username: { type: "string" },
+      password: { type: "string" },
+      role: { type: "string" },
+      run: { type: "string" },
+      user: { type: "string" },
+      force: { type: "boolean" },
+    },
+  });
+  const db = UsersDb.open(usersDbPath(values.out ?? RUNS_DIR_DEFAULT));
+  try {
+    if (sub === "bootstrap") {
+      // Create the first admin. With --force also allowed when users exist (recovery path).
+      if (db.countUsers() > 0 && !values.force) fail("accounts already exist — use the admin UI or --force");
+      const username = values.username?.trim();
+      if (!username || !/^[a-zA-Z0-9_.-]{2,64}$/.test(username)) fail("--username required (2-64 chars of [a-zA-Z0-9_.-])");
+      const password = values.password ?? process.env.VERDICT_ADMIN_PASSWORD;
+      if (!password) fail("pass the bootstrap password via --password or env VERDICT_ADMIN_PASSWORD");
+      const policy = passwordPolicyError(password);
+      if (policy) fail(policy);
+      if (db.getUserByUsername(username)) fail(`user '${username}' already exists`);
+      const role = values.role === "user" ? "user" : "admin";
+      if (db.countActiveAdmins() === 0 && role !== "admin") fail("the first account must be an admin");
+      const u = db.createUser({ username, passwordHash: hashPassword(password), role });
+      db.audit({ actorId: u.id, actorName: u.username, action: "user_created", detail: "cli bootstrap" });
+      console.log(`created ${role} account '${u.username}' (id ${u.id}) — multi-user auth is active on the next \`veritas serve\``);
+      return;
+    }
+    if (sub === "list") {
+      for (const u of db.listUsers()) console.log(`${u.id}  ${u.username.padEnd(20)}  ${u.role.padEnd(6)}  ${u.status}  ${new Date(u.createdAt).toISOString()}`);
+      return;
+    }
+    if (sub === "reassign") {
+      // veritas user reassign --run <id> --user <username> — transfer an ownerless/other run to a user.
+      const runId = values.run?.trim();
+      const target = values.user?.trim();
+      if (!runId || !target) fail("--run <id> and --user <username> required");
+      const user = db.getUserByUsername(target);
+      if (!user) fail(`user '${target}' not found`);
+      db.setRunOwner(runId, user.id);
+      db.audit({ actorName: "cli", action: "run_reassigned", target: `run:${runId} user:${user.id}` });
+      console.log(`run ${runId} is now owned by ${user.username}`);
+      return;
+    }
+    fail("usage: veritas user bootstrap --username <name> [--password <pw>] | list | reassign --run <id> --user <name>");
+  } finally {
+    db.close();
+  }
+}
+
 async function main(): Promise<void> {
   // cwd の .env を自動ロード(shell の export が優先・未設定キーだけ反映)。BURP_* / VERITAS_BROWSER_PATH 等。
   const loadedEnv = loadDotEnv();
@@ -2620,6 +2706,9 @@ async function main(): Promise<void> {
       return;
     case "serve":
       await cmdServe(rest);
+      return;
+    case "user":
+      await cmdUser(rest);
       return;
     case "report":
       await cmdReport(rest);
