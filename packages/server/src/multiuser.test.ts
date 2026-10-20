@@ -221,11 +221,15 @@ test("run ownership: users see only their own; admin sees all; ownerless is admi
     assert.equal((await authed(r.url, admin, "/api/assessments/run-b")).status, 200);
     assert.equal((await authed(r.url, admin, "/api/assessments/run-old")).status, 200);
 
-    // control routes are owner-gated too — POST on another user's run → 404 (+ access_denied audit)
+    // control routes are owner-gated too — POST on another user's run → 404. Every denied access is
+    // audited regardless of method: the earlier GET probes (lines above) and this POST both recorded.
     const denied = await authed(r.url, alice, "/api/assessments/run-b/pause", { method: "POST" });
     assert.equal(denied.status, 404);
     const audit = r.db.listAudit();
-    assert.ok(audit.some((e) => e.action === "access_denied" && e.target === "run:run-b"));
+    const deniedGet = audit.filter((e) => e.action === "access_denied" && e.target === "run:run-b" && e.detail === "GET");
+    const deniedPost = audit.filter((e) => e.action === "access_denied" && e.target === "run:run-b" && e.detail === "POST");
+    assert.equal(deniedGet.length, 1); // exactly the GET probe from above
+    assert.equal(deniedPost.length, 1); // exactly this POST
   } finally {
     await r.close();
   }

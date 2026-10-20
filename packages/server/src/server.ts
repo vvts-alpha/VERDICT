@@ -841,12 +841,11 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptio
       }
       return;
     }
-    // Run-ownership gate — covers every /api/{assessments,run}/<id>/* route in one place.
+    // Run-ownership gate — covers every /api/{assessments,run}/<id>/* route in one place. Denials are
+    // audited on any method: GET probing (run-id enumeration) is exactly what the audit trail exists for.
     const runId = runIdFromUrl(url);
     if (runId && !canAccessRun(usersDb, principal, runId)) {
-      if (req.method === "POST") {
-        usersDb.audit({ actorId: principal.userId, actorName: principal.username, action: "access_denied", target: `run:${runId}`, ip: remoteIp(req) });
-      }
+      usersDb.audit({ actorId: principal.userId, actorName: principal.username, action: "access_denied", target: `run:${runId}`, ip: remoteIp(req), detail: req.method });
       sendJson(res, 404, { error: "assessment not found" });
       return;
     }
