@@ -916,7 +916,13 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, opts: ServerOptio
   }
   if (url === "/api/assessments") {
     const rows = listAssessments(opts.runsDir).map((r) => ({ ...r, running: supervisor?.isRunning(r.id) ?? false }));
-    const visible = usersDb && principal && principal.role !== "admin" ? rows.filter((r) => usersDb.ownedRunIds(principal.userId).has(r.id)) : rows;
+    const withOwner = usersDb
+      ? rows.map((r) => {
+          const ownerId = usersDb.getRunOwner(r.id);
+          return { ...r, owner: ownerId ? (usersDb.getUserById(ownerId)?.username ?? null) : null };
+        })
+      : rows;
+    const visible = usersDb && principal && principal.role !== "admin" ? withOwner.filter((r) => usersDb.ownedRunIds(principal.userId).has(r.id)) : withOwner;
     sendJson(res, 200, visible);
     return;
   }

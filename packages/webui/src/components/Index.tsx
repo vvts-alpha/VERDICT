@@ -24,6 +24,8 @@ interface Row {
   createdAt: string;
   updatedAt: string;
   running: boolean;
+  /** Owning account's username in multi-user mode; null when unassigned (admin-only visibility). */
+  owner?: string | null;
 }
 
 function targetName(t: TargetInput): string {
@@ -54,7 +56,7 @@ export function Index() {
   const [rows, setRows] = useState<Row[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [creating, setCreating] = useState<{ initial?: LaunchInput } | null>(null);
-  const { canWrite } = useRole();
+  const { canWrite, multiUser, user } = useRole();
 
   useEffect(() => {
     let alive = true;
@@ -125,6 +127,7 @@ export function Index() {
               <TableHead>Phase</TableHead>
               <TableHead className="text-right">Screens</TableHead>
               <TableHead className="text-right">Findings</TableHead>
+              {multiUser ? <TableHead>Owner</TableHead> : null}
               <TableHead>Updated</TableHead>
               <TableHead>ID</TableHead>
               <TableHead><span className="sr-only">Action</span></TableHead>
@@ -144,6 +147,11 @@ export function Index() {
                 <TableCell><Badge variant="outline" className={r.phase === "report" ? "border-success/40 text-success" : r.phase === "phase1_recon" || r.phase === "phase2_scan" ? "border-primary/40 text-primary" : "text-muted-foreground"}>{r.phase}</Badge></TableCell>
                 <TableCell className="text-right">{r.screens}</TableCell>
                 <TableCell className={r.findings > 0 ? "text-right font-semibold text-warning" : "text-right"}>{r.findings}</TableCell>
+                {multiUser ? (
+                  <TableCell className="font-mono text-muted-foreground">
+                    {r.owner ? (r.owner === user?.username ? `${r.owner} (you)` : r.owner) : "—"}
+                  </TableCell>
+                ) : null}
                 <TableCell className="text-muted-foreground">{fmt(r.updatedAt)}</TableCell>
                 <TableCell className="font-mono text-[11px] text-muted-foreground">{r.id}</TableCell>
                 <TableCell className="text-right" onClick={(e) => e.stopPropagation()}>

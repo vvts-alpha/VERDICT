@@ -2,7 +2,7 @@ import { useRef, useState } from "react";
 import type { ReactNode } from "react";
 import type { StateView } from "@veritas/core";
 import type { ConnState } from "../api";
-import { useRole } from "../api";
+import { signOut, useRole } from "../api";
 import { screenHonestyMap } from "./screen-status";
 import { Download, Pause, Play, Upload } from "lucide-react";
 import { Badge } from "./ui/badge";
@@ -120,7 +120,12 @@ export function StatusBarShell({
   actions?: ReactNode;
   exportMenu?: ReactNode;
 }) {
-  const { canWrite, authEnabled, role } = useRole();
+  const { canWrite, authEnabled, role, multiUser, user } = useRole();
+  const roleTitle = multiUser
+    ? `${user?.username ?? "account"} — ${role === "admin" ? "administrator" : "user"} (${user?.method ?? "session"})`
+    : canWrite
+      ? "operator — full access"
+      : "viewer — read-only";
   return (
     <header className="flex h-12 shrink-0 items-center gap-3 border-b border-border px-4 whitespace-nowrap">
       {crumbs}
@@ -131,14 +136,20 @@ export function StatusBarShell({
       {actions}
       {exportMenu}
       {authEnabled ? (
-        <Badge variant="outline" className={canWrite ? "border-primary/40 bg-primary/15 text-primary" : "text-muted-foreground"} title={canWrite ? "operator — full access" : "viewer — read-only"}>
-          {role}
+        <Badge variant="outline" className={canWrite ? "border-primary/40 bg-primary/15 text-primary" : "text-muted-foreground"} title={roleTitle}>
+          {multiUser && user ? `${user.username} · ${role}` : role}
         </Badge>
       ) : null}
       {authEnabled ? (
-        <a className="text-xs text-muted-foreground hover:text-foreground" href="/logout" title="sign out">
-          sign out
-        </a>
+        multiUser ? (
+          <button type="button" className="text-xs text-muted-foreground hover:text-foreground" onClick={() => void signOut(true)} title="sign out">
+            sign out
+          </button>
+        ) : (
+          <a className="text-xs text-muted-foreground hover:text-foreground" href="/logout" title="sign out">
+            sign out
+          </a>
+        )
       ) : null}
       {conn ? (
         <span className={conn === "open" ? "text-success" : conn === "connecting" ? "text-warning" : "text-destructive"}>● {paused ? "paused" : conn}</span>

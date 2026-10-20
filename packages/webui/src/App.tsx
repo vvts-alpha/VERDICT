@@ -19,12 +19,14 @@ import { Sessions } from "./components/Sessions";
 import { Chat } from "./components/Chat";
 import { Control } from "./components/Control";
 import { LiveView } from "./components/LiveView";
+import { Account } from "./components/Account";
+import { Users } from "./components/Users";
 import { Badge } from "./components/ui/badge";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "./components/ui/resizable";
 import { useDefaultLayout } from "react-resizable-panels";
 import {
   Bug, FileCode2, KeyRound, LayoutGrid, MessageSquare,
-  Monitor, Network, ScrollText, SlidersHorizontal, Video, Workflow,
+  Monitor, Network, ScrollText, SlidersHorizontal, UserRound, UsersRound, Video, Workflow,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
@@ -70,8 +72,12 @@ export function App() {
   const id = useAssessmentId();
   const { view, conn } = useStateView(id);
   const desktop = useDesktopShell();
-  const { authEnabled } = useRole();
+  const me = useRole();
+  const { authEnabled } = me;
   const desktopNode = desktop && desktop.view !== "main" ? desktop.views[desktop.view] : null;
+  // Account / Users open as overlay panes (same pattern as desktop views) — the assessment DOM stays
+  // mounted-but-hidden so tab/screen/tree state survives the round-trip.
+  const [pane, setPane] = useState<"account" | "users" | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>("screen");
   // Transient error toast for rejected/dropped control POSTs (they used to fail silently).
@@ -122,6 +128,14 @@ export function App() {
   const control = (path: string, label = "control") => () => ctl(label, postControl(`/api/assessments/${view!.id}/${path}`));
   // Leaving a desktop view goes through the shell — it can veto (e.g. unsaved Settings edits).
   const goMain = (): boolean => !desktop || desktop.view === "main" || desktop.onNavigate("main");
+  const openPane = (p: "account" | "users"): void => {
+    if (pane === p) {
+      setPane(null);
+      return;
+    }
+    if (!goMain()) return;
+    setPane(p);
+  };
   const navTo = (t: Tab): void => {
     if (!goMain()) return;
     setTab(t);
@@ -184,6 +198,21 @@ export function App() {
             {n.label}
           </button>
         ))}
+        {/* Account surfaces — multi-user serve mode only (no-auth and shared-password mode have no accounts). */}
+        {me.multiUser ? (
+          <span className="ml-auto flex items-center gap-1">
+            {me.canAdmin ? (
+              <button type="button" onClick={() => openPane("users")} aria-current={pane === "users" ? "page" : undefined} className={topNavCls(pane === "users")}>
+                <UsersRound className="size-4" />
+                Users
+              </button>
+            ) : null}
+            <button type="button" onClick={() => openPane("account")} aria-current={pane === "account" ? "page" : undefined} className={topNavCls(pane === "account")}>
+              <UserRound className="size-4" />
+              Account
+            </button>
+          </span>
+        ) : null}
       </nav>
 
       {/* Status row — stays visible during desktop panes (spec: compact run state must remain). No run →
@@ -203,7 +232,7 @@ export function App() {
       {/* Working area: [Site Tree | tabs + content]. A desktop pane covers this whole row; the assessment
           DOM stays mounted-but-hidden so selected tab/screen, tree expansion, and unsaved drafts persist. */}
       <div className="relative min-h-0 flex-1">
-        <div className={desktopNode ? "hidden" : "flex h-full min-h-0"}>
+        <div className={desktopNode || pane ? "hidden" : "flex h-full min-h-0"}>
           {view ? (
             <ResizablePanelGroup
               orientation="horizontal"
@@ -281,6 +310,11 @@ export function App() {
           )}
         </div>
         {desktopNode ? <div className="absolute inset-0 z-10 flex flex-col bg-background">{desktopNode}</div> : null}
+        {!desktopNode && pane ? (
+          <div className="absolute inset-0 z-10 flex flex-col overflow-auto bg-background">
+            {pane === "users" ? <Users /> : <Account />}
+          </div>
+        ) : null}
       </div>
       {notice ? (
         <div className="fixed right-4 bottom-4 z-50 max-w-[420px] rounded-lg border border-destructive bg-destructive/20 px-4 py-2 shadow-lg" role="alert">

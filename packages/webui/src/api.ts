@@ -31,15 +31,27 @@ export function useAssessmentId(): string | null {
   return new URLSearchParams(window.location.search).get("id");
 }
 
+export interface MeUser {
+  id: string;
+  username: string;
+  role: "admin" | "user";
+  method: "session" | "token";
+}
+
 export interface Me {
-  role: "operator" | "viewer";
+  role: "operator" | "viewer" | "admin" | "user";
   authEnabled: boolean;
+  /** Account-based auth (veritas serve --multi-user); user carries the signed-in account. */
+  multiUser?: boolean;
+  user?: MeUser;
 }
 
 let _mePromise: Promise<Me> | null = null;
 
-/** Your own role (/api/me). operator = full access / viewer = read-only. No-auth or a failed fetch is treated as operator (all actions allowed, as before). */
-export function useRole(): Me & { canWrite: boolean } {
+/** Your own identity (/api/me). operator = full access / viewer = read-only (shared-password mode);
+ *  admin/user = account roles (multi-user mode). No-auth or a failed fetch is treated as operator
+ *  (all actions allowed, as before). */
+export function useRole(): Me & { canWrite: boolean; canAdmin: boolean } {
   const [me, setMe] = useState<Me>({ role: "operator", authEnabled: false });
   useEffect(() => {
     let alive = true;
@@ -51,7 +63,31 @@ export function useRole(): Me & { canWrite: boolean } {
       alive = false;
     };
   }, []);
-  return { ...me, canWrite: me.role === "operator" };
+  return { ...me, canWrite: me.role !== "viewer", canAdmin: me.role === "admin" };
+}
+
+/** JSON call for the account/admin endpoints. Throws Error(server message) on non-2xx. */
+export async function apiCall<T>(path: string, method = "GET", body?: unknown): Promise<T> {
+  const r = await fetch(path, {
+    method,
+    ...(body !== undefined ? { headers: { "content-type": "application/json" }, body: JSON.stringify(body) } : {}),
+  });
+  const j = (await r.json().catch(() => null)) as (T & { error?: string }) | null;
+  if (!r.ok) throw new Error(j?.error ?? `HTTP ${r.status}`);
+  return j as T;
+}
+
+/** End the session and return to the login page. Multi-user revokes the server-side session via POST;
+ *  the legacy shared-password gate clears its cookie via GET /logout. */
+export async function signOut(multiUser: boolean): Promise<void> {
+  if (multiUser) {
+    try {
+      await fetch("/api/auth/logout", { method: "POST" });
+    } catch { /* navigate either way — the cookie is gone or the server is unreachable */ }
+    window.location.assign("/login");
+    return;
+  }
+  window.location.assign("/logout");
 }
 
 export function useStateView(id: string | null): { view: StateView | null; conn: ConnState } {
