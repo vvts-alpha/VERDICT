@@ -13,6 +13,8 @@ Burp 取り込みは下の「外部」を参照。
 
 診断ステージがこれらを撃つ。手法ステージの計画にクラス名が載ると、カバレッジゲートが消化を要求する（`headers` / `info-disclosure` / `misconfig` は計画強制から除外）。
 
+さらに、画面の構造シグナルから**決定的に注入される最低限クラス（plan-floor）**が同じゲートを通る — メソドロジーが書き忘れても、id を持つパラメータ → `idor`（+mutating API があると `idor-write`）、URL 値のパラメータ → `open-redirect` / `ssrf`、GraphQL の id 変数リーフ → 操作単位 `idor`、login 系パラメータ＋POST → `user-enumeration`、JWT 形状の値 → `session`、price/qty/file の `guessedType` → `price-tampering` / `qty-tampering` / `upload`、XML/SOAP 系エンドポイント → `xxe` が必ず消化対象になる。floor 由来のスロットは `tool: "plan-floor"` で記録され、計画由来と区別できる。LLM の計画は floor を縮められない（拡張のみ）。
+
 | category | 名前 | 確認の仕方 | 深刻度帯 |
 |---|---|---|---|
 | `xss-reflected` | 反射 XSS / DOM XSS | `probe_xss`: HTML に未エスケープで残る。SPA は `probe_dom_xss` で実ブラウザ実行。DOM も category は `xss-reflected` | low–medium |
@@ -37,8 +39,28 @@ Burp 取り込みは下の「外部」を参照。
 | `ssrf` | SSRF | in-band は `probe_ssrf`（IMDS / file:// / loopback の応答差）。blind は `probe_oob`（Interactsh または Collaborator） | medium–high |
 | `xxe` | XXE | `probe_upload`（in-band）または `probe_oob`（XML / アップロードに `{{OOB}}`） | high–critical |
 
-追加の専用プローブとして `probe_nosql`（NoSQL 演算子・時間差）、`probe_cors`（Origin 反射と資格情報許可）、
-`probe_proto`（注入後の応答マーカー）が実装されている。これらの存在は対象全体の網羅や実害の自動証明を意味しない。
+追加の専用プローブ（確認まで機械化）:
+
+| probe | 対象 | 確認の仕方 |
+|---|---|---|
+| `probe_nosql` | NoSQL インジェクション | 演算子差・時間差 |
+| `probe_cors` | CORS 誤設定 | Origin 反射と資格情報許可の組合せ |
+| `probe_proto` | プロトタイプ汚染 | 注入後の応答マーカー |
+| `probe_parser` | パーサ差異 | content-type/charset/duplicate-key の解釈差 |
+| `probe_xxe` | XXE（in-band） | DOCTYPE/ENTITY が応答に実体化 |
+| `probe_websocket` | WebSocket 認証/Origin/CSWSH | raw Upgrade 3脚（legit/別Origin/無認証）＋双方向 echo 確認 |
+| `probe_cache` | キャッシュ・デセプション | 静的suffix で非公開 body を公開キーに保存させる |
+| `probe_cache_poison` | キャッシュ・ポイズニング | unkeyed ヘッダが応答に反射しキャッシュされる（自キーのみ） |
+| `probe_method_bypass` | verb tunneling / メソッド別認可差 | 同一リクエストを別メソッドで送りメソッド行列を作る |
+| `probe_rate_limit` | レート制限の欠如 | 上限付きバーストで 429/423/Retry-After/CAPTCHA を測定（執行が観測されたら coverage として報告、DoS にならないよう bounded） |
+| `probe_host_header` | Host/X-Forwarded-Host 信頼 | 注入ホストが応答にエコー（reset リンク生成・canonical 生成・cache key） |
+| `probe_crlf` | CRLF インジェクション / レスポンス分割 | `%0d%0a`・overlong エンコード等で注入ヘッダが実ヘッダ化 |
+| `probe_smuggling` | HTTP リクエストスマグリング | CL-vs-TE 不一致を安全なタイムアウトオラクルで検出（queue poisoning なし・socket に迷子バイトを残さない） |
+| `probe_oauth` | OAuth/OIDC authorize URL | state 欠落・implicit flow・nonce 欠落を静的監査＋redirect_uri 改竄の手動リダイレクト検証 |
+| `analyze_saml` | SAML 署名/アルゴリズム | assertion/response の署名・暗号・弱いアルゴリズムを受動監査（リプレイしない） |
+| `probe_deser` | デシリアライズ受容面 | フォーマット別 probe（Java マジック/PHP `O:`/`__VIEWSTATE`）で「シリアル化オブジェクトを消費するか」を検出 — gadget chain は送らない |
+
+これらの存在は対象全体の網羅や実害の自動証明を意味しない。
 
 `probe_params` はリード生成。確認は上のプローブへ。
 
@@ -61,7 +83,7 @@ GraphQL エンドポイントは専用プローブで診断される（同一 `P
 | category | 名前 | どう検出するか |
 |---|---|---|
 | `misconfig` | 設定不備 | シグネチャが弱い。専用にしない |
-| `rate-limit` | レート制限の欠如 | 連打は DoS になるので専用にしない |
+| `rate-limit` | レート制限の欠如 | `probe_rate_limit` が bounded バーストで測定（認証系画面のみ・執行観測時は coverage として報告）。無制限連打はしない |
 | `vulnerable-component` | 既知脆弱コンポーネント | `fingerprint_scan` + `cve_lookup`（別ステージ）。**版が取れた**コンポーネントだけ。版なしバナー（`Server: BigIP` など）＋ファミリーの CVE 履歴は対象外 |
 | `other` | その他 | 常用しない |
 
@@ -109,9 +131,9 @@ Cookie の予測可能性は `analyze_session` がライブの 1 リクエスト
 ## 7. 検出対象にしていないもの（明示）
 
 - GraphQL の残る制限は §1 の「GraphQL」節を参照（メタ面・操作認可・変数置換は対象内、深度/コスト/subscription/フェデレーション/batching実害は対象外）
-- HTTP リクエストスマグリング / キャッシュポイズニング
-- 本格デシリアライズ
+- 本格デシリアライズ（gadget chain の生成・RCE 化）— `probe_deser` は「シリアライズを消費する受容面」の検出まで
 - デフォルト認証情報の辞書ログイン
+- HTTP リクエストスマグリングの**実害確認**（queue poisoning・他人リクエスト横取り）— `probe_smuggling` はタイムアウトオラクルでの desync 検出まで（安全側設計）
 
 残作業は [`CHECKLIST.md`](CHECKLIST.md)。
 

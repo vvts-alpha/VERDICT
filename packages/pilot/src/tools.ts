@@ -1252,14 +1252,115 @@ function writePlanSlots(s: PilotSession, screenId: string, vulnClasses: string[]
 }
 
 /** Plans written before this ledger existed (or on a resumed run) have no slot rows — materialize them
- *  on demand at screen_done so legacy plans are still bound to concrete slots. */
+ *  on demand at screen_done so legacy plans are still bound to concrete slots. The deterministic floor
+ *  is (re)written after plan materialization — it is idempotent via checkKey dedup. */
 function ensurePlanSlots(s: PilotSession, screenId: string): void {
-  if (s.store.checks(s.assessmentId).some((c) => c.screenId === screenId && c.status === "planned")) return;
-  const plan = s.plans.get(screenId);
-  if (!plan) return;
-  const m = /^classes=\[([^\]]*)\]/.exec(plan);
-  if (!m) return;
-  writePlanSlots(s, screenId, (m[1] ?? "").split(",").map((x) => x.trim()).filter(Boolean));
+  const rows = s.store.checks(s.assessmentId).filter((c) => c.screenId === screenId);
+  // Materialize legacy plan slots only when no methodology-derived plan rows exist (floor rows are
+  // status "planned" too, so they must not count as methodology coverage here).
+  if (!rows.some((c) => c.status === "planned" && c.tool !== "plan-floor")) {
+    const plan = s.plans.get(screenId);
+    if (plan) {
+      const m = /^classes=\[([^\]]*)\]/.exec(plan);
+      if (m) writePlanSlots(s, screenId, (m[1] ?? "").split(",").map((x) => x.trim()).filter(Boolean));
+    }
+  }
+  writeFloorSlots(s, screenId);
+}
+
+// ───────────────────────── deterministic plan FLOOR ─────────────────────────
+// Signal-driven MINIMUM attack classes, written as bounded plan slots alongside the LLM methodology.
+// The model's plan can only EXPAND coverage; it can never shrink the floor — a screen whose plan omits
+// a structurally-indicated class still has to account for it at screen_done. Provenance: floor rows
+// carry tool "plan-floor" so the ledger/report shows exactly what the methodology itself missed.
+// Signals are deliberately HIGH-PRECISION (object refs, URL-valued params, typed money/secrets, upload
+// and auth-entry surfaces) — NOT "every param gets sqli", which would turn the floor into a cost blowup.
+
+/** Signal token sets — matched against the param name split into tokens (snake/camel/brackets), so
+ *  "download"/"resource"/"payload" never substring-match a fetch signal. */
+const FLOOR_TOKENS = {
+  redirect: new Set(["next", "redirect", "redir", "return", "returnto", "continue", "dest", "destination", "goto", "forward", "back"]),
+  fetch: new Set(["url", "uri", "link", "href", "callback", "webhook", "feed", "fetch", "image", "img", "avatar", "src", "endpoint", "proxy", "import"]),
+  login: new Set(["user", "username", "login", "email", "mail", "account", "password", "passwd", "pwd"]),
+} as const;
+function paramTokens(name: string): string[] {
+  return name
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2") // camelCase → tokens
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+}
+const paramHas = (p: Param, set: ReadonlySet<string>): boolean => paramTokens(p.name).some((t) => set.has(t));
+
+const FLOOR_JWT_EXAMPLE_RE = /^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$/;
+const FLOOR_XML_API_RE = /\.(xml|asmx|svc|ashx|wsdl)\b|\/soap/i;
+const MUTATING_METHOD_RE = /^(POST|PUT|PATCH|DELETE)$/i;
+
+/** Hard cap on floor rows per screen — bounded like plan slots; the floor must never become an
+ *  unbounded sweep. Signals are sparse by design so this is a safety valve, not a normal limit. */
+const MAX_FLOOR_SLOTS_PER_SCREEN = 16;
+
+/** Build the deterministic floor rows for a screen (pure — no store writes). Each row is a bounded
+ *  param- or target-scoped plan slot carrying tool "plan-floor". */
+export function floorRowsFor(s: PilotSession, sc: Screen): CheckExecution[] {
+  const rows: CheckExecution[] = [];
+  const floor = (checkClass: string, target: string, param?: string): void => {
+    const row = makePlanRow(sc.screenId, checkClass, target, param);
+    row.tool = "plan-floor";
+    rows.push(row);
+  };
+
+  // Object references → authorization testing. Reads always; writes only when a mutating surface exists.
+  const idParams = idBearingParamLocs(sc.params);
+  const gqlLeaves: Array<{ a: ApiCall; leaf: { pointer: string } }> = [];
+  for (const a of sc.apis) {
+    if (!a.graphql) continue;
+    for (const leaf of graphqlIdLeafPaths(a.graphql.variablesExample)) gqlLeaves.push({ a, leaf });
+  }
+  if (idParams.length > 0 || gqlLeaves.length > 0) {
+    const mutating = sc.apis.some((a) => MUTATING_METHOD_RE.test(a.method));
+    for (const p of idParams) floor("idor", "*", p.name);
+    for (const { a, leaf } of gqlLeaves) floor("idor", checkTargetOf(a.method, a.urlTemplate, s.targetUrl, a.graphql!.operationKey), leaf.pointer);
+    if (mutating) {
+      for (const p of idParams) floor("idor-write", "*", p.name);
+      for (const { a, leaf } of gqlLeaves) floor("idor-write", checkTargetOf(a.method, a.urlTemplate, s.targetUrl, a.graphql!.operationKey), leaf.pointer);
+    }
+  }
+
+  const mutating = sc.apis.some((a) => MUTATING_METHOD_RE.test(a.method));
+  for (const p of sc.params) {
+    if (p.in === "header") continue;
+    if (paramHas(p, FLOOR_TOKENS.redirect)) floor("open-redirect", "*", p.name);
+    // URL-valued params are server-side fetch candidates; object ids are covered by idor instead.
+    if (paramHas(p, FLOOR_TOKENS.fetch) && p.guessedType !== "id" && p.guessedType !== "object_ref") floor("ssrf", "*", p.name);
+    if (paramHas(p, FLOOR_TOKENS.login) && mutating) floor("user-enumeration", "*", p.name);
+    if (FLOOR_JWT_EXAMPLE_RE.test(p.example)) floor("session", "*", p.name);
+    if (p.guessedType === "price") floor("price-tampering", "*", p.name);
+    if (p.guessedType === "qty") floor("qty-tampering", "*", p.name);
+    if (p.guessedType === "file") floor("upload", "*", p.name);
+  }
+
+  // XML/SOAP-shaped endpoints → XXE surface.
+  for (const a of sc.apis)
+    if (FLOOR_XML_API_RE.test(a.urlTemplate)) floor("xxe", checkTargetOf(a.method, a.urlTemplate, s.targetUrl, a.graphql?.operationKey));
+
+  const dedup = new Map(rows.map((r) => [r.id, r]));
+  return [...dedup.values()].slice(0, MAX_FLOOR_SLOTS_PER_SCREEN);
+}
+
+/** Persist the floor for a screen. Any slot a plan/execution row already covers (same checkKey) is
+ *  left untouched — methodology provenance wins, and a floor write can never clobber a real outcome. */
+function writeFloorSlots(s: PilotSession, screenId: string): number {
+  const sc = s.inv.screens().find((x) => x.screenId === screenId);
+  if (!sc) return 0;
+  const existing = new Set(s.store.checks(s.assessmentId).filter((c) => c.screenId === screenId).map((c) => c.id));
+  let wrote = 0;
+  for (const row of floorRowsFor(s, sc)) {
+    if (existing.has(row.id)) continue;
+    s.store.upsertCheck(s.assessmentId, row);
+    wrote += 1;
+  }
+  return wrote;
 }
 
 /** screen_done coverage gate (pure). Requires that coverage accounts for every planned attack class, and that
@@ -2008,6 +2109,7 @@ const GENERIC_PROBE_CLASS: Record<string, string | ((a: Record<string, unknown>)
   probe_nosql: "nosql",
   probe_cmdi: "rce",
   probe_traversal: "path-traversal",
+  probe_xxe: "xxe",
   probe_redirect: "open-redirect",
   probe_cors: "cors-misconfig",
   probe_proto: "prototype-pollution",
@@ -2360,12 +2462,14 @@ export function buildTools(s: PilotSession) {
         const ids = new Set(s.inv.screens().map((sc) => sc.screenId));
         if (plans.some((p) => !ids.has(p.screenId)) || new Set(plans.map((p) => p.screenId)).size !== plans.length)
           return txt("REJECTED: use distinct mapped screenIds from get_inventory. No plans were changed.");
+        let floors = 0;
         for (const { screenId, vulnClasses, plan } of plans) {
           s.store.appendEvent(s.assessmentId, { type: "methodology_recorded", payload: { screenId, vulnClasses, plan } });
           s.plans.set(screenId, `classes=[${vulnClasses.join(",")}] ${plan}`);
           writePlanSlots(s, screenId, vulnClasses); // persist the bounded per-(target,param) check slots
+          floors += writeFloorSlots(s, screenId); // deterministic minimum coverage the plan can't shrink
         }
-        return txt(`planned ${plans.length} screens (${s.plans.size}/${ids.size} screens planned)`);
+        return txt(`planned ${plans.length} screens (${s.plans.size}/${ids.size} screens planned${floors ? `, +${floors} floor slot(s)` : ""})`);
       },
     ),
     tool(
@@ -2382,11 +2486,12 @@ export function buildTools(s: PilotSession) {
         s.store.appendEvent(s.assessmentId, { type: "methodology_recorded", payload: { screenId, vulnClasses, plan } });
         s.plans.set(screenId, `classes=[${vulnClasses.join(",")}] ${plan}`);
         const slots = writePlanSlots(s, screenId, vulnClasses); // persist the bounded per-(target,param) check slots
+        const floors = writeFloorSlots(s, screenId); // deterministic minimum coverage the plan can't shrink
         s.store.appendEvent(s.assessmentId, {
           type: "note",
-          payload: { message: `📋 PLAN ${screenId}: [${vulnClasses.join(",")}] ${plan.slice(0, 200)}${slots ? ` — ${slots} check slot(s)` : ""}` },
+          payload: { message: `📋 PLAN ${screenId}: [${vulnClasses.join(",")}] ${plan.slice(0, 200)}${slots ? ` — ${slots} check slot(s)` : ""}${floors ? ` +${floors} floor` : ""}` },
         });
-        return txt(`planned ${screenId} (${s.plans.size}/${s.inv.screens().length} screens planned)`);
+        return txt(`planned ${screenId} (${s.plans.size}/${s.inv.screens().length} screens planned${floors ? `, +${floors} floor slot(s)` : ""})`);
       },
     ),
     tool(
@@ -2418,6 +2523,13 @@ export function buildTools(s: PilotSession) {
             plan: s.plans.get(sc.screenId) ?? "(no recorded plan — use judgement)",
             // The checklist that must be worked through. screen_done requires coverage of each class (prevents stopping after the first find).
             plannedClasses: plannedClassesFor(s.plans.get(sc.screenId)),
+            // Deterministic floor slots (tool "plan-floor") — signal-derived minimum coverage the
+            // methodology can't shrink. Each outstanding slot also needs an execution row or an
+            // honest-gap coverage entry at screen_done, exactly like plan slots.
+            floorSlots: s.store
+              .checks(s.assessmentId)
+              .filter((c) => c.screenId === sc.screenId && c.tool === "plan-floor")
+              .map((c) => ({ class: c.checkClass, target: c.target, param: c.param, status: c.status })),
             currentRole: s.currentRole || "unauth",
             rolesAvailable: availableRoles(s),
             knownObjectIds: knownObjectIds(s),

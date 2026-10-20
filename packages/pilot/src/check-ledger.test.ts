@@ -150,7 +150,12 @@ test("a recorded finding satisfies its own slot via the ledger (not via note tex
   assert.match(msg, /NOT DONE/, `remaining slots still gate: ${msg}`);
   const r2 = await run(s, "screen_done", {
     verdict: "finding",
-    coverage: [{ class: "sqli", result: "found" }, { class: "sqli", result: "not-applicable", note: "q was the only injectable param; id/uid are pure numeric routing" }],
+    coverage: [
+      { class: "sqli", result: "found" },
+      { class: "sqli", result: "not-applicable", note: "q was the only injectable param; id/uid are pure numeric routing" },
+      // Deterministic floor slots (idor on the id/uid object refs) hold the same gate as plan slots.
+      { class: "idor", result: "not-applicable", note: "id/uid are single-tenant routing ids — no secondary principal exists to cross-check" },
+    ],
   });
   // id/uid get honest gap rows → close succeeds, finding row preserved.
   assert.match(String(r2.raw ?? JSON.stringify(r2)), /^screen s-0001/);
