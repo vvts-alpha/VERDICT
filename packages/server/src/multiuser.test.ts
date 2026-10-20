@@ -271,7 +271,7 @@ test("run creation records the owner (spawned via a fake CLI)", async () => {
   }
 });
 
-test("admin API: list + create only; management mutations stay host-local (CLI)", async () => {
+test("admin API: user CRUD, role/status changes, reset-password, audit; last admin protected", async () => {
   const r = await rig();
   try {
     const admin = (await login(r.url, "admin", PW.admin)).cookie;
@@ -296,14 +296,47 @@ test("admin API: list + create only; management mutations stay host-local (CLI)"
     assert.equal(dup.status, 409);
     assert.equal((await login(r.url, "carol", "carol-password-1")).status, 200);
 
-    // The mutation routes do not exist over HTTP — role/status/resets are `veritas user …` on the host.
+    // PATCH: role/status/display-name changes apply; non-admin session dies on disable.
+    const carolId = r.db.getUserByUsername("carol")!.id;
+    const carolSession = (await login(r.url, "carol", "carol-password-1")).cookie;
+    const patched = await authed(r.url, admin, `/api/admin/users/${carolId}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ status: "disabled" }),
+    });
+    assert.equal(patched.status, 200);
+    assert.equal((await authed(r.url, carolSession, "/api/me")).status, 401); // sessions revoked on disable
+    assert.equal((await authed(r.url, alice, `/api/admin/users/${carolId}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: "{}" })).status, 403);
+
+    // Last active admin cannot be demoted or disabled over HTTP either.
     const adminId = r.db.getUserByUsername("admin")!.id;
-    assert.equal(
-      (await authed(r.url, admin, `/api/admin/users/${adminId}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ role: "user" }) })).status,
-      404,
-    );
-    assert.equal((await authed(r.url, admin, `/api/admin/users/${adminId}/reset-password`, { method: "POST" })).status, 404);
-    assert.equal((await authed(r.url, admin, "/api/admin/audit")).status, 404);
+    for (const body of [{ role: "user" }, { status: "disabled" }]) {
+      const res = await authed(r.url, admin, `/api/admin/users/${adminId}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      assert.equal(res.status, 409);
+    }
+
+    // reset-password issues a one-time temp and kills existing sessions.
+    const aliceId = r.db.getUserByUsername("alice")!.id;
+    const reset = await authed(r.url, admin, `/api/admin/users/${aliceId}/reset-password`, { method: "POST" });
+    assert.equal(reset.status, 200);
+    const { temporaryPassword } = (await reset.json()) as { temporaryPassword: string };
+    assert.ok(temporaryPassword.length > 10);
+    const alice2 = (await login(r.url, "alice", temporaryPassword));
+    assert.equal(alice2.status, 200);
+    assert.equal((await authed(r.url, alice, "/api/me")).status, 401); // prior session dead
+
+    // Audit log is admin-only and records the mutations (never secrets).
+    assert.equal((await authed(r.url, alice2.cookie, "/api/admin/audit")).status, 403);
+    const audit = (await (await authed(r.url, admin, "/api/admin/audit")).json()) as Array<{ action: string; target?: string | null; detail?: string | null }>;
+    const actions = audit.map((a) => a.action);
+    assert.ok(actions.includes("user_created"));
+    assert.ok(actions.includes("user_updated"));
+    assert.ok(actions.includes("password_reset"));
+    assert.ok(audit.every((a) => !(a.detail ?? "").includes(temporaryPassword)));
   } finally {
     await r.close();
   }
