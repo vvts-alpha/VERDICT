@@ -104,6 +104,38 @@ test("runOpenAiAgentLoop drives tool handlers, refuses out-of-allowlist tools, a
     assert.equal(refusals.length, 2, "both bash and danger were refused, not executed");
 });
 
+test("runOpenAiAgentLoop echoes reasoning_content back on the assistant message (DeepSeek-thinking providers 400 without it)", async () => {
+    let done = false;
+    const bodies: string[] = [];
+    const tools: PilotToolDef[] = [
+        { name: "probe", description: "p", inputSchema: {}, handler: async () => ({ content: [{ type: "text", text: "r" }] }) },
+        { name: "fin", description: "finish", inputSchema: {}, handler: async () => { done = true; return { content: [{ type: "text", text: "done" }] }; } },
+    ];
+    let turn = 0;
+    const fetchImpl: FetchLike = async (_u, init) => {
+        bodies.push(String(init.body));
+        turn += 1;
+        if (turn === 1) {
+            return new Response(
+                JSON.stringify({
+                    choices: [{ message: { content: "thinking out loud", reasoning_content: "chain-of-thought-blob", tool_calls: [toolCall("c1", "probe", {})] } }],
+                    usage: { total_tokens: 10 },
+                }),
+                { status: 200, headers: { "content-type": "application/json" } },
+            );
+        }
+        return assistantWithTools([toolCall("c2", "fin", {})]);
+    };
+    const res = await runOpenAiAgentLoop({
+        baseURL: "http://x/v1", model: "m", system: "s", goal: "g",
+        tools, allowed: ["probe", "fin"], maxTurns: 5, shouldStop: () => done, fetchImpl,
+    });
+    assert.equal(res.stopped, "shouldStop");
+    const secondReq = JSON.parse(bodies[1]!) as { messages: Array<{ role: string; reasoning_content?: unknown }> };
+    const assistant = secondReq.messages.find((m) => m.role === "assistant");
+    assert.equal(assistant?.reasoning_content, "chain-of-thought-blob", "reasoning_content round-trips into the next request");
+});
+
 test("runOpenAiAgentLoop tolerates endpoint variance: object arguments, content-part arrays, and missing tool_call ids", async () => {
     const seen: Array<Record<string, unknown>> = [];
     const texts: string[] = [];

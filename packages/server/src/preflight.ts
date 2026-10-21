@@ -33,9 +33,12 @@ const defaults: PreflightDependencies = {
 /** Check the selected provider and local tools. Never submit a scan or send target data. */
 export async function checkReadiness(env: NodeJS.ProcessEnv, burpScan: boolean, deps: PreflightDependencies = defaults): Promise<ReadinessCheck[]> {
   const checks: ReadinessCheck[] = [];
-  const check = async (name: string, action: () => Promise<string>, failure: string): Promise<void> => {
+  const check = async (name: string, action: () => Promise<string>, failure: string | ((error: unknown) => string)): Promise<void> => {
     try { checks.push({ name, status: "ok", message: await action() }); }
-    catch (error) { checks.push({ name, status: "error", message: readinessFailure(error, failure, name === "Burp scanner") }); }
+    catch (error) {
+      const message = typeof failure === "function" ? failure(error) : readinessFailure(error, failure, name === "Burp scanner");
+      checks.push({ name, status: "error", message });
+    }
   };
   const checkedModels = new Map<string, ReadinessCheck>();
   for (const [tier, model] of [["Deep model", env.VERDICT_LLM_MODEL], ["Light model", env.VERDICT_LLM_FAST_MODEL]] as const) {
@@ -52,7 +55,12 @@ export async function checkReadiness(env: NodeJS.ProcessEnv, burpScan: boolean, 
     }, "Test request failed. Check the provider, model name, credentials, quota, and connectivity.");
     if (cfg.model) checkedModels.set(cfg.model, checks.at(-1)!);
   }
-  await check("Automation browser", async () => { await deps.browser(env); return "Browser launched and closed successfully"; }, "Could not launch the browser. Install Chrome/Edge or correct the Chromium path in Network settings.");
+  // Browser launch errors are local (Playwright spawn/profile/EPERM) — safe to surface, unlike provider bodies which may echo credentials.
+  await check("Automation browser", async () => { await deps.browser(env); return "Browser launched and closed successfully"; }, (error) => {
+    const base = "Could not launch the browser. Install Chrome/Edge or correct the Chromium path in Network settings.";
+    const first = (error instanceof Error ? error.message : String(error)).split("\n").map((l) => l.trim()).find(Boolean);
+    return first && first.length <= 240 ? `${base} (${first})` : base;
+  });
   const read = async (path: string, token?: string): Promise<Response> => {
     const u = new URL(path);
     if (!["http:", "https:"].includes(u.protocol)) throw new Error("invalid URL");

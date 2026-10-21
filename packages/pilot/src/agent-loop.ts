@@ -84,7 +84,7 @@ const AGENT_PREAMBLE =
 
 
 interface ChatResponse {
-    choices?: Array<{ message?: { content?: unknown; tool_calls?: ToolCall[] }; finish_reason?: string }>;
+    choices?: Array<{ message?: { content?: unknown; tool_calls?: ToolCall[]; reasoning_content?: unknown }; finish_reason?: string }>;
     usage?: { total_tokens?: number; prompt_tokens?: number; completion_tokens?: number };
     error?: { message?: string } | string;
 }
@@ -286,7 +286,13 @@ async function runNativeMode(p: OpenAiLoopParams, byName: ToolMap): Promise<Open
         }
         const msg = resp.choices?.[0]?.message ?? {};
         const toolCalls = (msg.tool_calls ?? []).map((tc, i) => ({ ...tc, id: tc.id ?? `call_${iter}_${i}` }));
-        messages.push({ role: "assistant", content: (msg.content as unknown) ?? null, ...(toolCalls.length ? { tool_calls: toolCalls } : {}) });
+        messages.push({
+            role: "assistant",
+            content: (msg.content as unknown) ?? null,
+            ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
+            // Reasoning-model providers (e.g. DeepSeek thinking) reject follow-up requests that drop reasoning_content — echo it back verbatim.
+            ...(msg.reasoning_content !== undefined ? { reasoning_content: msg.reasoning_content } : {}),
+        });
         const assistantText = contentToString(msg.content).trim();
         if (assistantText) {
             turns += 1;
@@ -341,8 +347,9 @@ async function runTextMode(p: OpenAiLoopParams, byName: ToolMap): Promise<OpenAi
         if (resp.choices?.[0]?.finish_reason === "length") {
             return { turns, stopped: "error", error: "Model response exceeded the reserved output budget; unfinished work must pause.", contextFailure: true };
         }
-        const content = contentToString(resp.choices?.[0]?.message?.content).trim();
-        messages.push({ role: "assistant", content });
+        const msg = resp.choices?.[0]?.message;
+        const content = contentToString(msg?.content).trim();
+        messages.push({ role: "assistant", content, ...(msg?.reasoning_content !== undefined ? { reasoning_content: msg.reasoning_content } : {}) });
         // Parse a {tool,args} action from the content (extractJson tolerates fences / surrounding prose).
         let action: AgentAction | null = null;
         try {

@@ -24,6 +24,16 @@ test("failures remain separate, never expose credentials, and do not prevent oth
   assert.ok(!JSON.stringify(result).includes("secret-token"));
 });
 
+test("browser launch failures surface the underlying local error (it cannot echo provider credentials)", async () => {
+  const result = await checkReadiness(env, false, {
+    model: async () => {}, browser: async () => { throw new Error("browserType.launchPersistentContext: EPERM operation not permitted"); }, fetch,
+  });
+  const browser = result.find((c) => c.name === "Automation browser");
+  assert.equal(browser?.status, "error");
+  assert.match(browser!.message, /Could not launch the browser/);
+  assert.match(browser!.message, /EPERM/, "the real launch error is visible to the operator");
+});
+
 test("same model is checked once; serial Burp compatibility is read-only and authenticated", async () => {
   let models = 0;
   const paths: string[] = [];

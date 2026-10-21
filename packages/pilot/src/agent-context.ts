@@ -11,6 +11,8 @@ export interface ChatMessage {
     content: unknown;
     tool_calls?: ToolCall[];
     tool_call_id?: string;
+    /** Thinking/reasoning blocks some providers (DeepSeek/Claude-via-proxy) emit and REQUIRE echoed back in the next request. */
+    reasoning_content?: unknown;
 }
 
 export interface ContextUsage {
