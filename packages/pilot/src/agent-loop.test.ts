@@ -136,6 +136,31 @@ test("runOpenAiAgentLoop echoes reasoning_content back on the assistant message 
     assert.equal(assistant?.reasoning_content, "chain-of-thought-blob", "reasoning_content round-trips into the next request");
 });
 
+test("runOpenAiAgentLoop injects a placeholder reasoning_content on tool-call turns that emitted none (DeepSeek strict channels 400 otherwise)", async () => {
+    let done = false;
+    const bodies: string[] = [];
+    const tools: PilotToolDef[] = [
+        { name: "probe", description: "p", inputSchema: {}, handler: async () => ({ content: [{ type: "text", text: "r" }] }) },
+        { name: "fin", description: "finish", inputSchema: {}, handler: async () => { done = true; return { content: [{ type: "text", text: "done" }] }; } },
+    ];
+    let turn = 0;
+    const fetchImpl: FetchLike = async (_u, init) => {
+        bodies.push(String(init.body));
+        turn += 1;
+        // Turn 1: a tool-call turn with NO reasoning_content (the upstream-emits-zero-reasoning case).
+        if (turn === 1) return assistantWithTools([toolCall("c1", "probe", {})]);
+        return assistantWithTools([toolCall("c2", "fin", {})]);
+    };
+    const res = await runOpenAiAgentLoop({
+        baseURL: "http://x/v1", model: "m", system: "s", goal: "g",
+        tools, allowed: ["probe", "fin"], maxTurns: 5, shouldStop: () => done, fetchImpl,
+    });
+    assert.equal(res.stopped, "shouldStop");
+    const secondReq = JSON.parse(bodies[1]!) as { messages: Array<{ role: string; reasoning_content?: unknown }> };
+    const assistant = secondReq.messages.find((m) => m.role === "assistant");
+    assert.equal(assistant?.reasoning_content, "(reasoning not emitted)", "a tool-call turn that emitted no reasoning still carries the field on replay");
+});
+
 test("runOpenAiAgentLoop tolerates endpoint variance: object arguments, content-part arrays, and missing tool_call ids", async () => {
     const seen: Array<Record<string, unknown>> = [];
     const texts: string[] = [];

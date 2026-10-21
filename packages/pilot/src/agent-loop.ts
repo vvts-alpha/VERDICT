@@ -145,11 +145,20 @@ async function chatCompletion(
 ): Promise<ChatResponse> {
     const doFetch: FetchLike = p.fetchImpl ?? (fetch as FetchLike);
     const url = chatCompletionsUrl(p.baseURL);
+    // DeepSeek thinking-mode upstreams REQUIRE reasoning_content on every tool-call assistant turn; relayed through
+    // OpenCode Go this surfaces intermittently (strict vs lenient upstream channels). Occasionally the model itself
+    // emits a tool-call turn with zero reasoning (reasoning_tokens:0) — replaying it bare makes EVERY later request
+    // 400 with "reasoning_content in the thinking mode must be passed back". Inject a placeholder so the invariant
+    // holds by construction; other providers ignore the unknown field.
+    const patched = messages.map((m) =>
+        m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length > 0 && !m.reasoning_content
+            ? { ...m, reasoning_content: "(reasoning not emitted)" }
+            : m);
     let lastErr = "";
     for (let attempt = 0; attempt < 3; attempt++) {
         if (p.shouldStop()) throw new Error("Stage stopped before model request");
         const limitField = completionLimitFields.get(p) ?? "max_tokens";
-        const body = JSON.stringify({ model: p.model, messages, ...(maxTokens ? { [limitField]: maxTokens } : {}), ...(tools && tools.length ? { tools, tool_choice: "auto" } : {}) });
+        const body = JSON.stringify({ model: p.model, messages: patched, ...(maxTokens ? { [limitField]: maxTokens } : {}), ...(tools && tools.length ? { tools, tool_choice: "auto" } : {}) });
         const ac = new AbortController();
         const timer = setTimeout(() => ac.abort(), p.timeoutMs ?? 180_000);
         try {
