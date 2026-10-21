@@ -853,7 +853,12 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     // loop instead of the Claude Agent SDK. The stage allowlist (p.allowed) is the locked toolbox — enforced by the loop.
     if (useOpenAi) {
       let lastContextBand = -1;
-      const res = await runOpenAiAgentLoop({
+      // Stage-level retry: a transient provider failure (relay routing, 429/5xx, network, strict-channel junk) must
+      // NOT pause the run — retry the stage a few times with backoff first. Context failures are structural, not
+      // transient, so they fall straight through to the pause path.
+      const isTransientStageError = (e?: string): boolean =>
+        !!e && /timeout|ECONNRESET|ETIMEDOUT|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|HTTP (429|5\d\d)|overload|rate.?limit|upstream|reasoning_content|invalid_request|temporar|unavailable|busy|failed after retries/i.test(e);
+      const loopArgs = {
         baseURL: llmCfg.baseURL!,
         ...(llmCfg.apiKey ? { apiKey: llmCfg.apiKey } : {}),
         model: p.model ?? deepModel ?? llmCfg.model!, // under openai llmCfg.model is guaranteed (checked at startup)
@@ -884,14 +889,23 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
           opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message } });
         },
         mode: llmToolMode,
-        onText: (t) => {
+        onText: (t: string) => {
           opts.onText?.(t);
           opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: t.slice(0, 400) } });
         },
-        onToolUse: (n, i) => opts.onTool?.(n, i),
+        onToolUse: (n: string, i: unknown) => opts.onTool?.(n, i),
         onTokens: addTokens,
         shouldStop: () => checkBudget() || p.shouldStop() || session.done,
-      });
+      };
+      let res = await runOpenAiAgentLoop(loopArgs);
+      for (let stageRetry = 1; res.stopped === "error" && !res.contextFailure && isTransientStageError(res.error) && stageRetry <= 3 && !session.done && !session.paused; stageRetry++) {
+        const waitMs = 5_000 * stageRetry;
+        const retryMsg = `↻ transient stage error — retry ${stageRetry}/3 in ${Math.round(waitMs / 1000)}s: ${(res.error ?? "").slice(0, 140)}`;
+        opts.onText?.(retryMsg);
+        opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: retryMsg } });
+        await new Promise((r) => setTimeout(r, waitMs));
+        res = await runOpenAiAgentLoop(loopArgs);
+      }
       if (res.stopped === "error") {
         opts.onText?.(`⚠ stage ended early: ${res.error}`);
         opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: `⚠ stage ended early: ${res.error}` } });

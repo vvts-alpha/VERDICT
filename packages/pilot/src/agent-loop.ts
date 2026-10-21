@@ -185,6 +185,15 @@ async function chatCompletion(
                     lastErr = "Endpoint requires max_completion_tokens";
                     continue;
                 }
+                // Transient-looking 4xx (proxy/routing flakiness, strict-channel reasoning validation that another
+                // channel accepts, provider-side overload): retrying the SAME body on a different upstream channel
+                // genuinely succeeds — these are not deterministic request errors. Deterministic 4xx (bad schema,
+                // auth) still throw immediately.
+                if (/upstream|reasoning_content|overload|temporar|try again|rate.?limit|busy|unavailable/i.test(t)) {
+                    lastErr = `HTTP ${res.status}: ${t.slice(0, 120)}`;
+                    await new Promise((r) => setTimeout(r, 800 * (attempt + 1)));
+                    continue;
+                }
                 throw new Error(`chat/completions ${res.status}: ${t.slice(0, 300)}`);
             }
             const response = (await res.json()) as ChatResponse;
