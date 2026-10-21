@@ -3,6 +3,7 @@ import type { ReactNode } from "react";
 import type { StateView } from "@veritas/core";
 import type { ConnState } from "../api";
 import { signOut, useRole } from "../api";
+import { useT } from "../i18n";
 import { screenHonestyMap } from "./screen-status";
 import { Download, Pause, Play, Upload } from "lucide-react";
 import { Badge } from "./ui/badge";
@@ -17,13 +18,14 @@ import {
 // The file input + status MUST live outside the DropdownMenu: onSelect closes (unmounts) the menu,
 // so an input inside it is destroyed before the picker fires change — the POST would never run.
 function useBurpImport(id: string): { fileRef: React.RefObject<HTMLInputElement | null>; input: ReactNode; status: ReactNode } {
+  const t = useT();
   const fileRef = useRef<HTMLInputElement>(null);
   const [status, setStatus] = useState<string>("");
   async function onPick(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     e.target.value = ""; // reset so the same file can be picked again in a row
     if (!file) return;
-    setStatus(`⏳ importing ${file.name}…`);
+    setStatus(t("⏳ importing {name}…", { name: file.name }));
     try {
       const r = await fetch(`/api/assessments/${encodeURIComponent(id)}/burp-import`, {
         method: "POST",
@@ -35,7 +37,7 @@ function useBurpImport(id: string): { fileRef: React.RefObject<HTMLInputElement 
         setStatus(`⚠ ${j.error ?? `HTTP ${r.status}`}`);
         return;
       }
-      setStatus("✓ importing — net-new findings appear, High+ get AI re-verified");
+      setStatus(t("✓ importing — net-new findings appear, High+ get AI re-verified"));
     } catch (err) {
       setStatus(`⚠ ${String(err).slice(0, 120)}`);
     }
@@ -54,14 +56,15 @@ function useBurpImport(id: string): { fileRef: React.RefObject<HTMLInputElement 
 // Shared report block for assessment export menus,
 // so "Report" never drifts per view. GET endpoints send cookies automatically; every report format downloads.
 export function ReportLinks({ id }: { id: string }) {
+  const t = useT();
   const rep = (f: string): string => `/api/assessments/${encodeURIComponent(id)}/report?format=${f}`;
   return (
     <>
-      <DropdownMenuLabel>Report</DropdownMenuLabel>
+      <DropdownMenuLabel>{t("Report")}</DropdownMenuLabel>
       <DropdownMenuItem asChild><a href={rep("html")} download={`${id}-report.html`}>HTML</a></DropdownMenuItem>
       <DropdownMenuItem asChild><a href={rep("pdf")} download={`${id}-report.pdf`}>PDF</a></DropdownMenuItem>
       <DropdownMenuItem asChild><a href={rep("md")}>Markdown</a></DropdownMenuItem>
-      <DropdownMenuItem asChild><a href={rep("csv")}>Findings CSV</a></DropdownMenuItem>
+      <DropdownMenuItem asChild><a href={rep("csv")}>{t("Findings CSV")}</a></DropdownMenuItem>
     </>
   );
 }
@@ -69,25 +72,26 @@ export function ReportLinks({ id }: { id: string }) {
 // Download the report / screen inventory. These are GET endpoints, so cookies are sent automatically.
 // Reports download as attachments; the inventory HTML keeps its separate preview.
 function DownloadMenu({ id, canWrite }: { id: string; canWrite: boolean }) {
+  const t = useT();
   const inv = (f: string): string => `/api/assessments/${encodeURIComponent(id)}/inventory?format=${f}`;
   const burp = useBurpImport(id);
   return (
     <>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
-          <Button type="button" variant="outline" size="xs"><Download /> {canWrite ? "Export / Import" : "Export"}</Button>
+          <Button type="button" variant="outline" size="xs"><Download /> {canWrite ? t("Export / Import") : t("Export")}</Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end" className="min-w-44">
           <ReportLinks id={id} />
           <DropdownMenuSeparator />
-          <DropdownMenuLabel>Screen inventory</DropdownMenuLabel>
-          <DropdownMenuItem asChild><a href={inv("html")} target="_blank" rel="noreferrer">Inventory HTML</a></DropdownMenuItem>
-          <DropdownMenuItem asChild><a href={inv("csv")}>Screens CSV</a></DropdownMenuItem>
+          <DropdownMenuLabel>{t("Screen inventory")}</DropdownMenuLabel>
+          <DropdownMenuItem asChild><a href={inv("html")} target="_blank" rel="noreferrer">{t("Inventory HTML")}</a></DropdownMenuItem>
+          <DropdownMenuItem asChild><a href={inv("csv")}>{t("Screens CSV")}</a></DropdownMenuItem>
           {canWrite ? (
             <>
               <DropdownMenuSeparator />
-              <DropdownMenuLabel>Import</DropdownMenuLabel>
-              <DropdownMenuItem onSelect={() => burp.fileRef.current?.click()}><Upload /> Burp XML report</DropdownMenuItem>
+              <DropdownMenuLabel>{t("Import")}</DropdownMenuLabel>
+              <DropdownMenuItem onSelect={() => burp.fileRef.current?.click()}><Upload /> {t("Burp XML report")}</DropdownMenuItem>
             </>
           ) : null}
         </DropdownMenuContent>
@@ -121,11 +125,12 @@ export function StatusBarShell({
   exportMenu?: ReactNode;
 }) {
   const { canWrite, authEnabled, role, multiUser, user } = useRole();
+  const t = useT();
   const roleTitle = multiUser
-    ? `${user?.username ?? "account"} — ${role === "admin" ? "administrator" : "user"}`
+    ? `${user?.username ?? t("account")} — ${role === "admin" ? t("administrator") : t("user")}`
     : canWrite
-      ? "operator — full access"
-      : "viewer — read-only";
+      ? t("operator — full access")
+      : t("viewer — read-only");
   return (
     <header className="flex h-12 shrink-0 items-center gap-3 border-b border-border px-4 whitespace-nowrap">
       {crumbs}
@@ -142,17 +147,19 @@ export function StatusBarShell({
       ) : null}
       {authEnabled ? (
         multiUser ? (
-          <button type="button" className="text-xs text-muted-foreground hover:text-foreground" onClick={() => void signOut(true)} title="sign out">
-            sign out
+          <button type="button" className="text-xs text-muted-foreground hover:text-foreground" onClick={() => void signOut(true)} title={t("sign out")}>
+            {t("sign out")}
           </button>
         ) : (
-          <a className="text-xs text-muted-foreground hover:text-foreground" href="/logout" title="sign out">
-            sign out
+          <a className="text-xs text-muted-foreground hover:text-foreground" href="/logout" title={t("sign out")}>
+            {t("sign out")}
           </a>
         )
       ) : null}
       {conn ? (
-        <span className={conn === "open" ? "text-success" : conn === "connecting" ? "text-warning" : "text-destructive"}>● {paused ? "paused" : conn}</span>
+        <span className={conn === "open" ? "text-success" : conn === "connecting" ? "text-warning" : "text-destructive"}>
+          ● {paused ? t("paused") : conn === "open" ? t("open") : conn === "connecting" ? t("connecting") : t("closed")}
+        </span>
       ) : null}
     </header>
   );
@@ -177,6 +184,7 @@ export function StatusBar({
   crumbs: ReactNode;
 }) {
   const { canWrite } = useRole();
+  const t = useT();
   return (
     <StatusBarShell
       conn={conn}
@@ -186,7 +194,7 @@ export function StatusBar({
       actions={
         canWrite ? (
           <Button type="button" variant="secondary" size="xs" onClick={onTogglePause}>
-            {view.paused ? <><Play /> resume</> : <><Pause /> pause</>}
+            {view.paused ? <><Play /> {t("resume")}</> : <><Pause /> {t("pause")}</>}
           </Button>
         ) : null
       }
@@ -198,6 +206,7 @@ export function StatusBar({
 /** The run's numeric metrics as a compact inline status line — phase/progress/findings/attention first,
     so truncation at narrow widths drops only the least important numbers. Each item carries a tooltip. */
 export function RunStats({ view }: { view: StateView }) {
+  const t = useT();
   const c = view.coverage;
   // Ledger-honest counts: a conclusive claim with no check records is "claimed", not tested; a
   // clean screen whose ledger still holds gaps/unfulfilled plans counts under unverified.
@@ -211,19 +220,19 @@ export function RunStats({ view }: { view: StateView }) {
   }
   const pending = view.handoffs.filter((h) => h.status === "pending").length;
   const items: { label: string; value: ReactNode; title?: string; warn?: boolean }[] = [
-    { label: "phase", value: view.phase },
-    { label: "tested", value: `${tested}/${c.total}`, title: "Screens whose diagnosis finished WITH recorded check executions; excludes omitted screens" },
-    { label: "findings", value: view.findings.length, warn: view.findings.length > 0 },
-    { label: "unfinished", value: c.remaining, title: "Queued, in progress, blocked, or failed; diagnosis is not complete", warn: c.remaining > 0 },
-    { label: "unverified", value: unverified, title: "Screens whose diagnosis ended inconclusive — check-execution gaps or unfulfilled plans remain", warn: unverified > 0 },
-    { label: "claimed", value: claimed, title: "Screens marked conclusive with no check records — a legacy/log claim, detail unknown" },
-    { label: "screens", value: c.total },
-    { label: "excluded", value: c.byStatus.excluded, title: "Screens omitted from diagnosis", warn: c.byStatus.excluded > 0 },
-    { label: "tokens", value: fmtTokens(view.budget.tokensUsed) },
-    { label: "handoffs", value: pending, warn: pending > 0 },
+    { label: t("phase"), value: view.phase },
+    { label: t("tested"), value: `${tested}/${c.total}`, title: t("Screens whose diagnosis finished WITH recorded check executions; excludes omitted screens") },
+    { label: t("findings"), value: view.findings.length, warn: view.findings.length > 0 },
+    { label: t("unfinished"), value: c.remaining, title: t("Queued, in progress, blocked, or failed; diagnosis is not complete"), warn: c.remaining > 0 },
+    { label: t("unverified"), value: unverified, title: t("Screens whose diagnosis ended inconclusive — check-execution gaps or unfulfilled plans remain"), warn: unverified > 0 },
+    { label: t("claimed"), value: claimed, title: t("Screens marked conclusive with no check records — a legacy/log claim, detail unknown") },
+    { label: t("screens"), value: c.total },
+    { label: t("excluded"), value: c.byStatus.excluded, title: t("Screens omitted from diagnosis"), warn: c.byStatus.excluded > 0 },
+    { label: t("tokens"), value: fmtTokens(view.budget.tokensUsed) },
+    { label: t("handoffs"), value: pending, warn: pending > 0 },
   ];
   return (
-    <div className="flex min-w-0 items-center gap-x-3 overflow-hidden text-xs whitespace-nowrap" aria-label="Run metrics">
+    <div className="flex min-w-0 items-center gap-x-3 overflow-hidden text-xs whitespace-nowrap" aria-label={t("Run metrics")}>
       {items.map((it) => (
         <span key={it.label} className="shrink-0" title={it.title}>
           <span className="text-muted-foreground">{it.label}</span>{" "}

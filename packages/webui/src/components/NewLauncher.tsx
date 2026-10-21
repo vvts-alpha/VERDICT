@@ -5,6 +5,7 @@
 import { useState, type ReactNode } from "react";
 import { ArrowLeft } from "lucide-react";
 import { NewAssessment, type LaunchInput } from "./NewAssessment";
+import { useT } from "../i18n";
 import { Button } from "./ui/button";
 
 type Mode = "web";
@@ -47,6 +48,7 @@ function Card({ icon, title, desc, onClick, disabled = false }: { icon: ReactNod
 }
 
 export function NewLauncher({ onCancel, initial }: { onCancel: () => void; initial?: LaunchInput }) {
+  const t = useT();
   // A duplicate skips the mode picker — the run's own command/spec decides which form opens.
   const [mode, setMode] = useState<Mode | null>(initial ? "web" : null);
   const back = (): void => setMode(null);
@@ -56,20 +58,20 @@ export function NewLauncher({ onCancel, initial }: { onCancel: () => void; initi
   return (
     <div className="space-y-5 pb-10">
       <div className="flex items-center justify-between border-b border-border pb-3">
-        <h2 className="text-base font-semibold">New assessment</h2>
-        <Button type="button" variant="ghost" onClick={onCancel}><ArrowLeft /> Cancel</Button>
+        <h2 className="text-base font-semibold">{t("New assessment")}</h2>
+        <Button type="button" variant="ghost" onClick={onCancel}><ArrowLeft /> {t("Cancel")}</Button>
       </div>
       <div className="grid grid-cols-[repeat(auto-fit,minmax(190px,1fr))] gap-3">
         <Card
           icon={<GlobeIcon />}
-          title="Web / API app"
-          desc="Autonomous recon → diagnosis of a web app from one URL."
+          title={t("Web / API app")}
+          desc={t("Autonomous recon → diagnosis of a web app from one URL.")}
           onClick={() => setMode("web")}
         />
         <Card
           icon={<BracesIcon />}
-          title="API spec"
-          desc="Coming Soon"
+          title={t("API spec")}
+          desc={t("Coming Soon")}
           disabled
         />
       </div>

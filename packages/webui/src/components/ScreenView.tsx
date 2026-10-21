@@ -1,6 +1,7 @@
 import type { Screen, StateView } from "@veritas/core";
 import { EvidenceList } from "./EvidenceList";
 import { useRole } from "../api";
+import { useT } from "../i18n";
 import { SeverityBadge, severityBorder } from "./SeverityBadge";
 import { ChevronRight } from "lucide-react";
 import { Badge } from "./ui/badge";
@@ -27,8 +28,9 @@ const CHECK_CLS: Record<string, string> = {
 // Details of the one screen selected in the tree. Order: "page info (screenshot → overview → API/params) → this screen's findings".
 export function ScreenView({ view, screen, onExclude }: { view: StateView; screen?: Screen; onExclude: (id: string) => void }) {
   const { canWrite } = useRole();
+  const t = useT();
   if (!screen) {
-    return <p className="p-4 text-muted-foreground">← Select a screen from the tree.</p>;
+    return <p className="p-4 text-muted-foreground">{t("← Select a screen from the tree.")}</p>;
   }
   const status = view.screenScans.find((s) => s.screenId === screen.screenId)?.status ?? "queued";
   const fs = view.findings
@@ -51,11 +53,11 @@ export function ScreenView({ view, screen, onExclude }: { view: StateView; scree
         <Badge
           variant="outline"
           className={`ml-auto ${effStatus === "finding" ? "border-warning text-warning" : effStatus === "clean" ? "border-success text-success" : effStatus === "unverified" ? "border-warning text-warning" : effStatus === "scanning" ? "border-primary text-primary" : effStatus === "error" || effStatus === "blocked" ? "border-destructive text-destructive" : "text-muted-foreground"}`}
-          title={honesty?.legacy ? "status claim — no check records (detail unknown)" : honesty && status === "clean" && effStatus === "unverified" ? `scan status said clean — ${honesty.gaps} check gap(s), ${honesty.unfulfilled} unfulfilled plan slot(s) remain` : undefined}
+          title={honesty?.legacy ? t("status claim — no check records (detail unknown)") : honesty && status === "clean" && effStatus === "unverified" ? t("scan status said clean — {gaps} check gap(s), {unfulfilled} unfulfilled plan slot(s) remain", { gaps: honesty.gaps, unfulfilled: honesty.unfulfilled }) : undefined}
         >
-          {effStatus === "unknown-records" ? `${status} (no records)` : effStatus}
+          {effStatus === "unknown-records" ? t("{status} (no records)", { status }) : t(effStatus)}
         </Badge>
-        {canWrite ? <Button type="button" variant="outline" size="xs" onClick={() => onExclude(screen.screenId)}>Exclude</Button> : null}
+        {canWrite ? <Button type="button" variant="outline" size="xs" onClick={() => onExclude(screen.screenId)}>{t("Exclude")}</Button> : null}
       </div>
       <div className="my-2 text-xs text-muted-foreground">
         {screen.screenType} · {screen.authState} · <span className="font-mono">{screen.screenId}</span>
@@ -70,14 +72,14 @@ export function ScreenView({ view, screen, onExclude }: { view: StateView; scree
         />
       ) : (
         <div className="w-full max-w-[940px] rounded border border-border bg-inset p-12 text-center text-muted-foreground">
-          no screenshot — backfill with <code className="font-mono">shots --id {view.id}</code>
+          {t("no screenshot — backfill with")} <code className="font-mono">shots --id {view.id}</code>
         </div>
       )}
 
       {/* 2. Page overview (if available) */}
       {screen.description ? (
         <div className="mt-5">
-          <h4 className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">Overview</h4>
+          <h4 className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">{t("Overview")}</h4>
           <p>{screen.description}</p>
         </div>
       ) : null}
@@ -91,7 +93,7 @@ export function ScreenView({ view, screen, onExclude }: { view: StateView; scree
       {/* 3. APIs / params (page info) */}
       {screen.apis.length > 0 ? (
         <div className="mt-5">
-          <h4 className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">APIs</h4>
+          <h4 className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">{t("APIs")}</h4>
           <ul className="list-disc pl-4">
             {screen.apis.map((a) => (
               <li key={`${a.method} ${a.urlTemplate}`} className="font-mono">
@@ -104,13 +106,13 @@ export function ScreenView({ view, screen, onExclude }: { view: StateView; scree
 
       {screen.params.length > 0 ? (
         <div className="mt-5">
-          <h4 className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">Params</h4>
+          <h4 className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">{t("Params")}</h4>
           <Table className="text-xs">
             <TableHeader>
               <TableRow>
-                <TableHead>name</TableHead>
-                <TableHead>in</TableHead>
-                <TableHead>type</TableHead>
+                <TableHead>{t("name")}</TableHead>
+                <TableHead>{t("in")}</TableHead>
+                <TableHead>{t("type")}</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -128,7 +130,7 @@ export function ScreenView({ view, screen, onExclude }: { view: StateView; scree
 
       {screen.observedUrls.length > 0 ? (
         <div className="mt-5">
-          <h4 className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">Observed URLs</h4>
+          <h4 className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">{t("Observed URLs")}</h4>
           <ul className="list-disc pl-4">
             {screen.observedUrls.slice(0, 8).map((u) => (
               <li key={u} className="break-all font-mono text-muted-foreground">{u}</li>
@@ -142,22 +144,22 @@ export function ScreenView({ view, screen, onExclude }: { view: StateView; scree
              coverage gaps, not silently-clean surface. */}
       {checks.length > 0 ? (
         <div className="mt-5">
-          <h4 className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">Check executions ({checks.length})</h4>
+          <h4 className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">{t("Check executions ({n})", { n: checks.length })}</h4>
           <div className="space-y-2">
             {checks.map((c) => (
               <Card size="sm" key={c.id} className="gap-1.5 p-3">
                 <div className="flex flex-wrap items-center gap-2">
-                  <Badge variant="outline" className={CHECK_CLS[c.status] ?? "text-muted-foreground"}>{c.status}</Badge>
+                  <Badge variant="outline" className={CHECK_CLS[c.status] ?? "text-muted-foreground"}>{t(c.status)}</Badge>
                   <Badge variant="secondary">{c.checkClass}</Badge>
                   <span className="min-w-0 break-all font-mono text-xs">{c.target}</span>
                   {c.tool ? <span className="text-[10px] text-muted-foreground">{c.tool}</span> : null}
                 </div>
                 <div className="flex flex-wrap gap-x-3 text-[11px] text-muted-foreground">
-                  {c.param ? <span>input <span className="font-mono">{c.param}</span></span> : null}
-                  {c.subject ? <span>as <span className="font-mono">{c.subject}</span>{c.principal ? <span className="font-mono"> ({c.principal})</span> : null}</span> : null}
-                  {c.tenant ? <span>tenant <span className="font-mono">{c.tenant}</span></span> : null}
-                  {c.resource ? <span>resource <span className="font-mono">{c.resource}</span></span> : null}
-                  {c.baselineOk === false ? <span className="text-warning">no valid baseline</span> : null}
+                  {c.param ? <span>{t("input")} <span className="font-mono">{c.param}</span></span> : null}
+                  {c.subject ? <span>{t("as")} <span className="font-mono">{c.subject}</span>{c.principal ? <span className="font-mono"> ({c.principal})</span> : null}</span> : null}
+                  {c.tenant ? <span>{t("tenant")} <span className="font-mono">{c.tenant}</span></span> : null}
+                  {c.resource ? <span>{t("resource")} <span className="font-mono">{c.resource}</span></span> : null}
+                  {c.baselineOk === false ? <span className="text-warning">{t("no valid baseline")}</span> : null}
                   {c.findingIds.length > 0 ? <span>→ {c.findingIds.join(", ")}</span> : null}
                 </div>
                 {c.reason ? <p className="text-xs text-muted-foreground">{c.reason}</p> : null}
@@ -168,15 +170,14 @@ export function ScreenView({ view, screen, onExclude }: { view: StateView; scree
         </div>
       ) : legacy ? (
         <div className="mt-5 rounded border border-warning/40 bg-warning/10 p-3 text-xs">
-          scan status <b className="font-mono">{status}</b> recorded without structured check executions —
-          coverage detail <b>unknown</b> (legacy run or log note; no evidence records).
+          {t("scan status {status} recorded without structured check executions — coverage detail unknown (legacy run or log note; no evidence records).", { status })}
         </div>
       ) : null}
 
       {/* 5. Finally, this screen's findings */}
       {fs.length > 0 ? (
         <div className="mt-5 space-y-3">
-          <h4 className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">Findings on this screen ({fs.length})</h4>
+          <h4 className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">{t("Findings on this screen ({n})", { n: fs.length })}</h4>
           {fs.map((f) => (
             <Card size="sm" key={f.id} className={`gap-2 border-l-[3px] py-3 ${severityBorder[f.severity]}`}>
               <div className="flex items-center gap-2 px-3">
@@ -187,7 +188,7 @@ export function ScreenView({ view, screen, onExclude }: { view: StateView; scree
               {f.reproSteps ? (
                 <Collapsible className="px-3 text-muted-foreground">
                   <CollapsibleTrigger type="button" className="group flex cursor-pointer items-center gap-1">
-                    <ChevronRight className="size-3 transition-transform group-data-[state=open]:rotate-90" /> repro
+                    <ChevronRight className="size-3 transition-transform group-data-[state=open]:rotate-90" /> {t("repro")}
                   </CollapsibleTrigger>
                   <CollapsibleContent>
                     <pre className="mt-2 whitespace-pre-wrap rounded bg-inset p-2 font-mono">{f.reproSteps}</pre>

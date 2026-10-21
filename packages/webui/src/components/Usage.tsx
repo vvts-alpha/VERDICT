@@ -4,6 +4,7 @@
 import { useEffect, useState } from "react";
 import type { TargetInput } from "@veritas/core";
 import { useRole } from "../api";
+import { useT } from "../i18n";
 import { ChartColumn, RefreshCw } from "lucide-react";
 import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
@@ -42,6 +43,7 @@ function num(n: number | undefined): string {
 
 export function Usage() {
   const { multiUser } = useRole();
+  const t = useT();
   const [rows, setRows] = useState<UsageRow[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
@@ -52,12 +54,12 @@ export function Usage() {
         setRows(l);
         setErr(null);
       })
-      .catch(() => setErr("Can't reach server"));
+      .catch(() => setErr(t("Can't reach server")));
   };
   useEffect(() => {
     load();
-    const t = window.setInterval(load, 5000); // running scans keep accruing — refresh lazily
-    return () => window.clearInterval(t);
+    const iv = window.setInterval(load, 5000); // running scans keep accruing — refresh lazily
+    return () => window.clearInterval(iv);
   }, []);
 
   const sum = (pick: (u: NonNullable<UsageRow["usage"]>) => number | undefined): number | undefined => {
@@ -77,8 +79,8 @@ export function Usage() {
   return (
     <div className="mx-auto w-full max-w-[1100px] space-y-4 px-5 py-6">
       <header className="flex items-center justify-between border-b border-border pb-4">
-        <h1 className="flex items-center gap-2 text-base font-semibold"><ChartColumn className="size-4" /> Usage</h1>
-        <Button type="button" variant="outline" size="sm" onClick={load}><RefreshCw /> Refresh</Button>
+        <h1 className="flex items-center gap-2 text-base font-semibold"><ChartColumn className="size-4" /> {t("Usage")}</h1>
+        <Button type="button" variant="outline" size="sm" onClick={load}><RefreshCw /> {t("Refresh")}</Button>
       </header>
       {err ? <p role="alert" className="text-xs text-destructive">{err}</p> : null}
       <Card>
@@ -87,13 +89,13 @@ export function Usage() {
             <Table className="text-xs">
               <TableHeader>
                 <TableRow>
-                  <TableHead>Project</TableHead>
-                  <TableHead>Phase</TableHead>
-                  {multiUser ? <TableHead>Owner</TableHead> : null}
-                  <TableHead className="text-right">Input</TableHead>
-                  <TableHead className="text-right">Output</TableHead>
-                  <TableHead className="text-right">Total tokens</TableHead>
-                  <TableHead className="text-right">Requests</TableHead>
+                  <TableHead>{t("Project")}</TableHead>
+                  <TableHead>{t("Phase")}</TableHead>
+                  {multiUser ? <TableHead>{t("Owner")}</TableHead> : null}
+                  <TableHead className="text-right">{t("Input")}</TableHead>
+                  <TableHead className="text-right">{t("Output")}</TableHead>
+                  <TableHead className="text-right">{t("Total tokens")}</TableHead>
+                  <TableHead className="text-right">{t("Requests")}</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -114,7 +116,7 @@ export function Usage() {
               </TableBody>
               <TableFooter>
                 <TableRow>
-                  <TableCell className="font-medium">Total</TableCell>
+                  <TableCell className="font-medium">{t("Total")}</TableCell>
                   <TableCell />
                   {multiUser ? <TableCell /> : null}
                   <TableCell className="text-right font-mono font-semibold">{num(sum((u) => u.inputTokens))}</TableCell>
@@ -125,12 +127,12 @@ export function Usage() {
               </TableFooter>
             </Table>
           ) : rows ? (
-            <p className="py-8 text-center text-sm text-muted-foreground">No assessments yet — token usage appears here once a run starts.</p>
+            <p className="py-8 text-center text-sm text-muted-foreground">{t("No assessments yet — token usage appears here once a run starts.")}</p>
           ) : (
-            <p className="py-4 text-xs text-muted-foreground">Loading…</p>
+            <p className="py-4 text-xs text-muted-foreground">{t("Loading…")}</p>
           )}
           <p className="mt-3 text-xs text-muted-foreground">
-            Input/output are provider-reported (prompt vs completion; Claude cache buckets count as input). "—" = recorded before split tracking or estimated without provider usage.
+            {t("Input/output are provider-reported (prompt vs completion; Claude cache buckets count as input). \"—\" = recorded before split tracking or estimated without provider usage.")}
           </p>
         </CardContent>
       </Card>

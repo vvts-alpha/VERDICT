@@ -1,10 +1,12 @@
 import type { StateView } from "@veritas/core";
+import { useT } from "../i18n";
 import { Button } from "./ui/button";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "./ui/table";
 
 // Aggregate APIs across all screens (method+endpoint+operation+auth → referencing screens). Tab for API-centric review.
 // GraphQL: one endpoint carries many operations — they are DISTINCT rows keyed by operationKey, shown as the op name.
 export function ApiList({ view, onJump }: { view: StateView; onJump: (screenId: string) => void }) {
+  const t = useT();
   const map = new Map<string, { k: string; method: string; url: string; op?: string; opType?: string; auth: string; screens: string[] }>();
   for (const sc of view.screens) {
     for (const a of sc.apis) {
@@ -21,19 +23,19 @@ export function ApiList({ view, onJump }: { view: StateView; onJump: (screenId: 
   }
   const rows = [...map.values()].sort((a, b) => (a.url < b.url ? -1 : a.url > b.url ? 1 : 0));
   if (rows.length === 0) {
-    return <p className="p-4 text-muted-foreground">No APIs discovered yet.</p>;
+    return <p className="p-4 text-muted-foreground">{t("No APIs discovered yet.")}</p>;
   }
   return (
     <section>
-      <h2 className="mb-3 text-xs font-semibold uppercase tracking-wide text-primary">APIs ({rows.length})</h2>
+      <h2 className="mb-3 text-xs font-semibold uppercase tracking-wide text-primary">{t("APIs ({n})", { n: rows.length })}</h2>
       <Table className="text-xs">
         <TableHeader>
           <TableRow>
-            <TableHead>method</TableHead>
-            <TableHead>endpoint</TableHead>
-            <TableHead>operation</TableHead>
-            <TableHead>auth</TableHead>
-            <TableHead>screens</TableHead>
+            <TableHead>{t("method")}</TableHead>
+            <TableHead>{t("endpoint")}</TableHead>
+            <TableHead>{t("operation")}</TableHead>
+            <TableHead>{t("auth")}</TableHead>
+            <TableHead>{t("screens")}</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>

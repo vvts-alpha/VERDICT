@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { ChevronRight } from "lucide-react";
+import { useT } from "../i18n";
 import { Button } from "./ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "./ui/collapsible";
 
@@ -17,6 +18,7 @@ const HDR_KEYS = ["content-type", "location", "set-cookie", "www-authenticate", 
 // Click an evId cited by a finding → show req/resp (headers masked) inline. MULTIPLE items can be open at once
 // (so a finding's negative control + its positive replays sit side by side); "expand all" opens them together.
 export function EvidenceList({ assessmentId, evidenceIds }: { assessmentId: string; evidenceIds: string[] }) {
+  const t = useT();
   const [open, setOpen] = useState<Set<string>>(() => new Set());
   const [data, setData] = useState<Record<string, Ev>>({});
 
@@ -52,9 +54,9 @@ export function EvidenceList({ assessmentId, evidenceIds }: { assessmentId: stri
   return (
     <div className="mt-2 space-y-1">
       <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
-        evidence ({evidenceIds.length})
+        {t("evidence ({n})", { n: evidenceIds.length })}
         {evidenceIds.length > 1 ? (
-          <Button type="button" variant="ghost" size="xs" onClick={toggleAll}>{allOpen ? "collapse all" : "expand all"}</Button>
+          <Button type="button" variant="ghost" size="xs" onClick={toggleAll}>{allOpen ? t("collapse all") : t("expand all")}</Button>
         ) : null}
       </div>
       {evidenceIds.map((ev) => {
@@ -66,16 +68,16 @@ export function EvidenceList({ assessmentId, evidenceIds }: { assessmentId: stri
         return (
           <Collapsible key={ev} open={isOpen} onOpenChange={() => toggle(ev)}>
             <CollapsibleTrigger asChild>
-              <Button type="button" variant="outline" size="xs" className="h-auto w-full justify-start py-1 font-mono" aria-label={`${isOpen ? "Collapse" : "Expand"} evidence ${ev}`}>
+              <Button type="button" variant="outline" size="xs" className="h-auto w-full justify-start py-1 font-mono" aria-label={t("{action} evidence {id}", { action: isOpen ? t("Collapse") : t("Expand"), id: ev })}>
                 <ChevronRight className={`size-3 transition-transform ${isOpen ? "rotate-90" : ""}`} /> {ev}
                 {d?.meta?.kind ? <span className="text-muted-foreground"> · {d.meta.kind}</span> : null}
               </Button>
             </CollapsibleTrigger>
             <CollapsibleContent className="rounded-b border border-t-0 border-border bg-inset p-2 font-mono text-xs">
-              {!d ? <div className="text-muted-foreground">loading …</div> : (
+              {!d ? <div className="text-muted-foreground">{t("loading …")}</div> : (
                 <>
                   <div className="break-all">
-                    <span className="text-muted-foreground">▷ request</span>
+                    <span className="text-muted-foreground">{t("▷ request")}</span>
                     {d.requestRaw ? (
                       // full request (raw HTTP: request line + all headers + body)
                       <pre className={pre}>{d.requestRaw}</pre>
@@ -89,7 +91,7 @@ export function EvidenceList({ assessmentId, evidenceIds }: { assessmentId: stri
                     )}
                   </div>
                   <div className="mt-2 break-all">
-                    <span className="text-muted-foreground">◁ res</span> <b>{d.response?.status}</b> {d.response?.finalUrl ?? ""}
+                    <span className="text-muted-foreground">{t("◁ res")}</span> <b>{d.response?.status}</b> {d.response?.finalUrl ?? ""}
                     {hdrLine ? <div className="text-muted-foreground">{hdrLine}</div> : null}
                     {d.body ? <pre className={pre}>{d.body.slice(0, 4000)}</pre> : null}
                   </div>

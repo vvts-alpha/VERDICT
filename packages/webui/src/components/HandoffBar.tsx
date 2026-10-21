@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import type { HumanHandoff } from "@veritas/core";
 import { useRole } from "../api";
+import { useT } from "../i18n";
 import { Button } from "./ui/button";
 
 const SHOW_BROWSER = "verdict-show-browser";
@@ -21,6 +22,7 @@ function isBrowserHandoff(h: HumanHandoff): h is HumanHandoff & { url: string } 
 // In the desktop app, captcha/auth walls auto-open the in-app Browser tab (real Chromium, no Playwright fingerprint).
 export function HandoffBar({ handoffs, onResolve }: { handoffs: HumanHandoff[]; onResolve: (id: string) => void }) {
   const { canWrite } = useRole();
+  const t = useT();
   const pending = handoffs.filter((h) => h.status === "pending");
   const opened = useRef(new Set<string>());
 
@@ -44,13 +46,13 @@ export function HandoffBar({ handoffs, onResolve }: { handoffs: HumanHandoff[]; 
         <div key={h.id} className="flex items-center gap-3 px-3 py-2">
           <span aria-hidden="true">🔐</span>
           <span className="flex-1 text-warning">
-            Needs human [{h.reason}]: <b className="font-mono">{h.url ?? ""}</b> — {h.message}
+            {t("Needs human [{reason}]:", { reason: h.reason })} <b className="font-mono">{h.url ?? ""}</b> — {h.message}
             {desktop && isBrowserHandoff(h)
-              ? " — log in / clear CAPTCHA in the Browser tab, then Capture session → Logged in → continue."
+              ? t(" — log in / clear CAPTCHA in the Browser tab, then Capture session → Logged in → continue.")
               : ""}
           </span>
           {canWrite && desktop && isBrowserHandoff(h) ? (
-            <Button type="button" size="sm" onClick={() => openInBrowser(h.url, h.id)} title="Open this URL in the in-app Browser tab">Open in Browser</Button>
+            <Button type="button" size="sm" onClick={() => openInBrowser(h.url, h.id)} title={t("Open this URL in the in-app Browser tab")}>{t("Open in Browser")}</Button>
           ) : null}
           {/* One "continue" verb per flow: when the attended browser is the path, its own
               "Logged in → continue" injects the captured session AND resolves — the bar's
@@ -58,9 +60,9 @@ export function HandoffBar({ handoffs, onResolve }: { handoffs: HumanHandoff[]; 
               browser, so the resolve button stays the primary continue. */}
           {canWrite ? (
             desktop && isBrowserHandoff(h) ? (
-              <Button type="button" variant="outline" size="sm" onClick={() => onResolve(h.id)} title="Resolve without capturing/applying a session">Resolve without session</Button>
+              <Button type="button" variant="outline" size="sm" onClick={() => onResolve(h.id)} title={t("Resolve without capturing/applying a session")}>{t("Resolve without session")}</Button>
             ) : (
-              <Button type="button" size="sm" onClick={() => onResolve(h.id)}>Logged in → continue</Button>
+              <Button type="button" size="sm" onClick={() => onResolve(h.id)}>{t("Logged in → continue")}</Button>
             )
           ) : null}
         </div>

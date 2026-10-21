@@ -6,6 +6,7 @@
   "description": "観測 WebUI(React 3 ペイン: 状態バー + サイトツリー + 画面詳細。DESIGN §8)",
   "exports": {
     ".": "./src/index.ts",
+    "./i18n": "./src/i18n.tsx",
     "./ui/*": "./src/components/ui/*.tsx",
     "./styles.css": "./src/styles.css",
     "./package.json": "./package.json"

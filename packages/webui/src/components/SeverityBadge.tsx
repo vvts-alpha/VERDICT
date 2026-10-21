@@ -1,4 +1,5 @@
 import type { Severity } from "@veritas/core";
+import { useT } from "../i18n";
 import { Badge } from "./ui/badge";
 
 export const severityBorder: Record<Severity, string> = {
@@ -18,5 +19,6 @@ const severityTone: Record<Severity, string> = {
 };
 
 export function SeverityBadge({ severity }: { severity: Severity }) {
-  return <Badge className={severityTone[severity]}>{severity}</Badge>;
+  const t = useT();
+  return <Badge className={severityTone[severity]}>{t(severity)}</Badge>;
 }

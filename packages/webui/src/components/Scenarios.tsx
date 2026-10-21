@@ -1,6 +1,7 @@
 import type { CheckExecution, StateView } from "@veritas/core";
 import { planSatisfied } from "./screen-status";
 import { SeverityBadge } from "./SeverityBadge";
+import { useT } from "../i18n";
 import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
 import { Card } from "./ui/card";
@@ -94,6 +95,7 @@ const ENTRY_CLS: Record<string, string> = {
 };
 
 export function Scenarios({ view, onJump }: { view: StateView; onJump: (screenId: string) => void }) {
+  const t = useT();
   const plans = new Map<string, Plan>();
   const covs = new Map<string, Cov>();
   let focus = "";
@@ -142,16 +144,16 @@ export function Scenarios({ view, onJump }: { view: StateView; onJump: (screenId
 
   return (
     <section className="space-y-4">
-      <h2 className="text-base font-semibold">Scenarios</h2>
+      <h2 className="text-base font-semibold">{t("Scenarios")}</h2>
       {focus ? (
-        <div className="rounded border border-success/40 bg-success/15 p-3 text-success" title="operator --focus, injected as the top priority of the scenario stage">
-          🎯 Operator focus: <b>{focus}</b>
+        <div className="rounded border border-success/40 bg-success/15 p-3 text-success" title={t("operator --focus, injected as the top priority of the scenario stage")}>
+          {t("🎯 Operator focus:")} <b>{focus}</b>
         </div>
       ) : null}
 
-      <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Per-screen attack plans ({screenIds.length})</h3>
+      <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{t("Per-screen attack plans ({n})", { n: screenIds.length })}</h3>
       {screenIds.length === 0 ? (
-        <p className="text-muted-foreground">No plans yet — methodology runs after the survey maps the surface.</p>
+        <p className="text-muted-foreground">{t("No plans yet — methodology runs after the survey maps the surface.")}</p>
       ) : (
         <div className="flex flex-col gap-2">
           {screenIds.map((sid) => {
@@ -165,12 +167,12 @@ export function Scenarios({ view, onJump }: { view: StateView; onJump: (screenId
                   {c ? (
                     <Badge
                       variant="outline"
-                      title={c.provenance === "note" ? "self-reported note — no structured check records; detail unknown" : "derived from recorded check executions"}
+                      title={c.provenance === "note" ? t("self-reported note — no structured check records; detail unknown") : t("derived from recorded check executions")}
                       className={c.provenance === "note" ? "text-muted-foreground" : c.verdict === "finding" ? "border-destructive text-destructive" : c.verdict === "clean" ? "border-success text-success" : c.verdict === "unverified" || c.verdict === "suspected" ? "border-warning text-warning" : "text-muted-foreground"}
                     >
-                      {c.verdict}{c.provenance === "note" ? " (note)" : ""}
+                      {t(c.verdict)}{c.provenance === "note" ? t(" (note)") : ""}
                     </Badge>
-                  ) : <Badge variant="outline">planned</Badge>}
+                  ) : <Badge variant="outline">{t("planned")}</Badge>}
                 </div>
                 {p && p.classes.length > 0 ? (
                   <div className="flex flex-wrap gap-1">
@@ -183,19 +185,19 @@ export function Scenarios({ view, onJump }: { view: StateView; onJump: (screenId
                       <span key={e.cls} className="inline-flex flex-wrap gap-1">
                         <Badge
                           variant="outline"
-                          title={c.provenance === "note" ? "self-reported note — no structured check records; detail unknown" : undefined}
+                          title={c.provenance === "note" ? t("self-reported note — no structured check records; detail unknown") : undefined}
                           className={c.provenance === "note" ? "text-muted-foreground" : (ENTRY_CLS[e.status] ?? "text-muted-foreground")}
                         >
-                          {e.cls}{e.status ? `: ${e.status}` : ""}{c.provenance === "note" ? " (note)" : ""}
+                          {e.cls}{e.status ? `: ${t(e.status)}` : ""}{c.provenance === "note" ? t(" (note)") : ""}
                         </Badge>
                         {e.others.map((o) => (
                           <Badge key={o.status} variant="outline" className={ENTRY_CLS[o.status] ?? "text-muted-foreground"}>
-                            +{o.count} {o.status}
+                            +{o.count} {t(o.status)}
                           </Badge>
                         ))}
                         {e.unfulfilled > 0 ? (
-                          <Badge variant="outline" className="text-muted-foreground" title="plan slot(s) with no satisfying terminal execution">
-                            +{e.unfulfilled} plan
+                          <Badge variant="outline" className="text-muted-foreground" title={t("plan slot(s) with no satisfying terminal execution")}>
+                            +{e.unfulfilled} {t("plan")}
                           </Badge>
                         ) : null}
                       </span>
@@ -209,9 +211,9 @@ export function Scenarios({ view, onJump }: { view: StateView; onJump: (screenId
         </div>
       )}
 
-      <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">A04 cross-screen scenarios ({scen.length})</h3>
+      <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{t("A04 cross-screen scenarios ({n})", { n: scen.length })}</h3>
       {scen.length === 0 ? (
-        <p className="text-muted-foreground">No multi-step / cross-screen scenario findings (yet).</p>
+        <p className="text-muted-foreground">{t("No multi-step / cross-screen scenario findings (yet).")}</p>
       ) : (
         <div className="flex flex-col gap-2">
           {scen.map((f) => {

@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from "react";
+import { useT } from "../i18n";
 
 // View-only live screencast of the auto-scan browser (the "watch it work" panel). The running pilot streams its
 // headless browser over the LiveHands reverse-WS as role "scan"; here we just render the JPEG frames on a canvas.
 // No input is sent (unlike the attended Sessions takeover) — this is observation only. Streaming is lazy: the child
 // only screencasts while this tab is open (the relay tells it to start on connect, stop on disconnect).
 export function LiveView({ id }: { id: string }) {
+  const t = useT();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [status, setStatus] = useState<"connecting" | "live" | "waiting" | "closed">("connecting");
   const [gotFrame, setGotFrame] = useState(false);
@@ -57,17 +59,17 @@ export function LiveView({ id }: { id: string }) {
         <span className={`size-2 shrink-0 rounded-full ${status === "live" ? "bg-success" : status === "closed" ? "bg-destructive" : "bg-warning"}`} aria-hidden="true" />
         <span className="text-muted-foreground">
           {status === "live"
-            ? "live — watching the scan browser"
+            ? t("live — watching the scan browser")
             : status === "waiting"
-              ? "connected — waiting for the scan to drive the browser…"
+              ? t("connected — waiting for the scan to drive the browser…")
               : status === "connecting"
-                ? "connecting…"
-                : "not streaming — the scan is not running (start or resume it to watch live)"}
+                ? t("connecting…")
+                : t("not streaming — the scan is not running (start or resume it to watch live)")}
         </span>
       </div>
       <div className="flex min-h-0 flex-1 items-center justify-center overflow-auto bg-inset p-3">
         <canvas ref={canvasRef} className="max-h-full max-w-full rounded border border-border" style={{ display: gotFrame ? "block" : "none" }} />
-        {!gotFrame ? <div className="text-muted-foreground">The live view appears here while an assessment is running.</div> : null}
+        {!gotFrame ? <div className="text-muted-foreground">{t("The live view appears here while an assessment is running.")}</div> : null}
       </div>
     </div>
   );

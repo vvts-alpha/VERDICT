@@ -3,6 +3,7 @@ import { AttendedBrowser } from "./AttendedBrowser";
 import { Settings } from "./Settings";
 import { Button } from "@veritas/webui/ui/button";
 import { DesktopShellContext, type DesktopShell } from "@veritas/webui";
+import { useT } from "@veritas/webui/i18n";
 import { AppWindow, Settings as SettingsIcon } from "lucide-react";
 
 // Desktop app chrome: a custom (frameless-window) title bar with window controls, rendered ONLY when running
@@ -35,6 +36,7 @@ function WinIcon({ kind }: { kind: "min" | "max" | "restore" | "close" }) {
 }
 
 export function DesktopChrome({ children }: { children: ReactNode }) {
+    const t = useT();
     const desktop = typeof window !== "undefined" ? window.verdictDesktop : undefined;
     const [maximized, setMaximized] = useState(false);
     // Debug: VERDICT_ATTB_URL (via ?attb=<url>) auto-opens the attended browser to a URL for screenshot verification.
@@ -114,8 +116,8 @@ export function DesktopChrome({ children }: { children: ReactNode }) {
         onNavigate,
         runGuarded,
         nav: [
-            { key: "browser", label: "Browser", icon: AppWindow },
-            { key: "settings", label: "Settings", icon: SettingsIcon },
+            { key: "browser", label: t("Browser"), icon: AppWindow },
+            { key: "settings", label: t("Settings"), icon: SettingsIcon },
         ],
         views: {
             browser: (
@@ -142,20 +144,20 @@ export function DesktopChrome({ children }: { children: ReactNode }) {
             {/* onMouseEnter refocuses the HTML so a title-bar click acts on the first press even while the
                 attended-browser native view holds OS focus (otherwise the first click just steals focus back). */}
             <div data-desk-titlebar="" className="flex h-[38px] shrink-0 items-stretch border-b border-border bg-card" onMouseEnter={() => desktop.focusChrome?.()}>
-                <Button type="button" variant="ghost" data-desk-no-drag="" className="h-full gap-2 rounded-none px-4 text-xs font-bold tracking-widest" onClick={() => void onNavigate("main")} title="Main — back to the assessments view">
+                <Button type="button" variant="ghost" data-desk-no-drag="" className="h-full gap-2 rounded-none px-4 text-xs font-bold tracking-widest" onClick={() => void onNavigate("main")} title={t("Main — back to the assessments view")}>
                     <span className="inline-block size-2 rounded-sm bg-primary" aria-hidden="true" />
                     VERDICT
                 </Button>
                 {/* Native title-bar convention: double-click the empty drag region to toggle maximize/restore. */}
                 <div className="flex-1" onDoubleClick={() => desktop?.toggleMaximize()} />
                 <div className="flex items-stretch" data-desk-no-drag="">
-                    <Button type="button" variant="ghost" size="icon" className="h-full w-11 rounded-none text-muted-foreground" onClick={() => desktop.minimize()} aria-label="Minimize" title="Minimize">
+                    <Button type="button" variant="ghost" size="icon" className="h-full w-11 rounded-none text-muted-foreground" onClick={() => desktop.minimize()} aria-label={t("Minimize")} title={t("Minimize")}>
                         <WinIcon kind="min" />
                     </Button>
-                    <Button type="button" variant="ghost" size="icon" className="h-full w-11 rounded-none text-muted-foreground" onClick={() => desktop.toggleMaximize()} aria-label={maximized ? "Restore" : "Maximize"} title={maximized ? "Restore" : "Maximize"}>
+                    <Button type="button" variant="ghost" size="icon" className="h-full w-11 rounded-none text-muted-foreground" onClick={() => desktop.toggleMaximize()} aria-label={maximized ? t("Restore") : t("Maximize")} title={maximized ? t("Restore") : t("Maximize")}>
                         <WinIcon kind={maximized ? "restore" : "max"} />
                     </Button>
-                    <Button type="button" variant="ghost" size="icon" className="h-full w-11 rounded-none text-muted-foreground hover:bg-destructive hover:text-foreground" onClick={() => desktop.close()} aria-label="Close" title="Close">
+                    <Button type="button" variant="ghost" size="icon" className="h-full w-11 rounded-none text-muted-foreground hover:bg-destructive hover:text-foreground" onClick={() => desktop.close()} aria-label={t("Close")} title={t("Close")}>
                         <WinIcon kind="close" />
                     </Button>
                 </div>

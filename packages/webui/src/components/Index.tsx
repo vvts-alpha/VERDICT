@@ -5,6 +5,7 @@ import type { TargetInput } from "@veritas/core";
 import { NewLauncher } from "./NewLauncher";
 import type { LaunchInput } from "./NewAssessment";
 import { useRole } from "../api";
+import { useT } from "../i18n";
 import { Copy, MoreHorizontal, Play, Square } from "lucide-react";
 import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
@@ -57,6 +58,7 @@ export function Index() {
   const [err, setErr] = useState<string | null>(null);
   const [creating, setCreating] = useState<{ initial?: LaunchInput } | null>(null);
   const { canWrite, multiUser, user } = useRole();
+  const t = useT();
 
   useEffect(() => {
     let alive = true;
@@ -70,14 +72,14 @@ export function Index() {
           }
         })
         .catch(() => {
-          if (alive) setErr("Can't reach server");
+          if (alive) setErr(t("Can't reach server"));
         });
     };
     poll();
-    const t = window.setInterval(poll, 3000);
+    const iv = window.setInterval(poll, 3000);
     return () => {
       alive = false;
-      window.clearInterval(t);
+      window.clearInterval(iv);
     };
   }, []);
 
@@ -89,10 +91,10 @@ export function Index() {
   const duplicate = (id: string) => (): void => {
     void fetch(`/api/assessments/${encodeURIComponent(id)}/launch-input`)
       .then(async (r) => {
-        if (!r.ok) { setErr((await r.json().catch(() => ({}))).error ?? `no launch input (${r.status})`); return; }
+        if (!r.ok) { setErr((await r.json().catch(() => ({}))).error ?? t("no launch input ({status})", { status: r.status })); return; }
         setCreating({ initial: (await r.json()) as LaunchInput });
       })
-      .catch(() => setErr("Can't reach server"));
+      .catch(() => setErr(t("Can't reach server")));
   };
 
   if (creating) {
@@ -103,18 +105,18 @@ export function Index() {
     <div className="mx-auto max-w-[1100px] px-5 pt-6 pb-12">
       <header className="flex items-center justify-between border-b border-border px-1 pb-5">
         <div className="flex items-baseline gap-3">
-          <h1 className="text-base font-semibold">Projects</h1>
+          <h1 className="text-base font-semibold">{t("Projects")}</h1>
           <span className="text-muted-foreground">{rows?.length ?? ""}</span>
         </div>
-        {canWrite ? <Button type="button" size="sm" onClick={() => setCreating({})}>+ New</Button> : null}
+        {canWrite ? <Button type="button" size="sm" onClick={() => setCreating({})}>{t("+ New")}</Button> : null}
       </header>
       {err ? <p role="alert" className="p-4 text-destructive">{err}</p> : null}
       {rows && rows.length === 0 ? (
         <Card className="mt-8">
           <CardContent className="flex flex-col items-center gap-3 py-12 text-center">
-            <h2 className="text-lg font-semibold">No assessments yet</h2>
-            <p className="max-w-md text-muted-foreground">Point VERDICT at a target and it maps the app, then hunts for vulnerabilities — autonomously.</p>
-            {canWrite ? <Button type="button" onClick={() => setCreating({})}>+ New assessment</Button> : <p className="text-muted-foreground">Ask an operator to start one.</p>}
+            <h2 className="text-lg font-semibold">{t("No assessments yet")}</h2>
+            <p className="max-w-md text-muted-foreground">{t("Point VERDICT at a target and it maps the app, then hunts for vulnerabilities — autonomously.")}</p>
+            {canWrite ? <Button type="button" onClick={() => setCreating({})}>{t("+ New assessment")}</Button> : <p className="text-muted-foreground">{t("Ask an operator to start one.")}</p>}
           </CardContent>
         </Card>
       ) : null}
@@ -122,15 +124,15 @@ export function Index() {
         <Table className="mt-3 text-xs">
           <TableHeader>
             <TableRow>
-              <TableHead>Target</TableHead>
-              <TableHead>Type</TableHead>
-              <TableHead>Phase</TableHead>
-              <TableHead className="text-right">Screens</TableHead>
-              <TableHead className="text-right">Findings</TableHead>
-              {multiUser ? <TableHead>Owner</TableHead> : null}
-              <TableHead>Updated</TableHead>
-              <TableHead>ID</TableHead>
-              <TableHead><span className="sr-only">Action</span></TableHead>
+              <TableHead>{t("Target")}</TableHead>
+              <TableHead>{t("Type")}</TableHead>
+              <TableHead>{t("Phase")}</TableHead>
+              <TableHead className="text-right">{t("Screens")}</TableHead>
+              <TableHead className="text-right">{t("Findings")}</TableHead>
+              {multiUser ? <TableHead>{t("Owner")}</TableHead> : null}
+              <TableHead>{t("Updated")}</TableHead>
+              <TableHead>{t("ID")}</TableHead>
+              <TableHead><span className="sr-only">{t("Action")}</span></TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -138,7 +140,7 @@ export function Index() {
               <TableRow key={r.id} className="cursor-pointer" onClick={() => { window.location.search = `?id=${encodeURIComponent(r.id)}`; }}>
                 <TableCell className="min-w-48 whitespace-normal">
                   <a href={`?id=${encodeURIComponent(r.id)}`} className="font-semibold text-foreground hover:text-primary" onClick={(e) => e.stopPropagation()}>
-                    {r.running ? <span className="mr-2 inline-block size-2 rounded-full bg-primary" title="running" /> : null}
+                    {r.running ? <span className="mr-2 inline-block size-2 rounded-full bg-primary" title={t("running")} /> : null}
                     {targetName(r.target)}
                   </a>
                   <div className="mt-1 break-all font-mono text-[11px] text-muted-foreground">{targetSub(r.target)}</div>
@@ -149,26 +151,26 @@ export function Index() {
                 <TableCell className={r.findings > 0 ? "text-right font-semibold text-warning" : "text-right"}>{r.findings}</TableCell>
                 {multiUser ? (
                   <TableCell className="font-mono text-muted-foreground">
-                    {r.owner ? (r.owner === user?.username ? `${r.owner} (you)` : r.owner) : "—"}
+                    {r.owner ? (r.owner === user?.username ? t("{owner} (you)", { owner: r.owner }) : r.owner) : "—"}
                   </TableCell>
                 ) : null}
                 <TableCell className="text-muted-foreground">{fmt(r.updatedAt)}</TableCell>
                 <TableCell className="font-mono text-[11px] text-muted-foreground">{r.id}</TableCell>
                 <TableCell className="text-right" onClick={(e) => e.stopPropagation()}>
                   {!canWrite ? (
-                    r.running ? <span className="inline-block size-2 rounded-full bg-primary" title="running" /> : null
+                    r.running ? <span className="inline-block size-2 rounded-full bg-primary" title={t("running")} /> : null
                   ) : (
                     <DropdownMenu>
                       <DropdownMenuTrigger asChild>
-                        <Button type="button" variant="ghost" size="icon-sm" aria-label={`Actions for ${r.id}`} title="Actions"><MoreHorizontal /></Button>
+                        <Button type="button" variant="ghost" size="icon-sm" aria-label={t("Actions for {id}", { id: r.id })} title={t("Actions")}><MoreHorizontal /></Button>
                       </DropdownMenuTrigger>
                       <DropdownMenuContent align="end">
                         {r.running ? (
-                          <DropdownMenuItem onSelect={runCtl(r.id, "stop")}><Square /> Stop</DropdownMenuItem>
+                          <DropdownMenuItem onSelect={runCtl(r.id, "stop")}><Square /> {t("Stop")}</DropdownMenuItem>
                         ) : (
-                          <DropdownMenuItem onSelect={runCtl(r.id, "resume")}><Play /> Resume</DropdownMenuItem>
+                          <DropdownMenuItem onSelect={runCtl(r.id, "resume")}><Play /> {t("Resume")}</DropdownMenuItem>
                         )}
-                        <DropdownMenuItem onSelect={duplicate(r.id)}><Copy /> Duplicate…</DropdownMenuItem>
+                        <DropdownMenuItem onSelect={duplicate(r.id)}><Copy /> {t("Duplicate…")}</DropdownMenuItem>
                       </DropdownMenuContent>
                     </DropdownMenu>
                   )}
@@ -178,7 +180,7 @@ export function Index() {
           </TableBody>
         </Table>
       ) : null}
-      {!rows && !err ? <p className="p-4 text-muted-foreground">Loading…</p> : null}
+      {!rows && !err ? <p className="p-4 text-muted-foreground">{t("Loading…")}</p> : null}
     </div>
   );
 }

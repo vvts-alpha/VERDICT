@@ -4,6 +4,7 @@
 // (runs/<id>/chat.json) and loaded on mount, so past exchanges survive a reload.
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { useRole } from "../api";
+import { useT } from "../i18n";
 import { Button } from "./ui/button";
 import { Textarea } from "./ui/textarea";
 
@@ -14,6 +15,7 @@ interface Msg {
 
 export function Chat({ id }: { id: string }) {
   const { canWrite } = useRole();
+  const t = useT();
   const [messages, setMessages] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
@@ -53,10 +55,10 @@ export function Chat({ id }: { id: string }) {
         body: JSON.stringify({ messages: next }),
       });
       const data = (await res.json()) as { answer?: string; error?: string };
-      if (!res.ok || !data.answer) setErr(data.error ?? `chat failed (${res.status})`);
+      if (!res.ok || !data.answer) setErr(data.error ?? t("chat failed ({status})", { status: res.status }));
       else setMessages((m) => [...m, { role: "assistant", content: data.answer! }]);
     } catch {
-      setErr("Can't reach server");
+      setErr(t("Can't reach server"));
     }
     setBusy(false);
   };
@@ -66,14 +68,14 @@ export function Chat({ id }: { id: string }) {
       <div className="flex flex-1 flex-col gap-3 overflow-y-auto p-1">
         {messages.length === 0 ? (
           <p className="p-4 text-muted-foreground">
-            Ask about this assessment — findings, risk, coverage, scope.
+            {t("Ask about this assessment — findings, risk, coverage, scope.")}
             <br />
-            e.g. “Why is f-001 high?” · “Summarize the auth posture” · “Which screens weren’t tested?”
+            {t("e.g. “Why is f-001 high?” · “Summarize the auth posture” · “Which screens weren’t tested?”")}
           </p>
         ) : (
           messages.map((m, i) => (
             <div key={i} className={`flex max-w-[80%] flex-col gap-1 ${m.role === "user" ? "self-end items-end" : "self-start"}`}>
-              <span className="text-[10px] uppercase tracking-wide text-muted-foreground">{m.role === "user" ? "You" : "VERDICT"}</span>
+              <span className="text-[10px] uppercase tracking-wide text-muted-foreground">{m.role === "user" ? t("You") : "VERDICT"}</span>
               <div className={`break-words whitespace-pre-wrap rounded-lg px-3 py-2 ${m.role === "user" ? "bg-accent text-accent-foreground" : "border border-border bg-card"}`}>{m.content}</div>
             </div>
           ))
@@ -81,7 +83,7 @@ export function Chat({ id }: { id: string }) {
         {busy ? (
           <div className="flex max-w-[80%] flex-col gap-1 self-start">
             <span className="text-[10px] uppercase tracking-wide text-muted-foreground">VERDICT</span>
-            <div className="rounded-lg border border-border bg-card px-3 py-2 text-muted-foreground italic">… thinking</div>
+            <div className="rounded-lg border border-border bg-card px-3 py-2 text-muted-foreground italic">{t("… thinking")}</div>
           </div>
         ) : null}
         {err ? <p role="alert" className="text-destructive">{err}</p> : null}
@@ -99,14 +101,14 @@ export function Chat({ id }: { id: string }) {
                 void send();
               }
             }}
-            placeholder="Ask a question…  (Ctrl/Cmd+Enter to send)"
+            placeholder={t("Ask a question…  (Ctrl/Cmd+Enter to send)")}
             rows={2}
           />
-          <Button type="button" disabled={busy || !input.trim()} onClick={() => void send()}>{busy ? "…" : "Send"}</Button>
+          <Button type="button" disabled={busy || !input.trim()} onClick={() => void send()}>{busy ? "…" : t("Send")}</Button>
         </div>
       ) : (
         <p className="px-3 py-2 text-muted-foreground">
-          Ask is read-only for viewers — sign in as operator to use it.
+          {t("Ask is read-only for viewers — sign in as operator to use it.")}
         </p>
       )}
     </div>

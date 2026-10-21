@@ -3,6 +3,7 @@ import type { MouseEvent } from "react";
 import type { StateView } from "@veritas/core";
 import { postControl, postControlBody, useAssessmentId, useRole, useStateView } from "./api";
 import { useDesktopShell } from "./desktop-shell";
+import { useT } from "./i18n";
 import { StatusBar, StatusBarShell } from "./components/StatusBar";
 import { HandoffBar } from "./components/HandoffBar";
 import { Progress } from "./components/Progress";
@@ -20,6 +21,7 @@ import { Chat } from "./components/Chat";
 import { Control } from "./components/Control";
 import { LiveView } from "./components/LiveView";
 import { Account } from "./components/Account";
+import { Settings } from "./components/Settings";
 import { Users } from "./components/Users";
 import { Usage } from "./components/Usage";
 import { Badge } from "./components/ui/badge";
@@ -70,6 +72,7 @@ function tabCls(active: boolean, danger: boolean): string {
 // open as panes over the tree+content area (status row stays); the assessment DOM stays mounted-but-hidden
 // so tab/screen selection, tree expansion, and unsaved form drafts survive the round-trip.
 export function App() {
+  const t = useT();
   const id = useAssessmentId();
   const { view, conn } = useStateView(id);
   const desktop = useDesktopShell();
@@ -78,19 +81,19 @@ export function App() {
   const desktopNode = desktop && desktop.view !== "main" ? desktop.views[desktop.view] : null;
   // Account / Users open as overlay panes (same pattern as desktop views) — the assessment DOM stays
   // mounted-but-hidden so tab/screen/tree state survives the round-trip.
-  const [pane, setPane] = useState<"account" | "users" | "usage" | null>(null);
+  const [pane, setPane] = useState<"account" | "users" | "usage" | "settings" | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>("screen");
   // Transient error toast for rejected/dropped control POSTs (they used to fail silently).
   const [notice, setNotice] = useState<string | null>(null);
   useEffect(() => {
     if (!notice) return;
-    const t = window.setTimeout(() => setNotice(null), 4500);
-    return () => window.clearTimeout(t);
+    const timer = window.setTimeout(() => setNotice(null), 4500);
+    return () => window.clearTimeout(timer);
   }, [notice]);
   const ctl = (label: string, p: Promise<true | string>): void => {
     void p.then((r) => {
-      if (r !== true) setNotice(`${label} failed — ${r}`);
+      if (r !== true) setNotice(t("{label} failed — {reason}", { label, reason: r }));
     });
   };
 
@@ -129,7 +132,7 @@ export function App() {
   const control = (path: string, label = "control") => () => ctl(label, postControl(`/api/assessments/${view!.id}/${path}`));
   // Leaving a desktop view goes through the shell — it can veto (e.g. unsaved Settings edits).
   const goMain = (): boolean => !desktop || desktop.view === "main" || desktop.onNavigate("main");
-  const openPane = (p: "account" | "users" | "usage"): void => {
+  const openPane = (p: "account" | "users" | "usage" | "settings"): void => {
     if (pane === p) {
       setPane(null);
       return;
@@ -162,10 +165,10 @@ export function App() {
   const crumbs = view ? (
     <span className="flex min-w-0 items-baseline gap-2 text-sm">
       <span className="truncate font-medium" title={targetLabel ?? ""}>{targetLabel}</span>
-      <span className="shrink-0 font-mono text-xs text-muted-foreground" title={view.id}>run {view.id}</span>
+      <span className="shrink-0 font-mono text-xs text-muted-foreground" title={view.id}>{t("run {id}", { id: view.id })}</span>
     </span>
   ) : id ? (
-    <span className="shrink-0 font-mono text-xs text-muted-foreground" title={id}>run {id}</span>
+    <span className="shrink-0 font-mono text-xs text-muted-foreground" title={id}>{t("run {id}", { id })}</span>
   ) : (
     // No run open — the top nav and the page heading already name the place; repeating "Projects"/the
     // pane label here only triples it. Keep the row for the conn dot and role badge.
@@ -177,7 +180,7 @@ export function App() {
     // 100vh here would overflow the flex-1 container below it and clip the tree/content bottom edge.
     <div className="flex h-full flex-col">
       {/* Common top nav — same row in web and desktop. Desktop-only entries come from the shell context. */}
-      <nav className="flex h-11 shrink-0 items-center gap-1 border-b border-border bg-card px-2" aria-label="Main">
+      <nav className="flex h-11 shrink-0 items-center gap-1 border-b border-border bg-card px-2" aria-label={t("Main")}>
         {!isDesktop ? (
           <a href="?" title="VERDICT" className="mr-1 flex shrink-0 items-center px-2" onClick={onProjectsClick}>
             <img className="block h-6 w-auto" src="/verdict-title.png" alt="VERDICT" />
@@ -185,12 +188,19 @@ export function App() {
         ) : null}
         <a href="?" onClick={onProjectsClick} className={topNavCls(!id && !desktopNode)} aria-current={!id && !desktopNode ? "page" : undefined}>
           <LayoutGrid className="size-4" />
-          Projects
+          {t("Projects")}
         </a>
         <button type="button" onClick={() => openPane("usage")} aria-current={pane === "usage" ? "page" : undefined} className={topNavCls(pane === "usage")}>
           <ChartColumn className="size-4" />
-          Usage
+          {t("Usage")}
         </button>
+        {/* Display-prefs pane — serve mode only; desktop carries its own Settings view (app config). */}
+        {!desktop ? (
+          <button type="button" onClick={() => openPane("settings")} aria-current={pane === "settings" ? "page" : undefined} className={topNavCls(pane === "settings")}>
+            <SlidersHorizontal className="size-4" />
+            {t("Settings")}
+          </button>
+        ) : null}
         {desktop?.nav.map((n) => (
           <button
             key={n.key}
@@ -209,12 +219,12 @@ export function App() {
             {me.canAdmin ? (
               <button type="button" onClick={() => openPane("users")} aria-current={pane === "users" ? "page" : undefined} className={topNavCls(pane === "users")}>
                 <UsersRound className="size-4" />
-                Users
+                {t("Users")}
               </button>
             ) : null}
             <button type="button" onClick={() => openPane("account")} aria-current={pane === "account" ? "page" : undefined} className={topNavCls(pane === "account")}>
               <UserRound className="size-4" />
-              Account
+              {t("Account")}
             </button>
           </span>
         ) : null}
@@ -262,20 +272,20 @@ export function App() {
                 <div className="flex h-full min-w-0 flex-col">
                   <Progress view={view} />
                   {/* View switcher — horizontal tabs, scrollable so every entry stays reachable at narrow widths. */}
-                  <nav className="flex shrink-0 items-center gap-1 overflow-x-auto border-b border-border px-2 py-1.5" aria-label="Assessment views">
-                    {TABS.map((t) => {
-                      const badge = t.key === "sessions" ? awaitingSessions : t.count?.(view);
-                      const danger = t.key === "sessions" && awaitingSessions > 0;
+                  <nav className="flex shrink-0 items-center gap-1 overflow-x-auto border-b border-border px-2 py-1.5" aria-label={t("Assessment views")}>
+                    {TABS.map((tb) => {
+                      const badge = tb.key === "sessions" ? awaitingSessions : tb.count?.(view);
+                      const danger = tb.key === "sessions" && awaitingSessions > 0;
                       return (
                         <button
-                          key={t.key}
+                          key={tb.key}
                           type="button"
-                          onClick={() => navTo(t.key)}
-                          aria-current={tab === t.key ? "page" : undefined}
-                          className={tabCls(tab === t.key, danger)}
+                          onClick={() => navTo(tb.key)}
+                          aria-current={tab === tb.key ? "page" : undefined}
+                          className={tabCls(tab === tb.key, danger)}
                         >
-                          <t.icon className="size-3.5" />
-                          {t.label}
+                          <tb.icon className="size-3.5" />
+                          {t(tb.label)}
                           {badge != null && badge > 0 ? (
                             <Badge variant="secondary" className={danger ? "bg-destructive/15 text-destructive" : ""}>{badge}</Badge>
                           ) : null}
@@ -309,7 +319,7 @@ export function App() {
               {!id ? (
                 <Index />
               ) : (
-                <p className="p-8 text-muted-foreground">Connecting to {id} … ({conn})</p>
+                <p className="p-8 text-muted-foreground">{t("Connecting to {id} … ({conn})", { id, conn })}</p>
               )}
             </main>
           )}
@@ -317,7 +327,7 @@ export function App() {
         {desktopNode ? <div className="absolute inset-0 z-10 flex flex-col bg-background">{desktopNode}</div> : null}
         {!desktopNode && pane ? (
           <div className="absolute inset-0 z-10 flex flex-col overflow-auto bg-background">
-            {pane === "users" ? <Users /> : pane === "usage" ? <Usage /> : <Account />}
+            {pane === "users" ? <Users /> : pane === "usage" ? <Usage /> : pane === "settings" ? <Settings /> : <Account />}
           </div>
         ) : null}
       </div>

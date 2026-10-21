@@ -4,6 +4,7 @@ import type { ReadinessCheck } from "@veritas/core";
 import { useEffect, useState } from "react";
 import { ArrowLeft, CircleHelp, Play, Upload, X } from "lucide-react";
 import { Disclosure } from "./Disclosure";
+import { useT } from "../i18n";
 import { Button } from "./ui/button";
 import { Checkbox } from "./ui/checkbox";
 import { Input } from "./ui/input";
@@ -44,6 +45,7 @@ function lines(s: string): string[] {
 }
 
 export function NewAssessment({ onCancel, apiSpec = false, initial }: { onCancel: () => void; apiSpec?: boolean; initial?: LaunchInput }) {
+  const t = useT();
   const [command, setCommand] = useState<"pilot" | "assess">("pilot");
   const [target, setTarget] = useState("");
   const [specText, setSpecText] = useState("");
@@ -197,7 +199,7 @@ export function NewAssessment({ onCancel, apiSpec = false, initial }: { onCancel
         .map((ln) => (ln.split(/[,\t]/)[0] ?? "").trim().replace(/^["']|["']$/g, ""))
         .filter((u) => /^https?:\/\//i.test(u));
       if (urls.length) setTargetUrls((prev) => [...lines(prev), ...urls].filter((u, i, a) => a.indexOf(u) === i).join("\n"));
-      else setErr("no http(s) URLs found in the file");
+      else setErr(t("no http(s) URLs found in the file"));
     };
     reader.readAsText(file);
   };
@@ -223,17 +225,17 @@ export function NewAssessment({ onCancel, apiSpec = false, initial }: { onCancel
       });
       const list = result.slice();
       if (!roles.some((r) => r.name.trim()) && !basicUser.trim()) {
-        list.push({ name: "auth", status: "warn", message: "No auth configured — the run goes unauthenticated; login-protected areas won't be reached (add a role under Auth if the target needs login)." });
+        list.push({ name: "auth", status: "warn", message: t("No auth configured — the run goes unauthenticated; login-protected areas won't be reached (add a role under Auth if the target needs login).") });
       }
       setChecks(list);
       return result.length > 0 && result.every((c) => c.status !== "error");
-    } catch { setErr("Could not check setup. Open Settings and check connections."); return false; }
+    } catch { setErr(t("Could not check setup. Open Settings and check connections.")); return false; }
     finally { setChecking(false); }
   };
 
   const submit = async (): Promise<void> => {
     if (!target.trim()) {
-      setErr("Target URL is required");
+      setErr(t("Target URL is required"));
       return;
     }
     // Require an explicit http(s) scheme. Without it "example.com" throws in new URL() and "host:3000" misparses to an
@@ -242,7 +244,7 @@ export function NewAssessment({ onCancel, apiSpec = false, initial }: { onCancel
       const u = new URL(target.trim());
       if (u.protocol !== "http:" && u.protocol !== "https:") throw new Error();
     } catch {
-      setErr(`Target must start with http:// or https:// (e.g. https://${target.trim()})`);
+      setErr(t("Target must start with http:// or https:// (e.g. https://{target})", { target: target.trim() }));
       return;
     }
     let spec: unknown;
@@ -250,7 +252,7 @@ export function NewAssessment({ onCancel, apiSpec = false, initial }: { onCancel
       try {
         spec = JSON.parse(specText);
         if (!spec || typeof spec !== "object") throw new Error();
-      } catch { setErr("Choose a valid OpenAPI / Swagger JSON file first"); return; }
+      } catch { setErr(t("Choose a valid OpenAPI / Swagger JSON file first")); return; }
     }
     setErr(null);
     setBusy(true);
@@ -310,7 +312,7 @@ export function NewAssessment({ onCancel, apiSpec = false, initial }: { onCancel
     if (command === "pilot" && context.trim()) options.context = context.trim();
 
     try {
-      if (!(await checkSetup())) { setErr("Fix the failed setup checks in Settings before starting."); setBusy(false); return; }
+      if (!(await checkSetup())) { setErr(t("Fix the failed setup checks in Settings before starting.")); setBusy(false); return; }
       const res = await fetch("/api/run", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -318,13 +320,13 @@ export function NewAssessment({ onCancel, apiSpec = false, initial }: { onCancel
       });
       const data = (await res.json()) as { id?: string; error?: string };
       if (!res.ok || !data.id) {
-        setErr(data.error ?? `launch failed (${res.status})`);
+        setErr(data.error ?? t("launch failed ({status})", { status: res.status }));
         setBusy(false);
         return;
       }
       window.location.search = `?id=${encodeURIComponent(data.id)}`;
     } catch {
-      setErr("Can't reach server");
+      setErr(t("Can't reach server"));
       setBusy(false);
     }
   };
@@ -332,59 +334,59 @@ export function NewAssessment({ onCancel, apiSpec = false, initial }: { onCancel
   return (
     <div className="space-y-3 pb-10">
       <div className="flex items-center justify-between border-b border-border pb-3">
-        <h2 className="text-base font-semibold">{initial ? "Duplicate assessment" : apiSpec ? "API specification assessment" : "New assessment"}</h2>
+        <h2 className="text-base font-semibold">{initial ? t("Duplicate assessment") : apiSpec ? t("API specification assessment") : t("New assessment")}</h2>
         <div className="flex items-center gap-1">
           <a
             className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground hover:text-foreground"
             href="https://github.com/vvts-alpha/VERDICT/blob/main/docs/USAGE.md"
             target="_blank"
             rel="noreferrer"
-            title="Operator usage guide — scope, auth roles, run options"
+            title={t("Operator usage guide — scope, auth roles, run options")}
           >
-            <CircleHelp className="size-3.5" /> Help
+            <CircleHelp className="size-3.5" /> {t("Help")}
           </a>
           <Button type="button" variant="ghost" onClick={onCancel}>
-            <ArrowLeft /> Cancel
+            <ArrowLeft /> {t("Cancel")}
           </Button>
         </div>
       </div>
 
       {apiSpec ? (
         <label className="my-2 flex flex-col gap-1 text-xs [&>span]:text-muted-foreground">
-          <span>OpenAPI 3.x / Swagger 2.0 JSON file *</span>
+          <span>{t("OpenAPI 3.x / Swagger 2.0 JSON file *")}</span>
           <Input type="file" accept=".json,application/json" onChange={(e) => {
             const file = e.target.files?.[0];
             setSpecText(""); setSpecName("");
             if (!file) return;
-            if (file.size > 2 * 1024 * 1024) { setErr("Specification must be 2 MB or smaller"); return; }
-            void file.text().then((text) => { setSpecText(text); setSpecName(file.name); setErr(null); }).catch(() => setErr("Could not read the specification"));
+            if (file.size > 2 * 1024 * 1024) { setErr(t("Specification must be 2 MB or smaller")); return; }
+            void file.text().then((text) => { setSpecText(text); setSpecName(file.name); setErr(null); }).catch(() => setErr(t("Could not read the specification")));
           }} />
-          <small>{specName || "Select a JSON file (YAML / external refs unsupported)."}</small>
+          <small>{specName || t("Select a JSON file (YAML / external refs unsupported).")}</small>
         </label>
       ) : null}
 
       {command === "pilot" && !apiSpec ? (
         <label className="my-2 flex flex-col gap-1 text-xs [&>span]:text-muted-foreground">
-          <span>Run</span>
+          <span>{t("Run")}</span>
           <NativeSelect className="w-full" value={runKind} onChange={(e) => setRunKind(e.target.value as "site" | "list" | "survey")}>
-            <option value="site">Full assess — crawl &amp; diagnose the whole site</option>
-            <option value="list">Page base — diagnose the URLs you enter below</option>
-            <option value="survey">Survey — map screens &amp; APIs only, no diagnosis</option>
+            <option value="site">{t("Full assess — crawl & diagnose the whole site")}</option>
+            <option value="list">{t("Page base — diagnose the URLs you enter below")}</option>
+            <option value="survey">{t("Survey — map screens & APIs only, no diagnosis")}</option>
           </NativeSelect>
         </label>
       ) : null}
 
       <label className="my-2 flex flex-col gap-1 text-xs [&>span]:text-muted-foreground">
-        <span>Target URL *</span>
+        <span>{t("Target URL *")}</span>
         <Input value={target} onChange={(e) => setTarget(e.target.value)} placeholder="https://app.example.com/" />
       </label>
 
       {runKind === "list" && !apiSpec ? (
         <label className="my-2 flex flex-col gap-1 text-xs [&>span]:text-muted-foreground">
           <span>
-            Pages to scan — one URL per line{" "}
-            <label className="ml-2 inline-flex cursor-pointer items-center gap-1 rounded border border-border px-2 py-0.5 text-primary hover:bg-accent" title="load a URL list from a file (CSV: first column, or one URL per line)">
-              <Upload className="size-3" /> import list
+            {t("Pages to scan — one URL per line")}{" "}
+            <label className="ml-2 inline-flex cursor-pointer items-center gap-1 rounded border border-border px-2 py-0.5 text-primary hover:bg-accent" title={t("load a URL list from a file (CSV: first column, or one URL per line)")}>
+              <Upload className="size-3" /> {t("import list")}
               <Input
                 type="file"
                 accept=".csv,.txt,text/csv,text/plain"
@@ -407,26 +409,26 @@ export function NewAssessment({ onCancel, apiSpec = false, initial }: { onCancel
 
       <div className="grid grid-cols-1 gap-x-4 sm:grid-cols-2">
         <label className="my-2 flex flex-col gap-1 text-xs [&>span]:text-muted-foreground">
-          <span>Target scope</span>
+          <span>{t("Target scope")}</span>
           <NativeSelect className="w-full" value={scopeMode} onChange={(e) => setScopeMode(e.target.value as "same-origin" | "etld" | "unrestricted")}>
-            <option value="etld">eTLD+1 — seed domain + subdomains</option>
-            <option value="same-origin">same-origin — exact host only</option>
-            <option value="unrestricted">unrestricted — any host (⚠ may leave the program)</option>
+            <option value="etld">{t("eTLD+1 — seed domain + subdomains")}</option>
+            <option value="same-origin">{t("same-origin — exact host only")}</option>
+            <option value="unrestricted">{t("unrestricted — any host (⚠ may leave the program)")}</option>
           </NativeSelect>
-          <small>Allowed hosts: {scopePreview.length ? scopePreview.join(", ") : "Enter target URLs to preview"}</small>
+          <small>{t("Allowed hosts: {hosts}", { hosts: scopePreview.length ? scopePreview.join(", ") : t("Enter target URLs to preview") })}</small>
         </label>
         {command === "pilot" && runKind !== "list" ? (
-          <label className="my-2 flex flex-col gap-1 text-xs [&>span]:text-muted-foreground" title="how many screens to diagnose (default 120). raise for large apps.">
-            <span>Max screens</span>
+          <label className="my-2 flex flex-col gap-1 text-xs [&>span]:text-muted-foreground" title={t("how many screens to diagnose (default 120). raise for large apps.")}>
+            <span>{t("Max screens")}</span>
             <Input value={maxScreens} onChange={(e) => setMaxScreens(e.target.value)} placeholder="120" inputMode="numeric" />
           </label>
         ) : null}
       </div>
 
-      <h3 className="mt-3 text-xs font-semibold uppercase tracking-wide text-primary">Agent</h3>
+      <h3 className="mt-3 text-xs font-semibold uppercase tracking-wide text-primary">{t("Agent")}</h3>
       <div className="grid grid-cols-1 gap-x-4 sm:grid-cols-2">
         <label className="my-2 flex flex-col gap-1 text-xs [&>span]:text-muted-foreground">
-          <span>{command === "pilot" ? "Model (deep)" : "Model"}</span>
+          <span>{command === "pilot" ? t("Model (deep)") : t("Model")}</span>
           {useDesktopSettings ? (
             // When running in the desktop app, the desktop Settings manage model choices; show a read-only hint.
             <Input readOnly value={model} />
@@ -441,13 +443,13 @@ export function NewAssessment({ onCancel, apiSpec = false, initial }: { onCancel
           )}
         </label>
         {command === "pilot" ? (
-          <label className="my-2 flex flex-col gap-1 text-xs [&>span]:text-muted-foreground" title="model tiering: high-value screens use the deep model, survey/methodology/low-value screens use this fast model">
-            <span>Fast model</span>
+          <label className="my-2 flex flex-col gap-1 text-xs [&>span]:text-muted-foreground" title={t("model tiering: high-value screens use the deep model, survey/methodology/low-value screens use this fast model")}>
+            <span>{t("Fast model")}</span>
             {useDesktopSettings ? (
               <Input readOnly value={fastModel ?? ""} />
             ) : (
               <NativeSelect className="w-full" value={fastModel} onChange={(e) => setFastModel(e.target.value)}>
-                <option value="">— none (single model)</option>
+                <option value="">{t("— none (single model)")}</option>
                 {MODELS.map((m) => (
                   <option key={m.id} value={m.id}>
                     {m.label}
@@ -459,49 +461,49 @@ export function NewAssessment({ onCancel, apiSpec = false, initial }: { onCancel
         ) : null}
       </div>
 
-      <Disclosure title="Advanced (rate · limits · crawl · headers)">
+      <Disclosure title={t("Advanced (rate · limits · crawl · headers)")}>
         {command === "pilot" && runKind !== "survey" ? (
-          <label className="my-2 flex flex-col gap-1 text-xs [&>span]:text-muted-foreground" title="operator focus — injected as the TOP priority of the scenario (A04) stage, not per-screen diagnosis. emphasis, not exclusive (full coverage still runs).">
-            <span>Focus — what to prioritize in this run</span>
+          <label className="my-2 flex flex-col gap-1 text-xs [&>span]:text-muted-foreground" title={t("operator focus — injected as the TOP priority of the scenario (A04) stage, not per-screen diagnosis. emphasis, not exclusive (full coverage still runs).")}>
+            <span>{t("Focus — what to prioritize in this run")}</span>
             <Textarea
               value={focus}
               onChange={(e) => setFocus(e.target.value)}
-              placeholder="e.g. Focus on the checkout flow and IDOR in /api/orders. Also coupons / price tampering."
+              placeholder={t("e.g. Focus on the checkout flow and IDOR in /api/orders. Also coupons / price tampering.")}
               rows={2}
             />
           </label>
         ) : null}
         <div className="grid grid-cols-1 gap-x-4 sm:grid-cols-2">
-          <label className="my-2 flex flex-col gap-1 text-xs [&>span]:text-muted-foreground" title="minimum delay between HTTP requests (politeness throttle)">
-            <span>Rate (ms)</span>
+          <label className="my-2 flex flex-col gap-1 text-xs [&>span]:text-muted-foreground" title={t("minimum delay between HTTP requests (politeness throttle)")}>
+            <span>{t("Rate (ms)")}</span>
             <Input value={rate} onChange={(e) => setRate(e.target.value)} inputMode="numeric" />
           </label>
 
 
           {command === "pilot" ? (
-            <label className="my-2 flex flex-col gap-1 text-xs [&>span]:text-muted-foreground" title="keepalive interval (minutes). touches a safe authed page (never /) to keep the session warm. set 0 to turn off for sites whose session dies on a cold / hit or a full reload.">
-              <span>Keepalive (min)</span>
-              <Input value={keepAliveMin} onChange={(e) => setKeepAliveMin(e.target.value)} placeholder="4 · 0 = off" inputMode="numeric" />
+            <label className="my-2 flex flex-col gap-1 text-xs [&>span]:text-muted-foreground" title={t("keepalive interval (minutes). touches a safe authed page (never /) to keep the session warm. set 0 to turn off for sites whose session dies on a cold / hit or a full reload.")}>
+              <span>{t("Keepalive (min)")}</span>
+              <Input value={keepAliveMin} onChange={(e) => setKeepAliveMin(e.target.value)} placeholder={t("4 · 0 = off")} inputMode="numeric" />
             </label>
           ) : null}
         </div>
         {command === "pilot" ? (
-          <label className="my-2 flex flex-col gap-1 text-xs [&>span]:text-muted-foreground" title="goto-safe authed hub (the app menu). for sites where deep routes die on a direct/cold navigation: a route that bounces to an error page is reached by clicking its link from here instead, and this becomes the keepalive target. blank = off (unchanged).">
-            <span>Anchor URL (menu hub)</span>
-            <Input value={anchorUrl} onChange={(e) => setAnchorUrl(e.target.value)} placeholder="e.g. http://host/Account/AccountMenu  (blank = off)" autoComplete="off" />
+          <label className="my-2 flex flex-col gap-1 text-xs [&>span]:text-muted-foreground" title={t("goto-safe authed hub (the app menu). for sites where deep routes die on a direct/cold navigation: a route that bounces to an error page is reached by clicking its link from here instead, and this becomes the keepalive target. blank = off (unchanged).")}>
+            <span>{t("Anchor URL (menu hub)")}</span>
+            <Input value={anchorUrl} onChange={(e) => setAnchorUrl(e.target.value)} placeholder={t("e.g. http://host/Account/AccountMenu  (blank = off)")} autoComplete="off" />
           </label>
         ) : null}
 
 
         {!apiSpec ? (
           <>
-            <p className="mt-3 text-xs text-muted-foreground">Crawl</p>
+            <p className="mt-3 text-xs text-muted-foreground">{t("Crawl")}</p>
             <div className="my-1 flex flex-wrap items-center gap-4 [&_label]:inline-flex [&_label]:items-center [&_label]:gap-2">
               <label>
-                <Checkbox checked={followLinks} onCheckedChange={(checked) => setFollowLinks(checked === true)} /> follow links
+                <Checkbox checked={followLinks} onCheckedChange={(checked) => setFollowLinks(checked === true)} /> {t("follow links")}
               </label>
               <label className="flex items-center gap-2 text-xs [&>input]:w-20">
-                <span>max depth</span>
+                <span>{t("max depth")}</span>
                 <Input value={maxDepth} onChange={(e) => setMaxDepth(e.target.value)} placeholder="10" inputMode="numeric" />
               </label>
 
@@ -509,89 +511,89 @@ export function NewAssessment({ onCancel, apiSpec = false, initial }: { onCancel
           </>
         ) : null}
 
-        <p className="mt-3 text-xs text-muted-foreground" title="added to in-scope requests (WAF bypass / required headers)">Custom headers ({headersList.length})</p>
+        <p className="mt-3 text-xs text-muted-foreground" title={t("added to in-scope requests (WAF bypass / required headers)")}>{t("Custom headers ({n})", { n: headersList.length })}</p>
         {headersList.map((h, i) => (
           <div className="my-2 flex flex-wrap items-center gap-2 [&_input]:min-w-28 [&_input]:flex-1" key={i}>
-            <Input placeholder="header name (e.g. X-Forwarded-For)" value={h.name} onChange={(e) => setHeader(i, { name: e.target.value })} autoComplete="off" />
-            <Input placeholder="value" value={h.value} onChange={(e) => setHeader(i, { value: e.target.value })} autoComplete="off" />
-            <Button type="button" size="icon-sm" aria-label="Remove header" onClick={() => rmHeader(i)}>
+            <Input placeholder={t("header name (e.g. X-Forwarded-For)")} value={h.name} onChange={(e) => setHeader(i, { name: e.target.value })} autoComplete="off" />
+            <Input placeholder={t("value")} value={h.value} onChange={(e) => setHeader(i, { value: e.target.value })} autoComplete="off" />
+            <Button type="button" size="icon-sm" aria-label={t("Remove header")} onClick={() => rmHeader(i)}>
               <X />
             </Button>
           </div>
         ))}
         <Button type="button" variant="outline" size="sm" onClick={addHeader}>
-          + add header
+          {t("+ add header")}
         </Button>
       </Disclosure>
 
       {!useDesktopSettings || command === "pilot" ? (
-        <h3 className="mt-3 text-xs font-semibold uppercase tracking-wide text-primary">Options</h3>
+        <h3 className="mt-3 text-xs font-semibold uppercase tracking-wide text-primary">{t("Options")}</h3>
       ) : null}
       <div className="my-3 flex flex-wrap items-center gap-4 [&_label]:inline-flex [&_label]:items-center [&_label]:gap-2">
         {!useDesktopSettings ? (
-          <label title="show the automation browser window (headless off) — for debugging. In the desktop app, open the Live tab to watch the scan instead, so this is hidden.">
-            <Checkbox checked={headed} onCheckedChange={(checked) => setHeaded(checked === true)} /> headed (debug)
+          <label title={t("show the automation browser window (headless off) — for debugging. In the desktop app, open the Live tab to watch the scan instead, so this is hidden.")}>
+            <Checkbox checked={headed} onCheckedChange={(checked) => setHeaded(checked === true)} /> {t("headed (debug)")}
           </label>
         ) : null}
         {command === "pilot" ? (
           <>
             {runKind !== "survey" ? (
-              <label title="active Burp scan after diagnosis (uses env BURP_API)">
+              <label title={t("active Burp scan after diagnosis (uses env BURP_API)")}>
                 <Checkbox checked={burpScan} onCheckedChange={(checked) => setBurpScan(checked === true)} /> burp-scan
               </label>
             ) : null}
-            <label title="route all traffic through the Burp proxy (uses env BURP_PROXY)">
+            <label title={t("route all traffic through the Burp proxy (uses env BURP_PROXY)")}>
               <Checkbox checked={burpProxy} onCheckedChange={(checked) => setBurpProxy(checked === true)} /> burp-proxy
             </label>
           </>
         ) : null}
       </div>
 
-      <Disclosure title="Path scope (optional)">
-        <p className="mt-1 text-xs text-muted-foreground">A trailing <code>*</code> is a wildcard; a specific allowed prefix wins over a block (a bare <code>/*</code> alone doesn't lift a block).</p>
+      <Disclosure title={t("Path scope (optional)")}>
+        <p className="mt-1 text-xs text-muted-foreground">{t("A trailing * is a wildcard; a specific allowed prefix wins over a block (a bare /* alone doesn't lift a block).")}</p>
         <div className="grid grid-cols-1 gap-x-4 sm:grid-cols-2">
-          <label className="my-2 flex flex-col gap-1 text-xs [&>span]:text-muted-foreground" title="if set, only paths matching one of these prefixes are scanned">
-            <span>Scan only these paths — e.g. /app/*</span>
-            <Textarea value={inPaths} onChange={(e) => setInPaths(e.target.value)} placeholder="one per line (blank = all in-scope paths)" />
+          <label className="my-2 flex flex-col gap-1 text-xs [&>span]:text-muted-foreground" title={t("if set, only paths matching one of these prefixes are scanned")}>
+            <span>{t("Scan only these paths — e.g. /app/*")}</span>
+            <Textarea value={inPaths} onChange={(e) => setInPaths(e.target.value)} placeholder={t("one per line (blank = all in-scope paths)")} />
           </label>
-          <label className="my-2 flex flex-col gap-1 text-xs [&>span]:text-muted-foreground" title="never scanned — unless an allowed prefix above also matches it">
-            <span>Never scan these paths — e.g. /logout</span>
-            <Textarea value={outPaths} onChange={(e) => setOutPaths(e.target.value)} placeholder="one per line" />
+          <label className="my-2 flex flex-col gap-1 text-xs [&>span]:text-muted-foreground" title={t("never scanned — unless an allowed prefix above also matches it")}>
+            <span>{t("Never scan these paths — e.g. /logout")}</span>
+            <Textarea value={outPaths} onChange={(e) => setOutPaths(e.target.value)} placeholder={t("one per line")} />
           </label>
         </div>
       </Disclosure>
 
-      <Disclosure title={`Auth — site-wide Basic / Digest & roles (${roles.length})`}>
-        <p className="mt-1 text-xs text-muted-foreground" title="the browser 401 dialog, before the app's own login">HTTP Basic / Digest</p>
+      <Disclosure title={t("Auth — site-wide Basic / Digest & roles ({n})", { n: roles.length })}>
+        <p className="mt-1 text-xs text-muted-foreground" title={t("the browser 401 dialog, before the app's own login")}>HTTP Basic / Digest</p>
         <div className="grid grid-cols-1 gap-x-4 sm:grid-cols-2">
           <label className="my-2 flex flex-col gap-1 text-xs [&>span]:text-muted-foreground">
-            <span>Basic user</span>
-            <Input value={basicUser} onChange={(e) => setBasicUser(e.target.value)} placeholder="(leave blank if none)" autoComplete="off" />
+            <span>{t("Basic user")}</span>
+            <Input value={basicUser} onChange={(e) => setBasicUser(e.target.value)} placeholder={t("(leave blank if none)")} autoComplete="off" />
           </label>
           <label className="my-2 flex flex-col gap-1 text-xs [&>span]:text-muted-foreground">
-            <span>Basic password</span>
+            <span>{t("Basic password")}</span>
             <Input type="password" value={basicPass} onChange={(e) => setBasicPass(e.target.value)} autoComplete="off" />
           </label>
         </div>
-        <p className="mt-3 text-xs text-muted-foreground" title="a “manual” role makes the run attended — log in via the Sessions tab">Roles</p>
-        <label className="my-2 flex flex-col gap-1 text-xs [&>span]:text-muted-foreground" title="entry URL for manual login windows (attended). blank = target URL.">
-          <span>Login URL (blank = target)</span>
+        <p className="mt-3 text-xs text-muted-foreground" title={t("a “manual” role makes the run attended — log in via the Sessions tab")}>{t("Roles")}</p>
+        <label className="my-2 flex flex-col gap-1 text-xs [&>span]:text-muted-foreground" title={t("entry URL for manual login windows (attended). blank = target URL.")}>
+          <span>{t("Login URL (blank = target)")}</span>
           <Input value={loginUrl} onChange={(e) => setLoginUrl(e.target.value)} placeholder="https://app.example.com/login" autoComplete="off" />
         </label>
         {roles.map((r, i) => (
           <div className="my-2 flex items-center gap-1.5" key={i}>
-            <Input className="w-20 flex-none" placeholder="name" value={r.name} onChange={(e) => setRole(i, { name: e.target.value })} />
+            <Input className="w-20 flex-none" placeholder={t("name")} value={r.name} onChange={(e) => setRole(i, { name: e.target.value })} />
             <NativeSelect className="w-28 flex-none" value={r.method} onChange={(e) => setRole(i, { method: e.target.value as AuthMethod })}>
-              <option value="manual">manual</option>
-              <option value="credentials">credentials</option>
-              <option value="cookie">cookie file</option>
+              <option value="manual">{t("manual")}</option>
+              <option value="credentials">{t("credentials")}</option>
+              <option value="cookie">{t("cookie file")}</option>
             </NativeSelect>
             {r.method === "credentials" ? (
-              <Input className="w-24 flex-none" placeholder="password" type="password" value={r.password} onChange={(e) => setRole(i, { password: e.target.value })} />
+              <Input className="w-24 flex-none" placeholder={t("password")} type="password" value={r.password} onChange={(e) => setRole(i, { password: e.target.value })} />
             ) : null}
             {r.method === "cookie" ? (
               <>
-                <Input className="min-w-0 flex-1" placeholder="cookie file" value={r.cookieFile} onChange={(e) => setRole(i, { cookieFile: e.target.value })} />
+                <Input className="min-w-0 flex-1" placeholder={t("cookie file")} value={r.cookieFile} onChange={(e) => setRole(i, { cookieFile: e.target.value })} />
                 {desktopBridge?.pickFile ? (
                   <Button
                     type="button"
@@ -600,31 +602,31 @@ export function NewAssessment({ onCancel, apiSpec = false, initial }: { onCancel
                     className="flex-none"
                     onClick={() => void desktopBridge.pickFile().then((p: string | null) => { if (p) setRole(i, { cookieFile: p }); })}
                   >
-                    Browse…
+                    {t("Browse…")}
                   </Button>
                 ) : null}
               </>
             ) : null}
-            <Input className="min-w-16 flex-1" placeholder="desc (e.g. admin)" value={r.description} onChange={(e) => setRole(i, { description: e.target.value })} />
-            <Input className="min-w-20 flex-1" placeholder="login URL (optional)" value={r.loginUrl} onChange={(e) => setRole(i, { loginUrl: e.target.value })} autoComplete="off" />
-            <Button type="button" size="icon-sm" aria-label="Remove role" onClick={() => rmRole(i)}>
+            <Input className="min-w-16 flex-1" placeholder={t("desc (e.g. admin)")} value={r.description} onChange={(e) => setRole(i, { description: e.target.value })} />
+            <Input className="min-w-20 flex-1" placeholder={t("login URL (optional)")} value={r.loginUrl} onChange={(e) => setRole(i, { loginUrl: e.target.value })} autoComplete="off" />
+            <Button type="button" size="icon-sm" aria-label={t("Remove role")} onClick={() => rmRole(i)}>
               <X />
             </Button>
           </div>
         ))}
         <Button type="button" variant="outline" size="sm" onClick={addRole}>
-          + add role
+          {t("+ add role")}
         </Button>
       </Disclosure>
 
       {err ? <p role="alert" className="text-xs text-destructive">{err}</p> : null}
       <div className="mt-5 flex flex-wrap items-center gap-3">
         {desktopBridge?.settings?.check ? <div className="w-full">
-          <Button type="button" disabled={busy || checking} title="checks models, browser, and Burp before launch (model pings may use quota)" onClick={() => void checkSetup()}>Check setup</Button>
-          <div aria-live="polite">{checks.map((c) => <p key={c.name} className={c.status === "error" ? "text-destructive" : c.status === "warn" ? "text-warning" : c.status === "ok" ? "text-success" : "text-muted-foreground"}><b>{c.name}: {c.status}</b> — {c.message}</p>)}</div>
+          <Button type="button" disabled={busy || checking} title={t("checks models, browser, and Burp before launch (model pings may use quota)")} onClick={() => void checkSetup()}>{t("Check setup")}</Button>
+          <div aria-live="polite">{checks.map((c) => <p key={c.name} className={c.status === "error" ? "text-destructive" : c.status === "warn" ? "text-warning" : c.status === "ok" ? "text-success" : "text-muted-foreground"}><b>{c.name}: {t(c.status)}</b> — {c.message}</p>)}</div>
         </div> : null}
         <Button type="button" disabled={busy || checking} onClick={() => void submit()}>
-          {checking ? "Checking setup…" : busy ? "Launching…" : <><Play /> Launch</>}
+          {checking ? t("Checking setup…") : busy ? t("Launching…") : <><Play /> {t("Launch")}</>}
         </Button>
       </div>
     </div>

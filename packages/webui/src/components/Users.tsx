@@ -2,6 +2,7 @@
 // Mounted from the top nav only when /api/me reports role "admin" — the server enforces it regardless.
 import { useCallback, useEffect, useState } from "react";
 import { apiCall, useRole } from "../api";
+import { useT } from "../i18n";
 import { KeyRound, RefreshCw, ShieldCheck, UserRound } from "lucide-react";
 import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
@@ -37,6 +38,7 @@ function fmt(ts: number): string {
 
 export function Users() {
   const { role, user: me } = useRole();
+  const t = useT();
   const [users, setUsers] = useState<AdminUser[] | null>(null);
   const [audit, setAudit] = useState<AuditRow[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -51,7 +53,7 @@ export function Users() {
   useEffect(load, [load]);
 
   if (role !== "admin") {
-    return <p className="mx-auto max-w-[1100px] p-8 text-muted-foreground">User management requires the admin role.</p>;
+    return <p className="mx-auto max-w-[1100px] p-8 text-muted-foreground">{t("User management requires the admin role.")}</p>;
   }
 
   const patch = (id: string, body: Record<string, unknown>) => async (): Promise<void> => {
@@ -86,7 +88,7 @@ export function Users() {
         role: form.role,
         password: form.password,
       });
-      setFormMsg({ kind: "ok", text: `Created ${form.username.trim()}` });
+      setFormMsg({ kind: "ok", text: t("Created {name}", { name: form.username.trim() }) });
       setForm({ username: "", displayName: "", role: "user", password: "" });
       load();
     } catch (e) {
@@ -97,20 +99,20 @@ export function Users() {
   return (
     <div className="mx-auto w-full max-w-[1100px] space-y-4 px-5 py-6">
       <header className="flex items-center justify-between border-b border-border pb-4">
-        <h1 className="flex items-center gap-2 text-base font-semibold"><ShieldCheck className="size-4" /> Users</h1>
-        <Button type="button" variant="outline" size="sm" onClick={load}><RefreshCw /> Refresh</Button>
+        <h1 className="flex items-center gap-2 text-base font-semibold"><ShieldCheck className="size-4" /> {t("Users")}</h1>
+        <Button type="button" variant="outline" size="sm" onClick={load}><RefreshCw /> {t("Refresh")}</Button>
       </header>
       {err ? <p role="alert" className="text-xs text-destructive">{err}</p> : null}
       {tempPw ? (
         <div className="rounded-md border border-warning/40 bg-warning/10 p-3">
-          <p className="mb-1 text-xs font-medium text-warning">Temporary password for {tempPw.user} — shown once, all their sessions were signed out.</p>
+          <p className="mb-1 text-xs font-medium text-warning">{t("Temporary password for {user} — shown once, all their sessions were signed out.", { user: tempPw.user })}</p>
           <code className="block break-all font-mono text-xs select-all">{tempPw.password}</code>
         </div>
       ) : null}
 
       <Card>
         <CardContent className="p-4">
-          <h2 className="mb-3 text-sm font-semibold">New user</h2>
+          <h2 className="mb-3 text-sm font-semibold">{t("New user")}</h2>
           <form
             className="flex flex-wrap items-end gap-2"
             onSubmit={(e) => {
@@ -119,25 +121,25 @@ export function Users() {
             }}
           >
             <label className="flex flex-col gap-1 text-xs text-muted-foreground">
-              username
+              {t("username")}
               <Input className="w-44" value={form.username} onChange={(e) => setForm({ ...form, username: e.target.value })} autoComplete="off" />
             </label>
             <label className="flex flex-col gap-1 text-xs text-muted-foreground">
-              display name
+              {t("display name")}
               <Input className="w-44" value={form.displayName} onChange={(e) => setForm({ ...form, displayName: e.target.value })} autoComplete="off" />
             </label>
             <label className="flex flex-col gap-1 text-xs text-muted-foreground">
-              role
+              {t("role")}
               <NativeSelect value={form.role} onChange={(e) => setForm({ ...form, role: e.target.value as "admin" | "user" })}>
-                <option value="user">user</option>
-                <option value="admin">admin</option>
+                <option value="user">{t("user")}</option>
+                <option value="admin">{t("admin")}</option>
               </NativeSelect>
             </label>
             <label className="flex flex-col gap-1 text-xs text-muted-foreground">
-              password (12+ chars)
+              {t("password (12+ chars)")}
               <Input className="w-52" type="password" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} autoComplete="new-password" />
             </label>
-            <Button type="submit" size="sm" disabled={!form.username.trim() || !form.password}>Create</Button>
+            <Button type="submit" size="sm" disabled={!form.username.trim() || !form.password}>{t("Create")}</Button>
           </form>
           {formMsg ? <p role={formMsg.kind === "err" ? "alert" : "status"} className={`mt-2 text-xs ${formMsg.kind === "err" ? "text-destructive" : "text-success"}`}>{formMsg.text}</p> : null}
         </CardContent>
@@ -145,17 +147,17 @@ export function Users() {
 
       <Card>
         <CardContent className="p-4">
-          <h2 className="mb-2 text-sm font-semibold">Accounts</h2>
+          <h2 className="mb-2 text-sm font-semibold">{t("Accounts")}</h2>
           {users && users.length > 0 ? (
             <Table className="text-xs">
               <TableHeader>
                 <TableRow>
-                  <TableHead>Username</TableHead>
-                  <TableHead>Display name</TableHead>
-                  <TableHead>Role</TableHead>
-                  <TableHead>Status</TableHead>
-                  <TableHead>Created</TableHead>
-                  <TableHead><span className="sr-only">Actions</span></TableHead>
+                  <TableHead>{t("Username")}</TableHead>
+                  <TableHead>{t("Display name")}</TableHead>
+                  <TableHead>{t("Role")}</TableHead>
+                  <TableHead>{t("Status")}</TableHead>
+                  <TableHead>{t("Created")}</TableHead>
+                  <TableHead><span className="sr-only">{t("Actions")}</span></TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -163,28 +165,28 @@ export function Users() {
                   <TableRow key={u.id}>
                     <TableCell className="font-mono font-medium">
                       {u.username}
-                      {u.id === me?.id ? <span className="ml-1 text-muted-foreground">(you)</span> : null}
+                      {u.id === me?.id ? <span className="ml-1 text-muted-foreground">{t("(you)")}</span> : null}
                     </TableCell>
                     <TableCell className="text-muted-foreground">{u.displayName || "—"}</TableCell>
                     <TableCell onClick={(e) => e.stopPropagation()}>
                       <NativeSelect
                         size="sm"
                         value={u.role}
-                        aria-label={`Role for ${u.username}`}
+                        aria-label={t("Role for {name}", { name: u.username })}
                         onChange={(e) => void patch(u.id, { role: e.target.value })()}
                       >
-                        <option value="user">user</option>
-                        <option value="admin">admin</option>
+                        <option value="user">{t("user")}</option>
+                        <option value="admin">{t("admin")}</option>
                       </NativeSelect>
                     </TableCell>
                     <TableCell>
-                      <Badge variant="outline" className={u.status === "active" ? "border-success/40 text-success" : "border-destructive/40 text-destructive"}>{u.status}</Badge>
+                      <Badge variant="outline" className={u.status === "active" ? "border-success/40 text-success" : "border-destructive/40 text-destructive"}>{t(u.status)}</Badge>
                     </TableCell>
                     <TableCell className="text-muted-foreground">{fmt(u.createdAt)}</TableCell>
                     <TableCell className="text-right">
                       <div className="flex justify-end gap-1">
-                        <Button type="button" variant="outline" size="xs" title="Reset password — signs out all their sessions" onClick={() => void resetPassword(u)}>
-                          <KeyRound /> Reset pw
+                        <Button type="button" variant="outline" size="xs" title={t("Reset password — signs out all their sessions")} onClick={() => void resetPassword(u)}>
+                          <KeyRound /> {t("Reset pw")}
                         </Button>
                         <Button
                           type="button"
@@ -192,7 +194,7 @@ export function Users() {
                           size="xs"
                           onClick={patch(u.id, { status: u.status === "active" ? "disabled" : "active" })}
                         >
-                          {u.status === "active" ? "Disable" : "Enable"}
+                          {u.status === "active" ? t("Disable") : t("Enable")}
                         </Button>
                       </div>
                     </TableCell>
@@ -201,25 +203,25 @@ export function Users() {
               </TableBody>
             </Table>
           ) : users ? (
-            <p className="text-xs text-muted-foreground"><UserRound className="mr-1 inline size-3.5" />No accounts.</p>
+            <p className="text-xs text-muted-foreground"><UserRound className="mr-1 inline size-3.5" />{t("No accounts.")}</p>
           ) : (
-            <p className="text-xs text-muted-foreground">Loading…</p>
+            <p className="text-xs text-muted-foreground">{t("Loading…")}</p>
           )}
         </CardContent>
       </Card>
 
       <Card>
         <CardContent className="p-4">
-          <h2 className="mb-2 text-sm font-semibold">Audit log <span className="font-normal text-muted-foreground">(latest 200)</span></h2>
+          <h2 className="mb-2 text-sm font-semibold">{t("Audit log")} <span className="font-normal text-muted-foreground">{t("(latest 200)")}</span></h2>
           {audit && audit.length > 0 ? (
             <Table className="text-xs">
               <TableHeader>
                 <TableRow>
-                  <TableHead>Time</TableHead>
-                  <TableHead>Actor</TableHead>
-                  <TableHead>Action</TableHead>
-                  <TableHead>Target</TableHead>
-                  <TableHead>IP</TableHead>
+                  <TableHead>{t("Time")}</TableHead>
+                  <TableHead>{t("Actor")}</TableHead>
+                  <TableHead>{t("Action")}</TableHead>
+                  <TableHead>{t("Target")}</TableHead>
+                  <TableHead>{t("IP")}</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -235,9 +237,9 @@ export function Users() {
               </TableBody>
             </Table>
           ) : audit ? (
-            <p className="text-xs text-muted-foreground">No audit events yet.</p>
+            <p className="text-xs text-muted-foreground">{t("No audit events yet.")}</p>
           ) : (
-            <p className="text-xs text-muted-foreground">Loading…</p>
+            <p className="text-xs text-muted-foreground">{t("Loading…")}</p>
           )}
         </CardContent>
       </Card>

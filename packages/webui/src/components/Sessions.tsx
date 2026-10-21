@@ -2,6 +2,7 @@
 // /api/assessments/:id/sessions for the role list; /ws/session?id=&role= to receive frames + send input.
 import { useEffect, useRef, useState, type KeyboardEvent, type MouseEvent, type ClipboardEvent, type WheelEvent } from "react";
 import { useRole } from "../api";
+import { useT } from "../i18n";
 import { Check } from "lucide-react";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
@@ -18,6 +19,7 @@ function mods(e: { altKey: boolean; ctrlKey: boolean; metaKey: boolean; shiftKey
 
 export function Sessions({ id }: { id: string }) {
   const { canWrite } = useRole();
+  const t = useT();
   const [roles, setRoles] = useState<RoleSession[]>([]);
   const [active, setActive] = useState<string | null>(null);
   const [status, setStatus] = useState("");
@@ -41,10 +43,10 @@ export function Sessions({ id }: { id: string }) {
         .catch(() => {});
     };
     poll();
-    const t = window.setInterval(poll, 3000);
+    const iv = window.setInterval(poll, 3000);
     return () => {
       alive = false;
-      window.clearInterval(t);
+      window.clearInterval(iv);
     };
   }, [id]);
 
@@ -54,9 +56,9 @@ export function Sessions({ id }: { id: string }) {
     const proto = window.location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(`${proto}://${window.location.host}/ws/session?id=${encodeURIComponent(id)}&role=${encodeURIComponent(active)}`);
     wsRef.current = ws;
-    setStatus("connecting…");
-    ws.onopen = () => setStatus("connected");
-    ws.onclose = () => setStatus("disconnected");
+    setStatus(t("connecting…"));
+    ws.onopen = () => setStatus(t("connected"));
+    ws.onclose = () => setStatus(t("disconnected"));
     ws.onmessage = (e) => {
       const m = JSON.parse(e.data as string);
       if (m.t === "frame") {
@@ -91,24 +93,24 @@ export function Sessions({ id }: { id: string }) {
   };
 
   if (!canWrite) {
-    return <p className="p-4 text-muted-foreground">Attended sessions (live browser takeover) are operator-only. Viewers have read-only access.</p>;
+    return <p className="p-4 text-muted-foreground">{t("Attended sessions (live browser takeover) are operator-only. Viewers have read-only access.")}</p>;
   }
 
   return (
     <div className="flex flex-col gap-3">
       {roles.length === 0 ? (
-        <p className="p-4 text-muted-foreground">No live session. (attended runs launched from “+ New” with attended on appear here.)</p>
+        <p className="p-4 text-muted-foreground">{t("No live session. (attended runs launched from “+ New” with attended on appear here.)")}</p>
       ) : (
         <>
           <div className="flex flex-wrap items-center gap-2">
             {roles.map((r) => (
-              <Button key={r.role} type="button" size="sm" variant={active === r.role ? "secondary" : "outline"} className={r.awaiting ? "border-destructive text-destructive" : undefined} onClick={() => setActive(r.role)} title={r.awaiting ? "waiting for login" : "logged in"}>
-                {r.awaiting ? <span className="inline-block size-2 rounded-full bg-destructive" aria-label="awaiting login" /> : null}{r.role}
+              <Button key={r.role} type="button" size="sm" variant={active === r.role ? "secondary" : "outline"} className={r.awaiting ? "border-destructive text-destructive" : undefined} onClick={() => setActive(r.role)} title={r.awaiting ? t("waiting for login") : t("logged in")}>
+                {r.awaiting ? <span className="inline-block size-2 rounded-full bg-destructive" aria-label={t("awaiting login")} /> : null}{r.role}
               </Button>
             ))}
             <span className="text-xs text-muted-foreground">{status}</span>
-            <Button type="button" className="ml-auto" onClick={() => { send({ t: "done" }); setStatus("✅ done sent — agent continues"); }}>
-              <Check /> Done (logged in)
+            <Button type="button" className="ml-auto" onClick={() => { send({ t: "done" }); setStatus(t("✅ done sent — agent continues")); }}>
+              <Check /> {t("Done (logged in)")}
             </Button>
           </div>
           <form
@@ -118,20 +120,20 @@ export function Sessions({ id }: { id: string }) {
               const u = url.trim();
               if (u) {
                 send({ t: "nav", url: u });
-                setStatus(`→ navigating to ${u}`);
+                setStatus(t("→ navigating to {url}", { url: u }));
               }
             }}
-            title="navigate the live session browser here — use this to recover from a blank/stuck page"
+            title={t("navigate the live session browser here — use this to recover from a blank/stuck page")}
           >
             <Input
               className="flex-1 font-mono"
               value={url}
               onChange={(e) => setUrl(e.target.value)}
-              placeholder="https://app.example.com/login  — navigate the live session here (blank-screen recovery)"
+              placeholder={t("https://app.example.com/login  — navigate the live session here (blank-screen recovery)")}
               spellCheck={false}
               autoComplete="off"
             />
-            <Button type="submit">Go ↵</Button>
+            <Button type="submit">{t("Go ↵")}</Button>
           </form>
           <div className="flex justify-center rounded-lg border border-border bg-black">
             <canvas
@@ -160,7 +162,7 @@ export function Sessions({ id }: { id: string }) {
               }}
               onPaste={(e: ClipboardEvent<HTMLCanvasElement>) => {
                 const text = e.clipboardData.getData("text");
-                if (text) { e.preventDefault(); send({ t: "paste", text }); setStatus(`pasted ${text.length}`); }
+                if (text) { e.preventDefault(); send({ t: "paste", text }); setStatus(t("pasted {n}", { n: text.length })); }
               }}
             />
           </div>
