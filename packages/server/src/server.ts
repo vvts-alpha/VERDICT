@@ -512,7 +512,14 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
     const id = decodeURIComponent(m[1] ?? "");
     const store = openStore(id);
     if (!store) return sendJson(res, 404, { error: "not found" });
-    return mutateAndReply(id, store, () => store.setPaused(id, m![2] === "pause", "via WebUI"));
+    return mutateAndReply(id, store, () => {
+      store.setPaused(id, m![2] === "pause", "via WebUI");
+      // Resume on a run whose pilot process already exited (stage pause, crash, app restart) only cleared the flag —
+      // nothing ever respawned. When the supervisor is available and no child is alive, spawn `pilot --resume`.
+      // A live child ignores this (it resumes by polling the flag between screens); supervisor.resume throws on
+      // unsupported run types, guarded identically to /api/run/:id/resume.
+      if (m![2] === "resume" && supervisor && !supervisor.isRunning(id) && isSupportedRun(opts.runsDir, id)) supervisor.resume(id);
+    });
   }
 
   m = url.match(/^\/api\/assessments\/([^/]+)\/handoffs\/([^/]+)\/resolve$/);
