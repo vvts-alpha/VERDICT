@@ -234,7 +234,7 @@ function cmdStatus(args: string[]): void {
     `  coverage: ${cov.terminal}/${cov.total} terminal, ${cov.remaining} remaining, ${cov.scannable} scannable${cov.complete ? " (complete)" : ""}`,
   );
   console.log(`  findings: ${state.findings.length}`);
-  console.log(`  tokens:   ${state.budget.tokensUsed.toLocaleString()} / ${state.budget.limits.maxTokens.toLocaleString()}`);
+  console.log(`  tokens:   ${state.budget.tokensUsed.toLocaleString()} / ${state.budget.limits.maxTokens >= Number.MAX_SAFE_INTEGER ? "unlimited" : state.budget.limits.maxTokens.toLocaleString()}`);
   console.log(`  handoffs: ${pending} pending`);
   console.log(`  events:   ${state.events.length}`);
   const stop = evaluateStop(state);

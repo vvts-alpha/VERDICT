@@ -21,14 +21,18 @@ export function newAssessmentId(now: Date = new Date()): string {
   return `a-${t}-${r}`;
 }
 
-/** Conservative default budget, keyed on wall-clock/request count (DESIGN §13: cost is flat under the Max subscription). */
+/** Default budget is effectively unbounded — runs stop on coverage/stop conditions or the operator, never
+ *  on token/wall-clock/request ceilings. The guard mechanics stay: writing explicit limits into a run's
+ *  budget re-enables them (evaluateBudget still enforces whatever limits are stored). */
+export const UNLIMITED_BUDGET = Number.MAX_SAFE_INTEGER;
+
 export function defaultBudget(now: Date = new Date()): BudgetState {
   return {
     limits: {
-      maxTokens: 5_000_000,
-      maxWallClockMs: 60 * 60 * 1000, // 1h
-      maxTotalRequests: 5_000,
-      maxRequestsPerTarget: 2_000,
+      maxTokens: UNLIMITED_BUDGET,
+      maxWallClockMs: UNLIMITED_BUDGET,
+      maxTotalRequests: UNLIMITED_BUDGET,
+      maxRequestsPerTarget: UNLIMITED_BUDGET,
     },
     startedAt: now.toISOString(),
     tokensUsed: 0,
