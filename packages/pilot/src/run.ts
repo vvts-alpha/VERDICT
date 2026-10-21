@@ -686,7 +686,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     availableRoles(session)
       .map(({ name, description }) => (description ? `${name} (${description})` : name))
       .join(", ") || "none";
-  const maxTurns = opts.maxTurns ?? 80; // matches the CLI default (main.ts is also 80). WebUI blank -> CLI default lands on 80.
+  const maxTurns = opts.maxTurns ?? 160; // matches the CLI default (main.ts is also 160). WebUI blank -> CLI default lands on 160.
 
   // ── resume: reseed from an existing run (skip survey/methodology, diagnose only un-diagnosed screens) ──
   const prev = opts.resume ? opts.store.loadAssessment(opts.assessmentId, { includeDuplicates: true }) : null;
@@ -840,6 +840,10 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     model?: string;
     contextWindowTokens: number;
     shouldStop: () => boolean;
+    /** "pause" (default): an unfinished stage pauses the run. "continue": bounded cutoffs (max_turns / model stopped
+     *  calling tools) cap only this stage's unit of work — the caller marks it and the run moves on. Real errors
+     *  (provider/context/usage/auth) still pause either way. */
+    onIncomplete?: "pause" | "continue";
   }): Promise<number> => {
     if (checkBudget()) return 0;
     // Operator context (target facts) is appended to EVERY stage's system prompt — additive, never a replacement
@@ -893,7 +897,10 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: `⚠ stage ended early: ${res.error}` } });
         if (res.contextFailure) pauseRun(res.error ?? "Context recovery failed", "context");
       }
-      if (!p.shouldStop() && !session.paused) pauseRun(res.error ?? `Stage stopped: ${res.stopped}`, "incomplete");
+      // A bounded cutoff (max_turns / model stopped calling tools) under onIncomplete:"continue" is the caller's
+      // problem — it marks its own unit of work incomplete and the run keeps going. Errors/usage/context still pause.
+      const cappedStop = res.stopped === "max_turns" || res.stopped === "no_tool_calls";
+      if (!p.shouldStop() && !session.paused && !(p.onIncomplete === "continue" && cappedStop)) pauseRun(res.error ?? `Stage stopped: ${res.stopped}`, "incomplete");
       return res.turns;
     }
     let turns = 0;
@@ -975,7 +982,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     // If the result is readable use its cumulative; otherwise fall back to the assistant accumulation.
     const delta = stageTokenDelta(assistantTokens, resultTokens, sawResult);
     addTokens(Math.max(0, delta - assistantTokens));
-    if (!p.shouldStop() && !session.paused) pauseRun("Stage ended without its completion tool", "incomplete");
+    if (!p.shouldStop() && !session.paused && p.onIncomplete !== "continue") pauseRun("Stage ended without its completion tool", "incomplete");
     return turns;
   };
 
@@ -1070,7 +1077,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         system: RECON_GUESS_PROMPT,
         goal: `${session.inv.screens().length} screens were mapped. Call get_inventory, infer the app's URL/naming convention, then probe_guesses the endpoints you predict exist but were not linked (missing CRUD actions on known controllers, sibling controllers by analogy, admin/privileged variants, API resources matching the observed style). Real pages are enrolled automatically; wrong guesses are dropped. Iterate AT MOST twice, then guess_done.`,
         allowed: allowedFor("reconGuess"),
-        maxTurns: Math.min(maxTurns, 12),
+        maxTurns: Math.min(maxTurns, 16),
         model: fastModel, // guessing is mechanical -> fast
         contextWindowTokens: contextWindows.light,
         shouldStop: () => session.reconGuessDone,
@@ -1155,8 +1162,9 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       opts.onText?.(
         `🔬 diagnosing ${screens.length} screen(s)${resumeStatus ? ` of ${candidates.length} queued` : ""}${candidates.length > screens.length ? ` (capped at ${opts.maxScreens ?? 120}; resume again or raise --max-screens for the rest)` : ""}`,
       );
-      // Screens with multiple endpoints need >25 turns to confirm IDOR. At 25 it capped out just before recording.
-      const perScreen = Math.min(maxTurns, 40);
+      // Screens with multiple endpoints need >25 turns to confirm IDOR. At 25 it capped out just before recording;
+      // at 40 it still truncates multi-param IDOR/3-role authz work (each check = negative control + 2 replays), so 80.
+      const perScreen = Math.min(maxTurns, 80);
 
       // ── Keep the auth session alive (A) ── if the gap between screens grows, do a raw-HTTP GET of a safe authed URL
       //   (never `/`, no page load) to keep a sliding/short-lived token from going stale, and re-sync the rotated cookie.
@@ -1295,16 +1303,26 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
           goal: `Diagnose screen ${sc.screenId} (${sc.urlTemplate}). Call get_screen for its detail and plan, test that plan with evidence discipline, then screen_done.`,
           allowed: allowedFor("diagnose"),
           maxTurns: perScreen,
+          onIncomplete: "continue",
           model: screenIsHighValue(sc) ? deepModel : fastModel, // only high-value screens go deep (opus)
           contextWindowTokens: screenIsHighValue(sc) ? contextWindows.deep : contextWindows.light,
           shouldStop: () => session.screenDone,
         });
-        // If interrupted by token/usage-limit exhaustion: return this screen to queued **still un-diagnosed** (not clean),
+        // Interrupted by usage/context/auth: return this screen to queued **still un-diagnosed** (not clean),
         // pause, and exit. On resume it continues from the queued screens (this one and the untouched rest).
-        if (session.paused || !session.screenDone) {
-          if (!session.paused) pauseRun("Diagnosis ended without screen_done", "incomplete");
+        if (session.paused) {
           opts.store.setScreenScanStatus(opts.assessmentId, sc.screenId, "queued");
           return "break";
+        }
+        // The stage hit its turn cap / ended without screen_done: DO NOT pause the run for one screen's problem.
+        // Return the screen to queued — `handled` already blocks a retry this run, and a --resume re-diagnoses it
+        // with a fresh turn budget. The run simply moves to the next screen.
+        if (!session.screenDone) {
+          const msg = `⏱ ${sc.screenId}: diagnosis ended before screen_done (turn cap or early stage end) — left queued for a future resume, continuing`;
+          opts.onText?.(msg);
+          opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: msg } });
+          opts.store.setScreenScanStatus(opts.assessmentId, sc.screenId, "queued");
+          return "continue";
         }
         // The ledger decides terminal by the **confidence of the finding actually recorded** (confirmed->finding / suspected->suspected /
         //   none->clean). screenVerdict is the authoritative value record_finding maintains (upgrade-only; the model's screen_done self-report never overwrites it).
@@ -1411,7 +1429,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
           system: SCENARIO_PROMPT,
           goal: `${focusClause}${defaultClause}Per-screen diagnosis is done. Call get_inventory, then (a) carry out the STANDING OBJECTIVES above, and (b) decide FROM THE INVENTORY whether this app has any multi-step / state-changing workflow worth abusing (e.g. a cart→checkout→order flow, a coupon/voucher redemption, a fund/points transfer, a multi-step registration/approval, a role/privilege change). For each workflow: log in, walk the legitimate flow once, then build probe_scenario(control, exploit, effectMarker) threading captured ids via {{var}}, and record_finding only on a confirmed verdict. Call scenario_done ONLY after the standing objectives AND every workflow have been covered${defaultsOn ? " (if there are no workflows, still finish the standing objectives before scenario_done)" : opts.focus ? " (if there is none beyond the operator focus, finish the focus first)" : " — if there is no workflow and nothing else to do, call scenario_done"}.`,
           allowed: allowedFor("scenario"),
-          maxTurns: Math.min(maxTurns, 40),
+          maxTurns: Math.min(maxTurns, 64),
           model: deepModel, // discovering and building workflows is the hardest reasoning -> pinned deep
           contextWindowTokens: contextWindows.deep,
           shouldStop: () => session.scenarioDone,
@@ -1434,7 +1452,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
           system: FINGERPRINT_PROMPT,
           goal: `Per-screen diagnosis and scenarios are done. Inventory the technology stack: call fingerprint_scan on ${opts.targetUrl} (plus a couple of representative in-scope URLs / the main JS bundle). ${cveClause}record_finding(category vulnerable-component) only for a component WITH a concrete version and a High/Critical CVE that applies to THAT version — name the CVE, cite the version evidence, set severity by the worst known issue, and state it is version-based unless actively confirmed. Skip patched/current versions AND skip version-unknown product banners (BigIP/WAF/VPN family CVE lists are not findings). Call fingerprint_done when every detected component has been assessed.`,
           allowed: fpTools,
-          maxTurns: Math.min(maxTurns, 25),
+          maxTurns: Math.min(maxTurns, 32),
           model: deepModel, // mapping version <-> CVE is knowledge-intensive -> pinned deep
           contextWindowTokens: contextWindows.deep,
           shouldStop: () => session.fingerprintDone,

@@ -42,11 +42,14 @@ for (const mode of ["401", "429", "network", "no-tools", "max-turns", "done", "r
         maxTurns: mode === "target-auth-wall" ? 2 : 1, maxScreens: 1, scenarioPass: false, fingerprintPass: false, keepAliveMinutes: 0 });
       const state = store.loadAssessment("a-1")!;
       const completed = mode === "done" || mode === "resume-existing-finding";
-      assert.equal(store.isPaused("a-1"), !completed);
-      assert.equal(state.phase, completed ? "report" : mode === "survey-incomplete" ? "phase1_recon" : "phase2_scan");
+      // Bounded per-screen cutoffs (turn cap / model stopped emitting tools) no longer pause the run — the screen
+      // returns to queued and the run finishes (a later --resume retries it). Infra failures still pause.
+      const cappedContinue = mode === "max-turns" || mode === "no-tools";
+      assert.equal(store.isPaused("a-1"), !completed && !cappedContinue);
+      assert.equal(state.phase, completed || cappedContinue ? "report" : mode === "survey-incomplete" ? "phase1_recon" : "phase2_scan");
       assert.equal(state.screenScans[0]?.status, mode === "resume-existing-finding" ? "finding" : completed ? "clean" : "queued");
       assert.equal(state.findings.length, mode === "resume-existing-finding" ? 1 : 0);
-      if (!completed) assert.match(result.summary, /paused/i);
+      if (!completed && !cappedContinue) assert.match(result.summary, /paused/i);
       if (mode === "target-auth-wall") assert.ok(state.handoffs.some((h) => h.id === "ho-authwall"));
     } finally {
       store.close(); rmSync(dir, { recursive: true, force: true });

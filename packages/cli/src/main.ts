@@ -1150,7 +1150,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
   if (proxyFlagGivenButEmpty(pf, bp, proxy))
     console.log("⚠ --proxy/--burp-proxy was given but no value/env (VERDICT_PROXY/BURP_PROXY) and no manifest proxy is set (continuing without a proxy)");
   const rate = values.rate ? Number.parseInt(values.rate, 10) : 250;
-  const maxTurns = values["max-turns"] ? Number.parseInt(values["max-turns"], 10) : 80;
+  const maxTurns = values["max-turns"] ? Number.parseInt(values["max-turns"], 10) : 160;
   // On resume, re-derive attended from the manifest's manual roles (neither creds nor cookie).
   const attended = !!values.attended || (resume && manifestHasManualRole(manifest)); // manual multi-session auth (always headed)
   const headed = attended || (!values.headless && !!values.headed);
