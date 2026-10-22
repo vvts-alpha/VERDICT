@@ -26,11 +26,13 @@ import { rawHttpProbe } from "./desync.js";
 import { SSRF_CONTROL, SSRF_PAYLOADS, placeSsrfTarget, ssrfHit } from "./ssrf.js";
 import { NOSQL_OP_OBJECTS, NOSQL_OP_QUERY, NOSQL_CONTROL_VALUE, nosqlTimeObject, nosqlErrorSignature, nosqlBypassConfirms, nosqlQueryUrl } from "./nosql.js";
 import { detectUrlWrapper } from "./encoding.js";
+import { effectiveCreds } from "./mutations.js";
 import { XXE_ENTITY_URLS, controlSvg, extractFetchUrls, xssSvg, xxeSvg } from "./upload.js";
 import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { join } from "node:path";
 import { readFileSync, renameSync } from "node:fs";
+import { createHash } from "node:crypto";
 
 export { forgeAlgNone } from "./jwt.js";
 
@@ -91,8 +93,26 @@ export interface PilotSession {
   /** Number of diagnosis probes fired on the current screen (reset when a screen starts). Used to cross-check the screen_done coverage gate
    *  (rejects "everything is clean" self-reports that actually never probed once). */
   screenProbes: number;
+  /** Per-screen count of identical http_request shapes (method|normalized-url|body-hash|sessionRef) — loop detection:
+   *  a repeated identical request can never return different information, so ≥3 gets a nudge and ≥5 a stop hint.
+   *  Lazily created; run.ts clears it when a screen starts. */
+  reqRepeats?: Map<string, number>;
+  /** sessionRef|url → analyze_session's rendered response. The 3-request battery is expensive and deterministic
+   *  for the same session+URL, so repeat calls return the cached result instead of re-firing. Lazily created. */
+  sessionGlanceCache?: Map<string, string>;
+  /** sessionRef|endpoint → verify_access's rendered response (same rationale — the verdict for one URL under
+   *  one session is deterministic). Lazily created. */
+  accessResultCache?: Map<string, string>;
   done: boolean;
   doneSummary: string;
+  /** Parallel-diagnosis binding: when set, this session belongs to ONE role's worker and `login()` may not
+   *  switch it to another role ("" = the unauthenticated worker — no login at all). Cross-role checks still
+   *  work through compare legs (probe_authz/probe_graphql_op/probe_idor replay under the other role's stored
+   *  session material). Unset = single-worker mode, login switches roles freely. */
+  boundRole?: string;
+  /** Shared finding-id allocator across parallel worker sessions — without it each worker's own findCounter
+   *  would produce colliding f-ids. Present ⇒ used instead of findCounter. */
+  fidSeq?: { n: number };
   /** Even within done, "interrupted by token/usage-limit exhaustion" = not a skip but a resumable pause.
    *  When set, finalization doesn't drop the phase to report, and screens still being diagnosed are returned to queued (re-diagnosable). */
   paused: boolean;
@@ -204,7 +224,7 @@ export const STAGE_TOOLS = {
   // recon extrapolation: after survey, read the mapped surface and forced-browse LLM-predicted unlinked endpoints.
   reconGuess: ["get_inventory", "probe_guesses", "browser_navigate", "guess_done"],
   methodology: ["get_inventory", "record_methodology", "record_methodologies", "methodology_done"],
-  diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_dom_xss", "probe_stored_xss", "probe_ssti", "probe_sqli", "probe_nosql", "probe_cmdi", "probe_traversal", "probe_redirect", "probe_cors", "probe_graphql", "probe_graphql_op", "probe_proto", "probe_jwt", "probe_csrf", "probe_oob", "probe_ssrf", "probe_upload", "probe_logic", "probe_race", "probe_reset_poison", "probe_user_enum", "probe_secrets", "probe_headers", "analyze_session", "verify_access", "probe_idor", "probe_authz", "analyze_js", "probe_parser", "probe_xxe", "probe_websocket", "probe_cache", "probe_cache_poison", "probe_smuggling", "probe_crlf", "probe_host_header", "probe_oauth", "probe_method_bypass", "probe_rate_limit", "analyze_saml", "probe_deser", "browser_navigate", "browser_fill", "browser_click", "browser_upload", "record_finding", "screen_done", "skip_screen"],
+  diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_dom_xss", "probe_stored_xss", "probe_ssti", "probe_sqli", "probe_nosql", "probe_cmdi", "probe_traversal", "probe_redirect", "probe_cors", "probe_graphql", "probe_graphql_op", "probe_proto", "probe_jwt", "probe_csrf", "probe_oob", "probe_ssrf", "probe_upload", "probe_logic", "probe_race", "probe_reset_poison", "probe_user_enum", "probe_secrets", "probe_headers", "analyze_session", "verify_access", "probe_idor", "probe_authz", "analyze_js", "probe_parser", "probe_xxe", "probe_websocket", "probe_cache", "probe_cache_poison", "probe_smuggling", "probe_crlf", "probe_host_header", "probe_oauth", "probe_method_bypass", "probe_rate_limit", "analyze_saml", "probe_deser", "browser_navigate", "browser_fill", "browser_click", "browser_upload", "record_finding", "coverage_status", "screen_done", "skip_screen"],
   // scenario (A04 cross-cutting logic): overview the inventory + fire multi-step request chains via probe_scenario. Once, after per-screen diagnosis.
   scenario: ["get_inventory", "login", "http_request", "browser_navigate", "browser_fill", "browser_click", "probe_scenario", "probe_race", "probe_reset_poison", "probe_user_enum", "probe_secrets", "record_finding", "scenario_done"],
   // fingerprint (A06 known-vulnerable components): fingerprint_scan to collect versions, evaluate known CVEs (cve_lookup opt-in) and record.
@@ -301,7 +321,9 @@ export function coarseClass(vulnClass: string): string {
 }
 
 /** Normalize an endpoint by the same rules as inventory (treat /orders/o10 and /orders/{id} as the same).
- *  Both a concrete URL (/orders/o10) and a template (/orders/{id}) collapse to the same key. */
+ *  Both a concrete URL (/orders/o10) and a template (/orders/{id}) collapse to the same key.
+ *  A trailing filename segment (/ftp/acquisitions.md, /backup/x.json.bak) folds to {file} — those are one
+ *  route handler serving many files, not distinct endpoints. */
 export function normEndpoint(ep: string, base: string): string {
   let path: string;
   try {
@@ -310,15 +332,25 @@ export function normEndpoint(ep: string, base: string): string {
     path = ep.split("?")[0] ?? ep;
   }
   try {
-    return normalizePath(path).template;
+    return normalizePath(path).template.replace(/\/[^/]+\.[a-z0-9]{1,5}$/i, "/{file}");
   } catch {
     return path.toLowerCase();
   }
 }
 
-/** finding dedup key = (coarse category × normalized endpoint × param). Coalesces duplicate reports of the same hole into one. */
+/** Categories that share one sink mechanism — coalesced for dedup so the same hole reported under
+ *  sibling labels (a file the server shouldn't serve = secret-exposure AND info-disclosure AND
+ *  path-traversal at /ftp/*) collapses to one finding instead of three. */
+const CLASS_FAMILY: Record<string, string> = {
+  "info-disclosure": "disclosure",
+  "secret-exposure": "disclosure",
+  "path-traversal": "disclosure",
+};
+
+/** finding dedup key = (category family × normalized endpoint × param). Coalesces duplicate reports of the same hole into one. */
 export function dedupKey(vulnClass: string, endpoint: string, param: string | undefined, base: string): string {
-  return `${coarseClass(vulnClass)}::${normEndpoint(endpoint, base)}::${param ?? ""}`;
+  const coarse = coarseClass(vulnClass);
+  return `${CLASS_FAMILY[coarse] ?? coarse}::${normEndpoint(endpoint, base)}::${param ?? ""}`;
 }
 
 /** Canonical classes for record_finding (classification consistency + stable dedup key). */
@@ -2589,6 +2621,13 @@ export function buildTools(s: PilotSession) {
         } catch (e) {
           return txt(`ERROR: ${String(e).slice(0, 200)}`);
         }
+        // Loop detection: an IDENTICAL request shape can never return different information. Count per screen
+        // (method + normalized url + body hash + session ref) and surface a nudge in the response so the model
+        // changes approach or closes instead of burning turns replaying the same call.
+        s.reqRepeats ??= new Map();
+        const repeatKey = `${req.method}|${normEndpoint(url, s.targetUrl)}|${createHash("sha1").update(`${body ?? ""}|${JSON.stringify(files ?? [])}`).digest("hex").slice(0, 12)}|${sessionRefOf(s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false))}`;
+        const repeats = (s.reqRepeats.get(repeatKey) ?? 0) + 1;
+        s.reqRepeats.set(repeatKey, repeats);
         // multipart is binary, so keep a human-readable summary (fields + a preview of file contents) as evidence.
         const evBody = multipart
           ? `[multipart/form-data]\nfields: ${JSON.stringify(fields ?? {})}\n` +
@@ -2615,6 +2654,11 @@ export function buildTools(s: PilotSession) {
             bodyLength: res.body.length,
             truncated: res.truncated ?? false,
             ...(res.truncated ? { incomplete: "Only a response prefix was read. Retry with a larger maxBodyBytes before concluding from missing content or body length." } : {}),
+            ...(repeats >= 5
+              ? { repeatNote: `You have sent this EXACT request ${repeats} times on this screen — an identical call cannot yield new information. STOP probing this request shape: vary the payload/param/method, mark the class's result, or call screen_done.` }
+              : repeats >= 3
+                ? { repeatNote: `This exact request was already sent ${repeats - 1} time(s) with the same result — replaying it again is wasted. Vary the input or move to the next check.` }
+                : {}),
             ...(impact.length
               ? {
                   impact: impact.map((i) => ({ kind: i.kind, severity: i.severity, marker: i.marker, detail: i.detail })),
@@ -2631,6 +2675,11 @@ export function buildTools(s: PilotSession) {
       "Log in as one of the provided roles to reach authenticated surface. Updates the browser + http session to that role.",
       { role: z.string() },
       async ({ role }) => {
+        // Parallel workers are bound to one role — a same-process login into ANOTHER role's material would
+        // race that role's own worker. Cross-role checks use compare legs (stored material) instead.
+        if (s.boundRole != null && role !== s.boundRole) {
+          return txt(`this worker is bound to role '${s.boundRole || "(unauthenticated)"}' — cannot login as '${role}'. Cross-role checks go through probe_authz(compareRole:"${role}"), probe_graphql_op(compareRole:"${role}") or probe_idor — they replay under '${role}'s stored session material without swapping this session.`);
+        }
         const desc = s.roleDescriptions.get(role);
         const tag = desc ? ` [${desc}]` : ""; // attach the privilege description (if any) to the response
         // ⓪ attended (manual multi-session): each role already has a live context.
@@ -2685,8 +2734,10 @@ export function buildTools(s: PilotSession) {
             return txt(`cookie file error for '${role}': ${String(e).slice(0, 150)}`);
           }
         }
-        // ② smartLogin with credentials.
-        const creds = s.roleCreds.get(role);
+        // ② smartLogin with credentials. The manifest password may be stale — VERDICT itself changes
+        // passwords during probes — so the mutation ledger's latest (username, password) wins.
+        const rawCreds = s.roleCreds.get(role);
+        const creds = rawCreds ? effectiveCreds(s.store.loadAssessment(s.assessmentId)?.events ?? [], rawCreds) : undefined;
         if (!creds) {
           markBlocked("no credentials or cookie file configured for this role");
           const avail = availableRoles(s).map((r) => (r.description ? `${r.name} (${r.description})` : r.name)).join(", ") || "none";
@@ -6105,8 +6156,8 @@ export function buildTools(s: PilotSession) {
             recordFindingRow(existing.id, findingVerdict(existing) === "confirmed" ? "found" : "suspected", existing.title);
             return `merged into ${existing.id} (same ${key}); now ${existing.evidenceIds.length} evidence, severity ${existing.severity}, verdict ${findingVerdict(existing)}. Do not re-report this endpoint+param.`;
           }
-          s.findCounter += 1;
-          const fid = `f-${String(s.findCounter).padStart(3, "0")}`;
+          const fidN = s.fidSeq ? (s.fidSeq.n += 1) : (s.findCounter += 1);
+          const fid = `f-${String(fidN).padStart(3, "0")}`;
           // Screenshot evidence (best-effort — a request/response alone is hard to read). For an XSS finding, prefer
           // the fire-time proof probe_dom_xss just captured (a visible "DOM-XSS EXECUTED" banner) over a generic
           // current-page shot that wouldn't actually show the XSS. Otherwise capture the current page state.
@@ -6402,15 +6453,39 @@ export function buildTools(s: PilotSession) {
       },
     ),
     tool(
+      "coverage_status",
+      "Check BEFORE calling screen_done: returns this screen's planned attack classes and which plan slots already have a real execution row vs which are still UNFULFILLED — plus the active-probe count the gate cross-checks. Use it to close every remaining slot in one pass instead of discovering gaps one screen_done rejection at a time.",
+      {},
+      async () => {
+        const scrId = s.currentScreenId ?? "";
+        ensurePlanSlots(s, scrId);
+        const planned = plannedClassesFor(s.plans.get(scrId));
+        const ledger = screenChecks({ checkExecutions: s.store.checks(s.assessmentId) }, scrId);
+        return txt(
+          JSON.stringify({
+            screenId: scrId,
+            screenProbes: s.screenProbes,
+            plannedClasses: planned,
+            classes: ledger.classes.map((c) => `${c.checkClass}: ${c.status}${c.unfulfilled.length ? ` (${c.unfulfilled.length} slot(s) unfulfilled)` : ""}`),
+            unfulfilled: ledger.unstarted.map((c) => `${c.checkClass}@${c.target}${c.param ? `:${c.param}` : ""}`),
+            hint:
+              ledger.unstarted.length > 0
+                ? "Each unfulfilled slot needs a real probe (an execution row), or a coverage entry marking it not-applicable/unverified/blocked WITH a concrete reason at screen_done."
+                : "Every planned slot has an execution row — screen_done should pass with a coverage entry per planned class.",
+          }),
+        );
+      },
+    ),
+    tool(
       "screen_done",
       "Finish diagnosing the current screen. You MUST account for EVERY class the plan named: pass `coverage` with one entry per planned class — result 'found' (confirmed + recorded), 'suspected' (you saw a real anomaly but couldn't fully confirm — record_finding it as verdict:suspected), 'tested-clean' (actively probed, held), 'not-applicable' (concrete reason it can't apply), 'unverified' (you tried but couldn't reach a verdict — say why in `note`), or 'blocked' (a missing prerequisite like an expired role session). 'found'/'suspected'/'tested-clean' require a REAL execution row in the check ledger — the coverage array alone can never declare them. Finding ONE hole does NOT let you skip the rest of the plan. verdict 'finding' if >=1 confirmed, 'suspected' if only suspected leads, else 'clean'.",
       {
         verdict: z.enum(["finding", "suspected", "clean"]),
         coverage: z
-          .array(z.object({ class: z.string(), result: z.enum(["found", "suspected", "tested-clean", "not-applicable", "unverified", "blocked"]), note: z.string().optional() }))
+          .array(z.object({ class: z.string(), result: z.enum(["found", "suspected", "tested-clean", "not-applicable", "unverified", "blocked"]), note: z.string().max(160).optional().describe("≤160 chars — terse concrete reason (required for not-applicable/unverified/blocked)") }))
           .optional()
           .describe("one entry per planned attack class (from get_screen.plannedClasses)"),
-        note: z.string().optional(),
+        note: z.string().max(160).optional().describe("≤160 chars — one-line close summary"),
       },
       async ({ verdict, coverage, note }) => {
         // ── カバレッジ・ゲート ── プランが挙げた攻撃クラスを全部 coverage で説明できるまで画面を閉じさせない。
@@ -6705,6 +6780,12 @@ export function buildTools(s: PilotSession) {
         const bearer = s.currentBearer || "";
         const authorization = bearer ? `Bearer ${bearer}` : "";
         if (!cookieHeader && !bearer) return txt("no session: login(role) first (no Cookie, no Bearer).");
+        // The 3-request battery is deterministic for the same session+URL — a repeat call gets the
+        // cached dump instead of re-firing two authed GETs and a control.
+        s.sessionGlanceCache ??= new Map();
+        const glanceKey = `${sessionRefOf(s.http.effectiveHeaders(authHeaders(s), true))}|${pageUrl}`;
+        const cachedGlance = s.sessionGlanceCache.get(glanceKey);
+        if (cachedGlance) return txt(cachedGlance);
         let jar: Array<{ name: string; value: string; httpOnly?: boolean; secure?: boolean; sameSite?: string }> = [];
         try {
           jar = await s.driver.cookies();
@@ -6796,8 +6877,7 @@ export function buildTools(s: PilotSession) {
           }
         }
         s.sessionFlagUnverified = deterministic.length > 0 && !confirmable;
-        return txt(
-          JSON.stringify({
+        const glanceResult = JSON.stringify({
             evidenceId: p2.evId,
             observation: p1.evId,
             ...(evidenceShape ? { negativeControl: ctrl.evId, positiveReplays: evidenceIds } : { flagEvidenceIds: evidenceIds, unauthControl: ctrl.evId }),
@@ -6812,8 +6892,9 @@ export function buildTools(s: PilotSession) {
             deterministicVerdict,
             judge:
               "YOU judge this request. Weak-looking session material (username/userid as cookie, sequential id, alg:none / unsigned JWT, session value = the role) is a lead. Confirm forge with http_request as another identity (garbage cookie must fail) → record_finding(session, confirmed). Cannot swap identity this run → record_finding(verdict:suspected, category session, medium+) citing this evidenceId. Do not confirm from the dump alone. Missing HttpOnly on a locale/csrf cookie is not a session finding. JWT in Authorization → also probe_jwt.",
-          }),
-        );
+          });
+        s.sessionGlanceCache.set(glanceKey, glanceResult);
+        return txt(glanceResult);
       },
     ),
 
@@ -6824,6 +6905,12 @@ export function buildTools(s: PilotSession) {
       { url: z.string() },
       async ({ url }) => {
         if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} is out of scope`);
+        // Same endpoint under the same session is a deterministic comparison — replaying re-fires two
+        // requests and re-writes a ledger row for zero new information. Return the cached verdict.
+        s.accessResultCache ??= new Map();
+        const accessKey = `${sessionRefOf(s.http.effectiveHeaders(authHeaders(s), true))}|${normEndpoint(url, s.targetUrl)}`;
+        const cachedAccess = s.accessResultCache.get(accessKey);
+        if (cachedAccess) return txt(cachedAccess);
         let rUnauth: HttpResponse;
         try {
           // Truly anonymous: inherited defaults (Basic auth, operator custom headers) must not ride along.
@@ -6878,18 +6965,18 @@ export function buildTools(s: PilotSession) {
           evidenceIds: evIds,
         });
         const gray = verdict === "needs_judgment";
-        return txt(
-          JSON.stringify({
-            verdict,
-            reason,
-            evidenceIds: evIds,
-            unauth: { status: rUnauth.status, len: rUnauth.body.length, ...(gray ? { body: rUnauth.body.slice(0, 1500) } : {}) },
-            auth: rAuth ? { status: rAuth.status, len: rAuth.body.length, ...(gray ? { body: rAuth.body.slice(0, 1500) } : {}) } : null,
-            ...(gray
-              ? { hint: "Confirm auth-bypass ONLY if the unauth body IS the protected data (matches authed / exposes sensitive info). A generic page that merely returns 200 is NOT a bypass." }
-              : {}),
-          }),
-        );
+        const accessResult = JSON.stringify({
+          verdict,
+          reason,
+          evidenceIds: evIds,
+          unauth: { status: rUnauth.status, len: rUnauth.body.length, ...(gray ? { body: rUnauth.body.slice(0, 1500) } : {}) },
+          auth: rAuth ? { status: rAuth.status, len: rAuth.body.length, ...(gray ? { body: rAuth.body.slice(0, 1500) } : {}) } : null,
+          ...(gray
+            ? { hint: "Confirm auth-bypass ONLY if the unauth body IS the protected data (matches authed / exposes sensitive info). A generic page that merely returns 200 is NOT a bypass." }
+            : {}),
+        });
+        s.accessResultCache.set(accessKey, accessResult);
+        return txt(accessResult);
       },
     ),
 

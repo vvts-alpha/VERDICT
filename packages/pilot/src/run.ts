@@ -21,6 +21,7 @@ import type { OobProvider } from "@veritas/scanner";
 import { join } from "node:path";
 import { buildTools, STAGE_TOOLS, applyLoadedAuth, dedupKey, isAuthWalled, loadCookieFile, mergeSetCookie, touchIsDead, stripHash, backfillParentPrefixes, availableRoles, analyzePageJs, enrolByNavigate, pathIsIgnored } from "./tools.js";
 import { triagePilotFindings } from "./findings-qa.js";
+import { detectMutation, effectiveCreds } from "./mutations.js";
 import { resolveSkills, buildSkillTools, skillToolNamesForStage, type Stage } from "./skills.js";
 import type { PilotSession, RoleSession } from "./tools.js";
 import { LiveControl } from "./live-control.js";
@@ -86,6 +87,9 @@ export interface RunPilotOptions {
   noSandbox?: boolean;
   /** Cap on the number of screens to diagnose (default 120). */
   maxScreens?: number;
+  /** Max concurrent diagnosis workers (bound-role + unauth). Default 4, capped at 8. Set 1 to force the legacy
+   *  sequential diagnosis loop. Parallelism needs ≥1 role with session material to add bound workers. */
+  parallelWorkers?: number;
   /** Cap on the number of screens survey maps (--max-survey-screens). Stops exploration once reached. Unset = unlimited. */
   maxSurveyScreens?: number;
   /** Resume an existing run: skip survey/methodology and diagnose only the un-diagnosed (non-terminal) screens. */
@@ -330,10 +334,13 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
   // ── attended: launch one headed persistent context per role and have a human log in ──
   //    Keep the live session per role; diagnosis swaps driver/cookie via login() to use them.
   let driver: PlaywrightDriver;
+  const extraWorkerDrivers: PlaywrightDriver[] = []; // parallel-diagnosis worker contexts (closed in finally)
   let roleSessions: Map<string, RoleSession> | undefined;
   let primaryRole = "";
   let primaryCookie = "";
   let liveControl: LiveControl | undefined;
+  // Manifest creds go stale the moment VERDICT rotates a password mid-run — the mutation ledger's latest wins.
+  const ledgerEvents = () => opts.store.loadAssessment(opts.assessmentId)?.events ?? [];
   if (opts.attended) {
     if (!opts.promptOperator && !opts.controlUrl)
       throw new Error("attended mode requires promptOperator (Enter-confirm) or controlUrl (WebUI login)");
@@ -358,8 +365,33 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     const earlyLlm = viaWeb ? makeLlmClient(resolveLlmConfig(process.env, { claudeDefaultModel: "claude-sonnet-5" })) : undefined; // smartLogin helper — honors VERDICT_LLM_PROVIDER
     // Each role's login entry: its own loginUrl (user vs admin log in at different pages) → global loginUrl → target.
     const roleLoginUrl = (role: string): string => opts.roleLoginUrls?.get(role) ?? opts.loginUrl ?? opts.targetUrl;
+    // Resume (attended): each role's persisted userDataDir may still carry a live session. Verify with a real
+    // authed GET before spending an auto-login run or an operator prompt on re-auth.
+    const probeAlive = async (cookie: string): Promise<boolean> => {
+      const st = opts.store.loadAssessment(opts.assessmentId);
+      const url =
+        opts.anchorUrl ??
+        st?.screens.find((sc) => sc.authState === "post-login" && sc.observedUrls[0] && !/logout|signout/i.test(sc.observedUrls[0]))?.observedUrls[0];
+      if (!url || !isInScope(url, opts.scope)) return false;
+      try {
+        const res = await fetch(url, { headers: { cookie }, redirect: "manual", signal: AbortSignal.timeout(10_000) });
+        const body = await res.text();
+        return !touchIsDead(res.status, res.headers.get("location") ?? undefined, body);
+      } catch {
+        return false;
+      }
+    };
     for (const role of roles) {
       const d = await PlaywrightDriver.launch({ ...launchBase, userDataDir: join(baseDir, role), headless: viaWeb });
+      if (opts.resume) {
+        const cookie = await d.sessionCookieHeader().catch(() => "");
+        if (cookie && (await probeAlive(cookie))) {
+          roleSessions.set(role, { driver: d, cookie });
+          opts.onText?.(`✅ role ${roleLabel(role, opts.roleDescriptions)}: persisted session still live — continuing without re-login`);
+          continue;
+        }
+        if (cookie) opts.onText?.(`↪ role ${roleLabel(role, opts.roleDescriptions)}: persisted session expired — re-authenticating`);
+      }
       const cookieFile = opts.roleCookieFiles?.get(role);
       const creds = opts.roleCreds.get(role);
       let deferred = false;
@@ -380,7 +412,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         let ok = false;
         try {
           await d.clearSession();
-          const r = await smartLogin(d, earlyLlm, creds, { targetUrl: opts.targetUrl, ...(opts.roleLoginUrls?.get(role) ? { loginScreenUrl: opts.roleLoginUrls.get(role)! } : {}), ...(opts.model ? { model: opts.model } : {}) });
+          const r = await smartLogin(d, earlyLlm, effectiveCreds(ledgerEvents(), creds), { targetUrl: opts.targetUrl, ...(opts.roleLoginUrls?.get(role) ? { loginScreenUrl: opts.roleLoginUrls.get(role)! } : {}), ...(opts.model ? { model: opts.model } : {}) });
           ok = r.ok;
           opts.onText?.(
             ok
@@ -589,6 +621,10 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     session.gatedByRole!.set(startRole, session.refererGated);
   }
 
+  // Mutation ledger: inspect every recorded request — a 2xx state-changing write appends a
+  // `mutation_recorded` event so "what did VERDICT change?" is answerable from the log.
+  session.evidence.onRecord = (rec) => detectMutation(session, rec);
+
   // Multiple seeds: push seed URLs other than target onto the frontier as survey starting points
   // (even under hard-lock the initial seeds are pushed; only later discovered-link expansion is suppressed by recordObservation).
   const seedList = [...new Set([opts.targetUrl, ...(opts.seedUrls ?? [])])];
@@ -766,6 +802,10 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       payload: { message: `↺ resume: ${prev.screens.length} screens / ${prev.findings.length} findings carried over` },
     });
   }
+  // Shared f-id allocator — parallel worker sessions mint ids through this one counter so two workers can't both
+  // produce f-006. Seeded from the resume carry-over (findCounter) so numbering continues monotonically.
+  const fidSeq = { n: session.findCounter };
+  session.fidSeq = fidSeq;
 
   // Token usage: pick tokens from each query()'s result, accumulate into the run's budget (cumulative), and persist.
   let budget = (prev ?? opts.store.loadAssessment(opts.assessmentId))?.budget ?? null;
@@ -775,10 +815,19 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
   // If a stage dies from token/usage-limit exhaustion, pause the run rather than skipping to the next screen.
   //   done=true stops all subsequent stages/screens; paused=true keeps the final step from dropping to report (resumable).
   //   Once the quota recovers, `pilot --resume --id <id>` (the WebUI's ▶ resume) continues from the un-diagnosed queued screens.
+  let pauseCause: "usage" | "context" | "incomplete" | "auth" | "budget" | null = null;
+  let pauseDetail = "";
+  let autoResumes = 0;
+  // Env override exists so tests can exercise the full auto-resume path without real-minute waits.
+  const AUTO_RESUME_DELAYS_MS: readonly number[] = (process.env.VERDICT_AUTO_RESUME_DELAYS_MS?.split(",").map((s) => Number(s.trim())).filter((n) => Number.isFinite(n) && n >= 0) ?? []).length
+    ? process.env.VERDICT_AUTO_RESUME_DELAYS_MS!.split(",").map((s) => Number(s.trim())).filter((n) => Number.isFinite(n) && n >= 0)
+    : [60_000, 300_000, 900_000];
   const pauseRun = (detail: string, cause: "usage" | "context" | "incomplete" | "auth" | "budget" = "usage"): void => {
     if (session.paused) return; // don't double-count
     session.done = true;
     session.paused = true;
+    pauseCause = cause;
+    pauseDetail = detail;
     const reason = cause === "budget" ? `Assessment budget reached: ${detail}` : cause === "context" ? "Model context could not be summarized" : cause === "usage" ? "Model usage/token limit reached" : cause === "auth" ? "Target authentication is required" : "Model stage did not complete";
     session.doneSummary = cause === "context"
       ? `⏸ paused — ${reason}. Check Max context and model availability, then resume: pilot --resume --id ${opts.assessmentId}`
@@ -789,6 +838,37 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       payload: { message: `${session.doneSummary}${detail ? ` — ${detail}` : ""}` },
     });
     opts.store.setPaused(opts.assessmentId, true, reason);
+  };
+
+  // Bounded auto-resume: a pause caused by a TRANSIENT provider condition (rate limit / 5xx / network /
+  // usage-limit window) waits out a backoff then clears the pause so the run continues instead of sitting
+  // dead for hours on a 429. Fatal conditions — auth wall, context-summarize failure, budget, operator
+  // pause, and provider auth/quota errors (401/403/subscription/billing) — never auto-resume.
+  const FATAL_PAUSE_DETAIL = /HTTP 40[0-9]|subscription|billing|forbidden|unauthorized|invalid_api_key|permission denied/i;
+  const transientPause = (): boolean => {
+    if (pauseCause !== "usage" && pauseCause !== "incomplete") return false;
+    if (FATAL_PAUSE_DETAIL.test(pauseDetail)) return false;
+    return true;
+  };
+  const tryAutoResume = async (): Promise<boolean> => {
+    if (!session.paused || !transientPause() || autoResumes >= AUTO_RESUME_DELAYS_MS.length) return false;
+    const wait = AUTO_RESUME_DELAYS_MS[autoResumes]!;
+    autoResumes += 1;
+    const waitTxt = wait >= 60_000 ? `${Math.round(wait / 60_000)}min` : `${Math.round(wait / 1000)}s`;
+    const msg = `↻ transient pause (${pauseCause}) — auto-resume attempt ${autoResumes}/${AUTO_RESUME_DELAYS_MS.length} in ${waitTxt}: ${pauseDetail.slice(0, 140)}`;
+    opts.onText?.(msg);
+    opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: msg } });
+    await new Promise((r) => setTimeout(r, wait));
+    if (!session.paused) return true; // an operator resume beat the timer
+    session.done = false;
+    session.paused = false;
+    pauseCause = null;
+    pauseDetail = "";
+    const resumed = `▶ auto-resumed after ${waitTxt} backoff — continuing the run`;
+    opts.onText?.(resumed);
+    opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: resumed } });
+    opts.store.setPaused(opts.assessmentId, false);
+    return true;
   };
 
   const checkBudget = (): boolean => {
@@ -844,7 +924,16 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
      *  calling tools) cap only this stage's unit of work — the caller marks it and the run moves on. Real errors
      *  (provider/context/usage/auth) still pause either way. */
     onIncomplete?: "pause" | "continue";
+    /** Parallel-diagnosis worker overrides: the session/tools/mcp-server bound to THAT worker. Default = the main
+     *  session (single-worker path unchanged). A worker's tools close over its own session so per-screen state
+     *  (currentScreenId/screenDone/probes) stays worker-local while store/findings/http stay shared. */
+    sess?: PilotSession;
+    toolDefs?: typeof toolDefs;
+    server?: typeof server;
   }): Promise<number> => {
+    const sess = p.sess ?? session;
+    const tdefs = p.toolDefs ?? toolDefs;
+    const mcp = p.server ?? server;
     if (checkBudget()) return 0;
     // Operator context (target facts) is appended to EVERY stage's system prompt — additive, never a replacement
     // (the SAFETY/discipline text in p.system still governs; see operatorContextBlock). One choke point covers all stages.
@@ -864,23 +953,23 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         model: p.model ?? deepModel ?? llmCfg.model!, // under openai llmCfg.model is guaranteed (checked at startup)
         system: sys,
         goal: p.goal,
-        tools: toolDefs as unknown as PilotToolDef[],
+        tools: tdefs as unknown as PilotToolDef[],
         allowed: p.allowed,
         maxTurns: p.maxTurns,
         contextWindowTokens: p.contextWindowTokens,
         contextCheckpoint: () => JSON.stringify({
-          currentScreenId: session.currentScreenId,
-          currentRole: session.currentRole,
-          authenticated: !!(session.currentCookie || session.currentBearer),
-          mappedScreens: session.inv.screens().length,
-          visitedCount: session.visited.size,
-          pendingUrlCount: session.frontier.size,
-          nextUrls: [...session.frontier].slice(0, 20),
-          unplannedScreenIds: session.inv.screens().filter((sc) => !session.plans.has(sc.screenId)).slice(0, 40).map((sc) => sc.screenId),
-          findings: session.findings.length,
-          recentEvidenceIds: session.evidence.records.slice(-20).map((record) => record.id),
+          currentScreenId: sess.currentScreenId,
+          currentRole: sess.currentRole,
+          authenticated: !!(sess.currentCookie || sess.currentBearer),
+          mappedScreens: sess.inv.screens().length,
+          visitedCount: sess.visited.size,
+          pendingUrlCount: sess.frontier.size,
+          nextUrls: [...sess.frontier].slice(0, 20),
+          unplannedScreenIds: sess.inv.screens().filter((sc) => !sess.plans.has(sc.screenId)).slice(0, 40).map((sc) => sc.screenId),
+          findings: sess.findings.length,
+          recentEvidenceIds: sess.evidence.records.slice(-20).map((record) => record.id),
         }),
-        onContext: ({ inputTokens, windowTokens, reservedTokens, remainingTokens }) => {
+        onContext: ({ inputTokens, windowTokens, reservedTokens, remainingTokens }: { inputTokens: number; windowTokens: number; reservedTokens: number; remainingTokens: number }) => {
           const band = Math.floor(inputTokens / windowTokens * 10);
           if (band === lastContextBand) return;
           lastContextBand = band;
@@ -895,11 +984,12 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         },
         onToolUse: (n: string, i: unknown) => opts.onTool?.(n, i),
         onTokens: addTokens,
-        shouldStop: () => checkBudget() || p.shouldStop() || session.done,
+        shouldStop: () => checkBudget() || p.shouldStop() || sess.done,
       };
       let res = await runOpenAiAgentLoop(loopArgs);
-      for (let stageRetry = 1; res.stopped === "error" && !res.contextFailure && isTransientStageError(res.error) && stageRetry <= 3 && !session.done && !session.paused; stageRetry++) {
-        const waitMs = 5_000 * stageRetry;
+      const stageRetryBaseMs = Number(process.env.VERDICT_STAGE_RETRY_BASE_MS ?? 5_000);
+      for (let stageRetry = 1; res.stopped === "error" && !res.contextFailure && isTransientStageError(res.error) && stageRetry <= 3 && !sess.done && !sess.paused; stageRetry++) {
+        const waitMs = stageRetryBaseMs * stageRetry;
         const retryMsg = `↻ transient stage error — retry ${stageRetry}/3 in ${Math.round(waitMs / 1000)}s: ${(res.error ?? "").slice(0, 140)}`;
         opts.onText?.(retryMsg);
         opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: retryMsg } });
@@ -914,7 +1004,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       // A bounded cutoff (max_turns / model stopped calling tools) under onIncomplete:"continue" is the caller's
       // problem — it marks its own unit of work incomplete and the run keeps going. Errors/usage/context still pause.
       const cappedStop = res.stopped === "max_turns" || res.stopped === "no_tool_calls";
-      if (!p.shouldStop() && !session.paused && !(p.onIncomplete === "continue" && cappedStop)) pauseRun(res.error ?? `Stage stopped: ${res.stopped}`, "incomplete");
+      if (!p.shouldStop() && !sess.paused && !(p.onIncomplete === "continue" && cappedStop)) pauseRun(res.error ?? `Stage stopped: ${res.stopped}`, "incomplete");
       return res.turns;
     }
     let turns = 0;
@@ -930,7 +1020,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       q = query({
         prompt: p.goal,
         options: {
-          mcpServers: { veritas: server },
+          mcpServers: { veritas: mcp },
           allowedTools: p.allowed.map((n) => `mcp__veritas__${n}`),
           disallowedTools: DISALLOWED,
           permissionMode: "bypassPermissions",
@@ -974,7 +1064,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
             if (isClaudeUsageLimit(detail)) pauseRun(detail.slice(0, 160));
           }
         }
-        if (p.shouldStop() || session.done) break;
+        if (p.shouldStop() || sess.done) break;
       }
     } catch (err) {
       // Preserve recorded evidence and pause unfinished stages, including non-quota SDK errors.
@@ -996,7 +1086,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     // If the result is readable use its cumulative; otherwise fall back to the assistant accumulation.
     const delta = stageTokenDelta(assistantTokens, resultTokens, sawResult);
     addTokens(Math.max(0, delta - assistantTokens));
-    if (!p.shouldStop() && !session.paused && p.onIncomplete !== "continue") pauseRun("Stage ended without its completion tool", "incomplete");
+    if (!p.shouldStop() && !sess.paused && p.onIncomplete !== "continue") pauseRun("Stage ended without its completion tool", "incomplete");
     return turns;
   };
 
@@ -1186,8 +1276,9 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       //   expiry — a role bounced to login (401/login body) prompts the operator to re-login (handoff).
       const keepAliveMs = (opts.keepAliveMinutes ?? (opts.attended ? 1 : 4)) * 60_000;
       let lastTouch = Date.now();
-      const keepAttendedWarm = async (): Promise<void> => {
+      const keepAttendedWarm = async (sess: PilotSession): Promise<void> => {
         if (!roleSessions) return;
+        const activeRole = sess.boundRole ?? sess.currentRole;
         for (const [role, rs] of roleSessions) {
           try {
             // The operator's live browser is authoritative — re-read its cookie jar (no navigation) to pick up rotation.
@@ -1195,18 +1286,49 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
             if (jar) rs.cookie = jar;
             let dead = false;
             if (lastWarmUrl) {
-              const r = await warmTouch(lastWarmUrl, rs.cookie, role === session.currentRole ? session.currentBearer : "");
+              const r = await warmTouch(lastWarmUrl, rs.cookie, role === activeRole ? sess.currentBearer : "");
               dead = r?.dead ?? false;
             }
-            if (dead && opts.promptOperator) {
-              opts.onText?.(`🔴 role ${roleLabel(role, opts.roleDescriptions)} session appears to have expired (bounced back to the login page)`);
-              await opts.promptOperator(`▶ Please log in again in the browser window for role ${roleLabel(role, opts.roleDescriptions)}. Press Enter when done…`);
-              const fresh = await rs.driver.sessionCookieHeader().catch(() => "");
-              if (fresh) rs.cookie = fresh;
+            if (dead) {
+              // creds 保持ロールは機械再ログインで復旧(ledger 優先 = VERDICT が回した後の最新パスワード)。
+              const creds = opts.roleCreds.get(role);
+              let relogged = false;
+              if (creds) {
+                try {
+                  const r = await smartLogin(rs.driver, session.loginLlm, effectiveCreds(ledgerEvents(), creds), {
+                    targetUrl: opts.targetUrl,
+                    ...(opts.roleLoginUrls?.get(role) ? { loginScreenUrl: opts.roleLoginUrls.get(role)! } : {}),
+                    ...(opts.model ? { model: opts.model } : {}),
+                  });
+                  relogged = r.ok;
+                  if (relogged) {
+                    const fresh = await rs.driver.sessionCookieHeader().catch(() => "");
+                    if (fresh) rs.cookie = fresh;
+                    if (role === activeRole) sess.currentBearer = (await rs.driver.bearerToken().catch(() => null)) ?? "";
+                    opts.onText?.(`🔑 role ${roleLabel(role, opts.roleDescriptions)}: session expired → auto re-login succeeded`);
+                  }
+                } catch {
+                  /* fall through to the operator prompt */
+                }
+              }
+              if (!relogged && opts.promptOperator) {
+                opts.onText?.(`🔴 role ${roleLabel(role, opts.roleDescriptions)} session appears to have expired (bounced back to the login page)`);
+                await opts.promptOperator(`▶ Please log in again in the browser window for role ${roleLabel(role, opts.roleDescriptions)}. Press Enter when done…`);
+                const fresh = await rs.driver.sessionCookieHeader().catch(() => "");
+                if (fresh) rs.cookie = fresh;
+              }
             }
-            if (role === session.currentRole) session.currentCookie = rs.cookie; // for the active role, update the http path too
+            if (role === activeRole) sess.currentCookie = rs.cookie; // for the active role, update the http path too
           } catch (e) {
-            opts.onText?.(`⚠ keepalive '${role}' failed: ${String(e).slice(0, 100)}`);
+            const msg = String(e);
+            // A closed attended window (ERR_USE_AFTER_CLOSE / Target closed) is gone for good — drop it from the
+            // warm set once instead of warning on every tick; login(role) surfaces it again only if needed.
+            if (/USE_AFTER_CLOSE|Target closed|browser has been closed/i.test(msg)) {
+              roleSessions.delete(role);
+              opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: `🫀 keepalive: role '${role}' browser closed — dropped from warm set` } });
+              continue;
+            }
+            opts.onText?.(`⚠ keepalive '${role}' failed: ${msg.slice(0, 100)}`);
           }
         }
         opts.store.appendEvent(opts.assessmentId, {
@@ -1214,20 +1336,55 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
           payload: { message: `🫀 keepalive (attended): re-synced ${roleSessions.size} role(s) (keep session alive)` },
         });
       };
-      const keepSessionWarm = async (warm: string | null): Promise<void> => {
+      // Attended warm is an ALL-role sweep — under parallel workers only one caller runs it per interval
+      // (the others skip; each worker's bound-role sync happens whichever worker's turn it is).
+      let attendedWarmBusy: Promise<void> | null = null;
+      const keepSessionWarm = async (sess: PilotSession, warm: string | null): Promise<void> => {
         if (keepAliveMs <= 0) return;
         if (Date.now() - lastTouch < keepAliveMs) return;
         if (opts.attended) {
-          await keepAttendedWarm();
+          if (!attendedWarmBusy) {
+            lastTouch = Date.now();
+            attendedWarmBusy = keepAttendedWarm(sess).finally(() => {
+              attendedWarmBusy = null;
+            });
+          }
+          await attendedWarmBusy;
+          return;
+        }
+        if (!sess.currentCookie && !sess.currentBearer) return; // unauth: nothing to keep warm
+        const url = warm ?? lastWarmUrl;
+        if (!url) return; // no safe authed URL yet — skip rather than touch `/`
+        const r = await warmTouch(url, sess.currentCookie, sess.currentBearer);
+        if (r?.dead) {
+          // Session expired — creds 保持ロールは機械再ログインで復旧(ledger 優先)。失敗したら次回 keepalive で再試行。
+          const creds = sess.currentRole ? opts.roleCreds.get(sess.currentRole) : undefined;
+          if (creds) {
+            try {
+              const relog = await smartLogin(sess.driver, sess.loginLlm, effectiveCreds(ledgerEvents(), creds), {
+                targetUrl: opts.targetUrl,
+                ...(opts.roleLoginUrls?.get(sess.currentRole) ? { loginScreenUrl: opts.roleLoginUrls.get(sess.currentRole)! } : {}),
+                ...(opts.model ? { model: opts.model } : {}),
+              });
+              if (relog.ok) {
+                sess.currentCookie = await sess.driver.sessionCookieHeader().catch(() => sess.currentCookie);
+                sess.currentBearer = (await sess.driver.bearerToken().catch(() => null)) ?? sess.currentBearer;
+                opts.store.appendEvent(opts.assessmentId, {
+                  type: "note",
+                  payload: { message: `🔑 keepalive: role '${sess.currentRole}' session expired → auto re-login succeeded` },
+                });
+              } else {
+                opts.onText?.(`🔴 keepalive: role '${sess.currentRole}' session expired and auto re-login failed (${relog.reason})`);
+              }
+            } catch (e) {
+              opts.onText?.(`🔴 keepalive auto re-login error: ${String(e).slice(0, 100)}`);
+            }
+          }
           lastTouch = Date.now();
           return;
         }
-        if (!session.currentCookie && !session.currentBearer) return; // unauth: nothing to keep warm
-        const url = warm ?? lastWarmUrl;
-        if (!url) return; // no safe authed URL yet — skip rather than touch `/`
-        const r = await warmTouch(url, session.currentCookie, session.currentBearer);
         if (r) {
-          session.currentCookie = r.cookie; // re-sync the raw HTTP path cookie (rotated Set-Cookie)
+          sess.currentCookie = r.cookie; // re-sync the raw HTTP path cookie (rotated Set-Cookie)
           opts.store.appendEvent(opts.assessmentId, {
             type: "note",
             payload: { message: `🫀 keepalive: touched ${new URL(url).pathname} (keep session alive, no reload)` },
@@ -1282,35 +1439,46 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         }
       };
 
+      // A diagnosis worker = one bound session + its own tool set (tools close over that session). Parallel workers
+      // share store/findings/evidence-dir/http but keep per-screen state (currentScreenId, probes, caches) local.
+      interface DiagWorker {
+        name: string; // the bound role, or "unauth"
+        sess: PilotSession;
+        toolDefs: typeof toolDefs;
+        server: typeof server;
+        queue: Screen[];
+      }
       // Diagnose one screen (shared body called from both the primary path and the drain). "break" stops the outer loop.
-      const diagnoseOne = async (sc: Screen): Promise<"continue" | "break"> => {
+      const diagnoseOne = async (w: DiagWorker, sc: Screen): Promise<"continue" | "break"> => {
+        const sess = w.sess;
         // ── between-screens checkpoint ── flush queued reconfigure/inject, then honor an operator (WebUI) pause.
         await applyPendingControls();
         // Operator pause: HOLD here (don't exit) until resumed via the WebUI toggle, keeping the live authed session warm so
         //   resume continues instantly with no re-login/re-survey. A stop (SIGTERM) kills the held process; the current screen
         //   is still queued (we haven't marked it scanning), so it stays resumable, and a --resume start clears paused (see above).
         if (opts.store.isPaused(opts.assessmentId)) {
-          opts.onText?.("⏸ paused by operator — holding between screens (session kept warm); resume to continue");
-          opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: "⏸ paused by operator" } });
-          while (opts.store.isPaused(opts.assessmentId) && !session.done) {
-            await keepSessionWarm(opts.anchorUrl ?? lastWarmUrl); // no-op until keepAliveMs elapses; keeps auth alive across a long pause
+          opts.onText?.(`⏸ paused by operator — holding between screens (worker ${w.name}, session kept warm); resume to continue`);
+          opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: `⏸ paused by operator (${w.name})` } });
+          while (opts.store.isPaused(opts.assessmentId) && !sess.done) {
+            await keepSessionWarm(sess, opts.anchorUrl ?? lastWarmUrl); // no-op until keepAliveMs elapses; keeps auth alive across a long pause
             await new Promise((r) => setTimeout(r, 2000)); // poll cadence for the pause flag (cheap SELECT)
           }
-          if (!session.done) {
+          if (!sess.done) {
             opts.onText?.("▶ resumed by operator");
             opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: "▶ resumed by operator" } });
             await applyPendingControls(); // apply anything reconfigured while paused
           }
         }
         const scUrl = warmTarget(sc.observedUrls?.[0]); // the authed page we're about to diagnose = a safe warm target
-        await keepSessionWarm(opts.anchorUrl ?? scUrl); // with an anchor set, keep warming the stable hub
+        await keepSessionWarm(sess, opts.anchorUrl ?? scUrl); // with an anchor set, keep warming the stable hub
         if (scUrl && !opts.anchorUrl) lastWarmUrl = scUrl; // else remember it for attended/Burp keepalive (no per-screen context)
-        session.currentScreenId = sc.screenId;
-        session.screenDone = false;
-        const existing = session.findings.filter((f) => f.screenId === sc.screenId);
-        session.screenVerdict = existing.some((f) => (f.verdict ?? "confirmed") === "confirmed") ? "finding" : existing.length ? "suspected" : null;
-        session.screenSkipReason = null;
-        session.screenProbes = 0; // reset per screen for the coverage-gate cross-check
+        sess.currentScreenId = sc.screenId;
+        sess.screenDone = false;
+        const existing = sess.findings.filter((f) => f.screenId === sc.screenId);
+        sess.screenVerdict = existing.some((f) => (f.verdict ?? "confirmed") === "confirmed") ? "finding" : existing.length ? "suspected" : null;
+        sess.screenSkipReason = null;
+        sess.screenProbes = 0; // reset per screen for the coverage-gate cross-check
+        sess.reqRepeats?.clear(); // identical-request loop counter is per screen
         opts.store.setScreenScanStatus(opts.assessmentId, sc.screenId, "scanning");
         turns += await runStage({
           system: DIAGNOSE_PROMPT,
@@ -1320,18 +1488,22 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
           onIncomplete: "continue",
           model: screenIsHighValue(sc) ? deepModel : fastModel, // only high-value screens go deep (opus)
           contextWindowTokens: screenIsHighValue(sc) ? contextWindows.deep : contextWindows.light,
-          shouldStop: () => session.screenDone,
+          shouldStop: () => sess.screenDone,
+          sess,
+          toolDefs: w.toolDefs,
+          server: w.server,
         });
         // Interrupted by usage/context/auth: return this screen to queued **still un-diagnosed** (not clean),
         // pause, and exit. On resume it continues from the queued screens (this one and the untouched rest).
-        if (session.paused) {
+        if (sess.paused) {
+          pausedScreenIds.add(sc.screenId); // auto-resume un-handles these so a transient pause retries the screen
           opts.store.setScreenScanStatus(opts.assessmentId, sc.screenId, "queued");
           return "break";
         }
         // The stage hit its turn cap / ended without screen_done: DO NOT pause the run for one screen's problem.
         // Return the screen to queued — `handled` already blocks a retry this run, and a --resume re-diagnoses it
         // with a fresh turn budget. The run simply moves to the next screen.
-        if (!session.screenDone) {
+        if (!sess.screenDone) {
           const msg = `⏱ ${sc.screenId}: diagnosis ended before screen_done (turn cap or early stage end) — left queued for a future resume, continuing`;
           opts.onText?.(msg);
           opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: msg } });
@@ -1345,11 +1517,11 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         //   (terminal, honest incomplete) — NOT clean: incomplete work is never converted to a pass.
         const checkView = screenChecks({ checkExecutions: opts.store.checks(opts.assessmentId) }, sc.screenId);
         const hasCheckGaps = checkView.unstarted.length > 0 || checkView.gaps.length > 0;
-        const status = session.screenSkipReason
+        const status = sess.screenSkipReason
           ? "excluded"
-          : session.screenVerdict === "finding"
+          : sess.screenVerdict === "finding"
             ? "finding"
-            : session.screenVerdict === "suspected"
+            : sess.screenVerdict === "suspected"
               ? "suspected"
               : hasCheckGaps
                 ? "unverified"
@@ -1357,15 +1529,15 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
 
         // ── Auth-wall circuit breaker ── if every probe returns 401 and nothing gets through (zero 2xx, zero findings),
         //    running more screens is pointless. Stop and prompt the operator to set auth (httpBasic/creds/cookie).
-        if (isAuthWalled(session)) {
-          const msg = `🛑 auth wall: ${session.httpAuthWall}/${session.httpProbes} probes returned 401 and 0 got through — stopping. Set auth (httpBasic / credentials / cookie) and resume.`;
+        if (isAuthWalled(sess)) {
+          const msg = `🛑 auth wall (${w.name}): ${sess.httpAuthWall}/${sess.httpProbes} probes returned 401 and 0 got through — stopping. Set auth (httpBasic / credentials / cookie) and resume.`;
           opts.onText?.(msg);
           opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: msg } });
           opts.store.upsertHandoff(opts.assessmentId, {
             id: "ho-authwall",
             reason: "auth",
             url: opts.targetUrl,
-            message: `Diagnosis is fully behind an auth wall (${session.httpAuthWall}/${session.httpProbes} probes 401, none authenticated). Configure site auth (httpBasic / credentials / cookie) and resume.`,
+            message: `Diagnosis is fully behind an auth wall (${sess.httpAuthWall}/${sess.httpProbes} probes 401, none authenticated). Configure site auth (httpBasic / credentials / cookie) and resume.`,
             status: "pending",
             createdAt: new Date().toISOString(),
             resolvedAt: null,
@@ -1379,13 +1551,174 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       };
 
       const handled = new Set<string>();
+      /** Screens returned to queued by a PAUSE (infra failure, not the screen's fault). A successful transient
+       *  auto-resume un-handles them so the drain actually retries them — otherwise a 429 mid-run would leave
+       *  every interrupted screen abandoned even though the provider recovered. Bounded by autoResumes. */
+      const pausedScreenIds = new Set<string>();
+      const afterAutoResume = (resumed: boolean): void => {
+        if (!resumed) return;
+        for (const id of pausedScreenIds) handled.delete(id);
+        pausedScreenIds.clear();
+      };
       // maxScan is declared above (let) so a live control_command can raise/lower it mid-run.
       // primary path: run the start-time snapshot (in priority order).
-      for (const sc of screens) {
-        if (session.done) break;
-        handled.add(sc.screenId);
-        if ((await diagnoseOne(sc)) === "break") break;
+      afterAutoResume(await tryAutoResume()); // a transient pause from an earlier stage clears before diagnosis starts
+
+      // ── parallel diagnosis workers ── one worker per role carrying session material, plus one unauth worker.
+      // A worker's session is BOUND to its role (login() to another role is rejected) — same-account parallel
+      // traffic is impossible by construction; cross-role depth still comes from compare legs (probe_authz /
+      // probe_idor / probe_graphql_op) replaying the other role's stored material. Mutating requests under the
+      // same session material are additionally serialized inside FetchHttpClient's write queue.
+      const makeWorkerSession = (boundRole: string, drv: PlaywrightDriver): PilotSession => {
+        const ws: PilotSession = {
+          ...session,
+          driver: drv,
+          // Own EvidenceStore → its onRecord attributes mutations to THIS worker's screen (evidence ids are
+          // globally unique via the module sequence, so sharing artifactsDir is safe).
+          evidence: new EvidenceStore(opts.artifactsDir),
+          boundRole,
+          currentRole: boundRole,
+          currentCookie: "",
+          currentBearer: "",
+          currentScreenId: null,
+          screenDone: false,
+          screenVerdict: null,
+          screenSkipReason: null,
+          screenProbes: 0,
+          reqRepeats: new Map(),
+          sessionGlanceCache: new Map(),
+          accessResultCache: new Map(),
+          accessVerdicts: new Map(), // verify_access verdicts are session-specific — never shared across roles
+          recordCalls: 0,
+          httpProbes: 0,
+          httpAuthWall: 0,
+          httpThrough: 0,
+          findCounter: 0, // fidSeq (shared) is the real allocator under workers
+          fidSeq,
+          xssProof: undefined,
+          model: fastModel,
+        };
+        // done/paused/doneSummary stay GLOBAL — pauseRun flips them on the main session; delegate so all workers
+        // observe (and a worker tool may set) the same flags.
+        for (const k of ["done", "paused", "doneSummary"] as const) {
+          Object.defineProperty(ws, k, {
+            get: () => session[k],
+            set: (v) => {
+              (session as unknown as Record<string, unknown>)[k] = v;
+            },
+          });
+        }
+        ws.evidence.onRecord = (rec) => detectMutation(ws, rec);
+        return ws;
+      };
+      const makeWorker = async (name: string, boundRole: string, drv: PlaywrightDriver): Promise<DiagWorker> => {
+        const ws = makeWorkerSession(boundRole, drv);
+        const sk = buildSkillTools(ws, enabledSkills);
+        const t = [...buildTools(ws), ...sk.map((e) => e.tool)] as typeof toolDefs;
+        return { name, sess: ws, toolDefs: t, server: createSdkMcpServer({ name: "veritas", version: "1.0.0", tools: t }), queue: [] };
+      };
+      const boundRoles = opts.attended
+        ? [...(roleSessions?.keys() ?? [])]
+        : [...new Set([...opts.roleCreds.keys(), ...(opts.roleCookieFiles?.keys() ?? [])])];
+      const workerCap = Math.max(1, Math.min(opts.parallelWorkers ?? 4, 8));
+      const hasUnauthScreens = screens.some((sc) => sc.authState !== "post-login");
+      const workers: DiagWorker[] = [];
+      let unauthWorker: DiagWorker | undefined;
+      if (boundRoles.length > 0 && (hasUnauthScreens || boundRoles.length > 1)) {
+        // Unauth worker: always a dedicated session (the main session keeps its auth for the later scenario /
+        //   fingerprint stages — binding it here would reject their login() calls). Non-attended shares the main
+        //   driver (nobody else touches it during the parallel block); attended gets a fresh headless context so
+        //   a role window isn't driven by two workers at once.
+        // Unauth worker: always a dedicated session (the main session keeps its auth for the later scenario /
+        //   fingerprint stages — binding it here would reject their login() calls). Non-attended shares the main
+        //   driver (nobody else touches it during the parallel block); attended gets a fresh headless context so
+        //   a role window isn't driven by two workers at once.
+        if (opts.attended) {
+          const d = await PlaywrightDriver.launch({ ...launchBase, userDataDir: join(opts.profileDir, "..", "worker-unauth") });
+          extraWorkerDrivers.push(d);
+          unauthWorker = await makeWorker("unauth", "", d);
+        } else {
+          await session.driver.clearSession().catch(() => {}); // unauth semantics: drop any browser-held auth
+          unauthWorker = await makeWorker("unauth", "", session.driver);
+        }
+        workers.push(unauthWorker);
       }
+      // Bound role workers up to the cap (one unauth slot already consumed when present).
+      for (const role of boundRoles.slice(0, workerCap - workers.length)) {
+        if (opts.attended) {
+          const rs = roleSessions!.get(role)!;
+          const w = await makeWorker(role, role, rs.driver);
+          w.sess.currentCookie = rs.cookie;
+          w.sess.currentBearer = (await rs.driver.bearerToken().catch(() => null)) ?? "";
+          workers.push(w);
+        } else {
+          const d = await PlaywrightDriver.launch({ ...launchBase, userDataDir: join(opts.profileDir, "..", `worker-${role.replace(/[^a-z0-9_-]/gi, "_")}`) });
+          extraWorkerDrivers.push(d);
+          const w = await makeWorker(role, role, d);
+          // Worker auth: cookie file first, else smartLogin with the mutation ledger's latest creds.
+          const cookieFile = opts.roleCookieFiles?.get(role);
+          const creds = opts.roleCreds.get(role);
+          try {
+            if (cookieFile) {
+              const loaded = loadCookieFile(cookieFile, opts.targetUrl);
+              const applied = await applyLoadedAuth(d, loaded, opts.targetUrl);
+              w.sess.currentCookie = applied.cookie;
+              w.sess.currentBearer = applied.bearer;
+            } else if (creds) {
+              const r = await smartLogin(d, session.loginLlm, effectiveCreds(ledgerEvents(), creds), {
+                targetUrl: opts.targetUrl,
+                ...(opts.roleLoginUrls?.get(role) ? { loginScreenUrl: opts.roleLoginUrls.get(role)! } : {}),
+                ...(opts.model ? { model: opts.model } : {}),
+              });
+              if (r.ok) {
+                w.sess.currentCookie = await d.sessionCookieHeader();
+                w.sess.currentBearer = (await d.bearerToken().catch(() => null)) ?? "";
+                opts.onText?.(`🔑 worker '${role}': logged in`);
+              } else {
+                opts.onText?.(`⚠ worker '${role}': auto-login failed (${r.reason}) — its screens may hit auth walls`);
+              }
+            }
+          } catch (e) {
+            opts.onText?.(`⚠ worker '${role}' auth init error: ${String(e).slice(0, 120)}`);
+          }
+          workers.push(w);
+        }
+      }
+      // Sequential fallback: no bound roles or nothing parallelizable → one worker on the main session (unchanged).
+      if (workers.length === 0) workers.push({ name: session.currentRole || "primary", sess: session, toolDefs, server, queue: [] });
+      if (workers.length > 1) {
+        opts.onText?.(`⚡ parallel diagnosis: ${workers.length} workers (${workers.map((w) => w.name).join(", ")})`);
+        opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: `⚡ parallel diagnosis: ${workers.map((w) => w.name).join(", ")}` } });
+      }
+      // Partition the start-time snapshot: post-login screens round-robin across bound workers (any bound session
+      // may diagnose them — cross-role checks are in the plan itself); everything else goes to the unauth worker.
+      {
+        const bound = workers.filter((w) => w.sess.boundRole);
+        const fallback = unauthWorker ?? workers[0]!;
+        let rr = 0;
+        for (const sc of screens) {
+          const w = sc.authState === "post-login" && bound.length ? bound[rr++ % bound.length]! : fallback;
+          w.queue.push(sc);
+          handled.add(sc.screenId);
+        }
+      }
+      const runWorker = async (w: DiagWorker): Promise<void> => {
+        for (let i = 0; i < w.queue.length; i++) {
+          const sc = w.queue[i]!;
+          if (session.done) {
+            afterAutoResume(await tryAutoResume()); // a transient pause clears itself and the loop continues
+            if (session.done) {
+              for (const rest of w.queue.slice(i)) handled.delete(rest.screenId); // stranded → drain reassigns
+              return;
+            }
+          }
+          if ((await diagnoseOne(w, sc)) === "break") {
+            for (const rest of w.queue.slice(i + 1)) handled.delete(rest.screenId); // stranded → drain reassigns
+            return;
+          }
+        }
+      };
+      await Promise.all(workers.map((w) => runWorker(w)));
       // ── Drain (reusable) ── pick up every queued screen newly enrolled by the input sweep / browser_navigate /
       //    **the later scenario & fingerprint stages**. for(screens) is a start-time snapshot, so screens added to the
       //    ledger afterward fall out of that fixed list and stay queued (= the "scanned 2/5" symptom). To honour the design
@@ -1394,7 +1727,11 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       const drainQueued = async (): Promise<void> => {
         let drained = 0;
         await ingestInjectedTargets(); // enrol any operator-injected URLs first (may raise maxScan) so an at-cap run still runs them
-        while (!session.done && handled.size < maxScan) {
+        while (handled.size < maxScan) {
+          if (session.done) {
+            afterAutoResume(await tryAutoResume());
+            if (session.done) break;
+          }
           await ingestInjectedTargets(); // catch targets injected while this drain is in progress
           const live = opts.store.loadAssessment(opts.assessmentId);
           if (!live) break;
@@ -1408,7 +1745,10 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
           if (drained === 0) opts.onText?.("🔁 draining screens discovered mid-run (input sweep / new routes / scenario navigation) so coverage closes");
           drained += 1;
           handled.add(next.screenId);
-          if ((await diagnoseOne(next)) === "break") break;
+          // Route a drained screen like the initial partition: post-login → a bound worker, else unauth.
+          const bound = workers.filter((w) => w.sess.boundRole);
+          const w = next.authState === "post-login" && bound.length ? bound[drained % bound.length]! : (unauthWorker ?? workers[0]!);
+          if ((await diagnoseOne(w, next)) === "break") break;
         }
         if (drained > 0)
           opts.store.appendEvent(opts.assessmentId, {
@@ -1423,6 +1763,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       //    observed behaviour to target multi-step workflow abuse (coupon / price & qty tampering / step skip / privilege escalation). Pinned to the deep model.
       //    Leave the contextual call "is there a transactional flow" **to the LLM** (no brittle lexical regex): the model reads
       //    get_inventory, finds workflows, and if there are none closes immediately with scenario_done. Disable with --no-scenario.
+      afterAutoResume(await tryAutoResume()); // a transient pause that survived diagnosis clears before the next stage
       if (opts.scenarioPass !== false && !session.done) {
         session.scenarioDone = false;
         // The operator emphasis hint (--focus) is **carried out in this scenario stage** (cross-cutting/objective-driven, so here rather than per-screen diagnosis is right).
@@ -1453,6 +1794,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       // ── STAGE: fingerprint (A06 known-vulnerable components) ── collect tech-stack versions and match known CVE/EOL.
       //    Collection is deterministic (fingerprint_scan extracts versions from headers/cookies/meta/script), CVE assessment relies on the deep model's knowledge.
       //    WebFetch is banned, so no external CVE DB is queried; findings are recorded honestly as "version-based, needs confirmation".
+      afterAutoResume(await tryAutoResume());
       if (opts.fingerprintPass !== false && !session.done) {
         session.fingerprintDone = false;
         opts.onText?.(`🔎 fingerprint stage: collecting tech/version banners → ${session.cveLookup ? "online CVE-DB (OSV/NVD)" : "model-knowledge"} CVE assessment (A06)`);
@@ -1576,6 +1918,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     } else {
       await driver.close();
     }
+    for (const d of extraWorkerDrivers) await d.close().catch(() => {}); // parallel-diagnosis worker contexts
   }
 
   const summary = opts.surveyOnly && !session.paused

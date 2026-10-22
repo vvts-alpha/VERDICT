@@ -11,6 +11,7 @@ import type { ScreenScanStatus } from "./screen-scan.js";
 import type { JsAsset } from "./js-asset.js";
 import type { CheckExecution } from "./check.js";
 import type { AuthzComparison, AuthzObject } from "./authz.js";
+import type { Mutation } from "./mutation.js";
 
 interface EventEnvelope<TType extends string, TPayload> {
   /** Monotonically increasing within an assessment, starting at 1 */
@@ -55,6 +56,7 @@ export type StateEvent =
       "survey_role_progress",
       { role: string; visited: number; urls?: string[]; pending?: string[]; gated?: string[]; seen?: string[]; state: "mapped" | "blocked"; reason?: string }
     >
+  | EventEnvelope<"mutation_recorded", { mutation: Mutation }>
   | EventEnvelope<"note", { message: string }>;
 
 /** A live reconfigure command for a running scan, applied by the pilot at its next between-screens checkpoint.

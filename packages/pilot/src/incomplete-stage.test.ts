@@ -10,7 +10,9 @@ import { runPilot } from "./run.js";
 const tool = (name: string, args: object) => ({ id: "call-1", type: "function", function: { name, arguments: JSON.stringify(args) } });
 for (const mode of ["401", "429", "network", "no-tools", "max-turns", "done", "resume-existing-finding", "survey-incomplete", "target-auth-wall"] as const) {
   test(`diagnosis completion: ${mode}`, async (t) => {
-    const env = { VERDICT_LLM_PROVIDER: "openai", VERDICT_LLM_BASE_URL: "http://model.test/v1", VERDICT_LLM_MODEL: "deep", VERDICT_LLM_FAST_MODEL: "light", VERDICT_LLM_TOOL_MODE: "native" };
+    // Tiny auto-resume/stage-retry delays so a permanently-failing provider still exercises the full
+    // transient-pause→auto-resume→retry→exhaust→paused path in milliseconds rather than real minutes.
+    const env = { VERDICT_LLM_PROVIDER: "openai", VERDICT_LLM_BASE_URL: "http://model.test/v1", VERDICT_LLM_MODEL: "deep", VERDICT_LLM_FAST_MODEL: "light", VERDICT_LLM_TOOL_MODE: "native", VERDICT_AUTO_RESUME_DELAYS_MS: "1,1,1", VERDICT_STAGE_RETRY_BASE_MS: "1" };
     const previous = Object.fromEntries(Object.keys(env).map((key) => [key, process.env[key]]));
     Object.assign(process.env, env);
     const dir = mkdtempSync(join(tmpdir(), "verdict-incomplete-"));

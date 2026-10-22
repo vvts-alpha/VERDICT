@@ -19,6 +19,7 @@ import type {
   TargetInput,
 } from "./types/index.js";
 import { coverage } from "./coverage.js";
+import { mutationLedger, type MutationRow } from "./mutations.js";
 import { buildSiteTree, type TreeNode } from "./tree.js";
 
 export interface StateView {
@@ -41,6 +42,8 @@ export interface StateView {
   authzObjects: AuthzObject[];
   /** Bounded A/B authorization comparisons with provenance evidence ids. */
   authzComparisons: AuthzComparison[];
+  /** Effective current state per (subject, field) — last-write-wins over mutation_recorded events. */
+  mutations: MutationRow[];
   /** Latest survey progress per authenticated role — projected from the FULL log, NOT the capped
    *  window below, so a blocked role's reason survives any amount of later log noise. */
   roleProgress: RoleProgress[];
@@ -125,6 +128,7 @@ export function buildStateView(state: AssessmentState): StateView {
     checkExecutions: state.checkExecutions,
     authzObjects: state.authzObjects,
     authzComparisons: state.authzComparisons,
+    mutations: mutationLedger(state.events),
     roleProgress: deriveRoleProgress(state.events),
     events: state.events.slice(-300),
     paused: derivePaused(state.events),

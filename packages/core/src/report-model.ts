@@ -6,6 +6,7 @@ import type { AssessmentState, AuthState, CheckExecution, CheckStatus, Finding, 
 import { coverage } from "./coverage.js";
 import { rollupChecks } from "./checks.js";
 import { deriveRoleProgress, type RoleProgress } from "./view.js";
+import { mutationLedger, type MutationRow } from "./mutations.js";
 
 export const SEVERITY_ORDER: Record<Severity, number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
 const VERDICT_ORDER: Record<FindingVerdict, number> = { confirmed: 0, suspected: 1 };
@@ -36,6 +37,9 @@ export interface ReportFindingRow {
   description: string;
   reproSteps: string;
   evidence: ReportEvidence[]; // with bodies (when loadEvidence is passed); otherwise path only
+  /** 1-based indexes of other findings sharing this finding's dedup family+endpoint — distinct vulnerabilities
+   *  on one mechanism (e.g. sibling disclosures on /ftp/{file}), shown as related but NOT merged. */
+  related?: number[];
 }
 
 /** Loader returning raw req/resp for an evidenceId (the impure fs read is injected by the caller = cli/server). core stays pure. */
@@ -137,6 +141,9 @@ export interface ReportModel {
   /** Latest survey outcome per authenticated role (full-log projection — a role blocked before any
    *  check row exists keeps its reason here even when it owns zero ledger rows). */
   roleProgress: RoleProgress[];
+  /** Mutation ledger — current effective state per (subject, field) for every state-changing write
+   *  the assessment performed (empty when nothing was written). */
+  mutations: MutationRow[];
 }
 
 /** AssessmentState → ReportModel (pure). The single input to every renderer.
@@ -158,6 +165,23 @@ export function buildReportModel(state: AssessmentState, now: Date = new Date(),
 
   const scanByScreen = new Map<string, ScreenScanStatus>();
   for (const sc of state.screenScans) scanByScreen.set(sc.screenId, sc.status);
+
+  // Cluster findings by dedup family::endpoint (the param tail is dropped — sibling params on one mechanism
+  // are related, not identical). Only clusters of ≥2 surface a `related` annotation.
+  const clusterOf = new Map<number, number[]>();
+  const byCluster = new Map<string, number[]>();
+  sorted.forEach((f, i) => {
+    const parts = (f.dedupKey ?? "").split("::");
+    if (parts.length < 2 || !parts[0] || !parts[1]) return;
+    const k = `${parts[0]}::${parts[1]}`;
+    const arr = byCluster.get(k) ?? [];
+    arr.push(i);
+    byCluster.set(k, arr);
+  });
+  for (const idxs of byCluster.values()) {
+    if (idxs.length < 2) continue;
+    for (const i of idxs) clusterOf.set(i, idxs.filter((j) => j !== i).map((j) => j + 1));
+  }
 
   const findings: ReportFindingRow[] = sorted.map((f, idx) => ({
     index: idx + 1,
@@ -194,6 +218,7 @@ export function buildReportModel(state: AssessmentState, now: Date = new Date(),
         truncated,
       };
     }),
+    ...(clusterOf.has(idx) ? { related: clusterOf.get(idx) } : {}),
   }));
 
   const screens: ReportScreenRow[] = [...state.screens]
@@ -290,5 +315,6 @@ export function buildReportModel(state: AssessmentState, now: Date = new Date(),
     checks,
     legacyScreens,
     roleProgress,
+    mutations: mutationLedger(state.events),
   };
 }

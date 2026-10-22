@@ -67,11 +67,43 @@ test("InventoryBuilder dedups by (template, domSkeletonHash) and merges observed
   assert.equal(inv.screens().length, 1);
 });
 
-test("different DOM skeleton at same URL is a separate screen (SPA case)", () => {
+test("different DOM skeleton at same URL with a different surface is a separate screen (SPA case)", () => {
   const inv = new InventoryBuilder();
   inv.ingest(obs({ finalUrl: "https://app.test/home", domSkeleton: "html>(body>(div))" }));
-  inv.ingest(obs({ finalUrl: "https://app.test/home", domSkeleton: "html>(body>(table))" }));
+  // Second variant exposes a search form the first lacked — a genuinely different attack surface.
+  inv.ingest(
+    obs({
+      finalUrl: "https://app.test/home",
+      domSkeleton: "html>(body>(table))",
+      forms: [{ action: "/search", method: "get", fields: [{ name: "q", type: "text" }] }],
+    }),
+  );
   assert.equal(inv.screens().length, 2);
+});
+
+test("same route + identical surface merges despite DOM-skeleton shift (per-role re-map)", () => {
+  // Per-role survey re-maps of ONE SPA route: the auth chrome (logout nav / avatar) re-hashes the DOM
+  // skeleton while params/apis stay identical — these were landing as 2-3 duplicate screens.
+  const inv = new InventoryBuilder();
+  const a = inv.ingest(obs({ finalUrl: "https://app.test/#/login", domSkeleton: "html>(body>(navlogin,form))" }));
+  const b = inv.ingest(obs({ finalUrl: "https://app.test/#/login", domSkeleton: "html>(body>(navlogout,avatar,form))" }), "post-login");
+  assert.equal(a.isNew, true);
+  assert.equal(b.isNew, false, "same route + same surface → merge even though the DOM hash differs");
+  assert.equal(b.screen.screenId, a.screen.screenId);
+  assert.equal(inv.screens().length, 1);
+});
+
+test("surface dedup still splits same-route variants with different params/apis", () => {
+  const inv = new InventoryBuilder();
+  inv.ingest(obs({ finalUrl: "https://app.test/account", domSkeleton: "html>(body>(div))" }));
+  inv.ingest(
+    obs({
+      finalUrl: "https://app.test/account",
+      domSkeleton: "html>(body>(section))",
+      apiCalls: [{ ...productApi, url: "https://app.test/api/orders/7" }],
+    }),
+  );
+  assert.equal(inv.screens().length, 2, "a variant that exposes an extra API is a different surface");
 });
 
 test("InventoryBuilder collapses list/detail pages differing only by item count (blog /post?id=N)", () => {
@@ -185,13 +217,25 @@ test("InventoryBuilder does NOT collapse distinct SPA hash routes into pathname-
 });
 
 // The cap's PURPOSE (fold DOM-skeleton churn of ONE page — e.g. self-injected XSS mutating markup — into <=maxPerTemplate
-// screens) is preserved: it now applies PER hash route, not globally to "/".
+// screens) is preserved: it now applies PER hash route, not globally to "/". Identical-surface churn folds even earlier,
+// via the surface dedup tier; the cap remains the backstop for churn that DOES change the surface (an injected form).
 test("InventoryBuilder still caps DOM-skeleton churn within a single SPA hash route", () => {
   const inv = new InventoryBuilder(3);
   for (let i = 0; i < 5; i++) {
     inv.ingest(obs({ finalUrl: "https://shop.test/#/search", domSkeleton: `html>(body>(span.${i}))` }));
   }
-  assert.equal(inv.screens().length, 3, "churn on one hash route is still capped (backstop preserved)");
+  assert.equal(inv.screens().length, 1, "same URL + identical (empty) surface folds to one screen via surface dedup");
+  const surfaced = new InventoryBuilder(3);
+  for (let i = 0; i < 5; i++) {
+    surfaced.ingest(
+      obs({
+        finalUrl: "https://shop.test/#/search",
+        domSkeleton: `html>(body>(span.${i}))`,
+        forms: [{ action: "/go", method: "get", fields: [{ name: `f${i}`, type: "text" }] }],
+      }),
+    );
+  }
+  assert.equal(surfaced.screens().length, 3, "surface-changing churn on one hash route is still capped (backstop preserved)");
 });
 
 test("same skeleton preserves distinct origins and SPA routes, including independent caps", () => {

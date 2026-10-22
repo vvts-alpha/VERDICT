@@ -123,6 +123,7 @@ export function NewAssessment({ onCancel, apiSpec = false, initial }: { onCancel
   const [maxScreens, setMaxScreens] = useState(""); // cap on the number of screens to diagnose (blank = default 120)
   const [maxSurveyScreens, setMaxSurveyScreens] = useState(""); // cap on the number of screens the survey maps (blank = unlimited)
   const [keepAliveMin, setKeepAliveMin] = useState(""); // keepalive touch interval in minutes (blank = default 4, "0" = off)
+  const [parallel, setParallel] = useState(""); // concurrent diagnosis workers (blank = default 4, "1" = sequential)
   const [anchorUrl, setAnchorUrl] = useState(""); // goto-safe authed hub (menu) — reach cold-nav-bouncing routes by clicking from here (blank = off)
 
   const [busy, setBusy] = useState(false);
@@ -177,6 +178,7 @@ export function NewAssessment({ onCancel, apiSpec = false, initial }: { onCancel
     if (o.maxScreens != null) setMaxScreens(String(o.maxScreens));
     if (o.maxSurveyScreens != null) setMaxSurveyScreens(String(o.maxSurveyScreens));
     if (o.keepAliveMin != null) setKeepAliveMin(String(o.keepAliveMin));
+    if (o.parallel != null) setParallel(String(o.parallel));
     if (o.anchorUrl) setAnchorUrl(String(o.anchorUrl));
     if (o.focus) setFocus(String(o.focus));
     if (o.context) setContext(String(o.context));
@@ -307,6 +309,7 @@ export function NewAssessment({ onCancel, apiSpec = false, initial }: { onCancel
     if (command === "pilot" && maxScreens && Number.isFinite(Number(maxScreens))) options.maxScreens = Number.parseInt(maxScreens, 10);
     if (command === "pilot" && maxSurveyScreens && Number.isFinite(Number(maxSurveyScreens))) options.maxSurveyScreens = Number.parseInt(maxSurveyScreens, 10);
     if (command === "pilot" && keepAliveMin.trim() !== "" && Number.isFinite(Number(keepAliveMin))) options.keepAliveMin = Number.parseInt(keepAliveMin, 10);
+    if (command === "pilot" && parallel.trim() !== "" && Number.isFinite(Number(parallel))) options.parallel = Number.parseInt(parallel, 10);
     if (command === "pilot" && anchorUrl.trim()) options.anchorUrl = anchorUrl.trim();
     if (command === "pilot" && focus.trim()) options.focus = focus.trim();
     if (command === "pilot" && context.trim()) options.context = context.trim();
@@ -484,6 +487,12 @@ export function NewAssessment({ onCancel, apiSpec = false, initial }: { onCancel
             <label className="my-2 flex flex-col gap-1 text-xs [&>span]:text-muted-foreground" title={t("keepalive interval (minutes). touches a safe authed page (never /) to keep the session warm. set 0 to turn off for sites whose session dies on a cold / hit or a full reload.")}>
               <span>{t("Keepalive (min)")}</span>
               <Input value={keepAliveMin} onChange={(e) => setKeepAliveMin(e.target.value)} placeholder={t("4 · 0 = off")} inputMode="numeric" />
+            </label>
+          ) : null}
+          {command === "pilot" ? (
+            <label className="my-2 flex flex-col gap-1 text-xs [&>span]:text-muted-foreground" title={t("concurrent diagnosis workers — one per role with session material + one unauth (default 4, max 8). each worker is bound to its own session; cross-role checks still run. set 1 for the sequential loop.")}>
+              <span>{t("Parallel workers")}</span>
+              <Input value={parallel} onChange={(e) => setParallel(e.target.value)} placeholder={t("4 · 1 = sequential")} inputMode="numeric" />
             </label>
           ) : null}
         </div>

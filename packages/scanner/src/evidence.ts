@@ -113,6 +113,9 @@ function nextEvidenceId(): string {
 
 export class EvidenceStore {
   readonly records: EvidenceRecord[] = [];
+  /** Optional sink invoked after each record is persisted — used for cross-cutting ledgers
+   *  (e.g. the mutation ledger inspecting every recorded write). */
+  onRecord?: (rec: EvidenceRecord) => void;
 
   constructor(private readonly artifactsDir: string) {}
 
@@ -147,6 +150,11 @@ export class EvidenceStore {
     );
 
     this.records.push(rec);
+    try {
+      this.onRecord?.(rec);
+    } catch {
+      /* ledger hooks must never break evidence recording */
+    }
     return rec;
   }
 }

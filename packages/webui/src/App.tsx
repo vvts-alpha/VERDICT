@@ -13,6 +13,7 @@ import { Findings } from "./components/Findings";
 import { ScreenView } from "./components/ScreenView";
 import { ApiList } from "./components/ApiList";
 import { JsAssets } from "./components/JsAssets";
+import { Mutations } from "./components/Mutations";
 import { Log } from "./components/Log";
 import { Scenarios } from "./components/Scenarios";
 import { Index } from "./components/Index";
@@ -28,12 +29,12 @@ import { Badge } from "./components/ui/badge";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "./components/ui/resizable";
 import { useDefaultLayout } from "react-resizable-panels";
 import {
-  Bug, ChartColumn, FileCode2, KeyRound, LayoutGrid, MessageSquare,
+  Bug, ChartColumn, FileCode2, FileDiff, KeyRound, LayoutGrid, MessageSquare,
   Monitor, Network, ScrollText, SlidersHorizontal, UserRound, UsersRound, Video, Workflow,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
-type Tab = "screen" | "findings" | "scenarios" | "log" | "apis" | "js" | "sessions" | "ask" | "control" | "live";
+type Tab = "screen" | "findings" | "scenarios" | "log" | "apis" | "js" | "changes" | "sessions" | "ask" | "control" | "live";
 
 /** Running inside the Electron desktop shell? (its title bar already carries the VERDICT brand). */
 const isDesktop = typeof window !== "undefined" && !!(window as unknown as { verdictDesktop?: unknown }).verdictDesktop;
@@ -44,6 +45,7 @@ const TABS: { key: Tab; label: string; icon: LucideIcon; count?: (v: StateView) 
   { key: "scenarios", label: "Scenarios", icon: Workflow },
   { key: "apis", label: "APIs", icon: Network },
   { key: "js", label: "JS", icon: FileCode2, count: (v) => v.jsAssets.length },
+  { key: "changes", label: "Changes", icon: FileDiff, count: (v) => v.mutations.length },
   { key: "log", label: "Log", icon: ScrollText, count: (v) => v.events.length },
   { key: "sessions", label: "Sessions", icon: KeyRound },
   { key: "ask", label: "Ask", icon: MessageSquare },
@@ -305,6 +307,7 @@ export function App() {
                     {tab === "scenarios" ? <Scenarios view={view} onJump={onSelect} /> : null}
                     {tab === "apis" ? <ApiList view={view} onJump={onSelect} /> : null}
                     {tab === "js" ? <JsAssets view={view} /> : null}
+                    {tab === "changes" ? <Mutations view={view} /> : null}
                     {tab === "log" ? <Log events={view.events} /> : null}
                     {tab === "sessions" ? <Sessions id={view.id} /> : null}
                     {tab === "live" ? <LiveView id={view.id} /> : null}

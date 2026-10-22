@@ -61,6 +61,14 @@ export interface BuiltScreen {
   screen: Omit<Screen, "screenId">;
 }
 
+/** route + the screen's functional attack surface (param locations+names, API endpoint signatures).
+ *  Two observations with the same surface are the same logical screen even if the DOM skeleton differs. */
+function surfaceKeyOf(route: string, screen: Pick<Screen, "params" | "apis">): string {
+  const params = screen.params.map((p) => `${p.in}:${p.name}`).sort().join(",");
+  const apis = screen.apis.map(apiKey).sort().join(",");
+  return `${route}${params}${apis}`;
+}
+
 /** Merge a re-observed ApiCall into the kept one: fill null schemas, and for GraphQL union the variable
  *  name→kind shape + refresh the replay example (newest values are the most likely to still resolve). */
 function mergeApiCall(cur: ApiCall | undefined, next: ApiCall): void {
@@ -180,6 +188,10 @@ const DEFAULT_MAX_SCREENS_PER_TEMPLATE = 3;
 export class InventoryBuilder {
   private readonly byKey = new Map<string, Screen>();
   private readonly byTemplate = new Map<string, Screen>();
+  /** route + identical attack surface (params + API endpoints) → screen. The DOM skeleton shifts with auth
+   *  chrome (a logged-in nav bar re-hashes the page), so per-role re-maps of ONE route landed as 2-3 screens
+   *  when only the skeleton differed. Same route + same functional surface = same logical screen. */
+  private readonly bySurface = new Map<string, Screen>();
   /** Origin + HTTP/SPA route representatives and counts bound DOM churn independently per route. */
   private readonly byCap = new Map<string, Screen>();
   private readonly capCount = new Map<string, number>();
@@ -213,6 +225,14 @@ export class InventoryBuilder {
       this.merge(existing, built);
       return { screen: existing, isNew: false };
     }
+    // Surface dedup: DOM-skeleton differs (auth chrome, per-role re-map) but the ATTACK surface is identical —
+    // same params, same API endpoints on the same route. Diagnosis would probe the same inputs 2-3×.
+    const surfaceKey = surfaceKeyOf(route, built.screen);
+    const twin = this.bySurface.get(surfaceKey);
+    if (twin) {
+      this.merge(twin, built);
+      return { screen: twin, isNew: false };
+    }
     // Per-template cap (backstop against DOM-skeleton churn, e.g. self-injected XSS mutating the page): once a
     // capTemplate already has maxPerTemplate distinct screens, treat a further skeleton variant as the same logical
     // page re-hashing and merge into its representative instead of spawning yet another screen. Keyed on capTemplate
@@ -225,6 +245,7 @@ export class InventoryBuilder {
     this.counter += 1;
     const screen: Screen = { screenId: screenIdFor(this.counter), ...built.screen };
     this.byKey.set(built.dedupKey, screen);
+    if (!this.bySurface.has(surfaceKey)) this.bySurface.set(surfaceKey, screen);
     this.capCount.set(built.capTemplate, (this.capCount.get(built.capTemplate) ?? 0) + 1);
     if (!this.byCap.has(built.capTemplate)) this.byCap.set(built.capTemplate, screen);
     if (!this.byTemplate.has(route)) this.byTemplate.set(route, screen);
@@ -268,6 +289,8 @@ export class InventoryBuilder {
     for (const screen of screens) {
       const cap = screenRouteKey(screen.urlTemplate, screen.observedUrls[0] ?? "");
       this.byKey.set(`${cap}\0${screen.domSkeletonHash}`, screen);
+      const sKey = surfaceKeyOf(cap, screen);
+      if (!this.bySurface.has(sKey)) this.bySurface.set(sKey, screen);
       if (!this.byTemplate.has(cap)) this.byTemplate.set(cap, screen);
       this.capCount.set(cap, (this.capCount.get(cap) ?? 0) + 1);
       if (!this.byCap.has(cap)) this.byCap.set(cap, screen);

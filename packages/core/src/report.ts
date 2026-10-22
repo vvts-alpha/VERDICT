@@ -47,6 +47,7 @@ export function renderMarkdown(m: ReportModel): string {
     for (const f of suspected) out.push(tocRow(f));
   }
   if (lowSignal.length > 0) out.push("- [Low-signal notes](#low-signal-notes)");
+  if (m.mutations.length > 0) out.push("- [State changes performed](#state-changes-performed)");
   out.push("");
 
   // ── Target info ──
@@ -147,6 +148,7 @@ export function renderMarkdown(m: ReportModel): string {
     out.push(`### ${f.index}. ${mark}[${f.severity.toUpperCase()}] ${f.title}`, "");
     out.push(`- Screen: \`${f.screenId ?? "(cross-screen)"}\``);
     out.push(`- Source: ${f.sourceKind === "validator" ? `validator \`${f.sourceName}\`` : `hypothesis \`${f.sourceName}\``}`);
+    if (f.related && f.related.length > 0) out.push(`- Related findings: ${f.related.map((i) => `#${i}`).join(", ")} _(same endpoint mechanism — distinct issues, not merged)_`);
     out.push(`- Scope basis: ${f.scopeBasis}`, "");
     if (f.anomaly) out.push(`**Anomaly (why this is a lead):** ${f.anomaly}`, "");
     out.push(f.description, "");
@@ -175,6 +177,18 @@ export function renderMarkdown(m: ReportModel): string {
     out.push("_Info/low-severity inconclusive observations (inert input reflections, weak-CSP notes, etc.) — real but not exploitation-worthy leads. Listed compactly; NOT counted in the confirmed total._", "");
     for (const f of lowSignal)
       out.push(`- **[${f.severity.toUpperCase()}] ${f.title}**${f.screenId ? ` — screen \`${f.screenId}\`` : ""}${f.anomaly ? ` — ${f.anomaly.slice(0, 160)}` : ""}`);
+    out.push("");
+  }
+
+  // ── Mutation ledger — what the assessment changed on the target (current effective state per field) ──
+  if (m.mutations.length > 0) {
+    out.push("## State changes performed", "");
+    out.push("_Current effective value per (subject, field) after every write the assessment performed — last write wins. The full per-request trail lives in the run's event log._", "");
+    out.push("| Subject | Field | Value | Action | Via | Evidence |", "|---|---|---|---|---|---|");
+    for (const r of m.mutations) {
+      const via = `${r.method} ${r.url.slice(0, 80)}`;
+      out.push(`| ${r.subject} | ${r.field} | \`${r.value.slice(0, 80)}\` | ${r.action} | ${via} | ${r.evidenceId ?? "—"} |`);
+    }
     out.push("");
   }
 

@@ -54,6 +54,8 @@ export interface StartRunInput {
     context?: string;
     /** pilot only: keepalive interval in minutes (0 = off). For sites whose session dies on a cold `/` hit / full reload. */
     keepAliveMin?: number;
+    /** pilot only: concurrent diagnosis workers (bound-role + unauth). Default 4, cap 8; 1 = sequential. */
+    parallel?: number;
     /** pilot only: goto-safe authed hub (menu). Reach cold-nav-bouncing routes by clicking their link from here; also the keepalive target. */
     anchorUrl?: string;
     /** pilot only: also run a Burp active scan after diagnosis (connection via env BURP_API). */
@@ -143,6 +145,7 @@ export class Supervisor {
       if (o.focus) args.push("--focus", o.focus);
       if (o.context) args.push("--context", o.context);
       if (o.keepAliveMin != null) args.push("--keepalive-min", String(o.keepAliveMin));
+      if (o.parallel != null) args.push("--parallel", String(o.parallel));
       if (o.anchorUrl) args.push("--anchor-url", o.anchorUrl);
       if (input.command === "pilot" && o.burpScan) args.push("--burp-scan");
       if (input.command === "pilot" && o.burpProxy) args.push("--burp-proxy");
@@ -184,6 +187,7 @@ export class Supervisor {
     if (o.maxScreens != null) args.push("--max-screens", String(o.maxScreens));
     if (o.focus) args.push("--focus", o.focus);
     if (o.keepAliveMin != null) args.push("--keepalive-min", String(o.keepAliveMin));
+    if (o.parallel != null) args.push("--parallel", String(o.parallel));
     if (o.anchorUrl) args.push("--anchor-url", o.anchorUrl);
     // LiveHands reverse-connection: attended re-opens the login windows; any pilot resume also gets a control-url for
     // the view-only auto-scan screencast. (--attended only when the run is attended.)

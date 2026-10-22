@@ -61,6 +61,7 @@ commands:
             (target / in·out-of-scope hosts·path / rate / crawl / model / auth roles. password echo is masked)
   pilot   --manifest <file.json> | --url <url> [--model <m>] [--fast-model <m>] [--max-turns <n>] [--max-screens <n>] [--max-survey-screens <n>] [--rate <ms>] [--headed] [--focus "<text>"] [--context "<text>"] [--browser-path <bin>] [--browser-channel <name>] [--no-sandbox] [--out <dir>]
             --max-screens caps how many screens get diagnosed (default 120); --max-survey-screens caps how many the survey maps (default unlimited — stops exploring once reached)
+            --parallel <n> runs up to n diagnosis workers concurrently — one per role with session material + one unauth (default 4, 1 = sequential)
             ★Claude-led: Claude drives the tools (browser/http/login/record) to autonomously explore, verify, and record
             --focus "<text>": operator emphasis injected as the TOP priority of the A04 scenario stage (not per-screen diagnosis). e.g. "focus on the payment flow and IDOR in /api/orders"
             --context "<text>": standing target FACTS appended to EVERY stage's system prompt (survey→diagnosis→scenario), so they inform the whole run — unlike --focus (scenario-only). e.g. "auth = JWT in X-Auth header; tenant id = last path segment; API is GraphQL at /graphql". Additive only — cannot override the safety/scope/evidence rules.
@@ -1111,6 +1112,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       rate: { type: "string" },
       "max-turns": { type: "string" },
       "max-screens": { type: "string" },
+      parallel: { type: "string" }, // --parallel <n>: concurrent diagnosis workers (bound-role + unauth). 1 = sequential.
       "max-survey-screens": { type: "string" },
       focus: { type: "string" }, // operator focus hint (free text). Injected as the scenario stage's top-priority objective (not mixed into per-screen)
       context: { type: "string" }, // operator context (free text). Target facts appended to EVERY stage's system prompt (additive, cannot override safety/discipline)
@@ -1309,6 +1311,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       ...(values["login-url"] ? { loginUrl: values["login-url"] } : {}),
       ...(values["control-url"] ? { controlUrl: values["control-url"] } : {}),
       ...(values["max-screens"] ? { maxScreens: Number.parseInt(values["max-screens"], 10) } : {}),
+      ...(values.parallel ? { parallelWorkers: Number.parseInt(values.parallel, 10) } : {}),
       ...(values["max-survey-screens"] ? { maxSurveyScreens: Number.parseInt(values["max-survey-screens"], 10) } : {}),
       ...(roleCookieFiles.size ? { roleCookieFiles } : {}),
       ...(roleLoginUrls.size ? { roleLoginUrls } : {}),

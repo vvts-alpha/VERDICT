@@ -51,6 +51,8 @@ export type {
   ExpectationBasis,
   ExpectedAccessRule,
   OwnershipBasis,
+  Mutation,
+  MutationAction,
 } from "./types/index.js";
 
 // SQLite state store
@@ -106,3 +108,5 @@ export type { ReadinessCheck } from "./types/readiness.js";
 export type { ModelContextSettings } from "./llm-context.js";
 export { diffStateViews, renderDiffMarkdown } from "./diff.js";
 export type { DiffReport, StatusChange } from "./diff.js";
+export { mutationEvents, mutationLedger } from "./mutations.js";
+export type { MutationRow } from "./mutations.js";

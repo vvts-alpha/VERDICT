@@ -32,3 +32,4 @@ export type {
   ExpectedAccessRule,
   OwnershipBasis,
 } from "./authz.js";
+export type { Mutation, MutationAction } from "./mutation.js";
