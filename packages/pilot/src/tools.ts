@@ -1534,7 +1534,7 @@ function roleSurveySnapshot(s: PilotSession, role: string) {
 }
 /** Persist the role's full survey state (visited + pending + gated + navigated) append-only — a resume
  *  restores all of it, so pending links discovered before a pause never silently disappear. */
-function emitRoleProgress(s: PilotSession, role: string, state: "mapped" | "blocked", reason?: string): void {
+export function emitRoleProgress(s: PilotSession, role: string, state: "mapped" | "blocked", reason?: string): void {
   s.store.appendEvent(s.assessmentId, {
     type: "survey_role_progress",
     payload: { role, ...roleSurveySnapshot(s, role), state, ...(reason ? { reason: reason.slice(0, 200) } : {}) },
@@ -1569,18 +1569,6 @@ function hasSignoutChrome(o: Observation): boolean {
   );
 }
 
-/** Auth-shaped destination pages — visiting /login, /register, /forgot-password etc. is deliberate
- *  navigation, NOT evidence of a session bounce. Their forms contain "password"/"sign in" markers that
- *  would otherwise false-positive the session-death check. Matches hash routes (SPA) too. */
-const AUTH_PAGE_RE = /(?:^|[/?#._-])(login|log-in|sign-in|signin|register|sign-up|signup|forgot|forgot-?password|reset-?password|change-?password|oauth|sso|auth|account|profile|settings|me)(?:[/?#._-]|$)/i;
-
-/** A deliberate visit to an auth-shaped page: requested == final (no redirect happened) and the
- *  destination itself is login/register/etc. Such a visit cannot prove the session died — a real
- *  bounce (requested != final landing on login) still marks the role blocked. */
-function isAuthPageVisit(o: Observation): boolean {
-  return stripHash(o.requestedUrl) === stripHash(o.finalUrl) && AUTH_PAGE_RE.test(o.finalUrl);
-}
-
 /** Does this observation demonstrate the ROLE's session actually reached authenticated surface ON THIS PAGE?
  *  Real observed signals only: sign-out chrome rendered for a logged-in browser, or an identity/profile
  *  API call that carried session material and was answered (2xx/3xx). A cookie header's mere presence is
@@ -1613,9 +1601,8 @@ function recordObservation(s: PilotSession, o: Observation): { screen: Screen; i
   // Per-role survey progress: role A's visited set must not satisfy role B's surface. Track who observed what —
   // and persist it through survey_role_progress so a resume restores honest per-role coverage instead of a
   // blank slate (or worse, one role's cookie satisfying them all). For a NAMED role a visit only counts when
-  // the observation proves the session reached authenticated surface — a public page under a valid cookie, an
-  // HTTP error, or a login page never counts; session-death signals record the role blocked instead of letting
-  // survey_done refuse forever.
+  // the observation proves the session reached authenticated surface — a public page under a valid cookie,
+  // an HTTP error, or a login page never counts.
   let counted = false;
   if (s.visitedByRole) {
     if (who === "unauth" || sessionBoundEvidence(s, o)) {
@@ -1630,11 +1617,11 @@ function recordObservation(s: PilotSession, o: Observation): { screen: Screen; i
           counted = true;
         }
       }
-    } else if (o.status === 401) {
-      markRoleSurveyBlocked(s, who, `session rejected — HTTP 401 on ${o.finalUrl.slice(0, 120)} (expired/unauthenticated)`);
-    } else if (looksLikeErrorCatchAll(o) || (looksLikeLogin(o.visibleText) && !isAuthPageVisit(o))) {
-      markRoleSurveyBlocked(s, who, `session bounced to a login/error page (${o.finalUrl.slice(0, 120)}) — expired or unauthenticated`);
     }
+    // NOTE: an observation NEVER marks a role blocked — a 403 may be a scope gap, a 401 a per-resource
+    // decision, and login-ish page content is unreliable (register/i18n assets false-fired on live
+    // sessions). A dead session simply stops accumulating session-bound visits, so the role stays
+    // unfinished; survey_done names it, and login() is the only authoritative blocked source.
   }
   // Exploration cap (--max-survey-screens): on reaching it, empty the frontier and add no further discovered links
   //   (map no more → survey_status's frontier goes empty and the model calls survey_done).
@@ -2216,11 +2203,8 @@ export function buildTools(s: PilotSession) {
           //   page, do NOT enroll it as a screen and do NOT seed its links to the frontier (that derails the crawl onto
           //   the error page). Flag the route referer-gated so it's reached by an in-app browser_click instead.
           if (looksLikeErrorCatchAll(o)) {
-            // A role session that bounced to a LOGIN page is expired/unauthenticated — record it blocked with a
-            // concrete reason (bounded survey completion) instead of letting survey_done refuse forever. A generic
-            // error catch-all without login content is a routing failure, not a session verdict.
-            if (s.currentRole && looksLikeLogin(o.visibleText))
-              markRoleSurveyBlocked(s, s.currentRole, `session bounced to a login page (${o.finalUrl.slice(0, 120)}) — expired or unauthenticated`);
+            // No role-blocked verdict here: a bounced navigation is a routing failure, not proof of session
+            // death (the only authoritative blocked source is a failed login()).
             // Anchor auto-recovery (opt-in via --anchor-url): the cold GET bounced, but the route may be reachable by
             // clicking its link from the goto-safe anchor hub. With no anchor set this whole block is skipped = unchanged.
             if (s.anchorUrl) {

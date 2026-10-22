@@ -11,10 +11,12 @@ import { EvidenceStore, FetchHttpClient } from "@veritas/scanner";
 import { buildTools } from "./tools.js";
 import type { PilotSession } from "./tools.js";
 
-// Regression: a deliberate visit to an auth-shaped page (register/login/account — whose forms legitimately
-// contain "password" markers) must NOT mark the role's session blocked. Only a genuine bounce (requested
-// != final landing on a login page) or an inline login wall on a non-auth route proves session death.
-// (The a-mvie79rl symptom: alice/bob were marked blocked by visiting /#/register while fully logged in.)
+// Regression: an observation NEVER marks a role's session blocked — a 403 may be a scope gap, a 401 a
+// per-resource decision, a redirect a routing quirk, and login-ish content appears on register/i18n/
+// settings pages of a live session. The ONLY authoritative blocked source is a failed login() itself.
+// A dead session simply stops accumulating session-bound visits (the role stays unfinished; survey_done
+// names it and the model resolves it through login). (The a-mvie79rl symptom: alice/bob were marked
+// blocked by visiting /#/register while fully logged in.)
 
 const base = "http://app.test/";
 const dir = mkdtempSync(join(tmpdir(), "veritas-sblk-"));
@@ -75,26 +77,54 @@ test("deliberate visit to /#/register (password fields, live session) does NOT m
   }
 });
 
-test("a genuine bounce (requested /account → final /#/login) still marks the role blocked", async () => {
+test("a redirect bounce to a login page does NOT mark the role blocked (it just doesn't count)", async () => {
   const s = session({
-    [`${base}account`]: { finalUrl: `${base}#/login`, visibleText: "Please log in — password" },
+    [`${base}account`]: { finalUrl: `${base}#/login`, visibleText: "Please log in" },
   });
   try {
     await navigate(s, `${base}account`);
-    assert.equal(s.roleSurveyBlocked.has("alice"), true, "a real redirect to login proves session death");
-    assert.match(s.roleSurveyBlocked.get("alice") ?? "", /login|expired/i);
+    assert.equal(s.roleSurveyBlocked.has("alice"), false, "a bounce is ambiguous — never a blocked verdict");
+    assert.equal(s.visitedByRole.get("alice")?.size ?? 0, 0, "nor does a bounced visit count as mapped");
   } finally {
     close(s);
   }
 });
 
-test("an inline login wall on a NON-auth route (no redirect) still marks blocked", async () => {
+test("an inline login wall on a NON-auth route does NOT mark blocked", async () => {
   const s = session({
-    [`${base}products`]: { visibleText: "Please sign in to continue — enter your password" },
+    [`${base}products`]: {
+      visibleText: "Please sign in to continue — enter your password",
+      forms: [{ action: `${base}login`, method: "POST", fields: [{ name: "email", type: "email" }, { name: "password", type: "password" }] }],
+    },
   });
   try {
     await navigate(s, `${base}products`);
-    assert.equal(s.roleSurveyBlocked.has("alice"), true, "login wall served at the requested URL = dead session");
+    assert.equal(s.roleSurveyBlocked.has("alice"), false, "even a real login form can't prove the session died");
+  } finally {
+    close(s);
+  }
+});
+
+test("a static asset whose body mentions login words (i18n JSON) does NOT mark the role blocked", async () => {
+  const s = session({
+    [`${base}assets/i18n/en.json`]: { visibleText: '{"SIGN_IN":"Sign in","PASSWORD":"Password","LOGIN":"Login","FORGOT_PASSWORD":"Forgot password"}' },
+  });
+  try {
+    const out = await navigate(s, `${base}assets/i18n/en.json`);
+    assert.doesNotMatch(out, /ERROR/);
+    assert.equal(s.roleSurveyBlocked.has("alice"), false, "a JSON resource's content is not a login wall");
+  } finally {
+    close(s);
+  }
+});
+
+test("the ONLY authoritative blocked source: a login() with no usable material records the role blocked", async () => {
+  const s = session({});
+  try {
+    const t = buildTools(s).find((x) => (x as { name: string }).name === "login") as { handler: (a: unknown, e: unknown) => Promise<{ content: { text: string }[] }> };
+    const out = (await t.handler({ role: "alice" }, {})).content[0]!.text;
+    assert.match(out, /no credentials\/cookie/);
+    assert.equal(s.roleSurveyBlocked.has("alice"), true, "a failed login() is the one reliable blocked verdict");
   } finally {
     close(s);
   }

@@ -19,7 +19,7 @@ import { EvidenceStore, FetchHttpClient, fingerprintTech, stackAttackHints, extr
 import type { TechSample } from "@veritas/scanner";
 import type { OobProvider } from "@veritas/scanner";
 import { join } from "node:path";
-import { buildTools, STAGE_TOOLS, applyLoadedAuth, dedupKey, isAuthWalled, loadCookieFile, mergeSetCookie, touchIsDead, stripHash, backfillParentPrefixes, availableRoles, analyzePageJs, enrolByNavigate, pathIsIgnored } from "./tools.js";
+import { buildTools, STAGE_TOOLS, applyLoadedAuth, dedupKey, emitRoleProgress, isAuthWalled, loadCookieFile, mergeSetCookie, touchIsDead, stripHash, backfillParentPrefixes, availableRoles, analyzePageJs, enrolByNavigate, pathIsIgnored } from "./tools.js";
 import { triagePilotFindings } from "./findings-qa.js";
 import { detectMutation, effectiveCreds } from "./mutations.js";
 import { resolveSkills, buildSkillTools, skillToolNamesForStage, type Stage } from "./skills.js";
@@ -336,6 +336,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
   let driver: PlaywrightDriver;
   const extraWorkerDrivers: PlaywrightDriver[] = []; // parallel-diagnosis worker contexts (closed in finally)
   let roleSessions: Map<string, RoleSession> | undefined;
+  const liveOnResume = new Set<string>(); // roles whose persisted session probed LIVE — supersedes stale blocked progress
   let primaryRole = "";
   let primaryCookie = "";
   let liveControl: LiveControl | undefined;
@@ -387,6 +388,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         const cookie = await d.sessionCookieHeader().catch(() => "");
         if (cookie && (await probeAlive(cookie))) {
           roleSessions.set(role, { driver: d, cookie });
+          liveOnResume.add(role);
           opts.onText?.(`✅ role ${roleLabel(role, opts.roleDescriptions)}: persisted session still live — continuing without re-login`);
           continue;
         }
@@ -765,6 +767,14 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       }
       if (p.state === "blocked") session.roleSurveyBlocked.set(p.role, typeof p.reason === "string" ? p.reason : "blocked (restored)");
       else if (p.state === "mapped") session.roleSurveyBlocked.delete(p.role);
+    }
+    // Self-heal stale blocked marks: a role whose persisted session just probed LIVE was wrongly recorded
+    // dead (a register/i18n-asset false positive) — clear it and supersede the stale event with a mapped one.
+    for (const role of liveOnResume) {
+      if (session.roleSurveyBlocked.delete(role)) {
+        emitRoleProgress(session, role, "mapped");
+        session.store.appendEvent(session.assessmentId, { type: "note", payload: { message: `🔓 role '${role}' unblocked — persisted session verified live on resume` } });
+      }
     }
     // Materialize each role's pending/gated: the LAST snapshot, minus what that session has since navigated,
     // and minus anything the operator later pruned via ignore_paths.
