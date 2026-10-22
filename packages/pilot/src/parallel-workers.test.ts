@@ -32,7 +32,10 @@ before(async () => {
     if (req.url === "/slow-write" || req.url === "/slow-read") {
       inFlight += 1;
       maxInFlight = Math.max(maxInFlight, inFlight);
+      let finished = false;
       const finish = () => {
+        if (finished) return; // a stale chained release must not double-end the response
+        finished = true;
         inFlight -= 1;
         res.writeHead(200, { "content-type": "text/plain" });
         res.end("ok");
@@ -93,8 +96,25 @@ async function runTool(s: PilotSession, name: string, args: Record<string, unkno
 }
 const close = (s: PilotSession): void => (s as unknown as { store: { close(): void } }).store.close();
 
+/** Release every /slow-* send to completion. Serialized sends arrive at the server one at a time, so wait
+ *  for each arrival (release != null) rather than releasing on a fixed timer — a fixed sleep races the
+ *  write-queue dispatch and flakes. */
+async function drainSends(sends: Promise<unknown>[]): Promise<void> {
+  let done = 0;
+  for (const p of sends) void p.then(() => (done += 1), () => (done += 1));
+  for (let guard = 0; guard < 600 && done < sends.length; guard++) {
+    if (release) {
+      const rel = release;
+      release = null;
+      rel();
+    }
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  await Promise.all(sends);
+}
+
 test("boundRole worker: login() to another role is rejected with compare-leg guidance", async () => {
-  const s = session({ boundRole: "alice", currentRole: "alice", roleCreds: new Map([["alice", { user: "a", pass: "p" }], ["admin", { user: "b", pass: "q" }]]) });
+  const s = session({ boundRole: "alice", currentRole: "alice", roleCreds: new Map([["alice", { username: "a", password: "p" }], ["admin", { username: "b", password: "q" }]]) });
   try {
     const out = await runTool(s, "login", { role: "admin" });
     assert.match(out, /bound to role 'alice'/);
@@ -106,7 +126,7 @@ test("boundRole worker: login() to another role is rejected with compare-leg gui
 });
 
 test("unauth worker (boundRole \"\"): any login is rejected", async () => {
-  const s = session({ boundRole: "", roleCreds: new Map([["alice", { user: "a", pass: "p" }]]) });
+  const s = session({ boundRole: "", roleCreds: new Map([["alice", { username: "a", password: "p" }]]) });
   try {
     const out = await runTool(s, "login", { role: "alice" });
     assert.match(out, /bound to role '\(unauthenticated\)'/);
@@ -133,15 +153,7 @@ test("write queue: mutating sends under the SAME session material never overlap"
   release = null;
   const headers = { cookie: "sess=alice" };
   const sends = [0, 1, 2].map(() => http.send({ method: "POST", url: `${base}slow-write`, headers, body: "x=1" }));
-  // Let the first request land, then free them one at a time via the queued release chain.
-  await new Promise((r) => setTimeout(r, 50));
-  for (let i = 0; i < 3; i++) {
-    const rel = release;
-    release = null;
-    rel?.();
-    await new Promise((r) => setTimeout(r, 20));
-  }
-  await Promise.all(sends);
+  await drainSends(sends);
   assert.equal(maxInFlight, 1, "mutating sends under one account must serialize (never 2 in flight)");
 });
 
@@ -154,14 +166,7 @@ test("write queue: mutating sends under DIFFERENT session material run concurren
     http.send({ method: "POST", url: `${base}slow-write`, headers: { cookie: "sess=alice" }, body: "x=1" }),
     http.send({ method: "POST", url: `${base}slow-write`, headers: { cookie: "sess=admin" }, body: "x=1" }),
   ];
-  await new Promise((r) => setTimeout(r, 50));
-  for (let i = 0; i < 2; i++) {
-    const rel = release;
-    release = null;
-    rel?.();
-    await new Promise((r) => setTimeout(r, 20));
-  }
-  await Promise.all(sends);
+  await drainSends(sends);
   assert.ok(maxInFlight >= 2, "different accounts' writes must stay parallel");
 });
 
@@ -171,13 +176,6 @@ test("write queue: plain reads under the same material are not serialized", asyn
   maxInFlight = 0;
   release = null;
   const sends = [0, 1].map(() => http.send({ method: "GET", url: `${base}slow-read`, headers: { cookie: "sess=alice" } }));
-  await new Promise((r) => setTimeout(r, 50));
-  for (let i = 0; i < 2; i++) {
-    const rel = release;
-    release = null;
-    rel?.();
-    await new Promise((r) => setTimeout(r, 20));
-  }
-  await Promise.all(sends);
+  await drainSends(sends);
   assert.ok(maxInFlight >= 2, "reads stay parallel — only writes serialize");
 });

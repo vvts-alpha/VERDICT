@@ -1558,22 +1558,42 @@ const SIGNOUT_RE = /(sign|log)[\s_-]*out|sign[\s_-]*off|log[\s_-]*off|logout|sig
  *  (the same request unauthenticated answers 401/empty). */
 const IDENTITY_API_RE = /\/(me|whoami|profile|account|user(?:s)?|session|self|current[-_]?user|identity|auth\/(?:me|status|session))(?:[/?#._-]|$)/i;
 
+/** Sign-out chrome — a functional control that only renders when the server believes the session is
+ *  authenticated. Positive proof of a live session; it WINS over login-ish page text (a logged-in register
+ *  or account-settings page legitimately shows Password fields — that text must not veto live evidence). */
+function hasSignoutChrome(o: Observation): boolean {
+  return (
+    o.links.some((l) => SIGNOUT_RE.test(l)) ||
+    (o.clickables ?? []).some((c) => SIGNOUT_RE.test(c.text) || SIGNOUT_RE.test(c.selector)) ||
+    o.forms.some((f) => SIGNOUT_RE.test(f.action ?? ""))
+  );
+}
+
+/** Auth-shaped destination pages — visiting /login, /register, /forgot-password etc. is deliberate
+ *  navigation, NOT evidence of a session bounce. Their forms contain "password"/"sign in" markers that
+ *  would otherwise false-positive the session-death check. Matches hash routes (SPA) too. */
+const AUTH_PAGE_RE = /(?:^|[/?#._-])(login|log-in|sign-in|signin|register|sign-up|signup|forgot|forgot-?password|reset-?password|change-?password|oauth|sso|auth|account|profile|settings|me)(?:[/?#._-]|$)/i;
+
+/** A deliberate visit to an auth-shaped page: requested == final (no redirect happened) and the
+ *  destination itself is login/register/etc. Such a visit cannot prove the session died — a real
+ *  bounce (requested != final landing on login) still marks the role blocked. */
+function isAuthPageVisit(o: Observation): boolean {
+  return stripHash(o.requestedUrl) === stripHash(o.finalUrl) && AUTH_PAGE_RE.test(o.finalUrl);
+}
+
 /** Does this observation demonstrate the ROLE's session actually reached authenticated surface ON THIS PAGE?
  *  Real observed signals only: sign-out chrome rendered for a logged-in browser, or an identity/profile
  *  API call that carried session material and was answered (2xx/3xx). A cookie header's mere presence is
  *  not proof — an anonymous/public page under a valid cookie must not count; an arbitrary profile-URL 2xx
  *  without session material is not evidence either; and a whoami binding only proves session LIVENESS at
- *  login time — it says nothing about THIS page. 4xx/5xx/login/error pages can never count. */
+ *  login time — it says nothing about THIS page. 4xx/5xx/error pages can never count — but login-ish TEXT
+ *  must not veto real chrome/API evidence (an authenticated page may legitimately contain a password field). */
 function sessionBoundEvidence(_s: PilotSession, o: Observation): boolean {
-  if (o.status >= 400 || looksLikeErrorCatchAll(o) || looksLikeLogin(o.visibleText)) return false;
-  const signOutChrome =
-    o.links.some((l) => SIGNOUT_RE.test(l)) ||
-    (o.clickables ?? []).some((c) => SIGNOUT_RE.test(c.text) || SIGNOUT_RE.test(c.selector)) ||
-    o.forms.some((f) => SIGNOUT_RE.test(f.action ?? ""));
+  if (o.status >= 400 || looksLikeErrorCatchAll(o)) return false;
   const identityApi = o.apiCalls.some(
     (a) => a.status >= 200 && a.status < 400 && (a.hasAuthorizationHeader || a.hasCookieHeader) && IDENTITY_API_RE.test(a.url),
   );
-  return signOutChrome || identityApi;
+  return hasSignoutChrome(o) || identityApi;
 }
 
 /** Persist one observation to screens (auto-enrolls it as queued in the coverage ledger) and update the frontier. */
@@ -1612,7 +1632,7 @@ function recordObservation(s: PilotSession, o: Observation): { screen: Screen; i
       }
     } else if (o.status === 401) {
       markRoleSurveyBlocked(s, who, `session rejected — HTTP 401 on ${o.finalUrl.slice(0, 120)} (expired/unauthenticated)`);
-    } else if (looksLikeErrorCatchAll(o) || looksLikeLogin(o.visibleText)) {
+    } else if (looksLikeErrorCatchAll(o) || (looksLikeLogin(o.visibleText) && !isAuthPageVisit(o))) {
       markRoleSurveyBlocked(s, who, `session bounced to a login/error page (${o.finalUrl.slice(0, 120)}) — expired or unauthenticated`);
     }
   }
