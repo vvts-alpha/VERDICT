@@ -167,6 +167,7 @@ export function NewAssessment({ onCancel, apiSpec = false, initial }: { onCancel
     }
     if (o.model) setModel(String(o.model));
     if (o.fastModel) setFastModel(String(o.fastModel));
+    else if (o.model) setFastModel(String(o.model)); // runs saved before fastModel was explicit: light == deep
     if (o.rate != null) setRate(String(o.rate));
     if (o.maxTurns != null) setMaxTurns(String(o.maxTurns));
     if (o.headed) setHeaded(true);
@@ -296,7 +297,7 @@ export function NewAssessment({ onCancel, apiSpec = false, initial }: { onCancel
 
     const options: Record<string, unknown> = {};
     if (model) options.model = model;
-    if (command === "pilot" && fastModel && fastModel !== model) options.fastModel = fastModel; // model tiering
+    if (command === "pilot" && fastModel) options.fastModel = fastModel; // model tiering — always persist (even light==deep) so duplicate/resume restore it exactly
     if (rate && Number.isFinite(Number(rate))) options.rate = Number.parseInt(rate, 10);
     if (command === "pilot" && maxTurns && Number.isFinite(Number(maxTurns))) options.maxTurns = Number.parseInt(maxTurns, 10);
     if (headed) options.headed = true;
