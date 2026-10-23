@@ -57,6 +57,50 @@ test("relay: agent registers, viewer relays frames in, input out", () => {
   assert.deepEqual(agent.last(), { t: "stop", role: "primary" });
 });
 
+test("relay: roster re-announcements preserve done, honour the child's awaiting hint", () => {
+  const relay = new Relay();
+  relay.issueToken("a-3", "tok");
+
+  const agent = new FakeWs();
+  relay.handleAgent(ws(agent), req("/ws/agent?id=a-3&token=tok"), () => {});
+
+  // Verified-live roles (resume probes / creds auto-login) announce awaiting:false — they must NOT be
+  // highlighted as needing login (this was the "all live roles look pending" regression).
+  agent.recv({
+    t: "sessions",
+    roles: [
+      { role: "admin", url: "https://x/", awaiting: false },
+      { role: "alice", url: "https://x/login", awaiting: true },
+    ],
+  });
+  assert.deepEqual(relay.rolesFor("a-3"), [
+    { role: "admin", url: "https://x/", awaiting: false },
+    { role: "alice", url: "https://x/login", awaiting: true },
+  ]);
+
+  // Operator finishes alice → done:true survives a later roster re-announcement.
+  const viewer = new FakeWs();
+  relay.handleSession(ws(viewer), req("/ws/session?id=a-3&role=alice"));
+  viewer.recv({ t: "done" });
+  agent.recv({
+    t: "sessions",
+    roles: [
+      { role: "admin", url: "https://x/", awaiting: false },
+      { role: "alice", url: "https://x/", awaiting: false },
+      { role: "bob", url: "https://x/login", awaiting: true },
+    ],
+  });
+  assert.deepEqual(relay.rolesFor("a-3"), [
+    { role: "admin", url: "https://x/", awaiting: false },
+    { role: "alice", url: "https://x/", awaiting: false },
+    { role: "bob", url: "https://x/login", awaiting: true },
+  ]);
+
+  // Keepalive expiry re-flags a live role (child marks awaiting again) → the highlight comes back.
+  agent.recv({ t: "sessions", roles: [{ role: "admin", url: "https://x/login", awaiting: true }] });
+  assert.deepEqual(relay.rolesFor("a-3"), [{ role: "admin", url: "https://x/login", awaiting: true }]);
+});
+
 test("relay: wrong token rejected, no session without agent", () => {
   const relay = new Relay();
   relay.issueToken("a-2", "good");

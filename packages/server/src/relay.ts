@@ -51,14 +51,23 @@ export class Relay {
     this.agents.set(id, conn);
     log(`▶ agent connected ← ${id}`);
     ws.on("message", (raw) => {
-      let m: { t?: string; role?: string; url?: string; roles?: Array<{ role: string; url?: string }> };
+      let m: { t?: string; role?: string; url?: string; roles?: Array<{ role: string; url?: string; awaiting?: boolean }> };
       try {
         m = JSON.parse(String(raw)) as typeof m;
       } catch {
         return;
       }
       if (m.t === "sessions") {
-        conn.roles = new Map((m.roles ?? []).map((r) => [r.role, { url: r.url ?? "", done: false }])); // right after registration, everyone is awaiting login
+        // Merge, don't blindly replace: a re-sent roster must not resurrect a Done role's highlight, and a
+        // re-login prompt must re-flag it. The child's `awaiting` hint is authoritative when present
+        // (it tracks Done itself); absent, keep the prior done state.
+        conn.roles = new Map(
+          (m.roles ?? []).map((r) => {
+            const prev = conn.roles.get(r.role);
+            const done = r.awaiting !== undefined ? !r.awaiting : (prev?.done ?? false);
+            return [r.role, { url: r.url ?? "", done }];
+          }),
+        );
       } else if (m.role && (m.t === "frame" || m.t === "url" || m.t === "copied")) {
         if (m.t === "url") {
           const e = conn.roles.get(m.role);

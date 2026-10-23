@@ -74,6 +74,9 @@ interface RoleCtl {
   driver: PlaywrightDriver;
   cdp: Cdp;
   started: boolean;
+  /** true = the operator must still press Done for this role (login gate pending). False for sessions
+   *  already verified live at startup (resume probes / cookie / creds auto-login). */
+  awaiting: boolean;
   doneResolve?: () => void;
 }
 
@@ -81,6 +84,8 @@ export class LiveControl {
   private ws: WebSocket | null = null;
   private readonly roles = new Map<string, RoleCtl>();
   private readonly connected: Promise<void>;
+  private closed = false;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     private readonly url: string,
@@ -107,9 +112,26 @@ export class LiveControl {
         }
         void this.onMessage(m);
       };
-      ws.onclose = (): void => resolve(); // the run proceeds even if the connection fails
+      // A dropped loopback WS (server restart, OS suspend/resume) used to kill the Sessions tab silently —
+      // the screencast/CDP hooks are browser-bound, not socket-bound, so reconnecting re-announces the
+      // roster and resumes forwarding with no re-registration needed.
+      ws.onclose = (): void => {
+        resolve(); // the run proceeds even if the connection fails
+        if (!this.closed) this.reconnectTimer ??= setTimeout(() => void this.retry(), 3_000);
+      };
       ws.onerror = (): void => resolve();
     });
+  }
+
+  private async retry(): Promise<void> {
+    this.reconnectTimer = null;
+    if (this.closed) return;
+    try {
+      await this.connect(); // resolves on open AND on close — check readiness to tell them apart
+      if (this.ws?.readyState === 1) this.onLog?.("🔌 live-control reconnected to serve");
+    } catch {
+      if (!this.closed) this.reconnectTimer ??= setTimeout(() => void this.retry(), 3_000);
+    }
   }
 
   private send(o: unknown): void {
@@ -117,14 +139,19 @@ export class LiveControl {
   }
 
   private sendSessions(): void {
-    this.send({ t: "sessions", roles: [...this.roles.entries()].map(([role, c]) => ({ role, url: c.driver.currentUrl() })) });
+    this.send({ t: "sessions", roles: [...this.roles.entries()].map(([role, c]) => ({ role, url: c.driver.currentUrl(), awaiting: c.awaiting })) });
   }
 
-  /** Register the role's raw context so it can receive a screencast. */
-  async register(role: string, driver: PlaywrightDriver): Promise<void> {
+  /** Register the role's raw context so it can receive a screencast.
+   *  `awaiting` marks "operator must still press Done to log in" — verified-live sessions register
+   *  with awaiting:false so they appear (take-overable) without the false login highlight. */
+  async register(role: string, driver: PlaywrightDriver, awaiting = true): Promise<void> {
     await this.connected;
+    // Replacing a RoleCtl must not strand a pending waitForDone — resolve the stale waiter so its
+    // continuation runs (it just re-reads cookie/bearer) instead of leaking forever.
+    this.roles.get(role)?.doneResolve?.();
     const cdp = await driver.cdpSession();
-    const rc: RoleCtl = { driver, cdp, started: false };
+    const rc: RoleCtl = { driver, cdp, started: false, awaiting };
     this.roles.set(role, rc);
     cdp.on("Page.screencastFrame", (ev: { data: string; metadata: unknown; sessionId: number }) => {
       this.send({ t: "frame", role, data: ev.data, meta: ev.metadata });
@@ -136,6 +163,26 @@ export class LiveControl {
   /** Whether a role is registered (has a live CDP hook) — register() first if this returns false. */
   hasRole(role: string): boolean {
     return this.roles.has(role);
+  }
+
+  /** Drop a role whose context is confirmed dead — otherwise it lingers on the tab as a dead screencast.
+   *  login()'s respawn path re-registers on recovery. */
+  unregister(role: string): void {
+    const rc = this.roles.get(role);
+    if (!rc) return;
+    rc.doneResolve?.(); // unblock any waiter — the session is gone, not coming back
+    this.roles.delete(role);
+    this.sendSessions();
+  }
+
+  /** Re-flag an already-registered role as needing operator login (keepalive detected expiry on a session
+   *  that registered with awaiting:false — without this the tab never re-highlights it). */
+  markAwaiting(role: string): void {
+    const rc = this.roles.get(role);
+    if (rc && !rc.awaiting) {
+      rc.awaiting = true;
+      this.sendSessions();
+    }
   }
 
   /** Wait for that role's operator "Done" (the attended login gate; replaces Enter). */
@@ -174,11 +221,17 @@ export class LiveControl {
       await rc.driver.gotoUrl(msg.url).catch(() => {});
       this.send({ t: "url", role, url: rc.driver.currentUrl() });
     } else if (msg.t === "done") {
+      rc.awaiting = false;
       rc.doneResolve?.();
     }
   }
 
   close(): void {
+    this.closed = true;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     try {
       this.ws?.close();
     } catch {

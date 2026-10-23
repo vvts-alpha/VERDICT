@@ -232,7 +232,7 @@ export class PlaywrightDriver implements Driver {
 
   private constructor(
     private readonly context: BrowserContext,
-    private readonly page: Page,
+    private page: Page, // mutable: ensurePage() re-acquires a live handle when the page is closed
     private readonly opts: SettledOptions,
   ) {}
 
@@ -377,7 +377,7 @@ export class PlaywrightDriver implements Driver {
     this.buffer = [];
     let status = 0;
     try {
-      const resp = await this.page.goto(url, {
+      const resp = await (await this.ensurePage()).goto(url, {
         waitUntil: "domcontentloaded",
         timeout: this.opts.navTimeoutMs,
       });
@@ -498,7 +498,7 @@ export class PlaywrightDriver implements Driver {
 
   async gotoUrl(url: string): Promise<void> {
     try {
-      await this.page.goto(url, { waitUntil: "domcontentloaded", timeout: this.opts.navTimeoutMs });
+      await (await this.ensurePage()).goto(url, { waitUntil: "domcontentloaded", timeout: this.opts.navTimeoutMs });
     } catch {
       /* continue even if unreachable */
     }
@@ -744,6 +744,13 @@ export class PlaywrightDriver implements Driver {
     await new Promise<void>((resolve) => setTimeout(resolve, this.opts.settleMs));
   }
 
+  /** Page death is NOT session death — the persistent context (cookies/localStorage) survives a closed
+   *  page (window.close(), popup teardown). Re-acquire a live page handle from the context before nav. */
+  private async ensurePage(): Promise<Page> {
+    if (this.page.isClosed()) this.page = this.context.pages().find((p) => !p.isClosed()) ?? (await this.context.newPage());
+    return this.page;
+  }
+
   /** Context-level liveness — the attended session lives in the persistent context. A closed PAGE
    *  (`this.page` gone, e.g. window.close()/popup teardown) does NOT mean the session is dead, so
    *  liveness is probed at the context, not the page. */
@@ -766,7 +773,7 @@ export class PlaywrightDriver implements Driver {
    *  Juice Shop and the like authenticate XHR/API via `Authorization: Bearer <localStorage.token>` rather than a cookie,
    *  so without picking this up and putting it on http_request/probe_logic, every write API would 401. Returns the raw token string. */
   async bearerToken(): Promise<string | null> {
-    const raw = await this.page
+    const raw = await (await this.ensurePage().catch(() => this.page))
       .evaluate(() => {
         const g = globalThis as any;
         const stores = [g.localStorage, g.sessionStorage].filter(Boolean);
@@ -901,7 +908,7 @@ export class PlaywrightDriver implements Driver {
   /** Return the current page's CDP session for live remote login (attended×LiveHands)
    *  (Page.startScreencast + Input.dispatch*). Auth state lives in the persistent userDataDir. */
   async cdpSession(): Promise<CDPSession> {
-    return this.context.newCDPSession(this.page);
+    return this.context.newCDPSession(await this.ensurePage());
   }
 
   /** Take and clear the intercept buffer (collect APIs fired by an interaction; for active exploration). */

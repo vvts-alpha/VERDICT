@@ -470,9 +470,11 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     }
     // Every live role session belongs on the Sessions tab — not just the ones that awaited manual login.
     // (A resume skips the manual path entirely, which once left verified-live roles invisible/unreachable.)
+    // awaiting:false — these sessions are already established; registering them must not raise a false
+    // "needs login" highlight.
     if (liveControl) {
       for (const [role, rs] of roleSessions) {
-        if (!liveControl.hasRole(role)) await liveControl.register(role, rs.driver).catch(() => {});
+        if (!liveControl.hasRole(role)) await liveControl.register(role, rs.driver, false).catch(() => {});
       }
     }
     primaryRole = roles[0]!;
@@ -486,7 +488,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     if (opts.controlUrl) {
       try {
         liveControl = new LiveControl(opts.controlUrl, opts.onText);
-        await liveControl.register("scan", driver);
+        await liveControl.register("scan", driver, false); // view-only screencast — never a login gate
       } catch {
         /* screencast is best-effort — never block the scan on it */
       }
@@ -648,12 +650,14 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
   // instead of reporting "no credentials" on roles that only ever authenticate by hand. The persistent
   // userDataDir is reused, so a still-valid session may not even need operator input.
   if (opts.attended) {
-    const respawnDir = (role: string): string => join(opts.attendedProfilesDir ?? join(opts.profileDir, "..", "profiles"), role.replace(/[^a-z0-9_-]/gi, "_"));
+    const respawnDir = (role: string): string => join(opts.attendedProfilesDir ?? join(opts.profileDir, "..", "profiles"), role);
     session.respawnAttended = async (role) => {
       const d = await PlaywrightDriver.launch({ ...launchBase, userDataDir: respawnDir(role), headless: !!opts.controlUrl });
       await d.gotoUrl(opts.roleLoginUrls?.get(role) ?? opts.loginUrl ?? opts.targetUrl).catch(() => {});
       if (liveControl) {
-        if (!liveControl.hasRole(role)) await liveControl.register(role, d);
+        // Always re-register — a respawned role may still hold a stale RoleCtl bound to the dead context
+        // (keepalive drops from roleSessions but the CDP hook lingers), which would stream a dead page.
+        await liveControl.register(role, d);
         opts.onText?.(`🖥 role ${roleLabel(role, opts.roleDescriptions)}: session was lost — log in again in the Sessions tab, then press Done`);
         await liveControl.waitForDone(role);
       } else if (opts.promptOperator) {
@@ -1378,11 +1382,20 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
                   try {
                     await rs.driver.gotoUrl(loginUrlFor(role)).catch(() => {});
                     if (!liveControl.hasRole(role)) await liveControl.register(role, rs.driver);
-                    await liveControl.waitForDone(role);
-                    const fresh = await rs.driver.sessionCookieHeader().catch(() => "");
-                    if (fresh) rs.cookie = fresh;
-                    const nb = await rs.driver.bearerToken().catch(() => null);
-                    if (nb) rs.bearer = nb;
+                    else liveControl.markAwaiting(role); // already registered as live — re-flag for the tab highlight
+                    if (!reloginPending.has(role)) {
+                      reloginPending.add(role);
+                      void liveControl
+                        .waitForDone(role)
+                        .then(async () => {
+                          const fresh = await rs.driver.sessionCookieHeader().catch(() => "");
+                          if (fresh) rs.cookie = fresh;
+                          const nb = await rs.driver.bearerToken().catch(() => null);
+                          if (nb) rs.bearer = nb;
+                        })
+                        .catch(() => {})
+                        .finally(() => reloginPending.delete(role));
+                    }
                   } catch {
                     /* keep the role — the next keepalive tick retries the prompt */
                   }
@@ -1402,6 +1415,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
             // ERR_USE_AFTER_CLOSE must never cost the role its live session).
             if (/Target closed|has been closed/i.test(msg) && !(await rs.driver.isAlive().catch(() => false))) {
               roleSessions.delete(role);
+              liveControl?.unregister(role); // drop the dead screencast from the Sessions tab too
               opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: `🫀 keepalive: role '${role}' browser context closed — dropped from warm set` } });
               continue;
             }
@@ -1413,6 +1427,10 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
           payload: { message: `🫀 keepalive (attended): re-synced ${roleSessions.size} role(s) (keep session alive)` },
         });
       };
+      // A re-login prompt must not block the sweep (every worker shares attendedWarmBusy — a hanging
+      // Done-wait would stall them all). Fire the prompt once per dead role; material refreshes when
+      // the operator presses Done, and the next tick re-syncs cookie/bearer on its own anyway.
+      const reloginPending = new Set<string>();
       // Attended warm is an ALL-role sweep — under parallel workers only one caller runs it per interval
       // (the others skip; each worker's bound-role sync happens whichever worker's turn it is).
       let attendedWarmBusy: Promise<void> | null = null;
@@ -1685,6 +1703,26 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
             },
           });
         }
+        // Session material read-through: the shared keepalive sweep refreshes rs.cookie/rs.bearer in place, but
+        // only the sweeper's own sess.currentCookie used to see it — every other bound worker kept probing with
+        // a stale cookie until it happened to win the (shared) interval. Bind each bound worker to its
+        // RoleSession so rotation/expiry reaches all of them; non-attended/unauth workers keep a local copy.
+        let localCookie = ws.currentCookie;
+        let localBearer = ws.currentBearer;
+        Object.defineProperty(ws, "currentCookie", {
+          get: () => (boundRole && roleSessions?.has(boundRole) ? roleSessions.get(boundRole)!.cookie : localCookie),
+          set: (v) => {
+            if (boundRole && roleSessions?.has(boundRole)) roleSessions.get(boundRole)!.cookie = v;
+            else localCookie = v;
+          },
+        });
+        Object.defineProperty(ws, "currentBearer", {
+          get: () => (boundRole && roleSessions?.has(boundRole) ? (roleSessions.get(boundRole)!.bearer ?? "") : localBearer),
+          set: (v) => {
+            if (boundRole && roleSessions?.has(boundRole)) roleSessions.get(boundRole)!.bearer = v;
+            else localBearer = v;
+          },
+        });
         ws.evidence.onRecord = (rec) => detectMutation(ws, rec);
         return ws;
       };
