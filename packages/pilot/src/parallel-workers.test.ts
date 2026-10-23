@@ -135,12 +135,12 @@ test("unauth worker (boundRole \"\"): any login is rejected", async () => {
   }
 });
 
-test("unbound session: login() to any role proceeds normally (no boundRole gate)", async () => {
-  const s = session({ roleCreds: new Map() }); // no boundRole, no material — fails at the creds step, not the gate
+test("unbound session: login() to any CONFIGURED role proceeds normally (no boundRole gate)", async () => {
+  const s = session({ roleNames: new Set(["alice"]), roleCreds: new Map() }); // configured role, no boundRole, no material — fails at the creds step, not the gates
   try {
     const out = await runTool(s, "login", { role: "alice" });
-    assert.doesNotMatch(out, /bound to role/);
-    assert.match(out, /no credentials\/cookie/, "reaches the credentials step — the boundRole gate never fired");
+    assert.doesNotMatch(out, /bound to role|unknown role/);
+    assert.match(out, /no credentials\/cookie/, "reaches the credentials step — neither gate fired");
   } finally {
     close(s);
   }

@@ -45,6 +45,7 @@ function session(site: Record<string, Parameters<FakeDriver["visit"]>[0] extends
     roleCreds: new Map(),
     roleCookieFiles: new Map(),
     roleDescriptions: new Map(),
+    roleNames: new Set(["alice"]), // 'alice' is a configured role (attended launch set) — mirrors run.ts population
     visited: new Set<string>(),
     frontier: new Set<string>(),
     refererGated: new Set<string>(),
@@ -170,6 +171,54 @@ test("a FAILED attended respawn still falls through to an honest blocked", async
     const out = (await t.handler({ role: "alice" }, {})).content[0]!.text;
     assert.match(out, /no credentials\/cookie/);
     assert.equal(s.roleSurveyBlocked.has("alice"), true);
+  } finally {
+    close(s);
+  }
+});
+
+test("a DROPPED role stays a configured requirement — availableRoles doesn't read live sessions", async () => {
+  const s = session({});
+  // Attended: 'alice' configured (roleNames) but her live session was dropped — the map is empty.
+  // If availableRoles read roleSessions.keys() the role's auth requirement would silently vanish
+  // (survey_done stops asking, and her screens stay queued forever).
+  s.roleSessions = new Map();
+  try {
+    const { availableRoles } = await import("./tools.js");
+    assert.ok(availableRoles(s).some((r) => r.name === "alice"), "a dropped session must not drop the role");
+  } finally {
+    close(s);
+  }
+});
+
+test("login() refuses an UNCONFIGURED role — no respawn, no phantom blocked mark", async () => {
+  const s = session({});
+  s.roleSessions = new Map();
+  let spawned = 0;
+  s.respawnAttended = async () => (spawned++, null);
+  try {
+    const t = buildTools(s).find((x) => (x as { name: string }).name === "login") as { handler: (a: unknown, e: unknown) => Promise<{ content: { text: string }[] }> };
+    const out = (await t.handler({ role: "ghost" }, {})).content[0]!.text;
+    assert.match(out, /unknown role/);
+    assert.equal(spawned, 0, "a typo'd role must never spawn a real browser");
+    assert.equal(s.roleSurveyBlocked.has("ghost"), false, "nor pollute the blocked ledger");
+  } finally {
+    close(s);
+  }
+});
+
+test("a material-less live session falls through to configured creds instead of blocking", async () => {
+  const s = session({});
+  const d = Object.assign(new FakeDriver({}), { saveScreenshot: async () => false, sessionCookieHeader: async () => "", bearerToken: async () => null });
+  s.roleSessions = new Map([["alice", { driver: d as unknown as import("@veritas/crawler").PlaywrightDriver, cookie: "" }]]);
+  s.roleCreds = new Map([["alice", { username: "a", password: "p" }]]);
+  try {
+    const t = buildTools(s).find((x) => (x as { name: string }).name === "login") as { handler: (a: unknown, e: unknown) => Promise<{ content: { text: string }[] }> };
+    const out = (await t.handler({ role: "alice" }, {})).content[0]!.text;
+    // The empty operator session must NOT win the verdict — creds-configured roles still get the
+    // machine login attempt (which honestly fails here: FakeDriver can't complete a real login).
+    assert.doesNotMatch(out, /carries no session material/, "empty live session must not pre-empt the creds path");
+    assert.match(out, /did not complete|login error|blocked/i);
+    assert.ok(s.roleSurveyBlocked.has("alice"), "the honest outcome is still recorded");
   } finally {
     close(s);
   }

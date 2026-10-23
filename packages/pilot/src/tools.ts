@@ -177,6 +177,10 @@ export interface PilotSession {
   // ── attended (manual multi-session auth) ──
   /** Per-role live sessions that were manually logged in. Unset = normal (single-context) mode. */
   roleSessions?: Map<string, RoleSession>;
+  /** The CONFIGURED role set (manifest/csv/creds/cookieFile names) — the authoritative "which roles exist"
+   *  list. A live-session drop must NOT remove a role's auth requirement; without this, availableRoles
+   *  (attended: roleSessions keys) silently un-required a dropped role and survey_done passed it by. */
+  roleNames?: Set<string>;
   // ── authorization context (operator config + session-established identity) ──
   /** Operator-declared principal per role (manifest `principal` — launch-time config, NOT a tool argument). */
   rolePrincipals?: Map<string, string>;
@@ -828,11 +832,17 @@ export function pathIsIgnored(urlOrPath: string, patterns: ReadonlyArray<string>
   });
 }
 
-/** The roles usable by login() (name + optional privilege description). In attended mode, the live-session keys (including pure-manual roles);
- *  normally, the credentials + Cookie-file keys. description is the material auth-diff uses to tell high/low privilege apart. */
+/** The roles usable by login() (name + optional privilege description) — the CONFIGURED set (roleNames),
+ *  unioned with any live-session keys so late-spawned sessions still appear. A role whose live session was
+ *  dropped stays listed: its auth requirement doesn't vanish with the context. */
 export function availableRoles(s: PilotSession): Array<{ name: string; description?: string }> {
-  const names = s.roleSessions ? [...s.roleSessions.keys()] : [...new Set([...s.roleCreds.keys(), ...s.roleCookieFiles.keys()])];
-  return names.map((name) => {
+  const names = new Set([
+    ...(s.roleNames ?? []),
+    ...(s.roleSessions?.keys() ?? []),
+    ...s.roleCreds.keys(),
+    ...s.roleCookieFiles.keys(),
+  ]);
+  return [...names].map((name) => {
     const description = s.roleDescriptions.get(name);
     return description ? { name, description } : { name };
   });
@@ -2696,6 +2706,13 @@ export function buildTools(s: PilotSession) {
         }
         const desc = s.roleDescriptions.get(role);
         const tag = desc ? ` [${desc}]` : ""; // attach the privilege description (if any) to the response
+        // Refuse names that aren't configured roles — a typo'd/hallucinated name would otherwise spawn a
+        // real browser context (attended respawn) and park a worker for minutes, then pollute the blocked
+        // ledger with a role that never existed.
+        if (role !== "unauth" && !availableRoles(s).some((r) => r.name === role)) {
+          const avail = availableRoles(s).map((r) => (r.description ? `${r.name} (${r.description})` : r.name)).join(", ") || "none";
+          return txt(`unknown role '${role}'. Configured roles: ${avail}`);
+        }
         // ⓪ attended (manual multi-session): each role already has a live context.
         //    Don't re-login; just swap the active driver / cookie to that role.
         const markBlocked = (why: string) => markRoleSurveyBlocked(s, role, why);
@@ -2706,6 +2723,14 @@ export function buildTools(s: PilotSession) {
           await establishPrincipal(s, role); // whoami-style identity binding when an identityUrl was configured
         };
         let live = s.roleSessions?.get(role);
+        const liveOk = !live || typeof live.driver.isAlive !== "function" || (await live.driver.isAlive().catch(() => false));
+        if (live && !liveOk) {
+          // Stale entry the keepalive sweep hasn't caught yet — don't bind the worker to a corpse; drop it so
+          // the respawn path below establishes a fresh context instead. (Drivers that can't report liveness
+          // are trusted — never drop on an unverifiable probe.)
+          s.roleSessions?.delete(role);
+          live = undefined;
+        }
         if (!live && s.respawnAttended) {
           // The role's attended context was dropped/closed — respawn it and hand login back to the
           // operator instead of falling into "no credentials" on a role that only ever auths by hand.
@@ -2724,16 +2749,17 @@ export function buildTools(s: PilotSession) {
           s.currentBearer = (await live.driver.bearerToken().catch(() => null)) ?? "";
           if (s.currentBearer) live.bearer = s.currentBearer;
           setActiveRole(s, role); // swap frontier/gated to this role's own sets before any navigation
-          // An attended session carrying no material cannot authenticate — record it blocked up front
-          // (a later real login, or the respawn's Done hook, clears it) instead of letting its
-          // public-page visits count as role mapping. Checked BEFORE markAuthed so a material-less
-          // swap never emits a transient mapped event.
-          if (!live.cookie && !s.currentBearer) {
+          if (live.cookie || s.currentBearer) {
+            await markAuthed();
+            return txt(`switched to live attended session for role '${role}'${tag} (manual login; cookie ${live.cookie ? "present" : "empty"}${s.currentBearer ? ", bearer present" : ""}).`);
+          }
+          // Material-less live session (respawn timed out / operator hasn't logged in yet). A role with
+          // configured cookieFile/creds must still get its machine login — don't die on the empty
+          // operator session, fall through to the material paths (they act on s.driver == live.driver).
+          if (!s.roleCookieFiles.has(role) && !s.roleCreds.has(role)) {
             markBlocked(`attended session for '${role}' carries no session material (empty cookie, no bearer)`);
             return txt(`switched to live attended session for role '${role}'${tag} — WARNING: the session has no cookie/bearer, its visits will NOT count as authenticated mapping and the role is recorded BLOCKED until a real session is established.`);
           }
-          await markAuthed();
-          return txt(`switched to live attended session for role '${role}'${tag} (manual login; cookie ${live.cookie ? "present" : "empty"}${s.currentBearer ? ", bearer present" : ""}).`);
         }
         // ① If there's a pre-captured Cookie file, inject it without logging in (for walls that can't be auto-logged-in).
         const cookieFile = s.roleCookieFiles.get(role);
@@ -2748,6 +2774,7 @@ export function buildTools(s: PilotSession) {
             const applied = await applyLoadedAuth(s.driver, loaded, s.targetUrl);
             s.currentCookie = applied.cookie;
             s.currentBearer = applied.bearer;
+            if (live) { live.cookie = s.currentCookie; live.bearer = s.currentBearer; } // sync the shared role session
             setActiveRole(s, role);
             await markAuthed();
             const bits = [
@@ -2780,6 +2807,7 @@ export function buildTools(s: PilotSession) {
           if (r.ok) {
             s.currentCookie = await s.driver.sessionCookieHeader();
             s.currentBearer = (await s.driver.bearerToken().catch(() => null)) ?? "";
+            if (live) { live.cookie = s.currentCookie; live.bearer = s.currentBearer; } // sync the shared role session
             setActiveRole(s, role);
             await markAuthed();
             return txt(`logged in as '${role}'${tag}; now at ${s.driver.currentUrl()}${s.currentBearer ? " (bearer JWT captured)" : ""}`);

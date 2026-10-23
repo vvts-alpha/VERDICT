@@ -582,6 +582,9 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     roleCookieFiles: opts.roleCookieFiles ?? new Map(),
     roleLoginUrls: opts.roleLoginUrls,
     roleDescriptions: opts.roleDescriptions ?? new Map(),
+    // The configured role set — attended manual roles + creds + cookieFile keys. availableRoles reads this so
+    // a dropped live session never removes the role's auth requirement from the survey_done gate.
+    roleNames: new Set([...(opts.attendedRoles ?? []), ...opts.roleCreds.keys(), ...(opts.roleCookieFiles?.keys() ?? [])]),
     loginLlm: makeLlmClient(resolveLlmConfig(process.env, { claudeDefaultModel: "claude-sonnet-5" })), // smartLogin helper — honors VERDICT_LLM_PROVIDER
     currentCookie: primaryCookie, // attended starts with the primary role's live cookie (normally "")
     currentBearer: "", // login() loads each role's localStorage Bearer JWT
@@ -660,6 +663,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     const RESPAWN_LOGIN_WAIT_MS = 5 * 60_000;
     session.respawnAttended = async (role) => {
       const d = await PlaywrightDriver.launch({ ...launchBase, userDataDir: respawnDir(role), headless: !!opts.controlUrl });
+      try {
       await d.gotoUrl(opts.roleLoginUrls?.get(role) ?? opts.loginUrl ?? opts.targetUrl).catch(() => {});
       const rs: RoleSession = { driver: d, cookie: "" };
       if (liveControl) {
@@ -691,6 +695,12 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       const bearer = (await d.bearerToken().catch(() => null)) ?? "";
       if (bearer) rs.bearer = bearer;
       return rs;
+      } catch (e) {
+        // Never leak the context — a thrown promptOperator/register would orphan it and leave the
+        // profile dir locked, which makes every later respawn of this role fail at launch.
+        await d.close().catch(() => {});
+        throw e;
+      }
     };
   }
 
@@ -839,14 +849,6 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       if (p.state === "blocked") session.roleSurveyBlocked.set(p.role, typeof p.reason === "string" ? p.reason : "blocked (restored)");
       else if (p.state === "mapped") session.roleSurveyBlocked.delete(p.role);
     }
-    // Self-heal stale blocked marks: a role whose persisted session just probed LIVE was wrongly recorded
-    // dead (a register/i18n-asset false positive) — clear it and supersede the stale event with a mapped one.
-    for (const role of liveOnResume) {
-      if (session.roleSurveyBlocked.delete(role)) {
-        emitRoleProgress(session, role, "mapped");
-        session.store.appendEvent(session.assessmentId, { type: "note", payload: { message: `🔓 role '${role}' unblocked — persisted session verified live on resume` } });
-      }
-    }
     // Materialize each role's pending/gated: the LAST snapshot, minus what that session has since navigated,
     // and minus anything the operator later pruned via ignore_paths.
     for (const [role, snap] of lastSnap) {
@@ -866,6 +868,16 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       session.gatedByRole?.set(active, session.refererGated);
       for (const [k, v] of session.frontierByRole ?? []) if (k !== active && v === session.frontier) session.frontierByRole!.delete(k);
       for (const [k, v] of session.gatedByRole ?? []) if (k !== active && v === session.refererGated) session.gatedByRole!.delete(k);
+    }
+    // Self-heal stale blocked marks: a role whose persisted session just probed LIVE was wrongly recorded
+    // dead (a register/i18n-asset false positive) — clear it and supersede the stale event with a mapped one.
+    // Runs AFTER pending/gated materialization: emitRoleProgress snapshots the live maps, so emitting earlier
+    // would persist an empty pending list and the NEXT resume would restore a wiped frontier.
+    for (const role of liveOnResume) {
+      if (session.roleSurveyBlocked.delete(role)) {
+        emitRoleProgress(session, role, "mapped");
+        session.store.appendEvent(session.assessmentId, { type: "note", payload: { message: `🔓 role '${role}' unblocked — persisted session verified live on resume` } });
+      }
     }
     // Carry over existing findings (continue id numbering + best-effort dedup key to suppress double-reporting)
     for (const f of prev.findings) {
@@ -1766,8 +1778,11 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         const t = [...buildTools(ws), ...sk.map((e) => e.tool)] as typeof toolDefs;
         return { name, sess: ws, toolDefs: t, server: createSdkMcpServer({ name: "veritas", version: "1.0.0", tools: t }), queue: [] };
       };
+      // Configured roles (roleNames) ∪ live sessions — a role whose context was dropped still gets its
+      // worker (respawn can restore it); keying off roleSessions alone silently lost the dropped role's
+      // screens — they stayed "queued" forever.
       const boundRoles = opts.attended
-        ? [...(roleSessions?.keys() ?? [])]
+        ? [...new Set([...(session.roleNames ?? []), ...(roleSessions?.keys() ?? [])])]
         : [...new Set([...opts.roleCreds.keys(), ...(opts.roleCookieFiles?.keys() ?? [])])];
       const workerCap = Math.max(1, Math.min(opts.parallelWorkers ?? 4, 8));
       const hasUnauthScreens = screens.some((sc) => sc.authState !== "post-login");
