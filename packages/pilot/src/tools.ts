@@ -2724,13 +2724,15 @@ export function buildTools(s: PilotSession) {
           s.currentBearer = (await live.driver.bearerToken().catch(() => null)) ?? "";
           if (s.currentBearer) live.bearer = s.currentBearer;
           setActiveRole(s, role); // swap frontier/gated to this role's own sets before any navigation
-          await markAuthed();
           // An attended session carrying no material cannot authenticate — record it blocked up front
-          // (a later real login clears it) instead of letting its public-page visits count as role mapping.
+          // (a later real login, or the respawn's Done hook, clears it) instead of letting its
+          // public-page visits count as role mapping. Checked BEFORE markAuthed so a material-less
+          // swap never emits a transient mapped event.
           if (!live.cookie && !s.currentBearer) {
             markBlocked(`attended session for '${role}' carries no session material (empty cookie, no bearer)`);
             return txt(`switched to live attended session for role '${role}'${tag} — WARNING: the session has no cookie/bearer, its visits will NOT count as authenticated mapping and the role is recorded BLOCKED until a real session is established.`);
           }
+          await markAuthed();
           return txt(`switched to live attended session for role '${role}'${tag} (manual login; cookie ${live.cookie ? "present" : "empty"}${s.currentBearer ? ", bearer present" : ""}).`);
         }
         // ① If there's a pre-captured Cookie file, inject it without logging in (for walls that can't be auto-logged-in).

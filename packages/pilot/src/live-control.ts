@@ -77,7 +77,9 @@ interface RoleCtl {
   /** true = the operator must still press Done for this role (login gate pending). False for sessions
    *  already verified live at startup (resume probes / cookie / creds auto-login). */
   awaiting: boolean;
-  doneResolve?: () => void;
+  /** Every armed Done waiter — keepalive's relogin watch and login()'s respawn gate coexist, so a
+   *  single-slot resolver would silently drop whichever armed first. All resolve on Done/re-register. */
+  doneResolvers: Set<() => void>;
 }
 
 export class LiveControl {
@@ -147,11 +149,11 @@ export class LiveControl {
    *  with awaiting:false so they appear (take-overable) without the false login highlight. */
   async register(role: string, driver: PlaywrightDriver, awaiting = true): Promise<void> {
     await this.connected;
-    // Replacing a RoleCtl must not strand a pending waitForDone — resolve the stale waiter so its
-    // continuation runs (it just re-reads cookie/bearer) instead of leaking forever.
-    this.roles.get(role)?.doneResolve?.();
+    // Replacing a RoleCtl must not strand pending waitForDone callers — resolve the stale waiters so
+    // their continuations run (they just re-read cookie/bearer) instead of leaking forever.
+    if (this.roles.get(role)) for (const r of this.roles.get(role)!.doneResolvers) r();
     const cdp = await driver.cdpSession();
-    const rc: RoleCtl = { driver, cdp, started: false, awaiting };
+    const rc: RoleCtl = { driver, cdp, started: false, awaiting, doneResolvers: new Set() };
     this.roles.set(role, rc);
     cdp.on("Page.screencastFrame", (ev: { data: string; metadata: unknown; sessionId: number }) => {
       this.send({ t: "frame", role, data: ev.data, meta: ev.metadata });
@@ -170,7 +172,8 @@ export class LiveControl {
   unregister(role: string): void {
     const rc = this.roles.get(role);
     if (!rc) return;
-    rc.doneResolve?.(); // unblock any waiter — the session is gone, not coming back
+    for (const r of rc.doneResolvers) r(); // unblock any waiter — the session is gone, not coming back
+    rc.doneResolvers.clear();
     this.roles.delete(role);
     this.sendSessions();
   }
@@ -185,12 +188,13 @@ export class LiveControl {
     }
   }
 
-  /** Wait for that role's operator "Done" (the attended login gate; replaces Enter). */
+  /** Wait for that role's operator "Done" (the attended login gate; replaces Enter). Multi-waiter —
+   *  concurrent callers (bounded respawn gate + background recovery hook + keepalive watch) all resolve. */
   waitForDone(role: string): Promise<void> {
     const rc = this.roles.get(role);
     if (!rc) return Promise.resolve();
     return new Promise<void>((resolve) => {
-      rc.doneResolve = resolve;
+      rc.doneResolvers.add(resolve);
     });
   }
 
@@ -222,7 +226,8 @@ export class LiveControl {
       this.send({ t: "url", role, url: rc.driver.currentUrl() });
     } else if (msg.t === "done") {
       rc.awaiting = false;
-      rc.doneResolve?.();
+      for (const r of rc.doneResolvers) r();
+      rc.doneResolvers.clear();
     }
   }
 

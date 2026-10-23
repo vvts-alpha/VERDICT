@@ -648,24 +648,49 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
 
   // Attended: a role whose context was dropped/closed can be re-spawned on demand — login(role) calls this
   // instead of reporting "no credentials" on roles that only ever authenticate by hand. The persistent
-  // userDataDir is reused, so a still-valid session may not even need operator input.
+  // userDataDir is reused, so a still-valid session may not even need operator input. A respawned context is
+  // sent straight to the login page and kept highlighted in the Sessions tab — "blocked" therefore always
+  // leaves a live recovery door: whenever the operator does log in + Done, the Done hook refreshes the
+  // session material and clears the blocked mark (no second login() call required).
   if (opts.attended) {
     const respawnDir = (role: string): string => join(opts.attendedProfilesDir ?? join(opts.profileDir, "..", "profiles"), role);
+    /** Bounded wait for the operator's Done — an absent operator must not stall the worker forever.
+     *  On timeout the material-less session still returns → login() marks the role blocked while the
+     *  persistent Done hook below keeps the recovery door open. */
+    const RESPAWN_LOGIN_WAIT_MS = 5 * 60_000;
     session.respawnAttended = async (role) => {
       const d = await PlaywrightDriver.launch({ ...launchBase, userDataDir: respawnDir(role), headless: !!opts.controlUrl });
       await d.gotoUrl(opts.roleLoginUrls?.get(role) ?? opts.loginUrl ?? opts.targetUrl).catch(() => {});
+      const rs: RoleSession = { driver: d, cookie: "" };
       if (liveControl) {
         // Always re-register — a respawned role may still hold a stale RoleCtl bound to the dead context
         // (keepalive drops from roleSessions but the CDP hook lingers), which would stream a dead page.
         await liveControl.register(role, d);
         opts.onText?.(`🖥 role ${roleLabel(role, opts.roleDescriptions)}: session was lost — log in again in the Sessions tab, then press Done`);
-        await liveControl.waitForDone(role);
+        // Persistent recovery hook on the SAME rs object the caller stores in roleSessions — a Done that
+        // arrives after the bounded wait still refreshes the session material and unblocks the role.
+        // (waitForDone is single-waiter — the race must share THIS promise, not call it again.)
+        const done = liveControl.waitForDone(role);
+        void done
+          .then(async () => {
+            const fresh = await rs.driver.sessionCookieHeader().catch(() => "");
+            if (fresh) rs.cookie = fresh;
+            const nb = await rs.driver.bearerToken().catch(() => null);
+            if (nb) rs.bearer = nb;
+            if ((rs.cookie || rs.bearer) && session.roleSurveyBlocked.delete(role)) {
+              emitRoleProgress(session, role, "mapped");
+              session.store.appendEvent(session.assessmentId, { type: "note", payload: { message: `🔓 role '${role}' re-authenticated via Sessions tab — unblocked` } });
+            }
+          })
+          .catch(() => {});
+        await Promise.race([done, new Promise((r) => setTimeout(r, RESPAWN_LOGIN_WAIT_MS))]);
       } else if (opts.promptOperator) {
         await opts.promptOperator(`▶ Please log in again in the browser window for role ${roleLabel(role, opts.roleDescriptions)}. Press Enter when done…`);
       }
-      const cookie = await d.sessionCookieHeader().catch(() => "");
+      rs.cookie = await d.sessionCookieHeader().catch(() => "");
       const bearer = (await d.bearerToken().catch(() => null)) ?? "";
-      return { driver: d, cookie, ...(bearer ? { bearer } : {}) };
+      if (bearer) rs.bearer = bearer;
+      return rs;
     };
   }
 
@@ -1395,6 +1420,12 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
                           if (fresh) rs.cookie = fresh;
                           const nb = await rs.driver.bearerToken().catch(() => null);
                           if (nb) rs.bearer = nb;
+                          // An operator re-login lifts the blocked mark too — the role must not stay
+                          // labelled blocked until some future login() happens to clear it.
+                          if ((rs.cookie || rs.bearer) && sess.roleSurveyBlocked.delete(role)) {
+                            emitRoleProgress(sess, role, "mapped");
+                            session.store.appendEvent(session.assessmentId, { type: "note", payload: { message: `🔓 role '${role}' re-authenticated via Sessions tab — unblocked` } });
+                          }
                         })
                         .catch(() => {})
                         .finally(() => reloginPending.delete(role));
