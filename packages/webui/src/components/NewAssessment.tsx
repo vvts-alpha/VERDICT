@@ -218,15 +218,19 @@ export function NewAssessment({ onCancel, apiSpec = false, initial }: { onCancel
   const rmRole = (i: number): void => setRoles((rs) => rs.filter((_, j) => j !== i));
 
   const checkSetup = async (): Promise<boolean> => {
-    if (!desktopBridge?.settings?.check) return true;
-    setChecking(true); setChecks([]);
+    const local: ReadinessCheck[] = [];
+    if (command === "pilot" && runKind === "site" && maxScreens.trim() === "") {
+      local.push({ name: "coverage", status: "warn", message: t("Max screens is blank — the default cap (120) applies: screens discovered beyond the cap stay undiagnosed (enter a number to raise the limit).") });
+    }
+    if (!desktopBridge?.settings?.check) { setChecks(local); return true; }
+    setChecking(true); setChecks(local);
     try {
       const saved = await desktopBridge.settings.get();
       const result: ReadinessCheck[] = await desktopBridge.settings.check({ ...saved,
         ...(model ? { deepModel: model } : {}), ...(fastModel ? { lightModel: fastModel } : {}),
         burpScan: burpScan || saved.burpScan,
       });
-      const list = result.slice();
+      const list = [...local, ...result];
       if (!roles.some((r) => r.name.trim()) && !basicUser.trim()) {
         list.push({ name: "auth", status: "warn", message: t("No auth configured — the run goes unauthenticated; login-protected areas won't be reached (add a role under Auth if the target needs login).") });
       }

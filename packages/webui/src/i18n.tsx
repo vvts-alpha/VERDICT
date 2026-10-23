@@ -225,6 +225,8 @@ const JA: Record<string, string> = {
   "Max context includes input and response. VERDICT reserves room for replies and summarizes older history as it fills. Blank defaults to 256,000 tokens; Light inherits Deep when they use the same model. Use each model's supported limit.":
     "最大コンテキストには入力と応答を含みます。VERDICT は応答用の余白を残し、いっぱいになると古い履歴を要約します。空欄は 256,000 トークンが既定。同じモデルを使う場合 Light は Deep を継承します。各モデルの対応上限を使ってください。",
   "Max screens": "最大画面数",
+  "Max screens is blank — the default cap (120) applies: screens discovered beyond the cap stay undiagnosed (enter a number to raise the limit).":
+    "最大画面数が未設定 — 既定の上限（120）が適用され、上限を超えて発見された画面は診断されません（上限を上げるには数値を入力）。",
   Maximize: "最大化",
   Minimize: "最小化",
   Model: "モデル",
