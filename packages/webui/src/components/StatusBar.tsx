@@ -208,23 +208,24 @@ export function StatusBar({
 export function RunStats({ view }: { view: StateView }) {
   const t = useT();
   const c = view.coverage;
-  // Ledger-honest counts: a conclusive claim with no check records is "claimed", not tested; a
-  // clean screen whose ledger still holds gaps/unfulfilled plans counts under unverified.
+  // Ledger-honest counts: "tested" = diagnosis executed (any outcome — clean, found, or inconclusive);
+  // a conclusive claim with no check records is "claimed", not tested; the unverified subset stays
+  // visible as its own metric so inconclusive work can't masquerade as verdicted coverage.
   let tested = 0;
   let unverified = 0;
   let claimed = 0;
   for (const h of screenHonestyMap(view).values()) {
-    if (h.status === "clean" || h.status === "finding" || h.status === "suspected") tested += 1;
-    else if (h.status === "unverified") unverified += 1;
+    if (h.status === "clean" || h.status === "finding" || h.status === "suspected" || h.status === "unverified") tested += 1;
+    if (h.status === "unverified") unverified += 1;
     else if (h.status === "unknown-records") claimed += 1;
   }
   const pending = view.handoffs.filter((h) => h.status === "pending").length;
   const items: { label: string; value: ReactNode; title?: string; warn?: boolean }[] = [
     { label: t("phase"), value: view.phase },
-    { label: t("tested"), value: `${tested}/${c.total}`, title: t("Screens whose diagnosis finished WITH recorded check executions; excludes omitted screens") },
+    { label: t("tested"), value: `${tested}/${c.total}`, title: t("Screens whose diagnosis ran to completion — recorded check executions, any outcome (clean / found / inconclusive); excludes omitted screens") },
     { label: t("findings"), value: view.findings.length, warn: view.findings.length > 0 },
     { label: t("unfinished"), value: c.remaining, title: t("Queued, in progress, blocked, or failed; diagnosis is not complete"), warn: c.remaining > 0 },
-    { label: t("unverified"), value: unverified, title: t("Screens whose diagnosis ended inconclusive — check-execution gaps or unfulfilled plans remain"), warn: unverified > 0 },
+    { label: t("unverified"), value: unverified, title: t("Tested screens whose checks ended inconclusive — check-execution gaps or unfulfilled plans remain"), warn: unverified > 0 },
     { label: t("claimed"), value: claimed, title: t("Screens marked conclusive with no check records — a legacy/log claim, detail unknown") },
     { label: t("screens"), value: c.total },
     { label: t("excluded"), value: c.byStatus.excluded, title: t("Screens omitted from diagnosis"), warn: c.byStatus.excluded > 0 },
