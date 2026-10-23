@@ -1792,13 +1792,11 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         // Unauth worker: always a dedicated session (the main session keeps its auth for the later scenario /
         //   fingerprint stages — binding it here would reject their login() calls). Non-attended shares the main
         //   driver (nobody else touches it during the parallel block); attended gets a fresh headless context so
-        //   a role window isn't driven by two workers at once.
-        // Unauth worker: always a dedicated session (the main session keeps its auth for the later scenario /
-        //   fingerprint stages — binding it here would reject their login() calls). Non-attended shares the main
-        //   driver (nobody else touches it during the parallel block); attended gets a fresh headless context so
-        //   a role window isn't driven by two workers at once.
+        //   a role window isn't driven by two workers at once. headless:true is explicit — attended forces
+        //   launchBase.headless=false for the operator-facing role windows, and this diagnostic context would
+        //   otherwise pop up as a stray headed window parked on about:blank.
         if (opts.attended) {
-          const d = await PlaywrightDriver.launch({ ...launchBase, userDataDir: join(opts.profileDir, "..", "worker-unauth") });
+          const d = await PlaywrightDriver.launch({ ...launchBase, userDataDir: join(opts.profileDir, "..", "worker-unauth"), headless: true });
           extraWorkerDrivers.push(d);
           unauthWorker = await makeWorker("unauth", "", d);
         } else {
