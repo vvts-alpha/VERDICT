@@ -337,10 +337,8 @@ const JA: Record<string, string> = {
   "Screens marked conclusive with no check records — a legacy/log claim, detail unknown":
     "チェック記録なしで確定扱いの画面 — 旧形式・ログベースの主張で詳細不明",
   "Screens omitted from diagnosis": "診断から除外された画面",
-  "Diagnosis executed — verdicts: {finding} finding · {suspected} suspected · {clean} clean · {unverified} inconclusive; excludes never-run and excluded screens":
-    "診断実行済み — 判定: finding {finding}・suspected {suspected}・clean {clean}・非確定 {unverified}（未実行・除外画面は含まない）",
-  "Tested screens whose checks ended inconclusive — check-execution gaps or unfulfilled plans remain":
-    "診断実行済みだがチェックが非確定で終わった画面 — チェック実行の欠落か未消化の計画が残存",
+  "Diagnosis executed — verdicts: {finding} finding · {suspected} suspected · {clean} clean · {inconclusive} inconclusive; excludes never-run and excluded screens":
+    "診断実行済み — 判定: finding {finding}・suspected {suspected}・clean {clean}・非確定 {inconclusive}（未実行・除外画面は含まない）",
   "Select a JSON file (YAML / external refs unsupported).":
     "JSON ファイルを選択してください（YAML・外部参照は未対応）。",
   "Selectors (optional — override the adapter's auto-discovery when it misfires)":

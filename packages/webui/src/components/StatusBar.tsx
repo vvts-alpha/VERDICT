@@ -218,25 +218,20 @@ export function RunStats({ view }: { view: StateView }) {
   const EXECUTED: ReadonlySet<EffectiveStatus> = new Set(["clean", "finding", "suspected", "unverified"]);
   const verdicts: Partial<Record<EffectiveStatus, number>> = {};
   let tested = 0;
-  let claimed = 0;
   for (const h of screenHonestyMap(view).values()) {
     verdicts[h.status] = (verdicts[h.status] ?? 0) + 1;
-    if (h.status === "unknown-records") claimed += 1;
-    else if (EXECUTED.has(h.status)) tested += 1;
+    if (EXECUTED.has(h.status)) tested += 1;
   }
-  const unverified = verdicts.unverified ?? 0;
+  const inconclusive = verdicts.unverified ?? 0;
   const pending = view.handoffs.filter((h) => h.status === "pending").length;
   const items: { label: string; value: ReactNode; title?: string; warn?: boolean }[] = [
     { label: t("phase"), value: view.phase },
     {
       label: t("tested"), value: `${tested}/${c.total}`,
-      title: t("Diagnosis executed — verdicts: {finding} finding · {suspected} suspected · {clean} clean · {unverified} inconclusive; excludes never-run and excluded screens",
-        { finding: verdicts.finding ?? 0, suspected: verdicts.suspected ?? 0, clean: verdicts.clean ?? 0, unverified }),
+      title: t("Diagnosis executed — verdicts: {finding} finding · {suspected} suspected · {clean} clean · {inconclusive} inconclusive; excludes never-run and excluded screens",
+        { finding: verdicts.finding ?? 0, suspected: verdicts.suspected ?? 0, clean: verdicts.clean ?? 0, inconclusive }),
     },
     { label: t("findings"), value: view.findings.length, warn: view.findings.length > 0 },
-    { label: t("unfinished"), value: c.remaining, title: t("Queued, in progress, blocked, or failed; diagnosis is not complete"), warn: c.remaining > 0 },
-    { label: t("unverified"), value: unverified, title: t("Tested screens whose checks ended inconclusive — check-execution gaps or unfulfilled plans remain"), warn: unverified > 0 },
-    { label: t("claimed"), value: claimed, title: t("Screens marked conclusive with no check records — a legacy/log claim, detail unknown") },
     { label: t("screens"), value: c.total },
     { label: t("excluded"), value: c.byStatus.excluded, title: t("Screens omitted from diagnosis"), warn: c.byStatus.excluded > 0 },
     { label: t("tokens"), value: fmtTokens(view.budget.tokensUsed) },
