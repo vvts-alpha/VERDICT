@@ -18,6 +18,18 @@ Use Node.js 24+ and pinned pnpm 9.15.4 (`corepack enable pnpm`).
 
 Build before testing dependent packages; workspace imports commonly resolve to `dist/`.
 
+## Design Before Implementation
+
+Settle the design before writing code — for every feature, fix, or mechanism:
+
+- **State the invariants** and identify the *single authoritative source* for every piece of state. No duplicated state that can silently diverge (e.g. a per-worker copy of shared session material). If state must exist twice, make one side a read-through of the other.
+- **Enumerate the failure modes up front**: startup, resume/replay, teardown, reconnect, concurrent callers. Write down what the mechanism does in each — a path that "usually works" is a bug queue, not a design.
+- **Prefer structural or behavioral evidence over heuristics.** Never classify security/liveness state from message strings, body keywords, or error text — those produce false-positive cascades. Use protocol/structural signals (HTTP status, redirect targets, DOM structure, context-liveness probes) and explicit state transitions.
+- **Distinguish observation from verdict.** A probe result (401, a login-looking page) is data; a state declaration (blocked, dead, done) must come from an authoritative event — an explicit attempt's outcome or a direct liveness check — never inferred from ambiguous observations.
+- **Don't patch symptoms with more heuristics.** When a mechanism misfires, re-examine the design before adding another marker/threshold/regex. If the design can't express the truth, change the design.
+
+For non-trivial mechanisms, write the design down first (in the PR description or a short note) and list the edge cases it must survive. Review the edge cases before implementing.
+
 ## Coding Style & Naming Conventions
 
 Use strict TypeScript, ESM, explicit `import type`, and `.js` extensions for NodeNext relative imports. Match surrounding indentation (two or four spaces), double quotes, and semicolons. Use kebab-case module filenames, PascalCase types/components, and camelCase functions. Write new comments in English. No linter or formatter is configured. Preserve internal `@veritas/*` names; operator-facing branding is VERDICT.
