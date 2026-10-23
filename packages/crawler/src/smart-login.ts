@@ -173,8 +173,15 @@ export async function smartLogin(
   const clicked = await driver.clickFirst(SUBMIT_SELECTORS);
   if (!clicked) await driver.pressEnter(`[name="${fields.password}"]`);
 
-  // 4) Success/failure decision (CAPTCHA/MFA → needsHuman; form still present → bad creds)
-  const after = await driver.snapshot();
+  // 4) Success/failure decision (CAPTCHA/MFA → needsHuman; form still present → bad creds).
+  //    SPA logins are async — the password form stays mounted until the POST resolves, so judging
+  //    on the immediate post-click snapshot misreads a slow-but-successful login as bad creds.
+  //    Poll briefly for the form to detach before concluding anything.
+  let after = await driver.snapshot();
+  for (let i = 0; i < 12 && passwordForm(after.forms); i++) {
+    await new Promise((r) => setTimeout(r, 400));
+    after = await driver.snapshot();
+  }
   const stuck = detectStuck({
     requestedUrl: loginUrl ?? opts.targetUrl,
     finalUrl: after.url,
