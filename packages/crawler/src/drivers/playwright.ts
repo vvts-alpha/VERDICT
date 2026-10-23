@@ -744,6 +744,18 @@ export class PlaywrightDriver implements Driver {
     await new Promise<void>((resolve) => setTimeout(resolve, this.opts.settleMs));
   }
 
+  /** Context-level liveness — the attended session lives in the persistent context. A closed PAGE
+   *  (`this.page` gone, e.g. window.close()/popup teardown) does NOT mean the session is dead, so
+   *  liveness is probed at the context, not the page. */
+  async isAlive(): Promise<boolean> {
+    try {
+      await this.context.cookies();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   /** Session cookies after login → a Cookie header string (for auth-diff roles). */
   async sessionCookieHeader(): Promise<string> {
     const cookies = await this.context.cookies().catch(() => []);

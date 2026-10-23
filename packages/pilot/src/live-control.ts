@@ -133,6 +133,11 @@ export class LiveControl {
     this.sendSessions();
   }
 
+  /** Whether a role is registered (has a live CDP hook) — register() first if this returns false. */
+  hasRole(role: string): boolean {
+    return this.roles.has(role);
+  }
+
   /** Wait for that role's operator "Done" (the attended login gate; replaces Enter). */
   waitForDone(role: string): Promise<void> {
     const rc = this.roles.get(role);

@@ -382,12 +382,17 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         return false;
       }
     };
+    // Bearer JWT is page-local (localStorage) — readable only while the role's page is on the target.
+    const bearerOf = async (d: PlaywrightDriver): Promise<{ bearer?: string }> => {
+      const b = await d.bearerToken().catch(() => null);
+      return b ? { bearer: b } : {};
+    };
     for (const role of roles) {
       const d = await PlaywrightDriver.launch({ ...launchBase, userDataDir: join(baseDir, role), headless: viaWeb });
       if (opts.resume) {
         const cookie = await d.sessionCookieHeader().catch(() => "");
         if (cookie && (await probeAlive(cookie))) {
-          roleSessions.set(role, { driver: d, cookie });
+          roleSessions.set(role, { driver: d, cookie, ...(await bearerOf(d)) });
           liveOnResume.add(role);
           opts.onText?.(`✅ role ${roleLabel(role, opts.roleDescriptions)}: persisted session still live — continuing without re-login`);
           continue;
@@ -439,7 +444,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       }
       if (!deferred) {
         const cookie = await d.sessionCookieHeader();
-        roleSessions.set(role, { driver: d, cookie });
+        roleSessions.set(role, { driver: d, cookie, ...(await bearerOf(d)) });
         opts.onText?.(`✅ role ${roleLabel(role, opts.roleDescriptions)} session established (cookie ${cookie ? "present" : "absent"})`);
       }
     }
@@ -450,7 +455,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       await Promise.all(manual.map((m) => liveControl!.waitForDone(m.role)));
       for (const m of manual) {
         const cookie = await m.driver.sessionCookieHeader();
-        roleSessions.set(m.role, { driver: m.driver, cookie });
+        roleSessions.set(m.role, { driver: m.driver, cookie, ...(await bearerOf(m.driver)) });
         opts.onText?.(`✅ role ${roleLabel(m.role, opts.roleDescriptions)} session established (cookie ${cookie ? "present" : "absent"})`);
       }
     }
@@ -621,6 +626,27 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     const startRole = session.currentRole || "unauth";
     session.frontierByRole!.set(startRole, session.frontier);
     session.gatedByRole!.set(startRole, session.refererGated);
+  }
+
+  // Attended: a role whose context was dropped/closed can be re-spawned on demand — login(role) calls this
+  // instead of reporting "no credentials" on roles that only ever authenticate by hand. The persistent
+  // userDataDir is reused, so a still-valid session may not even need operator input.
+  if (opts.attended) {
+    const respawnDir = (role: string): string => join(opts.attendedProfilesDir ?? join(opts.profileDir, "..", "profiles"), role.replace(/[^a-z0-9_-]/gi, "_"));
+    session.respawnAttended = async (role) => {
+      const d = await PlaywrightDriver.launch({ ...launchBase, userDataDir: respawnDir(role), headless: !!opts.controlUrl });
+      await d.gotoUrl(opts.roleLoginUrls?.get(role) ?? opts.loginUrl ?? opts.targetUrl).catch(() => {});
+      if (liveControl) {
+        if (!liveControl.hasRole(role)) await liveControl.register(role, d);
+        opts.onText?.(`🖥 role ${roleLabel(role, opts.roleDescriptions)}: session was lost — log in again in the Sessions tab, then press Done`);
+        await liveControl.waitForDone(role);
+      } else if (opts.promptOperator) {
+        await opts.promptOperator(`▶ Please log in again in the browser window for role ${roleLabel(role, opts.roleDescriptions)}. Press Enter when done…`);
+      }
+      const cookie = await d.sessionCookieHeader().catch(() => "");
+      const bearer = (await d.bearerToken().catch(() => null)) ?? "";
+      return { driver: d, cookie, ...(bearer ? { bearer } : {}) };
+    };
   }
 
   // Mutation ledger: inspect every recorded request — a 2xx state-changing write appends a
@@ -1289,14 +1315,18 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       const keepAttendedWarm = async (sess: PilotSession): Promise<void> => {
         if (!roleSessions) return;
         const activeRole = sess.boundRole ?? sess.currentRole;
+        const loginUrlFor = (role: string): string => opts.roleLoginUrls?.get(role) ?? opts.loginUrl ?? opts.targetUrl;
         for (const [role, rs] of roleSessions) {
           try {
             // The operator's live browser is authoritative — re-read its cookie jar (no navigation) to pick up rotation.
             const jar = await rs.driver.sessionCookieHeader().catch(() => "");
             if (jar) rs.cookie = jar;
+            // SPA bearer lives page-side — refresh it whenever the role's page happens to be on the target.
+            const b = await rs.driver.bearerToken().catch(() => null);
+            if (b) rs.bearer = b;
             let dead = false;
-            if (lastWarmUrl) {
-              const r = await warmTouch(lastWarmUrl, rs.cookie, role === activeRole ? sess.currentBearer : "");
+            if (lastWarmUrl && (rs.cookie || rs.bearer)) {
+              const r = await warmTouch(lastWarmUrl, rs.cookie, role === activeRole ? sess.currentBearer || (rs.bearer ?? "") : (rs.bearer ?? ""));
               dead = r?.dead ?? false;
             }
             if (dead) {
@@ -1314,28 +1344,49 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
                   if (relogged) {
                     const fresh = await rs.driver.sessionCookieHeader().catch(() => "");
                     if (fresh) rs.cookie = fresh;
-                    if (role === activeRole) sess.currentBearer = (await rs.driver.bearerToken().catch(() => null)) ?? "";
+                    const nb = await rs.driver.bearerToken().catch(() => null);
+                    if (nb) rs.bearer = nb;
+                    if (role === activeRole) sess.currentBearer = rs.bearer ?? "";
                     opts.onText?.(`🔑 role ${roleLabel(role, opts.roleDescriptions)}: session expired → auto re-login succeeded`);
                   }
                 } catch {
                   /* fall through to the operator prompt */
                 }
               }
-              if (!relogged && opts.promptOperator) {
-                opts.onText?.(`🔴 role ${roleLabel(role, opts.roleDescriptions)} session appears to have expired (bounced back to the login page)`);
-                await opts.promptOperator(`▶ Please log in again in the browser window for role ${roleLabel(role, opts.roleDescriptions)}. Press Enter when done…`);
-                const fresh = await rs.driver.sessionCookieHeader().catch(() => "");
-                if (fresh) rs.cookie = fresh;
+              if (!relogged) {
+                // Manual re-login. Under controlUrl the operator lives in the WebUI Sessions tab — the CLI
+                // readline prompt is dead stdin under Electron and must never fire there (its ERR_USE_AFTER_CLOSE
+                // was once misread as "browser closed" and silently dropped live sessions).
+                if (liveControl) {
+                  opts.onText?.(`🔴 role ${roleLabel(role, opts.roleDescriptions)} session appears to have expired — please log in again in the Sessions tab, then press Done`);
+                  try {
+                    await rs.driver.gotoUrl(loginUrlFor(role)).catch(() => {});
+                    if (!liveControl.hasRole(role)) await liveControl.register(role, rs.driver);
+                    await liveControl.waitForDone(role);
+                    const fresh = await rs.driver.sessionCookieHeader().catch(() => "");
+                    if (fresh) rs.cookie = fresh;
+                    const nb = await rs.driver.bearerToken().catch(() => null);
+                    if (nb) rs.bearer = nb;
+                  } catch {
+                    /* keep the role — the next keepalive tick retries the prompt */
+                  }
+                } else if (opts.promptOperator) {
+                  opts.onText?.(`🔴 role ${roleLabel(role, opts.roleDescriptions)} session appears to have expired (bounced back to the login page)`);
+                  await opts.promptOperator(`▶ Please log in again in the browser window for role ${roleLabel(role, opts.roleDescriptions)}. Press Enter when done…`);
+                  const fresh = await rs.driver.sessionCookieHeader().catch(() => "");
+                  if (fresh) rs.cookie = fresh;
+                }
               }
             }
             if (role === activeRole) sess.currentCookie = rs.cookie; // for the active role, update the http path too
           } catch (e) {
             const msg = String(e);
-            // A closed attended window (ERR_USE_AFTER_CLOSE / Target closed) is gone for good — drop it from the
-            // warm set once instead of warning on every tick; login(role) surfaces it again only if needed.
-            if (/USE_AFTER_CLOSE|Target closed|browser has been closed/i.test(msg)) {
+            // A driver error can mean a dead PAGE or a dead CONTEXT — only drop the role when the context
+            // itself is confirmed gone (a closed page handle, screencast teardown, or a dead readline's
+            // ERR_USE_AFTER_CLOSE must never cost the role its live session).
+            if (/Target closed|has been closed/i.test(msg) && !(await rs.driver.isAlive().catch(() => false))) {
               roleSessions.delete(role);
-              opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: `🫀 keepalive: role '${role}' browser closed — dropped from warm set` } });
+              opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: `🫀 keepalive: role '${role}' browser context closed — dropped from warm set` } });
               continue;
             }
             opts.onText?.(`⚠ keepalive '${role}' failed: ${msg.slice(0, 100)}`);
@@ -1660,6 +1711,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
           const w = await makeWorker(role, role, rs.driver);
           w.sess.currentCookie = rs.cookie;
           w.sess.currentBearer = (await rs.driver.bearerToken().catch(() => null)) ?? "";
+          if (w.sess.currentBearer) rs.bearer = w.sess.currentBearer;
           workers.push(w);
         } else {
           const d = await PlaywrightDriver.launch({ ...launchBase, userDataDir: join(opts.profileDir, "..", `worker-${role.replace(/[^a-z0-9_-]/gi, "_")}`) });

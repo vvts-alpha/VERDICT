@@ -35,9 +35,9 @@ test("mergeSetCookie: an empty value is ignored (never drops a live cookie)", ()
   assert.equal(merged, "sid=live");
 });
 
-test("touchIsDead: 401/403 mean the session expired", () => {
+test("touchIsDead: 401 means the session expired — 403 alone does NOT (may be a role-permission denial)", () => {
   assert.equal(touchIsDead(401, undefined, "{}"), true);
-  assert.equal(touchIsDead(403, undefined, "forbidden"), true);
+  assert.equal(touchIsDead(403, undefined, "forbidden"), false);
 });
 
 test("touchIsDead: a redirect to a login-ish location is dead", () => {
@@ -45,8 +45,8 @@ test("touchIsDead: a redirect to a login-ish location is dead", () => {
   assert.equal(touchIsDead(302, "https://app.example.com/dashboard", ""), false);
 });
 
-test("touchIsDead: a login/denied body is dead even on a 200", () => {
-  assert.equal(touchIsDead(200, undefined, "<form>Please sign in with your password</form>"), true);
+test("touchIsDead: login-looking BODY TEXT is not death evidence (register/settings/i18n pages carry the same words)", () => {
+  assert.equal(touchIsDead(200, undefined, "<form>Please sign in with your password</form>"), false);
 });
 
 test("touchIsDead: a normal authed 200 is alive", () => {

@@ -41,11 +41,19 @@ export interface RoleSession {
   driver: PlaywrightDriver;
   /** Most recently synced Cookie header (for the http path). Re-synced by keepalive. */
   cookie: string;
+  /** SPA bearer JWT captured from the role's live context (localStorage apps — Juice Shop and the like —
+   *  authenticate via `Authorization`, not cookies). Re-synced by keepalive / login(). */
+  bearer?: string;
 }
 
 export interface PilotSession {
   /** The driver for the currently active role. In attended mode, login() swaps between roles. */
   driver: PlaywrightDriver;
+  /** Attended only: re-spawn a role's persistent context and hand it to the operator for login (LiveHands
+   *  under controlUrl, terminal prompt otherwise). Called by login(role) when the role's RoleSession was
+   *  dropped (window/context actually closed) — the alternative is a wrong "no credentials" block on a
+   *  role that only ever authenticates by hand. */
+  respawnAttended?: (role: string) => Promise<RoleSession | null>;
   http: FetchHttpClient;
   evidence: EvidenceStore;
   store: AssessmentStore;
@@ -915,12 +923,14 @@ export function sessionLooksDead(snap: { url: string; visibleText: string }): bo
   return looksLikeLogin(snap.visibleText);
 }
 
-/** From a keepalive touch (a raw-HTTP GET of an authed URL), does the session look expired? 401/403, a redirect to a
- *  login-ish location, or a login/denied body all mean the session died and re-auth is needed. */
-export function touchIsDead(status: number, location: string | undefined, body: string): boolean {
-  if (status === 401 || status === 403) return true;
+/** From a keepalive touch (a raw-HTTP GET of an authed URL), does the session look expired? Structural signals
+ *  ONLY — 401 (unauthenticated) or a redirect that lands on a login-ish location. A 403 can merely mean the
+ *  role lacks that resource, and a login-looking body string appears on logged-in pages too (register forms,
+ *  account settings, i18n assets) — neither proves the session died, so neither is used. */
+export function touchIsDead(status: number, location: string | undefined, _body: string): boolean {
+  if (status === 401) return true;
   if (status >= 300 && status < 400 && location && /(login|signin|sign-in|auth|sso)/i.test(location)) return true;
-  return looksLikeLogin(body);
+  return false;
 }
 
 /** Merge a response's Set-Cookie into an existing `Cookie:` header (best-effort). Keeps cookies the response didn't
@@ -2695,13 +2705,24 @@ export function buildTools(s: PilotSession) {
           if (hadBlock) emitRoleProgress(s, role, "mapped");
           await establishPrincipal(s, role); // whoami-style identity binding when an identityUrl was configured
         };
-        const live = s.roleSessions?.get(role);
+        let live = s.roleSessions?.get(role);
+        if (!live && s.respawnAttended) {
+          // The role's attended context was dropped/closed — respawn it and hand login back to the
+          // operator instead of falling into "no credentials" on a role that only ever auths by hand.
+          try {
+            live = (await s.respawnAttended(role)) ?? undefined;
+            if (live) s.roleSessions?.set(role, live);
+          } catch {
+            /* respawn failed — fall through to the material paths / blocked */
+          }
+        }
         if (live) {
           s.driver = live.driver;
           const fresh = await live.driver.sessionCookieHeader().catch(() => live.cookie);
           if (fresh) live.cookie = fresh;
           s.currentCookie = live.cookie;
           s.currentBearer = (await live.driver.bearerToken().catch(() => null)) ?? "";
+          if (s.currentBearer) live.bearer = s.currentBearer;
           setActiveRole(s, role); // swap frontier/gated to this role's own sets before any navigation
           await markAuthed();
           // An attended session carrying no material cannot authenticate — record it blocked up front

@@ -130,6 +130,51 @@ test("the ONLY authoritative blocked source: a login() with no usable material r
   }
 });
 
+test("a dropped attended session RESPAWNS on login() instead of blocking (the a-mvk7tmnr regression)", async () => {
+  const s = session({});
+  // Attended: roleSessions map exists but 'alice' is absent (context was dropped); a respawn hook
+  // re-establishes it — the alternative was the live Sessions-tab browser staying up while login()
+  // answered "no credentials" and marked the role blocked.
+  s.roleSessions = new Map();
+  let respawned = 0;
+  s.respawnAttended = async (role) => {
+    respawned++;
+    assert.equal(role, "alice");
+    const d = Object.assign(new FakeDriver({}), {
+      saveScreenshot: async () => false,
+      sessionCookieHeader: async () => "sess=respawned",
+      bearerToken: async () => null,
+    });
+    return { driver: d as unknown as import("@veritas/crawler").PlaywrightDriver, cookie: "sess=respawned" };
+  };
+  try {
+    const t = buildTools(s).find((x) => (x as { name: string }).name === "login") as { handler: (a: unknown, e: unknown) => Promise<{ content: { text: string }[] }> };
+    const out = (await t.handler({ role: "alice" }, {})).content[0]!.text;
+    assert.equal(respawned, 1, "login() must try the attended respawn before declaring no material");
+    assert.match(out, /switched to live attended session/);
+    assert.equal(s.roleSurveyBlocked.has("alice"), false, "a respawned session is not blocked");
+    assert.ok(s.roleSessions.get("alice"), "the respawned session re-enters roleSessions for the warm set");
+  } finally {
+    close(s);
+  }
+});
+
+test("a FAILED attended respawn still falls through to an honest blocked", async () => {
+  const s = session({});
+  s.roleSessions = new Map();
+  s.respawnAttended = async () => {
+    throw new Error("launch failed");
+  };
+  try {
+    const t = buildTools(s).find((x) => (x as { name: string }).name === "login") as { handler: (a: unknown, e: unknown) => Promise<{ content: { text: string }[] }> };
+    const out = (await t.handler({ role: "alice" }, {})).content[0]!.text;
+    assert.match(out, /no credentials\/cookie/);
+    assert.equal(s.roleSurveyBlocked.has("alice"), true);
+  } finally {
+    close(s);
+  }
+});
+
 test("sign-out chrome on a password-bearing page = live session (counted, not blocked)", async () => {
   const s = session({
     [`${base}#/account/settings`]: {
