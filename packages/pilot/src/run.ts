@@ -1437,6 +1437,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
               // role's page happens to make a request, so an idle page would keep handing tools a stale cookie.
               if (r?.cookie) rs.cookie = r.cookie;
             }
+            if (!dead) deadNoted.delete(role); // back alive (or never dead) — a later dead spell notes fresh
             if (dead) {
               // creds 保持ロールは機械再ログインで復旧(ledger 優先 = VERDICT が回した後の最新パスワード)。
               const creds = opts.roleCreds.get(role);
@@ -1462,10 +1463,20 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
                 }
               }
               if (!relogged) {
-                // Manual re-login. Under controlUrl the operator lives in the WebUI Sessions tab — the CLI
-                // readline prompt is dead stdin under Electron and must never fire there (its ERR_USE_AFTER_CLOSE
-                // was once misread as "browser closed" and silently dropped live sessions).
-                if (liveControl) {
+                // Manual re-login is a RESUME-time ask only. Mid-run, a dead-looking session is left
+                // untouched: an app that drops sessions this often can't be usefully assessed anyway,
+                // and a 401 on the shared warm URL may just mean the role lacks that page — an
+                // authorization observation, not a session-death verdict. The sweep keeps re-checking;
+                // a note is recorded once per dead spell so the reason stays visible.
+                if (!opts.resume) {
+                  if (!deadNoted.has(role)) {
+                    deadNoted.add(role);
+                    opts.store.appendEvent(opts.assessmentId, {
+                      type: "note",
+                      payload: { message: `💤 role '${role}' session looks dead — left untouched mid-run (re-login prompts are resume-time only)` },
+                    });
+                  }
+                } else if (liveControl) {
                   opts.onText?.(`🔴 role ${roleLabel(role, opts.roleDescriptions)} session appears to have expired — please log in again in the Sessions tab, then press Done`);
                   try {
                     await rs.driver.gotoUrl(loginUrlFor(role)).catch(() => {});
@@ -1525,6 +1536,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       // Done-wait would stall them all). Fire the prompt once per dead role; material refreshes when
       // the operator presses Done, and the next tick re-syncs cookie/bearer on its own anyway.
       const reloginPending = new Set<string>();
+      const deadNoted = new Set<string>(); // mid-run dead sessions already noted once (no note spam)
       // Attended warm is an ALL-role sweep — under parallel workers only one caller runs it per interval
       // (the others skip; each worker's bound-role sync happens whichever worker's turn it is).
       let attendedWarmBusy: Promise<void> | null = null;
