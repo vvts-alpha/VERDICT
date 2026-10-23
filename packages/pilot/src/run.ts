@@ -8,7 +8,7 @@ import { restoreMethodologyPlans } from "./methodology.js";
 
 import { createSdkMcpServer, query } from "@anthropic-ai/claude-agent-sdk";
 import type { HookCallback } from "@anthropic-ai/claude-agent-sdk";
-import type { AssessmentStore, Screen, ScopePolicy } from "@veritas/core";
+import type { AssessmentStore, ControlCommand, Screen, ScopePolicy } from "@veritas/core";
 import { isInScope, isScannable, recordTokens, recordRequests, evaluateBudget, screenChecks } from "@veritas/core";
 import { modelContextWindows } from "@veritas/core/llm-context";
 import type { LoginCreds } from "@veritas/crawler";
@@ -731,58 +731,76 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
   // (and mid-query diagnosis) can pick up a CAPTCHA login inject — not only between diagnosis screens.
   let maxScan = opts.maxScreens ?? 120;
   let lastControlSeq = 0;
+  // One control command's durable fields (scope adds / rate / max-screens). `replay` is the resume pass — it
+  // re-applies only the durable fields; transient commands (notes, cookie injection) belong to the process that
+  // consumed them and are deliberately not re-applied to a fresh browser.
+  const applyControlCommand = async (cmd: ControlCommand, replay: boolean): Promise<boolean> => {
+    let applied = false;
+    let scopeChanged = false;
+    for (const raw of cmd.addHosts ?? []) {
+      const host = raw.trim().toLowerCase();
+      if (host && !opts.scope.inScopeHosts.includes(host)) {
+        opts.scope.inScopeHosts.push(host);
+        scopeChanged = true;
+      }
+    }
+    for (const p of cmd.addInScopePathPrefixes ?? []) {
+      if (p && !opts.scope.inScopePathPrefixes.includes(p)) {
+        opts.scope.inScopePathPrefixes.push(p);
+        scopeChanged = true;
+      }
+    }
+    if (scopeChanged) {
+      opts.store.updateScope(opts.assessmentId, opts.scope);
+      applied = true;
+      if (!replay) opts.onText?.(`⚙ scope widened → hosts=[${opts.scope.inScopeHosts.join(",")}] (live)`);
+    }
+    if (typeof cmd.rateMs === "number" && cmd.rateMs >= 0) {
+      http.setRate(cmd.rateMs);
+      applied = true;
+      if (!replay) opts.onText?.(`⚙ rate → ${cmd.rateMs}ms (live)`);
+    }
+    if (typeof cmd.maxScreens === "number" && cmd.maxScreens > 0) {
+      maxScan = cmd.maxScreens;
+      applied = true;
+      if (!replay) opts.onText?.(`⚙ max-screens → ${cmd.maxScreens} (live)`);
+    }
+    if (!replay && cmd.injectCookieFile) {
+      try {
+        const loaded = loadCookieFile(cmd.injectCookieFile, opts.targetUrl);
+        if (loaded.header || loaded.bearer || loaded.origins.length > 0) {
+          const authed = await applyLoadedAuth(session.driver, loaded, opts.targetUrl);
+          session.currentCookie = authed.cookie;
+          session.currentBearer = authed.bearer;
+          const live = session.roleSessions?.get(session.currentRole);
+          if (live) live.cookie = authed.cookie;
+          opts.onText?.("🔓 session injected (operator login) — continuing authenticated");
+          opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: "🔓 operator injected a login session — continuing authenticated" } });
+        } else {
+          opts.onText?.("⚠ injected session file was empty/unparseable");
+        }
+      } catch (e) {
+        opts.onText?.(`⚠ session injection failed: ${String(e instanceof Error ? e.message : e).slice(0, 120)}`);
+      }
+    }
+    if (!replay && cmd.note) opts.onText?.(`⚙ control note: ${cmd.note}`);
+    return applied;
+  };
   if (opts.resume) {
-    const seen = opts.store.controlCommandsSince(opts.assessmentId, 0);
-    lastControlSeq = seen.length ? (seen[seen.length - 1]?.seq ?? 0) : 0;
+    // Durable reconfigures (scope adds / rate / cap) live only in this command log — replay them so the operator's
+    // last live intent survives the restart instead of silently reverting to the launch-time args. Commands appended
+    // while no process was running land here too — they were never consumed by any checkpoint.
+    let replayed = 0;
+    for (const { seq, cmd } of opts.store.controlCommandsSince(opts.assessmentId, 0)) {
+      lastControlSeq = seq;
+      if (await applyControlCommand(cmd, true)) replayed += 1;
+    }
+    if (replayed) opts.onText?.(`⚙ replayed ${replayed} live reconfigure(s) from before the restart`);
   }
   const flushControls = async (): Promise<void> => {
     for (const { seq, cmd } of opts.store.controlCommandsSince(opts.assessmentId, lastControlSeq)) {
       lastControlSeq = seq;
-      let scopeChanged = false;
-      for (const raw of cmd.addHosts ?? []) {
-        const host = raw.trim().toLowerCase();
-        if (host && !opts.scope.inScopeHosts.includes(host)) {
-          opts.scope.inScopeHosts.push(host);
-          scopeChanged = true;
-        }
-      }
-      for (const p of cmd.addInScopePathPrefixes ?? []) {
-        if (p && !opts.scope.inScopePathPrefixes.includes(p)) {
-          opts.scope.inScopePathPrefixes.push(p);
-          scopeChanged = true;
-        }
-      }
-      if (typeof cmd.rateMs === "number" && cmd.rateMs >= 0) {
-        http.setRate(cmd.rateMs);
-        opts.onText?.(`⚙ rate → ${cmd.rateMs}ms (live)`);
-      }
-      if (typeof cmd.maxScreens === "number" && cmd.maxScreens > 0) {
-        maxScan = cmd.maxScreens;
-        opts.onText?.(`⚙ max-screens → ${cmd.maxScreens} (live)`);
-      }
-      if (scopeChanged) {
-        opts.store.updateScope(opts.assessmentId, opts.scope);
-        opts.onText?.(`⚙ scope widened → hosts=[${opts.scope.inScopeHosts.join(",")}] (live)`);
-      }
-      if (cmd.injectCookieFile) {
-        try {
-          const loaded = loadCookieFile(cmd.injectCookieFile, opts.targetUrl);
-          if (loaded.header || loaded.bearer || loaded.origins.length > 0) {
-            const applied = await applyLoadedAuth(session.driver, loaded, opts.targetUrl);
-            session.currentCookie = applied.cookie;
-            session.currentBearer = applied.bearer;
-            const live = session.roleSessions?.get(session.currentRole);
-            if (live) live.cookie = applied.cookie;
-            opts.onText?.("🔓 session injected (operator login) — continuing authenticated");
-            opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: "🔓 operator injected a login session — continuing authenticated" } });
-          } else {
-            opts.onText?.("⚠ injected session file was empty/unparseable");
-          }
-        } catch (e) {
-          opts.onText?.(`⚠ session injection failed: ${String(e instanceof Error ? e.message : e).slice(0, 120)}`);
-        }
-      }
-      if (cmd.note) opts.onText?.(`⚙ control note: ${cmd.note}`);
+      await applyControlCommand(cmd, false);
     }
   };
   // Serialize: a 2s interval must not overlap a still-running inject (Playwright + sqlite). Chain, don't fire-and-forget.
@@ -1540,10 +1558,10 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       // ── operator-injected targets ── URLs added mid-run via the WebUI (target_injected events). enrolByNavigate is the
       //    one safe enroll path: it cold-GETs the URL, rejects catch-alls, and populates BOTH session.inv (so get_screen
       //    resolves it) and the store (queued) — a store-only insert would be invisible to the diagnosis tools (tools.ts:1637).
-      let lastInjectSeq = ((): number => {
-        const seen = opts.store.targetInjectionsSince(opts.assessmentId, 0);
-        return seen.length ? (seen[seen.length - 1]?.seq ?? 0) : 0;
-      })();
+      // Watermark starts at 0, not the latest: targets injected while the previous process was dead were never
+      // consumed (the seq watermark died with it), and enrolByNavigate's dedup makes re-processing consumed ones
+      // a cheap no-op. Skipping to latest silently ate every dead-time injection.
+      let lastInjectSeq = 0;
       const ingestInjectedTargets = async (): Promise<void> => {
         const pending = opts.store.targetInjectionsSince(opts.assessmentId, lastInjectSeq);
         if (pending.length === 0) return;
@@ -1921,6 +1939,16 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       };
       await drainQueued();
       session.currentScreenId = null;
+
+      // Resume of a FINISHED run with nothing left: the drain above already replayed injected targets (any new work
+      // would have grown `handled`). Zero handled + the previous process reached report = every screen already has a
+      // verdict — re-running the LLM stages (scenario / fingerprint / findings-QA) would only re-buy the same results.
+      if (opts.resume && handled.size === 0 && (prev?.phase === "report" || prev?.phase === "done")) {
+        const msg = "✔ nothing to resume — every screen already has a verdict (the previous run reached report)";
+        opts.onText?.(msg);
+        opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: msg } });
+        return;
+      }
 
       // ── STAGE 4: scenario (A04 cross-screen logic) ── once, after per-screen diagnosis. Inherit real ids / confirmed auth /
       //    observed behaviour to target multi-step workflow abuse (coupon / price & qty tampering / step skip / privilege escalation). Pinned to the deep model.

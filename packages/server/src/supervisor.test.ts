@@ -51,6 +51,25 @@ test("resume restores start-time run options into CLI args", async () => {
       "--max-screens", "300", "--focus", "audit the checkout",
       "--context", "tenant=acme", "--keepalive-min", "2", "--parallel", "4",
     ]) assert.ok(argv.includes(flag), `missing ${flag} in ${argv.join(" ")}`);
+
+    // Burp-side launches restore the run's model too — the AI re-verify must not fall back to the env default.
+    // spawnChild refuses while a child is still "running" — wait for the fixture to exit before each launch.
+    const waitExit = async (): Promise<void> => {
+      const deadline = Date.now() + 8000;
+      while (supervisor.isRunning(id) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+    };
+    await waitExit();
+    rmSync(argvOut, { force: true });
+    supervisor.burpScan(id);
+    const burpArgv = JSON.parse(await waitForFile(argvOut)) as string[];
+    for (const flag of ["burp-scan", "--id", id, "--model", "deep"])
+      assert.ok(burpArgv.includes(flag), `missing ${flag} in ${burpArgv.join(" ")}`);
+    await waitExit();
+    rmSync(argvOut, { force: true });
+    supervisor.burpImport(id, join(runsDir, "report.xml"));
+    const impArgv = JSON.parse(await waitForFile(argvOut)) as string[];
+    for (const flag of ["burp-import", "--id", id, "--model", "deep"])
+      assert.ok(impArgv.includes(flag), `missing ${flag} in ${impArgv.join(" ")}`);
   } finally {
     rmSync(runsDir, { recursive: true, force: true });
   }

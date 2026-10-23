@@ -168,13 +168,7 @@ export class Supervisor {
     if (!isSupportedRun(this.cfg.runsDir, id)) throw new Error("This saved assessment type is no longer supported");
     const dir = join(this.cfg.runsDir, id);
     const manifestPath = join(dir, "manifest.json");
-    let o: NonNullable<StartRunInput["options"]> = {};
-    try {
-      const run = JSON.parse(readFileSync(join(dir, "run.json"), "utf8")) as { command?: string; options?: unknown };
-      o = (run.options ?? {}) as NonNullable<StartRunInput["options"]>;
-    } catch {
-      /* no run.json (old run) → continue as a pilot resume with defaults */
-    }
+    const o = this.readRunOptions(dir); /* no run.json (old run) → continue as a pilot resume with defaults */
 
     const args = [this.cfg.cliPath, "pilot", "--resume", "--id", id, "--out", this.cfg.runsDir];
     if (existsSync(manifestPath)) args.push("--manifest", manifestPath);
@@ -204,6 +198,16 @@ export class Supervisor {
     this.spawnChild(id, "pilot --resume", args);
   }
 
+  /** The run's persisted launch options (run.json) — the start-time settings every re-launch path must restore. */
+  private readRunOptions(dir: string): NonNullable<StartRunInput["options"]> {
+    try {
+      const run = JSON.parse(readFileSync(join(dir, "run.json"), "utf8")) as { command?: string; options?: unknown };
+      return (run.options ?? {}) as NonNullable<StartRunInput["options"]>;
+    } catch {
+      return {};
+    }
+  }
+
   /** Launch a Burp active scan (REST) against an existing run → poll until completion → auto-import issues.
    *  Connection via env (BURP_API/BURP_API_KEY/BURP_RESOURCE_POOL). If a manifest exists, an authenticated scan (application_logins).
    *  config is auto-selected from the surface (pickBurpConfigs). The live-import version that avoids exporting XML by hand. */
@@ -212,6 +216,8 @@ export class Supervisor {
     const args = [this.cfg.cliPath, "burp-scan", "--id", id, "--out", this.cfg.runsDir];
     const manifestPath = join(dir, "manifest.json");
     if (existsSync(manifestPath)) args.push("--manifest", manifestPath);
+    const o = this.readRunOptions(dir);
+    if (o.model) args.push("--model", o.model); // the AI re-verify must use the run's model, not the env default
     this.spawnChild(id, "burp-scan", args);
   }
 
@@ -223,6 +229,8 @@ export class Supervisor {
     const args = [this.cfg.cliPath, "burp-import", "--id", id, "--out", this.cfg.runsDir, "--report", reportPath];
     const manifestPath = join(dir, "manifest.json");
     if (existsSync(manifestPath)) args.push("--manifest", manifestPath);
+    const o = this.readRunOptions(dir);
+    if (o.model) args.push("--model", o.model); // same re-verify model as the run
     this.spawnChild(id, "burp-import", args);
   }
 
