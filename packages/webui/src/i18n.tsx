@@ -337,8 +337,8 @@ const JA: Record<string, string> = {
   "Screens marked conclusive with no check records — a legacy/log claim, detail unknown":
     "チェック記録なしで確定扱いの画面 — 旧形式・ログベースの主張で詳細不明",
   "Screens omitted from diagnosis": "診断から除外された画面",
-  "Screens whose diagnosis ran to completion — recorded check executions, any outcome (clean / found / inconclusive); excludes omitted screens":
-    "診断が最後まで実行された画面 — チェック実行記録あり（clean・found・inconclusive いずれの結果も。除外画面を除く）",
+  "Diagnosis executed — verdicts: {finding} finding · {suspected} suspected · {clean} clean · {unverified} inconclusive; excludes never-run and excluded screens":
+    "診断実行済み — 判定: finding {finding}・suspected {suspected}・clean {clean}・非確定 {unverified}（未実行・除外画面は含まない）",
   "Tested screens whose checks ended inconclusive — check-execution gaps or unfulfilled plans remain":
     "診断実行済みだがチェックが非確定で終わった画面 — チェック実行の欠落か未消化の計画が残存",
   "Select a JSON file (YAML / external refs unsupported).":

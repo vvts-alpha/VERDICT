@@ -4,7 +4,7 @@ import type { StateView } from "@veritas/core";
 import type { ConnState } from "../api";
 import { signOut, useRole } from "../api";
 import { useT } from "../i18n";
-import { screenHonestyMap } from "./screen-status";
+import { screenHonestyMap, type EffectiveStatus } from "./screen-status";
 import { Download, Pause, Play, Upload } from "lucide-react";
 import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
@@ -208,21 +208,31 @@ export function StatusBar({
 export function RunStats({ view }: { view: StateView }) {
   const t = useT();
   const c = view.coverage;
-  // Ledger-honest counts: "tested" = diagnosis executed (any outcome — clean, found, or inconclusive);
-  // a conclusive claim with no check records is "claimed", not tested; the unverified subset stays
-  // visible as its own metric so inconclusive work can't masquerade as verdicted coverage.
+  // Two independent axes, kept separate:
+  //   execution ("tested") — did a diagnosis pass actually run on this screen? clean/finding/
+  //     suspected/unverified are all terminal outcomes of an executed pass. NOT tested:
+  //     queued/scanning (never finished), blocked/error (died mid-pass), excluded (deliberately
+  //     skipped), unknown-records (a conclusive claim with ZERO ledger rows — no execution evidence).
+  //   verdict — what executed screens concluded. tested = Σ verdict buckets; the unverified subset
+  //     stays visible as its own warn metric so inconclusive work can't masquerade as clean.
+  const EXECUTED: ReadonlySet<EffectiveStatus> = new Set(["clean", "finding", "suspected", "unverified"]);
+  const verdicts: Partial<Record<EffectiveStatus, number>> = {};
   let tested = 0;
-  let unverified = 0;
   let claimed = 0;
   for (const h of screenHonestyMap(view).values()) {
-    if (h.status === "clean" || h.status === "finding" || h.status === "suspected" || h.status === "unverified") tested += 1;
-    if (h.status === "unverified") unverified += 1;
-    else if (h.status === "unknown-records") claimed += 1;
+    verdicts[h.status] = (verdicts[h.status] ?? 0) + 1;
+    if (h.status === "unknown-records") claimed += 1;
+    else if (EXECUTED.has(h.status)) tested += 1;
   }
+  const unverified = verdicts.unverified ?? 0;
   const pending = view.handoffs.filter((h) => h.status === "pending").length;
   const items: { label: string; value: ReactNode; title?: string; warn?: boolean }[] = [
     { label: t("phase"), value: view.phase },
-    { label: t("tested"), value: `${tested}/${c.total}`, title: t("Screens whose diagnosis ran to completion — recorded check executions, any outcome (clean / found / inconclusive); excludes omitted screens") },
+    {
+      label: t("tested"), value: `${tested}/${c.total}`,
+      title: t("Diagnosis executed — verdicts: {finding} finding · {suspected} suspected · {clean} clean · {unverified} inconclusive; excludes never-run and excluded screens",
+        { finding: verdicts.finding ?? 0, suspected: verdicts.suspected ?? 0, clean: verdicts.clean ?? 0, unverified }),
+    },
     { label: t("findings"), value: view.findings.length, warn: view.findings.length > 0 },
     { label: t("unfinished"), value: c.remaining, title: t("Queued, in progress, blocked, or failed; diagnosis is not complete"), warn: c.remaining > 0 },
     { label: t("unverified"), value: unverified, title: t("Tested screens whose checks ended inconclusive — check-execution gaps or unfulfilled plans remain"), warn: unverified > 0 },
