@@ -468,6 +468,13 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         opts.onText?.(`✅ role ${roleLabel(m.role, opts.roleDescriptions)} session established (cookie ${cookie ? "present" : "absent"})`);
       }
     }
+    // Every live role session belongs on the Sessions tab — not just the ones that awaited manual login.
+    // (A resume skips the manual path entirely, which once left verified-live roles invisible/unreachable.)
+    if (liveControl) {
+      for (const [role, rs] of roleSessions) {
+        if (!liveControl.hasRole(role)) await liveControl.register(role, rs.driver).catch(() => {});
+      }
+    }
     primaryRole = roles[0]!;
     const prim = roleSessions.get(primaryRole)!;
     driver = prim.driver;
