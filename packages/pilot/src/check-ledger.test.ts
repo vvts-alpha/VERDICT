@@ -133,6 +133,30 @@ test("honest gap declarations (unverified/blocked/not-applicable) close the scre
   assert.ok(!view.classes.every((c) => c.conclusive), "a screen with gaps is not 'conclusive'");
 });
 
+test("a tool's unverified row does not close the slot — it comes back for remediation or declaration", async () => {
+  const s = session();
+  await run(s, "record_methodology", METHODOLOGY(s, ["sqli"]));
+  // The probe ran on q but the baseline died — an unverified ATTEMPT row, not a decision.
+  recordCheck(s, { tool: "probe_sqli", checkClass: "sqli", target: "GET /search", param: "q", status: "unverified", reason: "benign baseline returned 500" });
+  const view = screenChecks({ checkExecutions: s.store.checks("a-1") }, s.currentScreenId ?? "");
+  assert.ok(view.unstarted.some((c) => c.param === "q"), "a failed attempt leaves the q slot open");
+  // The model cannot just claim clean — the open slot refuses the close.
+  const r = await run(s, "screen_done", { verdict: "clean", coverage: [{ class: "sqli", result: "tested-clean" }] });
+  assert.match(String(r.raw ?? JSON.stringify(r)), /NOT DONE/);
+  // Declaring the gap folds into the SAME row — no duplicate unverified row is grown.
+  const r2 = await run(s, "screen_done", {
+    verdict: "clean",
+    coverage: [
+      { class: "sqli", result: "unverified", note: "retried q with the observed shape — still 500; id/uid are routing-only" },
+      { class: "idor", result: "not-applicable", note: "no secondary principal configured" },
+    ],
+  });
+  assert.match(String(r2.raw ?? JSON.stringify(r2)), /^screen s-0001/);
+  const rows = s.store.checks("a-1").filter((c) => c.checkClass === "sqli" && c.param === "q" && c.status === "unverified");
+  assert.equal(rows.length, 1, "declaration folds into the failed-attempt row — no duplicate gap");
+  assert.equal(rows[0]!.tool, "screen_done", "the surviving row is the model's declaration");
+});
+
 test("a recorded finding satisfies its own slot via the ledger (not via note text)", async () => {
   const s = session();
   await run(s, "record_methodology", METHODOLOGY(s, ["sqli"]));

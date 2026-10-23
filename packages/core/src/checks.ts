@@ -50,11 +50,18 @@ export const EXECUTION_CHECK_STATUSES: ReadonlySet<CheckStatus> = new Set(["foun
  *  session, resource. An explicitly bound dimension requires an EXACT match; an execution that leaves
  *  a bound dimension absent can never satisfy it (an unparametrized probe is not evidence about a
  *  named param, and one role's run is not evidence about another). Empty plan dimensions are
- *  intentional bounded wildcards — they never constrain. */
+ *  intentional bounded wildcards — they never constrain.
+ *
+ *  A tool-emitted `unverified`/`blocked` row records that the check could NOT conclude — it is an
+ *  observation of a failed attempt, not a decision about the slot. It stays visible as a gap but does
+ *  NOT satisfy the slot: the diagnosis loop must either remediate (fix the session/baseline/stability
+ *  and re-run) or declare the gap with a concrete reason (a `screen_done` coverage row). Only the
+ *  declared row closes the slot — "couldn't run" can never silently masquerade as "dealt with". */
 export function planSatisfiedBy(plan: CheckExecution, e: CheckExecution): boolean {
   if (plan.status !== "planned" || e.status === "planned") return false;
   if (plan.screenId !== e.screenId || plan.checkClass !== e.checkClass) return false;
   if (!TERMINAL_CHECK_STATUSES.has(e.status)) return false;
+  if ((e.status === "unverified" || e.status === "blocked") && e.tool !== "screen_done") return false;
   if (plan.target !== "*" && plan.target !== e.target) return false;
   if (plan.param && plan.param !== e.param) return false;
   if (plan.subject && plan.subject !== e.subject) return false;

@@ -6688,7 +6688,7 @@ export function buildTools(s: PilotSession) {
             unfulfilled: ledger.unstarted.map((c) => `${c.checkClass}@${c.target}${c.param ? `:${c.param}` : ""}`),
             hint:
               ledger.unstarted.length > 0
-                ? "Each unfulfilled slot needs a real probe (an execution row), or a coverage entry marking it not-applicable/unverified/blocked WITH a concrete reason at screen_done."
+                ? "Each unfulfilled slot needs a conclusive execution row — a probe's unverified/blocked result does NOT close it. Fix the cause and re-run (different request shape / login() / another object id), or declare it not-applicable/unverified/blocked WITH a concrete reason at screen_done."
                 : "Every planned slot has an execution row — screen_done should pass with a coverage entry per planned class.",
           }),
         );
@@ -6696,7 +6696,7 @@ export function buildTools(s: PilotSession) {
     ),
     tool(
       "screen_done",
-      "Finish diagnosing the current screen. You MUST account for EVERY class the plan named: pass `coverage` with one entry per planned class — result 'found' (confirmed + recorded), 'suspected' (you saw a real anomaly but couldn't fully confirm — record_finding it as verdict:suspected), 'tested-clean' (actively probed, held), 'not-applicable' (concrete reason it can't apply), 'unverified' (you tried but couldn't reach a verdict — say why in `note`), or 'blocked' (a missing prerequisite like an expired role session). 'found'/'suspected'/'tested-clean' require a REAL execution row in the check ledger — the coverage array alone can never declare them. Finding ONE hole does NOT let you skip the rest of the plan. verdict 'finding' if >=1 confirmed, 'suspected' if only suspected leads, else 'clean'.",
+      "Finish diagnosing the current screen. You MUST account for EVERY class the plan named: pass `coverage` with one entry per planned class — result 'found' (confirmed + recorded), 'suspected' (you saw a real anomaly but couldn't fully confirm — record_finding it as verdict:suspected), 'tested-clean' (actively probed, held), 'not-applicable' (concrete reason it can't apply), 'unverified' (you tried but couldn't reach a verdict — say why in `note`), or 'blocked' (a missing prerequisite like an expired role session). 'found'/'suspected'/'tested-clean' require a REAL execution row in the check ledger — the coverage array alone can never declare them. A probe that RETURNED unverified/blocked does NOT close its plan slot: the slot stays open until you either remediate (reshape the request, login() a usable role, pick a readable object id) and re-run to a conclusive row, or you declare the gap here with a concrete reason — every failed attempt comes back to you for a decision, it never closes on its own. Finding ONE hole does NOT let you skip the rest of the plan. verdict 'finding' if >=1 confirmed, 'suspected' if only suspected leads, else 'clean'.",
       {
         verdict: z.enum(["finding", "suspected", "clean"]),
         coverage: z
@@ -6732,28 +6732,54 @@ export function buildTools(s: PilotSession) {
         const ledger = screenChecks({ checkExecutions: s.store.checks(s.assessmentId) }, scrId);
         if (ledger.unstarted.length > 0) {
           const byClass = new Map((coverage ?? []).map((c) => [coarseClass(c.class), c]));
+          const execs = ledger.classes.flatMap((c) => c.checks);
           for (const slot of ledger.unstarted) {
             const entry = byClass.get(slot.checkClass);
             const where = `${slot.checkClass} @${slot.target}${slot.param ? ` param:${slot.param}` : ""}`;
+            // A slot left open by a FAILED attempt (a tool's unverified/blocked row no longer satisfies)
+            // still owes the model a decision: remediate, or declare the gap with a concrete reason.
+            const prior = execs.find(
+              (e) =>
+                e.checkClass === slot.checkClass &&
+                (e.status === "unverified" || e.status === "blocked") &&
+                (slot.target === "*" || e.target === slot.target) &&
+                (!slot.param || e.param === slot.param) &&
+                (!slot.subject || e.subject === slot.subject),
+            );
             if (!entry)
               return txt(
-                `NOT DONE — plan slot ${where} has no execution row and no coverage entry. Run a probe that actually exercises it, or mark it not-applicable/unverified/blocked with a concrete reason.`,
+                `NOT DONE — plan slot ${where} has no conclusive execution row and no coverage entry.` +
+                  (prior ? ` A previous attempt failed: ${String(prior.reason ?? "").slice(0, 160)}` : "") +
+                  ` Fix the cause and re-run (different request shape / login() another role / another object id), or mark it not-applicable/unverified/blocked with a concrete reason.`,
               );
             if (entry.result === "not-applicable" || entry.result === "unverified" || entry.result === "blocked") {
               // A bare 'not-applicable' label is NOT a decision — without a concrete reason it collapses
               // to `unverified` so the gap stays visible and the class never reads as conclusive.
               const status = entry.result === "not-applicable" && !(entry.note ?? "").trim() ? "unverified" : entry.result;
-              // An honest-gap row satisfies THIS slot's scope (target+param) without claiming a verdict.
-              recordCheck(s, {
-                tool: "screen_done",
-                checkClass: slot.checkClass,
-                target: slot.target,
-                param: slot.param,
-                subject: slot.subject || undefined,
-                status,
-                reason: (entry.note?.trim() || (status === "unverified" ? "marked not-applicable with no concrete reason — unverifiable" : entry.result)).slice(0, 300),
-                detail: "coverage-declared gap — no execution row was produced for this slot",
-              });
+              if (prior) {
+                // Fold the declaration into the failed-attempt row: one gap row per slot, and flipping
+                // tool→screen_done is what makes the row satisfy the slot (a model-declared gap).
+                s.store.upsertCheck(s.assessmentId, {
+                  ...prior,
+                  status,
+                  tool: "screen_done",
+                  reason: (entry.note?.trim() || prior.reason || status).slice(0, 300),
+                  detail: `${prior.detail ? `${prior.detail} — ` : ""}declared at screen_done${prior.reason ? ` (attempt: ${prior.reason.slice(0, 140)})` : ""}`,
+                  updatedAt: new Date().toISOString(),
+                });
+              } else {
+                // An honest-gap row satisfies THIS slot's scope (target+param) without claiming a verdict.
+                recordCheck(s, {
+                  tool: "screen_done",
+                  checkClass: slot.checkClass,
+                  target: slot.target,
+                  param: slot.param,
+                  subject: slot.subject || undefined,
+                  status,
+                  reason: (entry.note?.trim() || (status === "unverified" ? "marked not-applicable with no concrete reason — unverifiable" : entry.result)).slice(0, 300),
+                  detail: "coverage-declared gap — no execution row was produced for this slot",
+                });
+              }
               continue;
             }
             // found/suspected claims can only be satisfied by the check row record_finding itself wrote for
