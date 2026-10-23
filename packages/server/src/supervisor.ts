@@ -180,12 +180,16 @@ export class Supervisor {
     if (existsSync(manifestPath)) args.push("--manifest", manifestPath);
     if (o.model) args.push("--model", o.model);
     if (o.fastModel) args.push("--fast-model", o.fastModel);
+    if (o.rate != null) args.push("--rate", String(o.rate));
+    if (o.maxTurns != null) args.push("--max-turns", String(o.maxTurns));
+    if (o.exhaustive) args.push("--exhaustive");
     if (o.burpScan) args.push("--burp-scan"); // re-arm the post-diagnosis Burp active-scan phase (an interrupted burp-enabled run only reaches it on resume)
     if (o.burpProxy) args.push("--burp-proxy"); // valueless flag (reads from BURP_PROXY env)
     if (o.proxy) args.push("--proxy", o.proxy); // general upstream proxy (any proxy)
     if (o.loginUrl) args.push("--login-url", o.loginUrl);
     if (o.maxScreens != null) args.push("--max-screens", String(o.maxScreens));
     if (o.focus) args.push("--focus", o.focus);
+    if (o.context) args.push("--context", o.context);
     if (o.keepAliveMin != null) args.push("--keepalive-min", String(o.keepAliveMin));
     if (o.parallel != null) args.push("--parallel", String(o.parallel));
     if (o.anchorUrl) args.push("--anchor-url", o.anchorUrl);
