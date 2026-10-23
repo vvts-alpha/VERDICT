@@ -2848,6 +2848,18 @@ export function buildTools(s: PilotSession) {
           const avail = availableRoles(s).map((r) => (r.description ? `${r.name} (${r.description})` : r.name)).join(", ") || "none";
           return txt(`no credentials/cookie for '${role}'. Available roles: ${avail}`);
         }
+        // Already-live session? An authenticated SPA bounces /login back to the app — destroying a working
+        // session to "re-login" then fails on the missing form and lands on a spurious block. The identity
+        // endpoint is the authoritative live check: if it answers this session, keep it.
+        if (s.currentRole === role && (s.currentCookie || s.currentBearer) && s.roleIdentityUrls?.has(role)) {
+          const headers = (await roleAuthHeaders(s, role)) ?? authHeaders(s);
+          const ref = sessionRefOf(s.http.effectiveHeaders(headers, false));
+          await establishPrincipal(s, role);
+          if (s.sessionLiveReads?.has(ref) && !s.invalidRoleSessions?.has(role)) {
+            setActiveRole(s, role);
+            return txt(`role '${role}'${tag}: session already authenticated (identity endpoint answered) — re-login skipped.`);
+          }
+        }
         try {
           await s.driver.clearSession();
           const r = await smartLogin(s.driver, s.loginLlm, creds, {

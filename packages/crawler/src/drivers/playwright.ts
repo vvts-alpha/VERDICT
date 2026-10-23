@@ -842,9 +842,27 @@ export class PlaywrightDriver implements Driver {
     }));
   }
 
-  /** Clear the persistent context's cookies (before re-logging-in as a different role). */
+  /** Clear the persistent context's cookies AND web storage (before re-logging-in as a different role).
+   *  SPA bearer tokens live in localStorage — a cookie-only clear leaves the app authenticated, which
+   *  then bounces every navigation to the login page and makes a fresh login impossible. */
   async clearSession(): Promise<void> {
     await this.context.clearCookies().catch(() => {});
+    await this.page
+      .evaluate(() => {
+        const g = globalThis as any;
+        if (!/^https?:$/.test(g.location?.protocol ?? "")) return;
+        try {
+          g.localStorage?.clear();
+        } catch {
+          /* opaque origin / storage disabled */
+        }
+        try {
+          g.sessionStorage?.clear();
+        } catch {
+          /* opaque origin / storage disabled */
+        }
+      })
+      .catch(() => {});
   }
 
   /** Inject cookies the operator pre-captured into the context (for cookie-file auth). */
