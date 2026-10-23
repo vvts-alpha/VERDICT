@@ -368,14 +368,21 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     const roleLoginUrl = (role: string): string => opts.roleLoginUrls?.get(role) ?? opts.loginUrl ?? opts.targetUrl;
     // Resume (attended): each role's persisted userDataDir may still carry a live session. Verify with a real
     // authed GET before spending an auto-login run or an operator prompt on re-auth.
-    const probeAlive = async (cookie: string): Promise<boolean> => {
+    const probeAlive = async (d: PlaywrightDriver, cookie: string): Promise<boolean> => {
       const st = opts.store.loadAssessment(opts.assessmentId);
       const url =
         opts.anchorUrl ??
         st?.screens.find((sc) => sc.authState === "post-login" && sc.observedUrls[0] && !/logout|signout/i.test(sc.observedUrls[0]))?.observedUrls[0];
       if (!url || !isInScope(url, opts.scope)) return false;
       try {
-        const res = await fetch(url, { headers: { cookie }, redirect: "manual", signal: AbortSignal.timeout(10_000) });
+        // JWT apps keep auth in localStorage — invisible to a cookie-only fetch. Load the target in the
+        // live context so the persisted bearer surfaces, then probe with BOTH session materials.
+        await d.gotoUrl(opts.targetUrl).catch(() => {});
+        const bearer = (await d.bearerToken().catch(() => null)) ?? "";
+        const headers: Record<string, string> = {};
+        if (cookie) headers.cookie = cookie;
+        if (bearer) headers.authorization = `Bearer ${bearer}`;
+        const res = await fetch(url, { headers, redirect: "manual", signal: AbortSignal.timeout(10_000) });
         const body = await res.text();
         return !touchIsDead(res.status, res.headers.get("location") ?? undefined, body);
       } catch {
@@ -391,7 +398,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       const d = await PlaywrightDriver.launch({ ...launchBase, userDataDir: join(baseDir, role), headless: viaWeb });
       if (opts.resume) {
         const cookie = await d.sessionCookieHeader().catch(() => "");
-        if (cookie && (await probeAlive(cookie))) {
+        if (await probeAlive(d, cookie)) {
           roleSessions.set(role, { driver: d, cookie, ...(await bearerOf(d)) });
           liveOnResume.add(role);
           opts.onText?.(`✅ role ${roleLabel(role, opts.roleDescriptions)}: persisted session still live — continuing without re-login`);
@@ -445,6 +452,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       if (!deferred) {
         const cookie = await d.sessionCookieHeader();
         roleSessions.set(role, { driver: d, cookie, ...(await bearerOf(d)) });
+        liveOnResume.add(role); // a session established at startup supersedes any stale blocked mark too
         opts.onText?.(`✅ role ${roleLabel(role, opts.roleDescriptions)} session established (cookie ${cookie ? "present" : "absent"})`);
       }
     }
@@ -456,6 +464,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       for (const m of manual) {
         const cookie = await m.driver.sessionCookieHeader();
         roleSessions.set(m.role, { driver: m.driver, cookie, ...(await bearerOf(m.driver)) });
+        liveOnResume.add(m.role);
         opts.onText?.(`✅ role ${roleLabel(m.role, opts.roleDescriptions)} session established (cookie ${cookie ? "present" : "absent"})`);
       }
     }
