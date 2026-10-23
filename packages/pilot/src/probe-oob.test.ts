@@ -63,7 +63,9 @@ function withDir(fn: (dir: string) => Promise<void>): Promise<void> {
 test("probe_oob is NOT AVAILABLE without a provider", async () => {
   await withDir(async (dir) => {
     const text = await callOob(dir, async () => resp(200, "ok"), undefined);
-    assert.match(text, /OOB NOT AVAILABLE/);
+    const out = JSON.parse(text) as { result: string; verdict: string };
+    assert.equal(out.result, "blocked");
+    assert.match(out.verdict, /OOB not available/i);
   });
 });
 

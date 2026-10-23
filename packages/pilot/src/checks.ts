@@ -290,6 +290,7 @@ export function extractProbeOutcome(s: PilotSession, text: string): ProbeOutcome
   if (result === "clean") return clean();
   if (result === "suspected") return { status: "suspected", reason: reason(), evidenceIds, baselineOk };
   if (result === "blocked") return { status: "blocked", reason: reason(), evidenceIds };
+  if (result === "not-applicable") return { status: "not-applicable", reason: reason(), evidenceIds, baselineOk };
   if (result === "unverified") return { status: "unverified", reason: reason(), evidenceIds, baselineOk };
 
   // Handling flags (not security conclusions): a tool that couldn't run is blocked; a lead is suspected.

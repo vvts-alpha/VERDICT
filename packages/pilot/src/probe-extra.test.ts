@@ -225,14 +225,15 @@ test("probe_cache_poison confirms when a primed key replays the injected header 
   });
 });
 
-test("probe_cache_poison stays UNVERIFIED when the cache keys on the header", async () => {
+test("probe_cache_poison is clean when the cache keys on the header (completed negative)", async () => {
   await withDir(async (dir) => {
     const s = fakeSession(dir, async (req: Req): Promise<Res> => {
       const xfh = req.headers?.["X-Forwarded-Host"];
       return ok(req, xfh ? `<a href="https://${xfh}/x">go</a>` : `<html>clean</html>`); // reflected only with header
     });
     const out = await run(s, "probe_cache_poison", { url: "https://app.test/page" });
-    assert.equal(out.verdict, "UNVERIFIED");
+    assert.equal(out.verdict, "NOT CONFIRMED");
+    assert.equal(out.result, "clean");
     assert.match(out.reason as string, /keyed|shared cache/i);
   });
 });

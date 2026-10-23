@@ -2069,7 +2069,7 @@ async function probeTiming(s: PilotSession, build: (value: string) => HttpReques
     if (!p2 || !usable(p2)) continue;
     const c2 = await send("1", "negative_control", { controlIds: [c0.id, c1.id], positiveIds: [p1.id, p2.id], delayMs });
     if (c2 && usable(c2) && checkTimingEvidence(c2, [p1, p2], s.evidence.records)) {
-      return { technique: "time-based", negativeControl: c2.id, positiveReplays: [p1.id, p2.id],
+      return { technique: "time-based", negativeControl: c2.id, positiveReplays: [p1.id, p2.id], result: "confirmed",
         verdict: `${validator.endsWith("sqli") ? "BLIND SQLi" : validator.endsWith("nosql") ? "BLIND NoSQL INJECTION" : "BLIND OS COMMAND INJECTION"} CONFIRMED (time-based): two measured delays matched ${delayMs}ms with three stable interleaved benign controls. Raw response bodies and measured durations are preserved.` };
     }
   }
@@ -2927,7 +2927,7 @@ export function buildTools(s: PilotSession) {
         } catch (e) {
           return txt(`ERROR: ${String(e).slice(0, 180)}`);
         }
-        if (!benign) return txt("ERROR: bad url/param — pass url+param or a body with {{XSS}}.");
+        if (!benign) return txt(JSON.stringify({ result: "unverified", verdict: "bad url/param — pass url+param or a body with {{XSS}}." }));
         const reflected = benign.body.includes(benignMarker);
         // A 5xx benign means the endpoint never evaluated the input — "not reflected" would be silence, not a verdict.
         if (benign.status >= 500)
@@ -2954,16 +2954,25 @@ export function buildTools(s: PilotSession) {
             break;
           }
         }
-        if (!winner)
+        if (!winner) {
+          // Evaluated negative — the endpoint answered a benign probe and either doesn't reflect or
+          // neutralized every bypass. Record the benign leg as the validity baseline for clean.
+          const baseEv = await recordSend(benignMarker, "negative_control", "benign baseline (no surviving bypass)");
+          const baseOk = validAppBaseline({ status: baseEv.status, body: baseEv.body });
           return txt(
             JSON.stringify({
               reflected,
               triedBypasses: tried.length,
-              verdict: reflected
-                ? `FILTER PRESENT (NOT clean): the input reflects but all ${tried.length} tag/handler bypasses were neutralized. Do NOT mark xss clean on this alone — run probe_dom_xss (client-side/DOM sink), and if the reflection lands in a specific context (JS string / attribute) craft a targeted payload via http_request.`
-                : `input not reflected in the response body — not a server-reflection XSS sink. For a client-rendered/SPA route use probe_dom_xss (browser execution).`,
+              negativeControl: baseEv.evId,
+              result: baseOk ? "clean" : "unverified",
+              verdict: !baseOk
+                ? `UNVERIFIED: the benign baseline did not reach a valid app response (status ${baseEv.status}) — "no bypass" is silence, not a negative.${baselineRetryHint(s, url, baseEv.status)}`
+                : reflected
+                  ? `FILTER PRESENT: the input reflects but all ${tried.length} tag/handler bypasses were neutralized (server-reflected XSS clean — a DOM sink is still possible: run probe_dom_xss on client-rendered routes).`
+                  : `input not reflected in the response body — not a server-reflection XSS sink. For a client-rendered/SPA route use probe_dom_xss (browser execution).`,
             }),
           );
+        }
         // ── confirm the surviving payload with control + 2 replays (marker-based) ──
         const ctrl = await recordSend(benignMarker, "negative_control", "control(benign)");
         const w1 = await recordSend(winner.payload, "positive_replay", `bypass ${winner.name} #1`);
@@ -2980,6 +2989,7 @@ export function buildTools(s: PilotSession) {
             effectMarker: winner.marker,
             bypass: winner.name,
             htmlResponse: htmlCtx,
+            result: verdict.ok ? "confirmed" : "suspected",
             verdict: verdict.ok
               ? `REFLECTED XSS CONFIRMED via the "${winner.name}" bypass — the payload reflected UNESCAPED. record_finding(category xss-reflected) with these evidenceIds + effectMarker.${htmlCtx ? "" : " (Response is not html content-type — confirm browser execution with probe_dom_xss before relying on it.)"}`
               : `not confirmed on replay: ${(verdict as { reason: string }).reason}`,
@@ -3050,7 +3060,7 @@ export function buildTools(s: PilotSession) {
           const arith = `$((${a}*${b}))`;
           const outPayloads = [arith, `;echo ${arith};`, `|echo ${arith}`, `$(expr ${a} \\* ${b})`, "`expr " + a + " \\* " + b + "`", `&&echo ${arith}`, `%0aecho ${arith}%0a`];
           const benign = await rawSend("1");
-          if (!benign) return txt("ERROR: bad url/param — pass url+param or a body with {{CMD}}.");
+          if (!benign) return txt(JSON.stringify({ result: "unverified", verdict: "bad url/param — pass url+param or a body with {{CMD}}." }));
           if (benign.status >= 500)
             return txt(JSON.stringify({ technique: null, result: "unverified", verdict: `UNVERIFIED: the benign baseline returned status ${benign.status} — the input never reached the app, so "no product echo" is silence, not a negative.${baselineRetryHint(s, url, benign.status)}` }));
           // ── output-based (arithmetic-product marker) ──
@@ -3065,7 +3075,7 @@ export function buildTools(s: PilotSession) {
               const p1 = await send(p, "positive_replay", "out#1");
               const p2 = await send(p, "positive_replay", "out#2");
               if (ctl && p1 && p2 && p1.body.includes(product) && p2.body.includes(product) && !ctl.body.includes(product))
-                return txt(JSON.stringify({ technique: "output-based", negativeControl: ctl.evId, positiveReplays: [p1.evId, p2.evId], effectMarker: product, verdict: `OS COMMAND INJECTION CONFIRMED (output): payload ${p} → shell computed ${product}, present in 2 STABLE replays (baseline absent). record_finding(category rce, critical) with these evidenceIds.` }));
+                return txt(JSON.stringify({ technique: "output-based", negativeControl: ctl.evId, positiveReplays: [p1.evId, p2.evId], result: "confirmed", effectMarker: product, verdict: `OS COMMAND INJECTION CONFIRMED (output): payload ${p} → shell computed ${product}, present in 2 STABLE replays (baseline absent). record_finding(category rce, critical) with these evidenceIds.` }));
               continue; // single/flaky echo not reproduced on replay → not a reliable injection; try the next payload
             }
           }
@@ -3125,7 +3135,7 @@ export function buildTools(s: PilotSession) {
         ];
         try {
           const benign = await rawSend("index.html");
-          if (!benign) return txt("ERROR: bad url/param — pass a {{PATH}} placeholder or a param.");
+          if (!benign) return txt(JSON.stringify({ result: "unverified", verdict: "could not build a request — pass a {{PATH}} placeholder or a param." }));
           for (const p of corpus) {
             const r = await rawSend(p);
             if (!r) continue;
@@ -3145,6 +3155,7 @@ export function buildTools(s: PilotSession) {
                   positiveReplays: [w1.evId, w2.evId],
                   effectMarker: fileHit.marker,
                   payload: p,
+                  result: verdict.ok ? "confirmed" : "suspected",
                   verdict: verdict.ok
                     ? `PATH TRAVERSAL / LFI CONFIRMED — payload "${p}" leaked ${fileHit.kind} (${fileHit.marker}); benign control did not. record_finding(category path-traversal) with these evidenceIds + effectMarker.`
                     : `file content leaked but replay evidence weak: ${(verdict as { reason: string }).reason} — re-check stability.`,
@@ -3152,7 +3163,18 @@ export function buildTools(s: PilotSession) {
               );
             }
           }
-          return txt(JSON.stringify({ verdict: "not confirmed: no file content leaked across ../, encoded, null-byte, Windows, or php-filter payloads. If the param is reflected into a template/include, also consider LFI-to-RCE via a log/wrapper, or probe_oob for a remote include." }));
+          // 否定: benign 脚を証拠記録して validity baseline にする。届いていなければ unverified のまま。
+          const baseEv = await recordSend("index.html", "negative_control", "benign baseline (clean path)");
+          const baseOk = validAppBaseline({ status: baseEv.status, body: baseEv.body });
+          return txt(
+            JSON.stringify({
+              negativeControl: baseEv.evId,
+              result: baseOk ? "clean" : "unverified",
+              verdict: baseOk
+                ? "not confirmed: no file content leaked across ../, encoded, null-byte, Windows, or php-filter payloads. If the param is reflected into a template/include, also consider LFI-to-RCE via a log/wrapper, or probe_oob for a remote include."
+                : `UNVERIFIED: the benign baseline did not reach a valid app response (status ${baseEv.status}) — "no leak" is silence, not a negative.${baselineRetryHint(s, url, baseEv.status)}`,
+            }),
+          );
         } catch (e) {
           return txt(`ERROR: ${String(e).slice(0, 180)}`);
         }
@@ -3219,7 +3241,7 @@ export function buildTools(s: PilotSession) {
         } catch (e) {
           return txt(`ERROR: ${String(e).slice(0, 180)}`);
         }
-        if (!ctrl || !p1 || !p2) return txt("ERROR: could not build injection URL — pass url with a {{XSS}} placeholder, or url + param.");
+        if (!ctrl || !p1 || !p2) return txt(JSON.stringify({ result: "unverified", verdict: "could not build injection URL — pass url with a {{XSS}} placeholder, or url + param." }));
         // Proof screenshot: p2 was the last run, so the browser is still on the XSS'd page with the injected banner
         // visible. Capture it now → record_finding will use THIS (the execution moment) for the finding screenshot.
         if (p2.executed || p1.executed) {
@@ -3236,6 +3258,7 @@ export function buildTools(s: PilotSession) {
             negativeControl: ctrl.evId,
             positiveReplays: [p1.evId, p2.evId],
             effectMarker: tok,
+            result: confirmed ? "confirmed" : ctrl.executed ? "unverified" : "clean",
             control: { executed: ctrl.executed },
             payload: [{ executed: p1.executed, signal: p1.signal }, { executed: p2.executed, signal: p2.signal }],
             verdict: confirmed
@@ -3298,7 +3321,7 @@ export function buildTools(s: PilotSession) {
         } catch (e) {
           return txt(`ERROR: ${String(e).slice(0, 180)}`);
         }
-        if (!ctrl || !p1 || !p2) return txt("ERROR: could not build request (pass a valid url + param, or a body with {{SSTI}})");
+        if (!ctrl || !p1 || !p2) return txt(JSON.stringify({ result: "unverified", verdict: "could not build request (pass a valid url + param, or a body with {{SSTI}})" }));
         const verdict = checkLogicEvidence(
           { status: ctrl.status, hasMarker: ctrl.evaluated },
           [p1, p2].map((p) => ({ status: p.status, hasMarker: p.evaluated })),
@@ -3390,7 +3413,7 @@ export function buildTools(s: PilotSession) {
         };
         try {
           const benign = await send("1", "negative_control", "baseline(benign)");
-          if (!benign) return txt("ERROR: bad url/param — pass url+param or a body with {{SQLI}}.");
+          if (!benign) return txt(JSON.stringify({ result: "unverified", verdict: "bad url/param — pass url+param or a body with {{SQLI}}." }));
           if (!validAppBaseline(benign))
             return txt(JSON.stringify({ technique: null, result: "unverified", baselineEvidenceId: benign.evId, evidenceIds: sentEvIds, verdict: `UNVERIFIED: the benign baseline did not reach a valid app response (status ${benign.status}${isAuthRedirect(benign) ? " — redirected to an auth/login page" : ""}). The endpoint cannot be probed through this session, so SQLi is neither confirmed nor ruled out here.${baselineRetryHint(s, url, benign.status)}` }));
           // Structured ledger contract: `result` is set at THIS branch (never parsed from verdict text),
@@ -3437,7 +3460,7 @@ export function buildTools(s: PilotSession) {
               return txt(JSON.stringify({ technique: "boolean", result: "confirmed", baselineEvidenceId: benign.evId, evidenceIds: sentEvIds, negativeControl: falseR.evId, positiveReplays: [t1.evId, t2.evId], verdict: `SQLi CONFIRMED (boolean): TRUE(${pair.t}) vs FALSE ${pair.f} on a structured (JSON/XML) response (delta > noise-floor ${thr}). record_finding(category sqli) with these evidenceIds.${errSig ? ` (SQL error also seen: ${errSig})` : ""}` }));
           }
           const timing = await probeTiming(s, buildReq, "claude-pilot-sqli", ["' AND SLEEP(5)-- -", " AND SLEEP(5)-- -", "' AND pg_sleep(5)-- -", "'; WAITFOR DELAY '0:0:5'-- -", "' OR SLEEP(5)-- -"]);
-          if (timing) return txt(JSON.stringify({ result: "confirmed", baselineEvidenceId: benign.evId, evidenceIds: sentEvIds, ...timing }));
+          if (timing) return txt(JSON.stringify({ baselineEvidenceId: benign.evId, evidenceIds: sentEvIds, ...timing, result: "confirmed" }));
           if (unstructuredLength)
             return txt(JSON.stringify({
               technique: null,
@@ -3496,12 +3519,12 @@ export function buildTools(s: PilotSession) {
           return { evId: ev.id, status: res.status, body: res.body, ms: res.durationMs };
         };
         try {
-          if (body == null && !param) return txt("ERROR: pass `body` (JSON) with a {{NOSQL}} placeholder at the injected value, or `param` (query) for the [$ne]= form.");
+          if (body == null && !param) return txt(JSON.stringify({ result: "unverified", verdict: "pass `body` (JSON) with a {{NOSQL}} placeholder at the injected value, or `param` (query) for the [$ne]= form." }));
           const controlSpec = body != null
             ? { u: url, b: body.replace(/\{\{NOSQL\}\}/g, NOSQL_CONTROL_VALUE) }
             : { u: (() => { try { const uu = new URL(url); uu.searchParams.set(param!, "__verdict_nonexistent_zzz__"); return uu.toString(); } catch { return url; } })(), b: null as string | null };
           const control = await fire(controlSpec.u, controlSpec.b, "negative_control", "control(benign literal)");
-          if (!control) return txt("ERROR: control request out of scope / bad url.");
+          if (!control) return txt(JSON.stringify({ result: "unverified", verdict: "control request out of scope / bad url." }));
           let errSig = nosqlErrorSignature(control.body);
           const ops = body != null
             ? NOSQL_OP_OBJECTS.map((o) => ({ label: o.label, u: url, b: body.replace(/\{\{NOSQL\}\}/g, o.json) as string | null }))
@@ -3517,13 +3540,13 @@ export function buildTools(s: PilotSession) {
             // control failed — that is NOT an operator bypass. Same guard the timing path already applies.
             if (looksBlocked(p1) || looksBlocked(p2) || looksBlocked(control)) continue;
             if (nosqlBypassConfirms({ status: control.status, body: control.body }, [{ status: p1.status, body: p1.body }, { status: p2.status, body: p2.body }], successMarker))
-              return txt(JSON.stringify({ technique: "operator-bypass", negativeControl: control.evId, positiveReplays: [p1.evId, p2.evId], effectMarker: successMarker ?? `status ${p1.status}`, verdict: `NoSQL OPERATOR INJECTION CONFIRMED — benign control (status ${control.status}) failed, operator ${op.label} succeeded (status ${p1.status}) twice${successMarker ? ` with marker "${successMarker}"` : ""}. record_finding(category sqli) — title it NoSQL/operator injection — with these evidenceIds + effectMarker.` }));
+              return txt(JSON.stringify({ technique: "operator-bypass", negativeControl: control.evId, positiveReplays: [p1.evId, p2.evId], effectMarker: successMarker ?? `status ${p1.status}`, result: "confirmed", verdict: `NoSQL OPERATOR INJECTION CONFIRMED — benign control (status ${control.status}) failed, operator ${op.label} succeeded (status ${p1.status}) twice${successMarker ? ` with marker "${successMarker}"` : ""}. record_finding(category sqli) — title it NoSQL/operator injection — with these evidenceIds + effectMarker.` }));
           }
           if (body != null) {
             const timing = await probeTiming(s, (value) => value === "1" ? mkReq(controlSpec.u, controlSpec.b) : mkReq(url, body.replace(/\{\{NOSQL\}\}/g, value)), "claude-pilot-nosql", [nosqlTimeObject(3000)], 3000);
             if (timing) return txt(JSON.stringify(timing));
           }
-          return txt(JSON.stringify({ technique: null, errorSignature: errSig ?? null, verdict: errSig ? `NoSQL error signature seen ("${errSig}") — likely a Mongo/Mongoose backend, but operator/time did not confirm. Try tailored payloads via http_request (login: password={"$ne":null}; or $where).` : "not confirmed: operator payloads did not bypass and $where showed no delay. On a login form, set successMarker to the token/success string and retry." }));
+          return txt(JSON.stringify({ technique: null, errorSignature: errSig ?? null, result: errSig ? "suspected" : validAppBaseline({ status: control.status, body: control.body }) ? "clean" : "unverified", verdict: errSig ? `NoSQL error signature seen ("${errSig}") — likely a Mongo/Mongoose backend, but operator/time did not confirm. Try tailored payloads via http_request (login: password={"$ne":null}; or $where).` : "not confirmed: operator payloads did not bypass and $where showed no delay. On a login form, set successMarker to the token/success string and retry." }));
         } catch (e) {
           return txt(`ERROR: ${String(e).slice(0, 180)}`);
         }
@@ -3554,9 +3577,10 @@ export function buildTools(s: PilotSession) {
           const reflects = (r: { acao: string } | null): boolean => !!r && r.acao === el;
           if (p1 && p2 && reflects(p1) && reflects(p2) && !reflects(control)) {
             const withCreds = p1.acac === "true";
-            return txt(JSON.stringify({ confirmed: true, negativeControl: control.evId, positiveReplays: [p1.evId, p2.evId], effectMarker: evil, severity: withCreds ? "high" : "low", verdict: `CORS MISCONFIG CONFIRMED — Access-Control-Allow-Origin reflects an arbitrary origin ${withCreds ? "WITH credentials (cross-origin theft of AUTHENTICATED responses = HIGH)" : "without credentials (LOW)"}. record_finding(category cors-misconfig, ${withCreds ? "high" : "low"}) with these evidenceIds + effectMarker "${evil}".` }));
+            return txt(JSON.stringify({ confirmed: true, negativeControl: control.evId, positiveReplays: [p1.evId, p2.evId], effectMarker: evil, severity: withCreds ? "high" : "low", result: "confirmed", verdict: `CORS MISCONFIG CONFIRMED — Access-Control-Allow-Origin reflects an arbitrary origin ${withCreds ? "WITH credentials (cross-origin theft of AUTHENTICATED responses = HIGH)" : "without credentials (LOW)"}. record_finding(category cors-misconfig, ${withCreds ? "high" : "low"}) with these evidenceIds + effectMarker "${evil}".` }));
           }
-          return txt(JSON.stringify({ confirmed: false, verdict: "not confirmed: the arbitrary Origin was not reflected into Access-Control-Allow-Origin (static '*' or no ACAO is not a finding)." }));
+          const baseOk = validAppBaseline({ status: control.status });
+          return txt(JSON.stringify({ confirmed: false, negativeControl: control.evId, result: baseOk ? "clean" : "unverified", verdict: baseOk ? "not confirmed: the arbitrary Origin was not reflected into Access-Control-Allow-Origin (static '*' or no ACAO is not a finding)." : `UNVERIFIED: the no-origin control did not reach a valid app response (status ${control.status}) — "no reflection" is silence, not a negative.${baselineRetryHint(s, url, control.status)}` }));
         } catch (e) {
           return txt(`ERROR: ${String(e).slice(0, 180)}`);
         }
@@ -3585,7 +3609,7 @@ export function buildTools(s: PilotSession) {
         try {
           const control = await fire(fu, null, "GET", "negative_control", "follow(before pollution)");
           if (!control) return txt("BLOCKED: url out of scope.");
-          if (stripProtoEcho(control.body).includes(markerVal)) return txt("not confirmed: the marker is ambiently present before pollution — pick a fresh followUrl.");
+          if (stripProtoEcho(control.body).includes(markerVal)) return txt(JSON.stringify({ result: "unverified", verdict: "the marker is ambiently present before pollution — pick a fresh followUrl." }));
           // Two vectors: the classic __proto__ key, and constructor.prototype (sinks that filter the literal
           // "__proto__" key often still merge the equivalent path). A pollution request that was REJECTED (>=400)
           // cannot be the source of a later leak — without this check a stored echo from an earlier request
@@ -3603,10 +3627,11 @@ export function buildTools(s: PilotSession) {
           const leaked = (r: { body: string } | null): boolean => !!r && stripProtoEcho(r.body).includes(markerVal);
           if (p1 && p2 && leaked(p1) && leaked(p2)) {
             if (!polluteAccepted)
-              return txt(JSON.stringify({ confirmed: false, verdict: "not confirmed: the marker appeared in the follow-up, but every pollution request was REJECTED (status >=400) — the leak is unattributed (likely a stored echo from an earlier request). Re-run with a fresh followUrl." }));
-            return txt(JSON.stringify({ confirmed: true, negativeControl: control.evId, positiveReplays: [p1.evId, p2.evId], effectMarker: markerVal, verdict: `PROTOTYPE POLLUTION CONFIRMED — after POSTing {"__proto__":{"${marker}":...}}, the injected inherited property "${markerVal}" appeared in the follow-up response (absent before). record_finding(category prototype-pollution, high) with these evidenceIds + effectMarker.` }));
+              return txt(JSON.stringify({ confirmed: false, result: "suspected", verdict: "the marker appeared in the follow-up, but every pollution request was REJECTED (status >=400) — the leak is unattributed (likely a stored echo from an earlier request). Re-run with a fresh followUrl." }));
+            return txt(JSON.stringify({ confirmed: true, negativeControl: control.evId, positiveReplays: [p1.evId, p2.evId], effectMarker: markerVal, result: "confirmed", verdict: `PROTOTYPE POLLUTION CONFIRMED — after POSTing {"__proto__":{"${marker}":...}}, the injected inherited property "${markerVal}" appeared in the follow-up response (absent before). record_finding(category prototype-pollution, high) with these evidenceIds + effectMarker.` }));
           }
-          return txt(JSON.stringify({ confirmed: false, verdict: "not confirmed: the injected __proto__ property did not leak into the follow-up. Try a gadget (__proto__.status / a config key the app reads) via http_request, or a different merge sink." }));
+          const baseOk = validAppBaseline({ status: control.status, body: control.body });
+          return txt(JSON.stringify({ confirmed: false, negativeControl: control.evId, result: baseOk ? "clean" : "unverified", verdict: baseOk ? "not confirmed: the injected __proto__ property did not leak into the follow-up. Try a gadget (__proto__.status / a config key the app reads) via http_request, or a different merge sink." : `UNVERIFIED: the follow-up control did not reach a valid app response (status ${control.status}) — "no leak" is silence, not a negative.` }));
         } catch (e) {
           return txt(`ERROR: ${String(e).slice(0, 180)}`);
         }
@@ -3657,7 +3682,7 @@ export function buildTools(s: PilotSession) {
         } catch (e) {
           return txt(`ERROR: ${String(e).slice(0, 180)}`);
         }
-        if (!ctrl || !p1 || !p2) return txt("ERROR: could not build request (bad url/param)");
+        if (!ctrl || !p1 || !p2) return txt(JSON.stringify({ result: "unverified", verdict: "could not build request (bad url/param)" }));
         const verdict = checkLogicEvidence(
           { status: ctrl.status, hasMarker: ctrl.toOob },
           [p1, p2].map((p) => ({ status: p.status, hasMarker: p.toOob })),
@@ -3666,7 +3691,9 @@ export function buildTools(s: PilotSession) {
           JSON.stringify({
             negativeControl: ctrl.evId,
             positiveReplays: [p1.evId, p2.evId],
+            baselineEvidenceId: p1.evId,
             effectMarker: marker,
+            result: verdict.ok ? "confirmed" : "clean",
             control: { location: ctrl.location, toOob: ctrl.toOob },
             payload: [{ location: p1.location, toOob: p1.toOob }, { location: p2.location, toOob: p2.toOob }],
             verdict: verdict.ok
@@ -3681,7 +3708,7 @@ export function buildTools(s: PilotSession) {
       "Confirm a JWT forgery: (1) weak HMAC secret — cracks the live Bearer against a small default-secret wordlist and mints a new token; (2) alg:none / None / NONE (signature not verified); (3) RS256->HS256 KEY CONFUSION — if the token is RS/PS/ES-signed, fetches the JWKS (jwksUrl or /.well-known/jwks.json) and re-signs the token as HS256 using the RSA PUBLIC KEY as the HMAC secret (a naive verifier accepts it → admin forgery). Requires login() so the session holds a Bearer JWT. Replays each candidate against an identity-returning authed `url`; garbage token is the negative control (must be rejected) and the forged token is sent twice (accepted = the server took a token we minted). Returns negativeControl + positiveReplays evidenceIds → record_finding(category session). Optionally mutate a claim via `claimKey`/`claimValue` for privilege escalation. Does not cover jku/x5u or kid injection.",
       { url: z.string(), claimKey: z.string().optional(), claimValue: z.string().optional(), jwksUrl: z.string().optional() },
       async ({ url, claimKey, claimValue, jwksUrl }) => {
-        if (!s.currentBearer) return txt("no Bearer JWT in the current session — login(role) first (this probe forges from the live token).");
+        if (!s.currentBearer) return txt(JSON.stringify({ result: "blocked", verdict: "no Bearer JWT in the current session — login(role) first (this probe forges from the live token)." }));
         if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} is out of scope`);
         const mutate = (c: Record<string, unknown>): void => {
           bumpJwtExp(c);
@@ -3707,7 +3734,7 @@ export function buildTools(s: PilotSession) {
           }
         }
         const candidates = jwtForgeCandidates(s.currentBearer, mutate, publicKeyPem ? { publicKeyPem } : {});
-        if (candidates.length === 0) return txt("could not parse the current Bearer token as a JWT (header.payload.signature).");
+        if (candidates.length === 0) return txt(JSON.stringify({ result: "not-applicable", verdict: "could not parse the current Bearer token as a JWT (header.payload.signature) — the session token isn't JWT-shaped, so JWT forgery checks don't apply." }));
         const sentEvIds: string[] = [];
         const send = async (bearer: string, kind: "negative_control" | "positive_replay", tag: string) => {
           const req: HttpRequest = { method: "GET", url, headers: { ...authHeaders(s), authorization: `Bearer ${bearer}` }, body: null };
@@ -3812,11 +3839,11 @@ export function buildTools(s: PilotSession) {
       },
       async ({ url, validUser, invalidUser, param, method, body }) => {
         const valid = (validUser?.trim() || [...s.roleCreds.values()][0]?.username || "").trim();
-        if (!valid) return txt("ERROR: pass validUser (a username that exists) or configure a role with credentials so the probe has a known-valid account.");
+        if (!valid) return txt(JSON.stringify({ result: "unverified", verdict: "pass validUser (a username that exists) or configure a role with credentials so the probe has a known-valid account." }));
         const nobody = (invalidUser?.trim() || `nosuch_${Date.now().toString(36)}@verdict.invalid`).trim();
-        if (valid === nobody) return txt("ERROR: validUser and invalidUser must differ.");
+        if (valid === nobody) return txt(JSON.stringify({ result: "unverified", verdict: "validUser and invalidUser must differ." }));
         const placed = (user: string) => placeUserIdentity(url, body ?? null, param, user);
-        if (!placed(valid) || !placed(nobody)) return txt("ERROR: put {{USER}} in url or body, or pass a query `param` to inject the username.");
+        if (!placed(valid) || !placed(nobody)) return txt(JSON.stringify({ result: "unverified", verdict: "put {{USER}} in url or body, or pass a query `param` to inject the username." }));
         const meth = (method ?? (body != null ? "POST" : "GET")).toUpperCase();
         const fire = async (user: string, kind: "negative_control" | "positive_replay", tag: string) => {
           const p = placed(user)!;
@@ -3865,6 +3892,7 @@ export function buildTools(s: PilotSession) {
               ...(hit ? { effectMarker: hit.marker } : {}),
               control: { status: ctrl.status },
               valid: [{ status: p1.status }, { status: p2.status }],
+              result: hit && logic.ok ? "confirmed" : validAppBaseline({ status: ctrl.status, body: ctrl.body }) ? "clean" : "unverified",
               verdict: hit && logic.ok
                 ? `USER ENUMERATION CONFIRMED — ${hit.reason}. record_finding(category user-enumeration) with these evidenceIds + effectMarker.`
                 : `not confirmed: ${!hit ? "valid and invalid usernames produced no stable distinguishing marker (generic error / username echo only)." : (logic as { reason: string }).reason}`,
@@ -3916,17 +3944,24 @@ export function buildTools(s: PilotSession) {
                 { requireSuccess: false },
               )
             : ({ ok: false, reason: !hit ? "no secret / info-disclosure signature (and none the control lacked)" : "marker not stable on replay" } as const);
+          // The TARGET leg (p1) is the "did the endpoint answer" leg — the control is a deliberately
+          // nonexistent path, so it can't be the validity baseline.
+          const reached = validAppBaseline({ status: p1.status, headers: {}, body: p1.body });
           return txt(
             JSON.stringify({
               negativeControl: ctrl.evId,
               positiveReplays: [p1.evId, p2.evId],
+              baselineEvidenceId: p1.evId,
               ...(hit ? { category: hit.category, effectMarker: hit.marker, detail: hit.detail } : {}),
               control: { status: ctrl.status },
               target: [{ status: p1.status }, { status: p2.status }],
+              result: hit && logic.ok ? "confirmed" : reached ? "clean" : "unverified",
               verdict:
                 hit && logic.ok
                   ? `${hit.category === "secret-exposure" ? "SECRET EXPOSURE" : "INFO DISCLOSURE"} CONFIRMED — ${hit.detail}. record_finding(category ${hit.category}) with these evidenceIds + effectMarker.`
-                  : `not confirmed: ${(logic as { reason: string }).reason}`,
+                  : !reached
+                    ? `UNVERIFIED: the target leg did not reach a valid app response (status ${p1.status}) — "no signature" is silence, not a negative.${baselineRetryHint(s, url, p1.status)}`
+                    : `not confirmed: ${(logic as { reason: string }).reason}`,
             }),
           );
         } catch (e) {
@@ -3957,26 +3992,32 @@ export function buildTools(s: PilotSession) {
         try {
           const a = await fire("negative_control", "#1");
           const b = await fire("positive_replay", "#2");
+          const c = await fire("positive_replay", "#3");
           if (looksLikeProxyError(a.body ?? "")) {
             return txt(
               JSON.stringify({
+                result: "unverified",
                 verdict:
-                  "NOT CONFIRMED: the response is an upstream proxy/connection error page (host unreachable through the proxy), NOT the target — the host was never actually reached. Do NOT record header findings on it. Move on (or retry without --burp-proxy).",
+                  "the response is an upstream proxy/connection error page (host unreachable through the proxy), NOT the target — the host was never actually reached. Do NOT record header findings on it. Move on (or retry without --burp-proxy).",
               }),
             );
           }
           const lc: Record<string, string> = {};
           for (const [k, v] of Object.entries(a.headers ?? {})) lc[k.toLowerCase()] = v;
           const missing = auditHeaders(lc, url);
+          const baseOk = validAppBaseline({ status: a.status, body: a.body });
           return txt(
             JSON.stringify({
               negativeControl: a.evId,
-              positiveReplays: [a.evId, b.evId],
+              positiveReplays: [b.evId, c.evId],
+              result: missing.length > 0 ? "confirmed" : baseOk ? "clean" : "unverified",
               missing: missing.map((r) => ({ key: r.key, header: r.header, severity: r.severity, title: r.title })),
               verdict:
-                missing.length === 0
-                  ? "not confirmed: all checked security headers are present (or HSTS n/a on http)."
-                  : `MISSING HEADERS — ${missing.map((r) => r.header).join(", ")}. record_finding(category headers, param=<key>) for each, citing these evidenceIds (absence class: no control differential required).`,
+                !baseOk
+                  ? `UNVERIFIED: the endpoint did not return a valid app response (status ${a.status}) — header absence on a dead/redirected response is not a finding.${baselineRetryHint(s, url, a.status)}`
+                  : missing.length === 0
+                    ? "not confirmed: all checked security headers are present (or HSTS n/a on http)."
+                    : `MISSING HEADERS — ${missing.map((r) => r.header).join(", ")}. record_finding(category headers, param=<key>) for each, citing these evidenceIds (absence class: no control differential required).`,
             }),
           );
         } catch (e) {
@@ -4051,6 +4092,7 @@ export function buildTools(s: PilotSession) {
             return txt(
               JSON.stringify({
                 negativeControl: ping.evId,
+                result: "not-applicable",
                 control: { status: ping.status },
                 verdict: `NOT CONFIRMED: ${url} did not answer a GraphQL-shaped response to a POST {__typename} (no "data"/"errors" JSON; status ${ping.status}). Confirm this really is a GraphQL endpoint (POST JSON {query}), and login(role) first if it is auth-gated, then retry.`,
               }),
@@ -4126,8 +4168,13 @@ export function buildTools(s: PilotSession) {
                 : "array body not accepted",
           };
           const confirmed = [intro, suggest].filter((c) => c.confirmed);
+          const anyHit = confirmed.length > 0 || batching.accepted;
+          const firstHit = confirmed[0] ?? (batching.accepted ? { negativeControl: batching.negativeControl, positiveReplays: batching.positiveReplays } : null);
           return txt(
             JSON.stringify({
+              ...(anyHit && firstHit
+                ? { negativeControl: firstHit.negativeControl, positiveReplays: firstHit.positiveReplays, result: "confirmed" }
+                : { baselineEvidenceId: ping.evId, result: "clean" as const }),
               checks: [
                 { name: intro.name, confirmed: intro.confirmed, ...(intro.reason ? { reason: intro.reason } : {}), negativeControl: intro.negativeControl, positiveReplays: intro.positiveReplays, category: "info-disclosure", param: "introspection", effectMarker: '"types"', public: introspectionPublic, ...(unauthEvId ? { unauthControl: unauthEvId } : {}), note: introNote },
                 { name: suggest.name, confirmed: suggest.confirmed, ...(suggest.reason ? { reason: suggest.reason } : {}), negativeControl: suggest.negativeControl, positiveReplays: suggest.positiveReplays, category: "info-disclosure", param: "field-suggestions", effectMarker: "Did you mean", note: "validation errors disclose real schema field names (works with introspection disabled)" },
@@ -4488,6 +4535,8 @@ export function buildTools(s: PilotSession) {
           JSON.stringify({
             negativeControl: baseO.evId,
             positiveReplays: [mut1.evId, mut2.evId],
+            baselineEvidenceId: baseO.evId,
+            result: verdict.ok ? "confirmed" : "clean",
             baseline: { status: baseO.status, len: baseO.len, marker: baseO.hasMarker },
             mutated: [
               { status: mut1.status, len: mut1.len, marker: mut1.hasMarker },
@@ -4575,6 +4624,7 @@ export function buildTools(s: PilotSession) {
           JSON.stringify({
             negativeControl: ctrl.evId,
             positiveReplays: [p1.evId, p2.evId],
+            result: confirmed ? "confirmed" : "clean",
             effectMarker,
             renderedAs: renderAsRole ?? s.currentRole ?? "current session",
             mode: renderBrowser ? "browser-execution" : "http-reflection",
@@ -4594,7 +4644,7 @@ export function buildTools(s: PilotSession) {
       async ({ method, url, headers, body, stripFields, stripHeaders }) => {
         if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} out of scope`);
         if (!s.currentCookie)
-          return txt("NOT APPLICABLE: no session cookie — this session is Bearer/none. Browsers don't auto-send Authorization cross-site, so Bearer-auth endpoints are not CSRF-able (CSRF needs a cookie-based session).");
+          return txt(JSON.stringify({ result: "not-applicable", verdict: "no session cookie — this session is Bearer/none. Browsers don't auto-send Authorization cross-site, so Bearer-auth endpoints are not CSRF-able (CSRF needs a cookie-based session)." }));
         const fields = (stripFields ?? ["csrf", "_csrf", "csrf_token", "csrftoken", "authenticity_token", "__requestverificationtoken", "xsrf", "_token"]).map((f) => f.toLowerCase());
         const dropHeaders = new Set((stripHeaders ?? ["x-csrf-token", "x-xsrf-token", "x-csrftoken", "x-requested-with", "csrf-token"]).map((h) => h.toLowerCase()));
         const stripBody = (b: string | null): string | null => {
@@ -4622,10 +4672,13 @@ export function buildTools(s: PilotSession) {
           const ev = s.evidence.record({ screenId: s.currentScreenId ?? "pilot", validator: "claude-pilot-csrf", kind, request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false) }, response: res, note: `csrf ${tag}` });
           return { evId: ev.id, status: res.status };
         };
+        let base: Awaited<ReturnType<typeof fire>>;
         let ctrl: Awaited<ReturnType<typeof fire>>;
         let p1: Awaited<ReturnType<typeof fire>>;
         let p2: Awaited<ReturnType<typeof fire>>;
         try {
+          // (0) モデルが「成功する」と渡したそのままのリクエスト + セッション auth → 動作 baseline。
+          base = await fire({ ...authHeaders(s), ...(headers ?? {}) }, body ?? null, "positive_replay", "auth baseline (must succeed)");
           // (1) 無認証(cookie も bearer も無し)+ cross-origin → 認証が効いていれば失敗するはず。
           ctrl = await fire({ ...baseHeaders, ...crossOrigin }, body ?? null, "negative_control", "no-auth (must fail)");
           // (2) cookie のみ(Authorization は付けない=ブラウザのクロスサイト相当)+ token 除去 + cross-origin。
@@ -4637,20 +4690,27 @@ export function buildTools(s: PilotSession) {
           return txt(`ERROR: ${String(e).slice(0, 160)}`);
         }
         const ok2xx = (n: number): boolean => n >= 200 && n < 300;
+        const baselineOk = ok2xx(base.status);
         const authEnforced = !ok2xx(ctrl.status);
         const csrfWorks = ok2xx(p1.status) && ok2xx(p2.status);
+        const result = !baselineOk ? "unverified" : authEnforced && csrfWorks ? "suspected" : "clean";
         return txt(
           JSON.stringify({
             negativeControl: ctrl.evId,
             positiveReplays: [p1.evId, p2.evId],
+            baselineEvidenceId: base.evId,
+            result,
             noAuth: { status: ctrl.status },
+            baseline: { status: base.status },
             strippedCookieOnly: [{ status: p1.status }, { status: p2.status }],
             verdict:
-              authEnforced && csrfWorks
-                ? "LIKELY CSRF — auth IS enforced (no-auth failed) yet the cookie-only, token-stripped, cross-origin request SUCCEEDED twice. Before record_finding(csrf): confirm the session cookie is NOT SameSite=Strict/Lax (analyze_session) — only then is it cross-site exploitable."
-                : !authEnforced
-                  ? "not confirmed: the no-auth request also succeeded — this endpoint isn't auth-gated (not CSRF; treat as access-control / missing-auth instead)."
-                  : "not confirmed: the token-stripped / cross-origin request did NOT succeed — CSRF protection appears present.",
+              !baselineOk
+                ? `UNVERIFIED: the as-given session request did not succeed (status ${base.status}) — the operator-supplied request shape doesn't reach the app, so nothing else was evaluated.${baselineRetryHint(s, url, base.status)}`
+                : authEnforced && csrfWorks
+                  ? "LIKELY CSRF — auth IS enforced (no-auth failed) yet the cookie-only, token-stripped, cross-origin request SUCCEEDED twice. Before record_finding(csrf): confirm the session cookie is NOT SameSite=Strict/Lax (analyze_session) — only then is it cross-site exploitable."
+                  : !authEnforced
+                    ? "not confirmed: the no-auth request also succeeded — this endpoint isn't auth-gated (not CSRF; treat as access-control / missing-auth instead)."
+                    : "not confirmed: the token-stripped / cross-origin request did NOT succeed — CSRF protection appears present.",
           }),
         );
       },
@@ -4660,15 +4720,15 @@ export function buildTools(s: PilotSession) {
       "Confirm a BLIND / out-of-band vuln via Interactsh or Burp Collaborator: blind SSRF, blind XXE, blind SQLi (DNS/HTTP exfil), OS command injection, header SSRF (X-Forwarded-Host / Referer / Host), email/webhook SSRF — anything where the EFFECT is the SERVER making an external request, not a visible response. Requires OOB enabled (Settings → OOB → Interactsh, or BURP_AUDIT_API + Collaborator). Put a {{OOB}} placeholder where the callback host belongs (a URL field, an XXE SYSTEM entity `<!ENTITY x SYSTEM \"http://{{OOB}}/\">`, a hostname, a header value, OR inside an uploaded file's text content — see `files`). The tool generates a unique callback host, injects it (in-scope target request), and polls ~waitSec for a DNS/HTTP/SMTP callback FROM the target; a callback = the server reached our host out-of-band = confirmed. FILE-BORNE OOB: for a blind SSRF/XXE that must live INSIDE an uploaded file (FFmpeg/HLS video-SSRF, ImageMagick, an uploaded SVG/DOCX with a SYSTEM entity), pass `files` (each {name, filename, contentType?, and `content` text OR `base64` bytes}) with {{OOB}} in a file's text `content` — it is sent as multipart/form-data and the callback confirms the file-borne case. Records a benign control + the injected request → negativeControl + positiveReplays evidenceIds for record_finding(category ssrf / rce as appropriate). NOTE: callbacks can lag seconds; nothing back after waitSec = not confirmed (try other params/headers/schemes).",
       { method: z.string(), url: z.string(), headers: z.record(z.string()).optional(), body: z.string().nullable().optional(), files: z.array(z.object({ name: z.string(), filename: z.string(), contentType: z.string().optional(), content: z.string().optional(), base64: z.string().optional() })).optional(), waitSec: z.number().optional(), note: z.string().optional(), checkClass: z.string().optional().describe("plan class under test (ssrf / xxe / rce / sqli blind) — attributes the coverage-ledger row") },
       async ({ method, url, headers, body, files, waitSec, note }) => {
-        if (!s.oob) return txt("OOB NOT AVAILABLE: enable OOB in Settings (Interactsh) or set BURP_AUDIT_API (Burp Collaborator). Without it, blind SSRF/XXE/SQLi cannot be confirmed out-of-band. In-band probe_ssrf still applies.");
+        if (!s.oob) return txt(JSON.stringify({ result: "blocked", verdict: "OOB not available: enable OOB in Settings (Interactsh) or set BURP_AUDIT_API (Burp Collaborator). Without it, blind SSRF/XXE/SQLi cannot be confirmed out-of-band. In-band probe_ssrf still applies." }));
         const oob = s.oob;
         const inPlaceholder = url.includes("{{OOB}}") || (body?.includes("{{OOB}}") ?? false) || Object.values(headers ?? {}).some((v) => v.includes("{{OOB}}")) || filesHaveOobPlaceholder(files, "{{OOB}}");
-        if (!inPlaceholder) return txt("ERROR: put a {{OOB}} placeholder where the callback host should be injected (in url, body, a header value, or an uploaded file's text content via `files`).");
+        if (!inPlaceholder) return txt(JSON.stringify({ result: "unverified", verdict: "put a {{OOB}} placeholder where the callback host should be injected (in url, body, a header value, or an uploaded file's text content via `files`)." }));
         let payload: { host: string; id: string };
         try {
           payload = await oob.payload();
         } catch (e) {
-          return txt(`OOB error: ${String(e).slice(0, 160)} (is Interactsh reachable, or Collaborator enabled in Burp?)`);
+          return txt(JSON.stringify({ result: "blocked", verdict: `OOB provider error: ${String(e).slice(0, 160)} (is Interactsh reachable, or Collaborator enabled in Burp?)` }));
         }
         const startTs = Date.now();
         const sub = (v: string, host: string): string => v.replace(/\{\{OOB\}\}/g, host);
@@ -4740,11 +4800,12 @@ export function buildTools(s: PilotSession) {
             collaboratorHost: payload.host,
             provider: oob.kind,
             interactions: hits,
+            result: confirmed ? "confirmed" : lastPollErr ? "unverified" : "clean",
             verdict: confirmed
               ? `OOB CONFIRMED — the target made ${hits.length} out-of-band ${hits.map((h) => h.type).join("/")} request(s) to our callback host. record_finding(ssrf / rce / xxe as fits the sink) with these evidenceIds + effectMarker (the callback host).`
               : lastPollErr
                 ? `not confirmed: OOB poll error (${lastPollErr}). The callback channel may be misconfigured — check Settings → OOB / Interactsh reachability, or BURP_AUDIT_API.`
-                : `not confirmed: no OOB callback within ${Math.round(budgetMs / 1000)}s. The sink may be filtered, the response not blind, or the callback slow — try another param/header (X-Forwarded-Host, Referer), scheme (http/dns/gopher), or a longer waitSec.`,
+                : `not confirmed: no OOB callback within ${Math.round(budgetMs / 1000)}s (channel verified working). The sink may be filtered, the response not blind, or the callback slow — try another param/header (X-Forwarded-Host, Referer), scheme (http/dns/gopher), or a longer waitSec.`,
           }),
         );
       },
@@ -4760,7 +4821,7 @@ export function buildTools(s: PilotSession) {
       },
       async ({ url, param, method, body }) => {
         if (!placeSsrfTarget(url, body ?? null, param, SSRF_CONTROL)) {
-          return txt("ERROR: put {{SSRF}} in url or body, or pass a query `param` (the URL/host the server fetches).");
+          return txt(JSON.stringify({ result: "unverified", verdict: "put {{SSRF}} in url or body, or pass a query `param` (the URL/host the server fetches)." }));
         }
         const meth = (method ?? (body != null ? "POST" : "GET")).toUpperCase();
         const fire = async (val: string, kind: "negative_control" | "positive_replay", tag: string) => {
@@ -4809,6 +4870,7 @@ export function buildTools(s: PilotSession) {
                 detail: hit.detail,
                 control: { status: ctrl.status },
                 payload: [{ status: p1.status }, { status: p2.status }],
+                result: "confirmed",
                 verdict: `IN-BAND SSRF CONFIRMED — ${hit.detail} (payload ${payload}). record_finding(category ssrf) with these evidenceIds + effectMarker.`,
               }),
             );
@@ -4817,6 +4879,7 @@ export function buildTools(s: PilotSession) {
             JSON.stringify({
               tried,
               negativeControl: ctrl.evId,
+              result: validAppBaseline({ status: ctrl.status, body: ctrl.body }) ? "clean" : "unverified",
               control: { status: ctrl.status },
               verdict: "not confirmed: no metadata / file / internal-content marker vs the .invalid control. If the sink is BLIND, use probe_oob.",
             }),
@@ -4907,6 +4970,7 @@ export function buildTools(s: PilotSession) {
                   negativeControl: ctrlGet.evId,
                   positiveReplays: [g1.evId, g2.evId],
                   effectMarker: tok,
+                  result: "confirmed",
                   verdict: `UPLOAD SVG XSS CONFIRMED — fetched ${xssFetchUrl} executes the marker in a live HTML position. record_finding(category xss-stored) with these evidenceIds + effectMarker. An accepted upload alone is not a finding.`,
                 }),
               );
@@ -4944,6 +5008,7 @@ export function buildTools(s: PilotSession) {
                 positiveReplays: [p1.evId, pos2.evId],
                 effectMarker: hit.marker,
                 detail: hit.detail,
+                result: "confirmed",
                 verdict: `UPLOAD XXE CONFIRMED — ${hit.detail}. record_finding(category xxe) with these evidenceIds + effectMarker. An accepted upload alone is not a finding.`,
               }),
             );
@@ -4955,6 +5020,8 @@ export function buildTools(s: PilotSession) {
               ...(fetched ? { fetchUrl: fetched } : { fetchUrl: null }),
               negativeControl: ctrlUp.evId,
               positiveReplays: [xssUp.evId],
+              baselineEvidenceId: ctrlUp.evId,
+              result: fetched ? "clean" : "unverified",
               verdict: fetched
                 ? `not confirmed: uploaded and fetched ${fetched}, but no live XSS marker and no XXE file contents vs the control. Accepted ≠ vulnerability.`
                 : "not confirmed: file was accepted but no in-scope fetch URL in the response (and no in-band XXE leak). Do not record a finding from accept-alone; try another field name or browser_upload.",
@@ -5036,6 +5103,7 @@ export function buildTools(s: PilotSession) {
           JSON.stringify({
             negativeControl: ctrl.evId,
             positiveReplays: [ex1.evId, ex2.evId],
+            result: verdict.ok ? "confirmed" : "clean",
             control: { status: ctrl.status, marker: ctrl.hasMarker, steps: ctrl.evIds.length },
             exploit: [
               { status: ex1.status, marker: ex1.hasMarker, steps: ex1.evIds.length },
@@ -5134,6 +5202,7 @@ export function buildTools(s: PilotSession) {
                 JSON.stringify({
                   category: "xxe",
                   verdict: "CONFIRMED",
+                  result: "confirmed",
                   negativeControl: ctrl.evId,
                   positiveReplays: [a!.evId, b!.evId],
                   effectMarker: "file content surfaced via alternate exfil legs (XInclude / parameter-entity error channel)",
@@ -5143,8 +5212,10 @@ export function buildTools(s: PilotSession) {
             }
             return txt(
               JSON.stringify({
-                verdict: "UNVERIFIED",
+                verdict: "SUSPECTED LEAD",
+                result: "suspected",
                 negativeControl: ctrl.evId,
+                positiveReplays: [f1.evId, f2.evId],
                 canaryExpanded,
                 exfilLegs: [f1, f2, xi, pe].map((l) => ({ evidenceId: l.evId, hasFile: legHasFile(l.body) })),
                 reason: `entities expand but no exfil leg surfaced file content (${logic.reason}). probe_oob with an external DTD covers the blind case.`,
@@ -5157,6 +5228,7 @@ export function buildTools(s: PilotSession) {
               JSON.stringify({
                 category: "xxe",
                 verdict: "CONFIRMED",
+                result: "confirmed",
                 negativeControl: ctrl.evId,
                 positiveReplays: [f1.evId, f2.evId],
                 effectMarker: "file content (root:x:0:0 / win.ini sections) inline in entity-XXE responses",
@@ -5166,8 +5238,13 @@ export function buildTools(s: PilotSession) {
           }
           return txt(
             JSON.stringify({
-              verdict: "UNVERIFIED",
+              verdict: canaryExpanded ? "SUSPECTED LEAD" : "UNVERIFIED",
+              // No expansion is NOT a clean negative even when the control succeeded: the
+              // in-band read missed but blind XXE (external DTD / parameter entities) was
+              // never tested — hand off to probe_oob.
+              result: canaryExpanded ? "suspected" : "unverified",
               negativeControl: ctrl.evId,
+              positiveReplays: canaryExpanded ? [canary.evId, f1.evId] : undefined,
               observation: canaryExpanded ? canary.evId : null,
               canaryExpanded,
               reason: canaryExpanded
@@ -5214,6 +5291,7 @@ export function buildTools(s: PilotSession) {
             return txt(
               JSON.stringify({
                 verdict: "UNVERIFIED",
+                result: "unverified",
                 legit: { status: legit.status, evidenceId: legit.evId, error: legit.error },
                 note: "the endpoint did not accept an upgrade even with a valid session+origin — other legs would be meaningless. Check the URL/scheme and whether the WS path differs from HTTP.",
               }),
@@ -5233,6 +5311,9 @@ export function buildTools(s: PilotSession) {
           return txt(
             JSON.stringify({
               verdict: leads.length ? "LEADS" : "ENFORCED",
+              result: leads.length ? "suspected" : "clean",
+              negativeControl: legit.evId,
+              positiveReplays: leads.length ? [unauth.evId, evil.evId] : undefined,
               legit: { status: legit.status, evidenceId: legit.evId, firstFrame: legit.firstFrame },
               unauth: { status: unauth.status, evidenceId: unauth.evId, accepted: unauth.accepted, firstFrame: unauth.firstFrame, echoed: unauth.echoed },
               evilOrigin: { status: evil.status, evidenceId: evil.evId, accepted: evil.accepted, firstFrame: evil.firstFrame, echoed: evil.echoed },
@@ -5277,7 +5358,7 @@ export function buildTools(s: PilotSession) {
         try {
           const baseline = await send(url, true, "negative_control", "authed baseline");
           if (baseline.body.length < 64) {
-            return txt(JSON.stringify({ verdict: "UNVERIFIED", reason: `baseline body too small (${baseline.body.length}B) to fingerprint`, evidenceId: baseline.evId }));
+            return txt(JSON.stringify({ verdict: "UNVERIFIED", result: "unverified", reason: `baseline body too small (${baseline.body.length}B) to fingerprint`, evidenceId: baseline.evId }));
           }
           const mid = baseline.body.slice(Math.floor(baseline.body.length / 2), Math.floor(baseline.body.length / 2) + 64);
           const overlaps = (b: string) => b.includes(mid);
@@ -5287,7 +5368,8 @@ export function buildTools(s: PilotSession) {
             return txt(
               JSON.stringify({
                 verdict: "PUBLIC-CONTENT",
-                control: control.evId,
+                result: "suspected",
+                negativeControl: control.evId,
                 note: "unauth on the NORMAL url already returns the private body — that's an authz/public-content question, not cache deception. Check probe_authz/accessibility instead.",
               }),
             );
@@ -5305,7 +5387,9 @@ export function buildTools(s: PilotSession) {
             if (priv && !primed) primed = { evId: leg.evId, status: leg.status, url: decUrl };
           }
           if (!primed) {
-            return txt(JSON.stringify({ verdict: "UNVERIFIED", control: control.evId, tried, note: "no deception suffix served the private body while authed — deception can't prime here (normalizer strips suffix or cache varies on path)." }));
+            // The attack precondition was never exercised — no deception URL served private
+            // content while authed, so the unauth-leak test could not run. Honest gap.
+            return txt(JSON.stringify({ verdict: "UNVERIFIED", result: "unverified", negativeControl: control.evId, baselineEvidenceId: baseline.evId, tried, note: "no deception suffix served the private body while authed — deception can't prime here (normalizer strips suffix or cache varies on path)." }));
           }
           // The kill shot — unauth replay of the primed deception URL, twice.
           const g1 = await send(primed.url, false, "positive_replay", "unauth deception #1");
@@ -5320,6 +5404,7 @@ export function buildTools(s: PilotSession) {
               JSON.stringify({
                 category: "info-disclosure",
                 verdict: "CONFIRMED",
+                result: "confirmed",
                 negativeControl: control.evId,
                 positiveReplays: [g1.evId, g2.evId],
                 deceptionUrl: primed.url,
@@ -5331,11 +5416,13 @@ export function buildTools(s: PilotSession) {
           }
           return txt(
             JSON.stringify({
-              verdict: "UNVERIFIED",
-              control: control.evId,
+              verdict: "NOT CONFIRMED",
+              result: "clean",
+              negativeControl: control.evId,
+              baselineEvidenceId: baseline.evId,
               primed: { url: primed.url, evidenceId: primed.evId },
               unauthReplays: [g1.evId, g2.evId],
-              reason: logic.ok ? "" : `deception URL serves private body while authed but NOT unauthenticated — ${logic.reason}. Either no shared cache stores it or the key includes the session. ${controlDenied ? "" : "(note: unauth control was not clearly denied)"}`,
+              reason: `deception URL serves private body while authed but NOT unauthenticated — ${logic.reason}. Either no shared cache stores it or the key includes the session. ${controlDenied ? "" : "(note: unauth control was not clearly denied)"}`,
               cacheHeaders: cacheHdr(g1.headers),
             }),
           );
@@ -5408,9 +5495,12 @@ export function buildTools(s: PilotSession) {
         const reached = legs.filter((l) => !l.denied && l.status >= 200 && l.status < 400);
         const blocked = legs.filter((l) => l.denied);
         const bypass = reached.length > 0 && blocked.length > 0;
+        const baseLeg = legs.find((l) => l.method === base);
         return txt(
           JSON.stringify({
             verdict: bypass ? "SUSPECTED-BYPASS" : "UNIFORM",
+            result: bypass ? "suspected" : "clean",
+            ...(bypass ? { positiveReplays: reached.map((l) => l.evidenceId) } : baseLeg ? { baselineEvidenceId: baseLeg.evidenceId } : {}),
             matrix: legs,
             reason: bypass
               ? `${reached.map((l) => l.method).join(",")} reached ${reached[0]!.status} while ${blocked.map((l) => l.method).join(",")} were denied — method-scoped authz. Replays: ${reached.map((l) => l.evidenceId).join(", ")}. Verify the accepted method actually mutates/reads (not just a generic OPTIONS/405 echo) then file via probe_authz or suspected.`
@@ -5451,11 +5541,13 @@ export function buildTools(s: PilotSession) {
           return { evId: ev.id, status: res.status, body: res.body };
         };
         const tried: Array<{ header: string; reflected: boolean }> = [];
+        let lastCtrlEvId = "";
         try {
           for (const h of candidates) {
             const key = keyed(`${tok}-${h.replace(/[^a-z]/gi, "").toLowerCase()}`);
             const marker = `${tok}.${h.replace(/[^a-z]/gi, "").toLowerCase()}.example`;
             const control = await send(key, {}, "negative_control", `control ${h}`);
+            lastCtrlEvId = control.evId;
             if (control.body.includes(marker)) continue; // impossible, but never claim on tainted control
             const prime = await send(key, { [h]: marker }, "positive_replay", `prime ${h}`);
             const reflected = prime.body.includes(marker);
@@ -5486,7 +5578,9 @@ export function buildTools(s: PilotSession) {
           }
           return txt(
             JSON.stringify({
-              verdict: "UNVERIFIED",
+              verdict: "NOT CONFIRMED",
+              result: "clean",
+              baselineEvidenceId: lastCtrlEvId,
               tried,
               reason: tried.some((t) => t.reflected)
                 ? "header(s) reflected during prime but the plain replay did NOT serve the poisoned body — the cache keys on the header (or no shared cache). Correctly keyed."
@@ -5546,10 +5640,12 @@ export function buildTools(s: PilotSession) {
         return txt(
           JSON.stringify({
             verdict: enforced ? "ENFORCED" : allOk && sensitive ? "UNBOUNDED-LEAD" : "INCONCLUSIVE",
+            result: enforced ? "clean" : allOk && sensitive ? "suspected" : allOk ? "clean" : "unverified",
             count: statuses.length,
             statuses,
             enforcedAt,
             evidenceIds: evIds,
+            ...(evIds.length ? { baselineEvidenceId: evIds[0] } : {}),
             note: enforced
               ? `throttle signal at send ${enforcedAt + 1} — enforcement exists; report as coverage.`
               : allOk && sensitive
@@ -5621,6 +5717,8 @@ export function buildTools(s: PilotSession) {
           JSON.stringify({
             source,
             evidenceId: evId,
+            ...(evId ? { baselineEvidenceId: evId } : {}),
+            result: leads.length ? "suspected" : "clean",
             signed,
             encrypted,
             sigAlg,
@@ -5697,6 +5795,7 @@ export function buildTools(s: PilotSession) {
         return txt(
           JSON.stringify({
             verdict: hits.length ? "CONSUMES-SERIALIZED" : "INCONCLUSIVE",
+            result: hits.length ? "suspected" : "unverified",
             results,
             note: hits.length
               ? `${hits.map((h) => h.fmt).join(",")} produced a format-specific deserializer error — the endpoint feeds the blob to a deserializer. This is a SUSPECTED lead (deserialization-attack precondition): the next step is a gadget chain appropriate to the stack (see backend-lib guesses), NOT this tool's scope. record_finding(suspected) citing the evidenceId(s).`
@@ -5745,15 +5844,17 @@ export function buildTools(s: PilotSession) {
         const [ctrl, p1, p2, p3] = legs;
         const p1Rejected = p1 !== undefined && p1.status >= 400 && p1.status < 500 && !p1.timedOut;
         if (!ctrl || ctrl.timedOut || ctrl.status === 0) {
-          return txt(JSON.stringify({ verdict: "INCONCLUSIVE", legs, reason: "control request itself produced no clean response — the raw socket path is unusable here (proxy, H2-only, TLS). Not a desync signal." }));
+          return txt(JSON.stringify({ verdict: "INCONCLUSIVE", result: "unverified", legs, reason: "control request itself produced no clean response — the raw socket path is unusable here (proxy, H2-only, TLS). Not a desync signal." }));
         }
         if (p1Rejected) {
-          return txt(JSON.stringify({ verdict: "HARDENED", legs, reason: `P1 dual-header request rejected with ${p1!.status} — the front-end/app refuses conflicting CL/TE. Desync is blocked at intake.` }));
+          return txt(JSON.stringify({ verdict: "HARDENED", result: "clean", baselineEvidenceId: ctrl.evidenceId, legs, reason: `P1 dual-header request rejected with ${p1!.status} — the front-end/app refuses conflicting CL/TE. Desync is blocked at intake.` }));
         }
         const verdict = p2!.timedOut && p3!.timedOut ? "SUSPECTED-DESYNC" : "CONSISTENT";
         return txt(
           JSON.stringify({
             verdict,
+            result: verdict === "SUSPECTED-DESYNC" ? "suspected" : "clean",
+            ...(verdict === "SUSPECTED-DESYNC" ? { positiveReplays: [p2!.evidenceId, p3!.evidenceId] } : { baselineEvidenceId: ctrl.evidenceId }),
             legs,
             note:
               verdict === "SUSPECTED-DESYNC"
@@ -5801,7 +5902,7 @@ export function buildTools(s: PilotSession) {
         };
         try {
           const control = await send(inject("plain"), "negative_control", "control");
-          if (split(control)) return txt(JSON.stringify({ verdict: "UNVERIFIED", reason: "control itself reflects an x-vcrlf header — can't claim injection", control: control.evId }));
+          if (split(control)) return txt(JSON.stringify({ verdict: "UNVERIFIED", result: "unverified", reason: "control itself reflects an x-vcrlf header — can't claim injection", control: control.evId }));
           const variants = [
             { tag: "crlf-encoded", val: `%0d%0aX-VCrlf:%20${tok}` },
             { tag: "lf-only", val: `%0aX-VCrlf:%20${tok}` },
@@ -5818,6 +5919,7 @@ export function buildTools(s: PilotSession) {
               JSON.stringify({
                 category: "crlf-injection",
                 verdict: "CONFIRMED",
+                result: "confirmed",
                 legs,
                 negativeControl: control.evId,
                 positiveReplays: hits.slice(0, 2).map((h) => h.evidenceId),
@@ -5827,7 +5929,7 @@ export function buildTools(s: PilotSession) {
             );
           }
           return txt(
-            JSON.stringify({ verdict: hits.length === 1 ? "UNVERIFIED" : "CLEAN-HERE", control: control.evId, legs, reason: hits.length === 1 ? "only one encoding split — needs a second independent variant to confirm" : "no encoding split the response — CRLF is sanitized on this surface." }),
+            JSON.stringify({ verdict: hits.length === 1 ? "UNVERIFIED" : "CLEAN-HERE", result: hits.length === 1 ? "suspected" : "clean", baselineEvidenceId: control.evId, control: control.evId, legs, reason: hits.length === 1 ? "only one encoding split — needs a second independent variant to confirm" : "no encoding split the response — CRLF is sanitized on this surface." }),
           );
         } catch (e) {
           return txt(JSON.stringify({ error: `probe_crlf failed: ${String(e).slice(0, 200)}` }));
@@ -5877,13 +5979,14 @@ export function buildTools(s: PilotSession) {
         const [ctrl, ...rest] = legs;
         const hits = rest.filter((l) => l.reflected);
         if (ctrl!.reflected) {
-          return txt(JSON.stringify({ verdict: "UNVERIFIED", legs, reason: "control already contains the marker — reflection is not attributable to the injected host" }));
+          return txt(JSON.stringify({ verdict: "UNVERIFIED", result: "unverified", legs, reason: "control already contains the marker — reflection is not attributable to the injected host" }));
         }
         if (hits.length >= 2) {
           return txt(
             JSON.stringify({
               category: "host-header-injection",
               verdict: "CONFIRMED",
+              result: "confirmed",
               legs,
               negativeControl: ctrl!.evidenceId,
               positiveReplays: hits.slice(0, 2).map((h) => h.evidenceId),
@@ -5893,7 +5996,7 @@ export function buildTools(s: PilotSession) {
           );
         }
         return txt(
-          JSON.stringify({ verdict: hits.length === 1 ? "UNVERIFIED" : "CLEAN-HERE", legs, reason: hits.length === 1 ? "single variant reflected — needs a second independent vector" : "injected host never surfaced — Host handling looks sane on this endpoint." }),
+          JSON.stringify({ verdict: hits.length === 1 ? "UNVERIFIED" : "CLEAN-HERE", result: hits.length === 1 ? "suspected" : "clean", baselineEvidenceId: ctrl!.evidenceId, legs, reason: hits.length === 1 ? "single variant reflected — needs a second independent vector" : "injected host never surfaced — Host handling looks sane on this endpoint." }),
         );
       },
     ),
@@ -5918,7 +6021,7 @@ export function buildTools(s: PilotSession) {
         if (/\btoken\b|\bid_token\b/.test(rt) && !u.searchParams.has("nonce")) staticLeads.push("implicit/hybrid flow without `nonce` — replay/mix-up risk");
         const origRu = u.searchParams.get("redirect_uri");
         if (!origRu) {
-          return txt(JSON.stringify({ verdict: "UNVERIFIED", staticLeads, reason: "no redirect_uri param in the URL — tampering needs the registered URI to mutate" }));
+          return txt(JSON.stringify({ verdict: "UNVERIFIED", result: "unverified", staticLeads, reason: "no redirect_uri param in the URL — tampering needs the registered URI to mutate" }));
         }
         const tok = `vo${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`;
         const evil = `${tok}.verdict.invalid`;
@@ -5968,6 +6071,7 @@ export function buildTools(s: PilotSession) {
             JSON.stringify({
               category: "oauth-misconfig",
               verdict: "CONFIRMED",
+              result: "confirmed",
               staticLeads,
               negativeControl: legs[0]!.evidenceId,
               positiveReplays: hits.slice(0, 2).map((h) => h.evidenceId),
@@ -5977,11 +6081,12 @@ export function buildTools(s: PilotSession) {
           );
         }
         if (loginGated) {
-          return txt(JSON.stringify({ verdict: "UNVERIFIED", staticLeads, legs, reason: "every response redirects to a login page — the redirect_uri decision is behind auth; the Location of the control leg can't reveal validation. Re-run with an authenticated session or check whether the AS defers URI validation until post-login." }));
+          return txt(JSON.stringify({ verdict: "UNVERIFIED", result: "unverified", staticLeads, legs, reason: "every response redirects to a login page — the redirect_uri decision is behind auth; the Location of the control leg can't reveal validation. Re-run with an authenticated session or check whether the AS defers URI validation until post-login." }));
         }
         return txt(
           JSON.stringify({
             verdict: hits.length === 1 ? "UNVERIFIED" : "CLEAN-HERE",
+            result: hits.length === 1 ? "suspected" : "clean",
             staticLeads,
             legs,
             reason: hits.length === 1 ? "one tampered URI redirected to the marker — needs a second variant" : "all tampered redirect_uris were rejected/errored — the AS validates the URI against its registry on this flow.",
@@ -6822,6 +6927,15 @@ export function buildTools(s: PilotSession) {
         } catch (e) {
           return txt(`ERROR baseline: ${String(e).slice(0, 150)}`);
         }
+        const baseReq: HttpRequest = { method: "GET", url, headers: authHeaders(s), body: null };
+        const baseEv = s.evidence.record({
+          screenId: s.currentScreenId ?? "pilot",
+          validator: "claude-pilot",
+          kind: "negative_control",
+          request: { ...baseReq, headers: s.http.effectiveHeaders(baseReq.headers) },
+          response: base,
+          note: "probe_params baseline",
+        });
         const probes = [
           ...PARAM_PROBES,
           ...Object.entries(extra ?? {}).map(([name, value]) => ({ name, value, kind: "idor" as const })),
@@ -6869,7 +6983,21 @@ export function buildTools(s: PilotSession) {
             evidenceId: ev.id,
           });
         }
-        return txt(JSON.stringify({ baseline: { status: base.status, len: base.body.length }, interesting }));
+        const baseOk = validAppBaseline(base);
+        return txt(
+          JSON.stringify({
+            baseline: { status: base.status, len: base.body.length },
+            baselineEvidenceId: baseEv.id,
+            result: !baseOk ? "unverified" : interesting.length ? "suspected" : "clean",
+            verdict: !baseOk
+              ? `UNVERIFIED: the baseline did not reach a valid app response (status ${base.status}) — "interesting" diffs against a dead baseline are unreliable`
+              : interesting.length
+                ? `${interesting.length} hidden param(s) changed behaviour — leads worth probing (idor/redirect/debug/file)`
+                : "no hidden param changed behaviour vs baseline",
+            evidenceIds: interesting.map((i) => i.evidenceId).filter((x): x is string => typeof x === "string"),
+            interesting,
+          }),
+        );
       },
     ),
 
@@ -6892,7 +7020,7 @@ export function buildTools(s: PilotSession) {
         const cookieHeader = s.currentCookie || "";
         const bearer = s.currentBearer || "";
         const authorization = bearer ? `Bearer ${bearer}` : "";
-        if (!cookieHeader && !bearer) return txt("no session: login(role) first (no Cookie, no Bearer).");
+        if (!cookieHeader && !bearer) return txt(JSON.stringify({ result: "blocked", verdict: "no session: login(role) first (no Cookie, no Bearer)." }));
         // The 3-request battery is deterministic for the same session+URL — a repeat call gets the
         // cached dump instead of re-firing two authed GETs and a control.
         s.sessionGlanceCache ??= new Map();
@@ -6993,7 +7121,17 @@ export function buildTools(s: PilotSession) {
         const glanceResult = JSON.stringify({
             evidenceId: p2.evId,
             observation: p1.evId,
-            ...(evidenceShape ? { negativeControl: ctrl.evId, positiveReplays: evidenceIds } : { flagEvidenceIds: evidenceIds, unauthControl: ctrl.evId }),
+            baselineEvidenceId: p1.evId,
+            ...(evidenceShape ? { negativeControl: ctrl.evId, positiveReplays: evidenceIds } : {}),
+            result:
+              looksLikeProxyError(p1.body ?? "") || p1.status !== p2.status || !positivesOk
+                ? "unverified"
+                : deterministic.length > 0 && confirmable
+                  ? "confirmed"
+                  : deterministic.length > 0
+                    ? "suspected"
+                    : "clean",
+            ...(evidenceShape ? {} : { flagEvidenceIds: evidenceIds, unauthControl: ctrl.evId }),
             currentRole: s.currentRole || "unauth",
             requestDump: formatRequestDump("GET", pageUrl, cookieHeader, authorization),
             response: { status: p1.status, setCookie: setCookie || undefined },
@@ -8042,7 +8180,10 @@ export function buildTools(s: PilotSession) {
           if (!priv) why.push(`response classified '${bodyClass}' (public directory / identity-only)`);
           return finish("inconclusive", {
             reason: `access observed but NOT confirmable: ${why.join("; ")}`,
-            checkStatus: "unverified",
+            // Access WAS observed. Private data + stable replays → a real lead (suspected, matching
+            // probe_idor's "POPULATED but unprovable" rule). Public-classified content → evaluated
+            // negative (clean). Unstable → genuinely unknowable (unverified).
+            checkStatus: !stable ? "unverified" : priv ? "suspected" : "tested-clean",
             ownerEvidenceId: base.evId,
             deniedEvidenceIds,
             compareEvidenceIds,
@@ -8086,8 +8227,12 @@ export function buildTools(s: PilotSession) {
             ),
           );
           const ok = results.filter(isSuccess);
-          if (ok.length < 2)
-            return txt(JSON.stringify({ concurrentSuccesses: ok.length, of: n, verdict: `not confirmed: at most ${ok.length}/${n} concurrent requests succeeded — the limit looks concurrency-safe (or the marker/target was wrong; point at a FRESH single-use resource and pass the exact success marker).` }));
+          if (ok.length < 2) {
+            // ok===1: the single-use limit held under a concurrent burst — a real evaluated negative.
+            // ok===0: nothing succeeded — can't tell "concurrency-safe" from "wrong marker/target".
+            const oneEv = ok.length === 1 ? rec(ok[0]!, "positive_replay", "the one success (limit held for the rest)") : "";
+            return txt(JSON.stringify({ concurrentSuccesses: ok.length, of: n, ...(oneEv ? { baselineEvidenceId: oneEv } : {}), result: ok.length === 1 ? "clean" : "unverified", verdict: `not confirmed: at most ${ok.length}/${n} concurrent requests succeeded — ${ok.length === 1 ? "the limit looks concurrency-safe" : "the marker/target may be wrong; point at a FRESH single-use resource and pass the exact success marker"}.` }));
+          }
           // control = a rejected concurrent attempt (the limit DID fire for it). If ALL succeeded, a sequential follow-up
           // should now be denied (resource consumed) — if it also succeeds, the action simply isn't single-use.
           const deniedRes = results.find((r): r is HttpResponse => !!r && !isSuccess(r));
@@ -8097,8 +8242,10 @@ export function buildTools(s: PilotSession) {
           } else {
             const seq = await s.http.send({ ...req });
             bumpHttp(s, seq.status);
-            if (isSuccess(seq))
-              return txt(JSON.stringify({ concurrentSuccesses: ok.length, of: n, verdict: `not a RACE: ${ok.length}/${n} concurrent succeeded AND a sequential follow-up ALSO succeeds — the action is simply repeatable (no single-use limit to overrun). If it is SUPPOSED to be single-use, that is a separate logic bug.` }));
+            if (isSuccess(seq)) {
+              const seqEv = rec(seq, "positive_replay", "sequential follow-up also succeeded — the action is repeatable, not single-use");
+              return txt(JSON.stringify({ concurrentSuccesses: ok.length, of: n, baselineEvidenceId: seqEv, result: "clean", verdict: `not a RACE: ${ok.length}/${n} concurrent succeeded AND a sequential follow-up ALSO succeeds — the action is simply repeatable (no single-use limit to overrun). If it is SUPPOSED to be single-use, that is a separate logic bug.` }));
+            }
             ctrlEv = rec(seq, "negative_control", "sequential follow-up denied (resource consumed) — the limit exists");
           }
           const p1 = rec(ok[0]!, "positive_replay", "concurrent success #1");
@@ -8107,6 +8254,8 @@ export function buildTools(s: PilotSession) {
             JSON.stringify({
               negativeControl: ctrlEv,
               positiveReplays: [p1, p2],
+              baselineEvidenceId: p1,
+              result: "confirmed",
               effectMarker: successMarker,
               concurrentSuccesses: ok.length,
               of: n,
@@ -8144,6 +8293,8 @@ export function buildTools(s: PilotSession) {
             JSON.stringify({
               negativeControl: ctrl.evId,
               positiveReplays: [p1.evId, p2.evId],
+              baselineEvidenceId: ctrl.evId,
+              result: confirmed ? "confirmed" : ctrl.reflected ? "unverified" : "clean",
               effectMarker: host,
               reflected: { control: ctrl.reflected, poisoned1: p1.reflected, poisoned2: p2.reflected },
               verdict: confirmed

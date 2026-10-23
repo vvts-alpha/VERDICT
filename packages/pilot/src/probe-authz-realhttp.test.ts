@@ -102,6 +102,12 @@ before(async () => {
       if (!who) return json(res, 401, { error: "unauthenticated" });
       return json(res, 200, { id: m[2], ownerId: doc.owner, tenant: m[1], invoice: `INV-${m[1]}-${m[2]}`, secret: doc.secret }); // BUG: cross-tenant
     }
+    m = /^\/api\/vuln\/cards\/([^/]+)$/.exec(u.pathname);
+    if (m) {
+      if (m[1] !== "c-1") return json(res, 404, { error: "not found" });
+      if (!who) return json(res, 401, { error: "unauthenticated" });
+      return json(res, 200, { id: m[1], displayName: "Alice A", avatar: "/avatars/a.png" }); // public directory card — readable by anyone authenticated
+    }
     if (u.pathname === "/graphql" && req.method === "POST") {
       const body = await readBody(req).catch(() => "");
       const id = /"id"\s*:\s*"([^"]+)"/.exec(body)?.[1] ?? "";
@@ -537,4 +543,32 @@ test("a missing owner/compare session reports which sessions ARE usable — neve
   assert.equal(r2.outcome, "unverified", JSON.stringify(r2));
   assert.match(String(r2.reason), /no usable session for compareRole 'ghost'/);
   assert.match(String(r2.reason), /Sessions usable now: .*userA/);
+});
+
+test("access observed on a PRIVATE object without proven ownership/expectation lands as a suspected lead — not unverified", async () => {
+  // No identityUrl, no operator principals/expectedAccess: the compare role DOES stably read a private
+  // object (invoice/items → private-object) and the non-existent-id control denies, but ownership and a
+  // deny expectation can't be established — a lead (suspected), matching probe_idor's POPULATED-but-
+  // unprovable rule, rather than sinking into unverified.
+  const s = session({ roles: { userA: "tok-a", userB: "tok-b" }, identity: false, currentRole: "userB", bearer: "tok-b" });
+  const r = await run(s, "probe_authz", {
+    url: `${base}api/vuln/orders/{{ID}}`, objectId: "o-a1", resourceType: "order",
+    ownerRole: "userA", compareRole: "userB",
+  });
+  assert.equal(r.outcome, "inconclusive", JSON.stringify(r));
+  const row = s.store.checks("a-1").find((c) => c.checkClass === "idor");
+  assert.equal(row?.status, "suspected", JSON.stringify(s.store.checks("a-1")));
+});
+
+test("access observed on a PUBLIC-directory card without proven ownership is tested-clean — not a lead", async () => {
+  // Same missing-proof shape, but the body classifies as a public directory card (displayName/avatar) —
+  // the access itself is unremarkable, so the check row is an evaluated negative, not suspected.
+  const s = session({ roles: { userA: "tok-a", userB: "tok-b" }, identity: false, currentRole: "userB", bearer: "tok-b" });
+  const r = await run(s, "probe_authz", {
+    url: `${base}api/vuln/cards/{{ID}}`, objectId: "c-1", resourceType: "card",
+    ownerRole: "userA", compareRole: "userB",
+  });
+  assert.equal(r.outcome, "inconclusive", JSON.stringify(r));
+  const row = s.store.checks("a-1").find((c) => c.checkClass === "idor");
+  assert.equal(row?.status, "tested-clean", JSON.stringify(s.store.checks("a-1")));
 });
