@@ -10,6 +10,7 @@ import { createSdkMcpServer, query } from "@anthropic-ai/claude-agent-sdk";
 import type { HookCallback } from "@anthropic-ai/claude-agent-sdk";
 import type { AssessmentStore, ControlCommand, Screen, ScopePolicy } from "@veritas/core";
 import { isInScope, isScannable, recordTokens, recordRequests, evaluateBudget, screenChecks } from "@veritas/core";
+import type { ScreenCheckView, ScreenScanStatus } from "@veritas/core";
 import { modelContextWindows } from "@veritas/core/llm-context";
 import type { LoginCreds } from "@veritas/crawler";
 import { InventoryBuilder, PlaywrightDriver, smartLogin } from "@veritas/crawler";
@@ -155,6 +156,35 @@ export interface RunPilotOptions {
   inputSweep?: boolean;
   /** In the input sweep, also submit POST forms (= writes data to the target). Default true. If false, GET/search only. */
   aggressiveForms?: boolean;
+}
+
+/** The screen-close decision, pure: verdict from recorded findings wins; a confirmed/suspected ledger
+ *  outcome nobody filed is a verifier/model divergence → unverified (never a silent clean); leftover
+ *  gaps → unverified; otherwise clean. Returns the divergence classes so the caller can log them. */
+export function closeScreenScanStatus(args: {
+  skipReason: string | null;
+  verdict: "finding" | "suspected" | null;
+  checkView: Pick<ScreenCheckView, "unstarted" | "gaps" | "classes">;
+}): { status: ScreenScanStatus; divergent: string[] } {
+  const ledgerFound = args.checkView.classes.filter((c) => c.status === "found").map((c) => c.checkClass);
+  const ledgerSuspected = args.checkView.classes.filter((c) => c.status === "suspected").map((c) => c.checkClass);
+  const divergent = [
+    ...(ledgerFound.length > 0 && args.verdict !== "finding" ? [`confirmed (${[...new Set(ledgerFound)].join(",")})`] : []),
+    ...(ledgerSuspected.length > 0 && args.verdict == null ? [`suspected (${[...new Set(ledgerSuspected)].join(",")})`] : []),
+  ];
+  const hasGaps = args.checkView.unstarted.length > 0 || args.checkView.gaps.length > 0;
+  const status: ScreenScanStatus = args.skipReason
+    ? "excluded"
+    : args.verdict === "finding"
+      ? "finding"
+      : divergent.length > 0
+        ? "unverified" // a confirmed ledger outcome reduced to suspected/none is still unresolved
+        : args.verdict === "suspected"
+          ? "suspected"
+          : hasGaps
+            ? "unverified"
+            : "clean";
+  return { status, divergent };
 }
 
 export interface PilotResult {
@@ -1675,16 +1705,16 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         //   A screen with no finding but unverified/blocked/unfulfilled check-ledger gaps closes as "unverified"
         //   (terminal, honest incomplete) — NOT clean: incomplete work is never converted to a pass.
         const checkView = screenChecks({ checkExecutions: opts.store.checks(opts.assessmentId) }, sc.screenId);
-        const hasCheckGaps = checkView.unstarted.length > 0 || checkView.gaps.length > 0;
-        const status = sess.screenSkipReason
-          ? "excluded"
-          : sess.screenVerdict === "finding"
-            ? "finding"
-            : sess.screenVerdict === "suspected"
-              ? "suspected"
-              : hasCheckGaps
-                ? "unverified"
-                : "clean";
+        // The close decision itself lives in closeScreenScanStatus: a confirmed/suspected ledger outcome
+        // nobody filed is a verifier/model divergence → unverified, never a silent clean (record_finding
+        // stays the only finding path — the outcome is never auto-promoted).
+        const close = closeScreenScanStatus({ skipReason: sess.screenSkipReason, verdict: sess.screenVerdict, checkView });
+        if (close.divergent.length > 0) {
+          const msg = `⚠ ${sc.screenId}: check ledger holds ${close.divergent.join(" + ")} outcome(s) with no matching recorded finding — verifier/model divergence, closing unverified`;
+          opts.onText?.(msg);
+          opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: msg } });
+        }
+        const status = close.status;
 
         // ── Auth-wall circuit breaker ── if every probe returns 401 and nothing gets through (zero 2xx, zero findings),
         //    running more screens is pointless. Stop and prompt the operator to set auth (httpBasic/creds/cookie).
@@ -1947,7 +1977,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         const msg = "✔ nothing to resume — every screen already has a verdict (the previous run reached report)";
         opts.onText?.(msg);
         opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: msg } });
-        return;
+        return { findings: session.findings, summary: msg, turns, tokensUsed: runTokens, costUsd };
       }
 
       // ── STAGE 4: scenario (A04 cross-screen logic) ── once, after per-screen diagnosis. Inherit real ids / confirmed auth /

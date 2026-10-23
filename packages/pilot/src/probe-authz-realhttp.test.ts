@@ -482,3 +482,59 @@ test("session isolation: each leg carries ONLY its own role's credentials", asyn
   assert.ok(!orderHits.some((w) => w.auth === "Bearer tok-b" && w.path.includes("o-c")), "B's token never sent on C's object leg");
   assert.ok(meHits.some((w) => w.auth === "Bearer tok-b") && meHits.some((w) => w.auth === "Bearer tok-c"), "each whoami ran under its own session");
 });
+
+// ───────────────────────── objectId:'auto' (owner-object discovery) ─────────────────────────
+
+test("probe_authz objectId:'auto' adopts the first observed id the OWNER can actually read", async () => {
+  const s = session({
+    roles: { userA: "tok-a", userB: "tok-b" }, tenants: { userA: "t1", userB: "t1" },
+    currentRole: "userA", bearer: "tok-a",
+    expectedAccess: [{ object: "o-a1", role: "userB", allow: false }],
+  });
+  // Earlier traffic observed the owner's own order — real ids are harvested from recorded response
+  // bodies, so 'auto' never guesses an id the app never served.
+  await run(s, "http_request", { method: "GET", url: `${base}api/orders/o-a1`, kind: "positive_replay" });
+  const r = await run(s, "probe_authz", {
+    url: `${base}api/vuln/orders/{{ID}}`, objectId: "auto", resourceType: "order",
+    ownerRole: "userA", compareRole: "userB",
+  });
+  assert.equal(r.outcome, "unexpected-access", JSON.stringify(r));
+  assert.equal((r.object as { id: string }).id, "o-a1", "the adopted object is what the comparison records");
+  const cmp = s.store.authzComparisons("a-1")[0];
+  assert.ok(cmp, "the comparison persisted — auto is a discovery step, not an evidence shortcut");
+});
+
+test("probe_authz objectId:'auto' with no READABLE observed ids reports honestly instead of guessing", async () => {
+  // A fresh session still harvests the identity-endpoint bodies (u-a/u-b are real observed ids — and on
+  // /api/users/{id}-style endpoints a principal id IS a legitimate object candidate). None is a readable
+  // order, so the outcome must be an honest unverified naming the recovery step — never a guess.
+  const s = session({ roles: { userA: "tok-a", userB: "tok-b" }, currentRole: "userA", bearer: "tok-a" });
+  const r = await run(s, "probe_authz", {
+    url: `${base}api/orders/{{ID}}`, objectId: "auto", resourceType: "order",
+    ownerRole: "userA", compareRole: "userB",
+  });
+  assert.equal(r.outcome, "unverified", JSON.stringify(r));
+  assert.match(String(r.reason), /objectId:'auto' tried \d+ observed id\(s\)/);
+  assert.match(String(r.reason), /none was a readable object/);
+  assert.match(String(r.reason), /List the owner's own resources/, "the reason names the recovery step");
+  assert.ok(!s.store.checks("a-1").some((c) => c.status === "found"), "no readable candidate → no fabricated comparison");
+});
+
+test("a missing owner/compare session reports which sessions ARE usable — never falls back", async () => {
+  const s = session({ roles: { userA: "tok-a" }, currentRole: "userA", bearer: "tok-a" });
+  const r = await run(s, "probe_authz", {
+    url: `${base}api/orders/{{ID}}`, objectId: "o-a1", resourceType: "order",
+    ownerRole: "ghost", compareRole: "userB",
+  });
+  assert.equal(r.outcome, "unverified", JSON.stringify(r));
+  assert.match(String(r.reason), /no usable session for ownerRole 'ghost'/);
+  assert.match(String(r.reason), /Sessions usable now: .*userA/, "the failure enumerates the usable sessions");
+  // The compare-side message carries the same enumeration.
+  const r2 = await run(s, "probe_authz", {
+    url: `${base}api/orders/{{ID}}`, objectId: "o-a1", resourceType: "order",
+    ownerRole: "userA", compareRole: "ghost",
+  });
+  assert.equal(r2.outcome, "unverified", JSON.stringify(r2));
+  assert.match(String(r2.reason), /no usable session for compareRole 'ghost'/);
+  assert.match(String(r2.reason), /Sessions usable now: .*userA/);
+});

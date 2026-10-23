@@ -4,7 +4,7 @@
 
 import type { AssessmentState, AuthState, CheckExecution, CheckStatus, Finding, FindingVerdict, Phase, ScopePolicy, ScreenScanStatus, ScreenType, Severity } from "./types/index.js";
 import { coverage } from "./coverage.js";
-import { rollupChecks } from "./checks.js";
+import { OBSERVATION_CHECK_CLASSES, rollupChecks } from "./checks.js";
 import { deriveRoleProgress, type RoleProgress } from "./view.js";
 import { mutationLedger, type MutationRow } from "./mutations.js";
 
@@ -267,9 +267,13 @@ export function buildReportModel(state: AssessmentState, now: Date = new Date(),
       .map((s) => [s, 0]),
   ) as Record<CheckStatus, number>;
   for (const c of state.checkExecutions) byStatus[c.status] += 1;
+  const checkGaps = state.checkExecutions.filter(
+    (c) => (c.status === "unverified" || c.status === "blocked" || c.status === "running") && !OBSERVATION_CHECK_CLASSES.has(c.checkClass),
+  ).length;
   const unfulfilledPlans = rollupChecks(state.checkExecutions).reduce((n, cell) => n + cell.unfulfilled.length, 0);
 
-  const checkedScreens = new Set(state.checkExecutions.map((c) => c.screenId));
+  // A screen is "checked" only by verdict-bearing rows — raw traffic observations neither gap nor back it.
+  const checkedScreens = new Set(state.checkExecutions.filter((c) => !OBSERVATION_CHECK_CLASSES.has(c.checkClass)).map((c) => c.screenId));
   const findingScreens = new Set(sorted.map((f) => f.screenId).filter((x): x is string => x != null));
   const legacyScreens: ReportLegacyScreen[] = screens
     // A conclusive scan status asserts a finished diagnosis; with zero ledger rows the claim traces to
@@ -283,10 +287,11 @@ export function buildReportModel(state: AssessmentState, now: Date = new Date(),
     })
     .map((s) => ({ screenId: s.screenId, url: s.url, scanStatus: s.scanStatus as ScreenScanStatus }));
 
-  // "Tested" counts only conclusive statuses that carry structured backing. A legacy/log-claimed
-  // clean or finding with zero check rows (and no recorded finding) is disclosed as `claimed` —
-  // an unknown-detail status, never folded into the tested headline.
-  const statusClaims = cov.byStatus.clean + cov.byStatus.finding + cov.byStatus.suspected;
+  // "Scanned" counts every screen whose diagnosis actually EXECUTED — conclusive outcomes AND
+  // honest inconclusive ones (unverified is an executed terminal status, never a pass but always
+  // real work). A legacy/log-claimed clean or finding with zero check rows (and no recorded
+  // finding) is disclosed as `claimed` — an unknown-detail status, never folded into the headline.
+  const statusClaims = cov.byStatus.clean + cov.byStatus.finding + cov.byStatus.suspected + cov.byStatus.unverified;
   const backedScanned = statusClaims - legacyScreens.length;
   const roleProgress = deriveRoleProgress(state.events);
 
@@ -306,7 +311,7 @@ export function buildReportModel(state: AssessmentState, now: Date = new Date(),
         total: checks.length,
         byStatus,
         unfulfilledPlans,
-        gaps: byStatus.unverified + byStatus.blocked + byStatus.running,
+        gaps: checkGaps,
         legacyCleanScreens: legacyScreens.length,
       },
     },

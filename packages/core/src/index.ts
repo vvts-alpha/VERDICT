@@ -83,6 +83,7 @@ export {
   screenChecks,
   TERMINAL_CHECK_STATUSES,
   EXECUTION_CHECK_STATUSES,
+  OBSERVATION_CHECK_CLASSES,
 } from "./checks.js";
 export type { ClassRollup, ScreenCheckView } from "./checks.js";
 

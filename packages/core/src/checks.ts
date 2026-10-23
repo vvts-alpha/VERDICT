@@ -66,6 +66,11 @@ export function planSatisfiedBy(plan: CheckExecution, e: CheckExecution): boolea
   return true;
 }
 
+/** Check classes that record raw traffic/observations rather than a verdict-bearing check: they
+ *  stay listed in the ledger but cover nothing and can never hold a screen "unverified" — an
+ *  unattributed fetch has no conclusion to leave hanging. */
+export const OBSERVATION_CHECK_CLASSES: ReadonlySet<string> = new Set(["http-request"]);
+
 /** Rollup precedence for a (screen, class) cell: a real hole outranks; gaps stay visible via conclusive. */
 const ROLLUP_RANK: Record<CheckStatus, number> = {
   found: 7,
@@ -95,7 +100,7 @@ export interface ClassRollup {
 export function rollupChecks(checks: ReadonlyArray<CheckExecution>): ClassRollup[] {
   const byCell = new Map<string, CheckExecution[]>();
   for (const c of checks) {
-    if (c.checkClass === "http-request") continue; // unattributed raw requests are listed but cover nothing
+    if (OBSERVATION_CHECK_CLASSES.has(c.checkClass)) continue; // unattributed raw requests are listed but cover nothing
     const k = `${c.screenId}${c.checkClass}`;
     const arr = byCell.get(k) ?? [];
     arr.push(c);
@@ -140,6 +145,8 @@ export function screenChecks(state: Pick<AssessmentState, "checkExecutions">, sc
   const mine = state.checkExecutions.filter((c) => c.screenId === screenId);
   const classes = rollupChecks(mine);
   const unstarted = classes.flatMap((c) => c.unfulfilled);
-  const gaps = mine.filter((c) => c.status === "unverified" || c.status === "blocked" || c.status === "running");
-  return { screenId, unstarted, classes, gaps, legacy: mine.length === 0 };
+  const gaps = mine.filter((c) => (c.status === "unverified" || c.status === "blocked" || c.status === "running") && !OBSERVATION_CHECK_CLASSES.has(c.checkClass));
+  // "legacy" = no VERDICT-BEARING rows: a conclusive status backed only by raw traffic observations is
+  // a claim, not tested evidence — same substance as zero rows.
+  return { screenId, unstarted, classes, gaps, legacy: !mine.some((c) => !OBSERVATION_CHECK_CLASSES.has(c.checkClass)) };
 }

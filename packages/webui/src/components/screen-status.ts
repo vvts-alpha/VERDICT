@@ -23,10 +23,13 @@ export interface ScreenHonesty {
   unfulfilled: number;
 }
 
-// Mirrors core TERMINAL_CHECK_STATUSES / planSatisfiedBy — webui stays types-only on core, so the
-// rollup is ported faithfully: a plan slot is satisfied ONLY by a terminal execution matching every
-// explicitly bound dimension (target/param/subject/principal/tenant/origin/session/resource).
+// Mirrors core TERMINAL_CHECK_STATUSES / planSatisfiedBy / OBSERVATION_CHECK_CLASSES — webui stays
+// types-only on core, so the rollup is ported faithfully: a plan slot is satisfied ONLY by a terminal
+// execution matching every explicitly bound dimension (target/param/subject/principal/tenant/origin/
+// session/resource). Observation rows (raw fetches) record traffic but carry no verdict — they can
+// never be a screen's "gap".
 const TERMINAL: ReadonlySet<string> = new Set(["found", "suspected", "tested-clean", "not-applicable", "unverified", "blocked"]);
+const OBSERVATION_CLASSES: ReadonlySet<string> = new Set(["http-request"]);
 export function planSatisfied(plan: CheckExecution, e: CheckExecution): boolean {
   if (e.status === "planned" || !TERMINAL.has(e.status)) return false;
   if (plan.screenId !== e.screenId || plan.checkClass !== e.checkClass) return false;
@@ -58,9 +61,11 @@ export function screenHonestyMap(view: StateView): Map<string, ScreenHonesty> {
     const plans = rows.filter((r) => r.status === "planned");
     const execs = rows.filter((r) => r.status !== "planned");
     const unfulfilled = plans.filter((p) => !execs.some((e) => planSatisfied(p, e))).length;
-    const gaps = execs.filter((e) => e.status === "unverified" || e.status === "blocked" || e.status === "running").length;
+    const gaps = execs.filter((e) => (e.status === "unverified" || e.status === "blocked" || e.status === "running") && !OBSERVATION_CLASSES.has(e.checkClass)).length;
     const conclusive = s.status === "clean" || s.status === "finding" || s.status === "suspected";
-    const legacy = conclusive && rows.length === 0 && (s.status === "clean" || !findingScreens.has(s.screenId));
+    // Legacy = no VERDICT-BEARING rows — a conclusive status backed only by raw traffic observations is
+    // a claim (unknown detail), not tested evidence.
+    const legacy = conclusive && !rows.some((r) => !OBSERVATION_CLASSES.has(r.checkClass)) && (s.status === "clean" || !findingScreens.has(s.screenId));
     let status: EffectiveStatus = s.status;
     if (legacy) status = "unknown-records";
     else if (s.status === "clean" && (gaps > 0 || unfulfilled > 0)) status = "unverified";

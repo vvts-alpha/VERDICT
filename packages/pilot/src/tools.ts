@@ -744,6 +744,57 @@ export function observationDiffersFromControl(ctrl: { status: number; body: stri
 /** A safe marker that never attempts external reachability (for open-redirect / reflection detection; a non-resolving domain). */
 const OOB_MARKER = "veritas-oob.example";
 
+/** Roles with replayable session material right now — for error messages that should name which
+ *  subjects a comparison could actually run under. 'unauth' is always usable (anonymous legs need no headers). */
+function usableRoles(s: PilotSession): string[] {
+  const roles = new Set<string>(["unauth"]);
+  if (s.currentRole) roles.add(s.currentRole);
+  for (const r of s.roleSessions?.keys() ?? []) roles.add(r);
+  for (const r of s.roleCookieFiles.keys()) roles.add(r);
+  for (const r of s.roleCreds.keys()) roles.add(r);
+  for (const r of s.invalidRoleSessions ?? []) roles.delete(r);
+  return [...roles];
+}
+
+/** When a probe's control/baseline leg can't reach a valid app response, say WHY in terms of what was
+ *  sent and hand back the observed request shape — a malformed hand-crafted request becomes a
+ *  directed retry instead of a dead unverified. Purely observational: reads the current screen's
+ *  recorded apis/params, never fabricates an endpoint. */
+export function baselineRetryHint(s: PilotSession, url: string, st: number): string {
+  const bits: string[] = [];
+  if (st === 401 || st === 403) bits.push(`status ${st} = this session has no read access — login(<role>) first, then re-run under it`);
+  else if (st >= 400) bits.push(`status ${st} = the request SHAPE was refused (param name/location/method), not that the check is impossible`);
+  const sc = s.inv.screens().find((x) => x.screenId === s.currentScreenId);
+  if (sc) {
+    let stem = "";
+    try {
+      stem = new URL(url, s.targetUrl).pathname.replace(/\/+$/, "");
+    } catch {
+      /* keep stem empty */
+    }
+    const seen = new Set<string>();
+    const shapes: string[] = [];
+    for (const a of sc.apis) {
+      const tmplStem = a.urlTemplate.split("{")[0]!.replace(/\/+$/, "");
+      if (!tmplStem || !(stem === tmplStem || stem.startsWith(`${tmplStem}/`))) continue;
+      const sh = `${a.method} ${a.urlTemplate}`;
+      if (!seen.has(sh)) {
+        seen.add(sh);
+        shapes.push(sh);
+      }
+    }
+    for (const p of sc.params.slice(0, 6)) {
+      const sh = `${p.name}@${p.in}${p.example ? `=${p.example.slice(0, 24)}` : ""}`;
+      if (!seen.has(sh)) {
+        seen.add(sh);
+        shapes.push(sh);
+      }
+    }
+    if (shapes.length) bits.push(`observed shape on ${sc.screenId}: ${shapes.slice(0, 6).join(" · ")} — retry with that method/location (a path id is location:'path:-1', not ?id=)`);
+  }
+  return bits.length ? ` RECOVERY: ${bits.join(" ")}.` : "";
+}
+
 /** Does the Location header actually REDIRECT to `host` (its parsed target host), rather than merely mention it as a
  *  substring? A same-site interstitial like `Location: /leaving?url=https://host/` reflects the payload but redirects
  *  ON-SITE — `loc.includes(host)` false-confirms it as an open redirect; the parsed hostname does not. */
@@ -2878,6 +2929,9 @@ export function buildTools(s: PilotSession) {
         }
         if (!benign) return txt("ERROR: bad url/param — pass url+param or a body with {{XSS}}.");
         const reflected = benign.body.includes(benignMarker);
+        // A 5xx benign means the endpoint never evaluated the input — "not reflected" would be silence, not a verdict.
+        if (benign.status >= 500)
+          return txt(JSON.stringify({ reflected, result: "unverified", verdict: `UNVERIFIED: the benign baseline returned status ${benign.status} — the input never reached the app, so reflection cannot be judged either way.${baselineRetryHint(s, url, benign.status)}` }));
         // ── filter-bypass corpus iteration ── look for a payload that survives (one at a time).
         let winner: (typeof corpus)[number] | null = null;
         let htmlCtx = false;
@@ -2997,6 +3051,8 @@ export function buildTools(s: PilotSession) {
           const outPayloads = [arith, `;echo ${arith};`, `|echo ${arith}`, `$(expr ${a} \\* ${b})`, "`expr " + a + " \\* " + b + "`", `&&echo ${arith}`, `%0aecho ${arith}%0a`];
           const benign = await rawSend("1");
           if (!benign) return txt("ERROR: bad url/param — pass url+param or a body with {{CMD}}.");
+          if (benign.status >= 500)
+            return txt(JSON.stringify({ technique: null, result: "unverified", verdict: `UNVERIFIED: the benign baseline returned status ${benign.status} — the input never reached the app, so "no product echo" is silence, not a negative.${baselineRetryHint(s, url, benign.status)}` }));
           // ── output-based (arithmetic-product marker) ──
           for (const p of outPayloads) {
             const r = await rawSend(p);
@@ -3015,7 +3071,7 @@ export function buildTools(s: PilotSession) {
           }
           const timing = await probeTiming(s, buildReq, "claude-pilot-cmdi", [";sleep 5;", "|sleep 5", "$(sleep 5)", "&&sleep 5", "%0asleep 5%0a", "&ping -n 5 127.0.0.1", "|ping -c 5 127.0.0.1"]);
           if (timing) return txt(JSON.stringify(timing));
-          return txt(JSON.stringify({ technique: null, verdict: "not confirmed: no product echo and no time delay across separator/substitution payloads. If a URL/host param, also try probe_oob (blind CMDi via a DNS/HTTP callback)." }));
+          return txt(JSON.stringify({ technique: null, result: benign.status >= 400 ? "unverified" : "clean", verdict: `not confirmed: no product echo and no time delay across separator/substitution payloads. If a URL/host param, also try probe_oob (blind CMDi via a DNS/HTTP callback).${benign.status >= 400 ? ` (Note: the baseline itself was status ${benign.status} — the input may never have been evaluated.${baselineRetryHint(s, url, benign.status)})` : ""}` }));
         } catch (e) {
           return txt(`ERROR: ${String(e).slice(0, 180)}`);
         }
@@ -3265,11 +3321,13 @@ export function buildTools(s: PilotSession) {
             effectMarker: product,
             control: { evaluated: ctrl.evaluated },
             payload: [{ evaluated: p1.evaluated, echoedLiteral: p1.echoedLiteral }, { evaluated: p2.evaluated, echoedLiteral: p2.echoedLiteral }],
-            verdict: verdict.ok
-              ? `SSTI CONFIRMED — the server evaluated ${a}*${b} to ${product} (control did not). record_finding(category ssti) with these evidenceIds + effectMarker; severity high+ (template eval is RCE-class — you can escalate to OS command exec).`
-              : p1.echoedLiteral || p2.echoedLiteral
-                ? `not confirmed: the payload was REFLECTED LITERALLY (not evaluated) — that is XSS-surface, not SSTI. ${(verdict as { reason: string }).reason}`
-                : `not confirmed: ${(verdict as { reason: string }).reason}`,
+            verdict: `${
+              verdict.ok
+                ? `SSTI CONFIRMED — the server evaluated ${a}*${b} to ${product} (control did not). record_finding(category ssti) with these evidenceIds + effectMarker; severity high+ (template eval is RCE-class — you can escalate to OS command exec).`
+                : p1.echoedLiteral || p2.echoedLiteral
+                  ? `not confirmed: the payload was REFLECTED LITERALLY (not evaluated) — that is XSS-surface, not SSTI. ${(verdict as { reason: string }).reason}`
+                  : `not confirmed: ${(verdict as { reason: string }).reason}`
+            }${outcome === "unverified" ? baselineRetryHint(s, url, baselineOk ? p1.status : ctrl.status) : ""}`,
           }),
         );
       },
@@ -3334,7 +3392,7 @@ export function buildTools(s: PilotSession) {
           const benign = await send("1", "negative_control", "baseline(benign)");
           if (!benign) return txt("ERROR: bad url/param — pass url+param or a body with {{SQLI}}.");
           if (!validAppBaseline(benign))
-            return txt(JSON.stringify({ technique: null, result: "unverified", baselineEvidenceId: benign.evId, evidenceIds: sentEvIds, verdict: `UNVERIFIED: the benign baseline did not reach a valid app response (status ${benign.status}${isAuthRedirect(benign) ? " — redirected to an auth/login page" : ""}). The endpoint cannot be probed through this session, so SQLi is neither confirmed nor ruled out here.` }));
+            return txt(JSON.stringify({ technique: null, result: "unverified", baselineEvidenceId: benign.evId, evidenceIds: sentEvIds, verdict: `UNVERIFIED: the benign baseline did not reach a valid app response (status ${benign.status}${isAuthRedirect(benign) ? " — redirected to an auth/login page" : ""}). The endpoint cannot be probed through this session, so SQLi is neither confirmed nor ruled out here.${baselineRetryHint(s, url, benign.status)}` }));
           // Structured ledger contract: `result` is set at THIS branch (never parsed from verdict text),
           // `baselineEvidenceId` = the benign leg that validates the baseline, `evidenceIds` = every leg sent.
           // ── noise-floor ── measure the page's own per-request jitter from two benign baselines (normalized to strip
@@ -3726,7 +3784,7 @@ export function buildTools(s: PilotSession) {
               ...(cracked ? { hmacCracked: { technique: cracked.technique, secret: cracked.secret } } : {}),
               control: { status: ctrl.status },
               verdict: !baselineOk
-                ? `UNVERIFIED: the original token did not reach a valid app response (status ${orig.status}${isAuthRedirect(orig) ? " — redirected to login" : ""}), so "forgeries denied" cannot be trusted — the endpoint may not accept ANY JWT here.`
+                ? `UNVERIFIED: the original token did not reach a valid app response (status ${orig.status}${isAuthRedirect(orig) ? " — redirected to login" : ""}), so "forgeries denied" cannot be trusted — the endpoint may not accept ANY JWT here.${baselineRetryHint(s, url, orig.status)}`
                 : !ctrlRejected
                   ? `UNVERIFIED: the garbage-token control was not cleanly rejected (status ${ctrl.status}), so the endpoint's JWT validation could not be evaluated.`
                   : inconclusiveLegs > 0
@@ -7327,12 +7385,12 @@ export function buildTools(s: PilotSession) {
     // ───────────────────────── evidence-backed A/B authorization comparison ─────────────────────────
     tool(
       "probe_authz",
-      "Run a BOUNDED, evidence-backed A/B authorization test on ONE concrete object — the only path that can produce a CONFIRMABLE idor/idor-write finding. `ownerRole` = the subject that legitimately owns the object (its session sends the baseline read), `compareRole` = the non-owner/lower-privileged subject under test. The tool: establishes each role's principal (identityUrl when configured), reads the object AS THE OWNER (baseline must succeed and carry the object), sends a denied control (a non-existent id as the compare role — proves the endpoint discriminates), then replays the access AS THE COMPARE ROLE twice (stability). Confirms ONLY when: ownership is verified (owner field in the owner baseline binds to the owner's established principal — OR an operator expectedAccess rule), the compare principal is established and differs from the owner, the denied control actually denied, and both compare replays returned the private object. Everything else is recorded honestly: unexpected-looking access without verified ownership/expectation = 'inconclusive' (a LEAD, cite it as suspected at most); a missing/expired comparison session NEVER falls back to another session — the run is recorded 'unverified'/'blocked'. Same-principal A/B (two aliases for one account) is REJECTED. `objectId` must appear in `url` (path/query) or `body`; a {{ID}} placeholder is also accepted (the tool swaps objectId in). `action` 'write' marks the comparison a mutating test (idor-write) — use only for requests that actually mutate, a search/query POST is a READ.",
+      "Run a BOUNDED, evidence-backed A/B authorization test on ONE concrete object — the only path that can produce a CONFIRMABLE idor/idor-write finding. `ownerRole` = the subject that legitimately owns the object (its session sends the baseline read), `compareRole` = the non-owner/lower-privileged subject under test. The tool: establishes each role's principal (identityUrl when configured), reads the object AS THE OWNER (baseline must succeed and carry the object), sends a denied control (a non-existent id as the compare role — proves the endpoint discriminates), then replays the access AS THE COMPARE ROLE twice (stability). Confirms ONLY when: ownership is verified (owner field in the owner baseline binds to the owner's established principal — OR an operator expectedAccess rule), the compare principal is established and differs from the owner, the denied control actually denied, and both compare replays returned the private object. Everything else is recorded honestly: unexpected-looking access without verified ownership/expectation = 'inconclusive' (a LEAD, cite it as suspected at most); a missing/expired comparison session NEVER falls back to another session — the run is recorded 'unverified'/'blocked'. Same-principal A/B (two aliases for one account) is REJECTED. `objectId` must appear in `url` (path/query) or `body`; a {{ID}} placeholder is also accepted (the tool swaps objectId in) — OR pass `objectId:'auto'`: the tool tries observed ids (this screen's id examples first, then ids seen in real traffic) as the owner baseline and adopts the first one '${ownerRole}' can actually read — use it when you know the roles to compare but not a concrete owned object. `action` 'write' marks the comparison a mutating test (idor-write) — use only for requests that actually mutate, a search/query POST is a READ.",
       {
         url: z.string(),
         method: z.string().optional(),
         body: z.string().nullable().optional(),
-        objectId: z.string().describe("the concrete object identifier under test (must appear in url or body, or use {{ID}})"),
+        objectId: z.string().describe("the concrete object identifier under test (must appear in url or body, or use {{ID}}) — or 'auto' to let the tool try observed ids as the owner baseline"),
         resourceType: z.string().optional().describe("logical resource type label, e.g. 'order' — defaults to a guess from the url"),
         param: z.string().optional().describe("the param carrying objectId (query name / json:path) — informational; the check row keys on it"),
         ownerRole: z.string().describe("role that legitimately owns/reads this object (baseline leg)"),
@@ -7341,7 +7399,11 @@ export function buildTools(s: PilotSession) {
         tenant: z.string().optional().describe("the object's tenant — only meaningful when operator-established (ignored for boundary claims otherwise)"),
         note: z.string().optional(),
       },
-      async ({ url, method, body, objectId, resourceType, param, ownerRole, compareRole, action, note }) => {
+      async ({ url: urlArg, method, body, objectId: objectIdArg, resourceType, param, ownerRole, compareRole, action, note }) => {
+        // `let` — objectId:'auto' may rewrite the url's {id} template into a {{ID}} placement and adopt a
+        // discovered object id; placeId/send/carriesId/readLeg all read these variables at call time.
+        let url = urlArg;
+        let objectId = objectIdArg;
         const m = (method ?? (body != null ? "POST" : "GET")).toUpperCase();
         const act: "read" | "write" = action ?? "read";
         const cls = act === "write" ? "idor-write" : "idor";
@@ -7457,9 +7519,9 @@ export function buildTools(s: PilotSession) {
         const ownerH = (await roleAuthHeaders(s, ownerRole)) ?? (ownerRole === s.currentRole ? authHeaders(s) : null);
         const cmpH = (await roleAuthHeaders(s, compareRole)) ?? (compareRole === s.currentRole ? authHeaders(s) : null);
         if (ownerH === null)
-          return finish("unverified", { reason: `no usable session for ownerRole '${ownerRole}' (no live/cookie-file session and it is not the active role) — cannot take an owner baseline`, checkStatus: "blocked" });
+          return finish("unverified", { reason: `no usable session for ownerRole '${ownerRole}' (no live/cookie-file session and it is not the active role) — cannot take an owner baseline. Sessions usable now: ${usableRoles(s).join(", ")} — login('${ownerRole}') first, or pick an owner among them`, checkStatus: "blocked" });
         if (cmpH === null)
-          return finish("unverified", { reason: `no usable session for compareRole '${compareRole}' — missing/expired comparison session (no fallback to another role's credentials)`, checkStatus: "blocked" });
+          return finish("unverified", { reason: `no usable session for compareRole '${compareRole}' — missing/expired comparison session (no fallback to another role's credentials). Sessions usable now: ${usableRoles(s).join(", ")} — login('${compareRole}') first, or pick a compare role among them`, checkStatus: "blocked" });
 
         // ── principals (whoami identity binding when identityUrl configured; evidence-linked, session-bound) ──
         const identityEvidenceIds: string[] = [];
@@ -7473,7 +7535,7 @@ export function buildTools(s: PilotSession) {
         const invalid = [ownerRole, compareRole].filter((r) => s.invalidRoleSessions?.has(r));
         if (invalid.length)
           return finish("unverified", {
-            reason: `session(s) ${invalid.map((r) => `'${r}'`).join(", ")} rejected by the identity endpoint — expired/invalid session material. Any denial under it is a session failure, not an authorization decision`,
+            reason: `session(s) ${invalid.map((r) => `'${r}'`).join(", ")} rejected by the identity endpoint — expired/invalid session material. Any denial under it is a session failure, not an authorization decision. Sessions usable now: ${usableRoles(s).join(", ")} — login() the rejected role(s) again to refresh, or pick subjects among them`,
             checkStatus: "blocked",
             identityEvidenceIds,
           });
@@ -7708,6 +7770,55 @@ export function buildTools(s: PilotSession) {
         };
 
         try {
+          // ── leg 0 (auto): resolve WHICH object the owner actually owns. The model supplies the
+          //    comparison shape ({url with a {{ID}}/{id} placement or a `param`, ownerRole, compareRole});
+          //    the tool discovers the concrete object. Candidates: this screen's observed id examples
+          //    first (right resource family), then the run-wide pool of ids seen in real traffic. The
+          //    owner baseline READ is the arbiter — a candidate the owner can't read just fails its leg.
+          if (objectId === "auto") {
+            // Convert a single-brace path template ({id}) into the {{ID}} placement — but ONLY when no
+            // {{ID}} exists already: the regex's inner class also matches '{', so running it on an
+            // existing {{ID}} would leave a stray trailing '}' (o-a1} → 404).
+            if (!url.includes("{{ID}}")) url = url.replace(/\/\{[^}/]+\}/, "/{{ID}}");
+            if (!url.includes("{{ID}}") && !(body ?? "").includes("{{ID}}") && !param)
+              return finish("unverified", { reason: "objectId:'auto' needs a placement — a {{ID}} or {id} segment in the url/body, or a 'param' naming the field the id lives in", checkStatus: "unverified" });
+            const cands: string[] = [];
+            const scAuto = s.inv.screens().find((x) => x.screenId === s.currentScreenId);
+            for (const l of scAuto ? idBearingParamLocs(scAuto.params) : []) if (l.example && !cands.includes(l.example)) cands.push(l.example);
+            for (const k of knownObjectIds(s)) {
+              const v = k.includes("=") ? k.split("=").pop()! : k;
+              if (v && !cands.includes(v)) cands.push(v);
+            }
+            const tried: string[] = [];
+            let adopted: string | null = null;
+            for (const cand of cands.slice(0, 6)) {
+              const leg = await send(cand, ownerH, "negative_control", `auto owner-baseline '${cand}'`);
+              if (!leg) {
+                tried.push(`${cand}→unplaced`);
+                continue;
+              }
+              tried.push(`${cand}→${leg.status}`);
+              // carriesId/readLeg judge the response against `objectId` — point it at THIS candidate.
+              objectId = cand;
+              if (readLeg(leg) === "access") {
+                adopted = cand;
+                break;
+              }
+            }
+            if (adopted === null) {
+              objectId = objectIdArg; // the recorded comparison keeps "auto" — no object was ever adopted
+              return finish("unverified", {
+                reason: `objectId:'auto' tried ${tried.length} observed id(s) for '${ownerRole}' and none was a readable object (${tried.join(", ") || "no candidates"}). List the owner's own resources via http_request to learn a real owned id, then pass it as objectId`,
+                checkStatus: "unverified",
+                identityEvidenceIds,
+              });
+            }
+            objectId = adopted;
+            // ownerTenant, not the outer objectTenant let — a `const objectTenant` later in this try block
+            // shadows the name, so referencing it here would hit the temporal dead zone.
+            objectKey = JSON.stringify([rtype, origin, target, ownerTenant ?? "", objectId]);
+          }
+
           // ── leg 1: owner baseline — must actually carry the object ──
           const base = await send(objectId, ownerH, "negative_control", `owner baseline as '${ownerRole}'`);
           if (!base)
@@ -7715,7 +7826,7 @@ export function buildTools(s: PilotSession) {
           const baseLeg = readLeg(base);
           if (baseLeg !== "access")
             return finish("unverified", {
-              reason: `owner baseline failed: '${ownerRole}' read of its own ${rtype} ${objectId} → ${baseLeg === "denied" ? "denied" : `invalid (status ${base.status})`} — the claimed owner cannot read the object, so the ownership premise is wrong`,
+              reason: `owner baseline failed: '${ownerRole}' read of its own ${rtype} ${objectId} → ${baseLeg === "denied" ? "denied" : `invalid (status ${base.status})`} — the claimed owner cannot read the object, so the ownership premise is wrong. Establish a real owned object first: list '${ownerRole}'s own resources via http_request (an endpoint that returns THEIR records) and retry with an id it actually owns — or pass objectId:'auto' to try observed ids`,
               checkStatus: "unverified",
               ownerEvidenceId: base.evId,
               identityEvidenceIds,

@@ -7,9 +7,10 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildTools } from "./tools.js";
+import { buildTools, baselineRetryHint } from "./tools.js";
 import type { PilotSession } from "./tools.js";
 import { recordCheck } from "./checks.js";
+import { closeScreenScanStatus } from "./run.js";
 import { EvidenceStore, FetchHttpClient } from "@veritas/scanner";
 import { InventoryBuilder } from "@veritas/crawler";
 import { AssessmentStore, deriveScopeFromSingleUrl, screenChecks } from "@veritas/core";
@@ -196,4 +197,70 @@ test("A/B rows for different principals/resources never collapse into one key", 
   const keys = new Set(rows.map((c) => c.id));
   assert.equal(keys.size, rows.length, "distinct (subject,resource) rows — no key collapse");
   assert.ok(rows.some((c) => c.status === "unverified") && rows.some((c) => c.status === "found"), "one object's unverified does not erase another's finding");
+});
+
+test("raw http-request observation rows never create a screen gap (real probe gaps still do)", () => {
+  const s = session();
+  recordCheck(s, { tool: "probe_sqli", checkClass: "sqli", target: "GET /search", param: "q", status: "tested-clean", reason: "no differential" });
+  // Raw traffic observations — even inconclusive/blocked ones — are not verdict-bearing checks.
+  recordCheck(s, { tool: "http_request", checkClass: "http-request", target: "GET /search", status: "unverified", reason: "raw fetch 500" });
+  recordCheck(s, { tool: "http_request", checkClass: "http-request", target: "GET /x", status: "blocked", reason: "scope" });
+  recordCheck(s, { tool: "http_request", checkClass: "http-request", target: "GET /y", status: "running", reason: "in flight" });
+  const view = screenChecks({ checkExecutions: s.store.checks("a-1") }, s.currentScreenId ?? "");
+  assert.equal(view.gaps.length, 0, "observation rows can never gap a screen");
+  // …but an inconclusive outcome on a real check class still is a gap.
+  recordCheck(s, { tool: "probe_xss", checkClass: "xss-reflected", target: "GET /search", param: "q", status: "unverified", reason: "baseline 500" });
+  const view2 = screenChecks({ checkExecutions: s.store.checks("a-1") }, s.currentScreenId ?? "");
+  assert.equal(view2.gaps.length, 1);
+  assert.equal(view2.gaps[0]!.checkClass, "xss-reflected");
+});
+
+test("a confirmed/suspected ledger outcome nobody filed closes unverified — never a silent clean", () => {
+  const s = session();
+  recordCheck(s, { tool: "probe_sqli", checkClass: "sqli", target: "GET /search", param: "q", status: "found", reason: "confirmed differential" });
+  const view = screenChecks({ checkExecutions: s.store.checks("a-1") }, s.currentScreenId ?? "");
+  // Model filed nothing: the ledger's confirmed outcome has no matching finding → unverified + divergence.
+  const r1 = closeScreenScanStatus({ skipReason: null, verdict: null, checkView: view });
+  assert.equal(r1.status, "unverified");
+  assert.ok(r1.divergent.some((d) => d.includes("confirmed")), JSON.stringify(r1));
+  // A suspected-only ledger with no verdict is likewise unresolved.
+  const s2 = session();
+  recordCheck(s2, { tool: "probe_idor", checkClass: "idor", target: "GET /search", status: "suspected", reason: "anomaly" });
+  const v2 = screenChecks({ checkExecutions: s2.store.checks("a-1") }, s2.currentScreenId ?? "");
+  const r2 = closeScreenScanStatus({ skipReason: null, verdict: null, checkView: v2 });
+  assert.equal(r2.status, "unverified");
+  assert.ok(r2.divergent.some((d) => d.includes("suspected")));
+  // Once the model records the matching verdict the same ledger closes by it.
+  assert.equal(closeScreenScanStatus({ skipReason: null, verdict: "finding", checkView: view }).status, "finding");
+  assert.equal(closeScreenScanStatus({ skipReason: null, verdict: "suspected", checkView: v2 }).status, "suspected");
+  // A found row covered only by a suspected verdict is still divergent (confidence was downgraded).
+  const r3 = closeScreenScanStatus({ skipReason: null, verdict: "suspected", checkView: view });
+  assert.equal(r3.status, "unverified");
+  // And a fully clean ledger with a filed-nothing verdict closes clean.
+  const s3 = session();
+  recordCheck(s3, { tool: "probe_sqli", checkClass: "sqli", target: "GET /search", param: "q", status: "tested-clean", reason: "no diff" });
+  const v3 = screenChecks({ checkExecutions: s3.store.checks("a-1") }, s3.currentScreenId ?? "");
+  assert.equal(closeScreenScanStatus({ skipReason: null, verdict: null, checkView: v3 }).status, "clean");
+});
+
+test("baselineRetryHint says WHY a baseline leg failed and hands back the observed request shape", () => {
+  // Stub session — baselineRetryHint only reads inv.screens()/currentScreenId/targetUrl.
+  const s = {
+    inv: {
+      screens: () => [{
+        screenId: "s-1",
+        params: [{ name: "q", in: "query", example: "verdict-probe" }],
+        apis: [{ method: "GET", urlTemplate: "/search/{id}" }],
+      }],
+    },
+    currentScreenId: "s-1",
+    targetUrl: TARGET,
+  } as unknown as PilotSession;
+  assert.match(baselineRetryHint(s, `${TARGET}search/zzz`, 401), /login\(<role>\) first/);
+  const h500 = baselineRetryHint(s, `${TARGET}search/zzz`, 500);
+  assert.match(h500, /status 500 = the request SHAPE was refused/);
+  assert.match(h500, /GET \/search\/\{id\}/, "the observed api template is handed back");
+  assert.match(h500, /q@query=verdict-probe/, "the observed param name+location+example is handed back");
+  const h200 = baselineRetryHint(s, `${TARGET}search`, 200);
+  assert.match(h200, /observed shape/, "non-error statuses still surface the observed shape");
 });

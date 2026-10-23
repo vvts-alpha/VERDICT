@@ -194,3 +194,35 @@ test("excluded screens are not reported as tested in HTML or Markdown", () => {
     assert.match(renderReportHtml(model), /0 tested · 2 status-claimed \(no check records\) · 1 excluded · 1 unfinished/);
   } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("an executed-but-inconclusive (unverified) screen counts as scanned — tested is an execution axis", () => {
+  const dir = mkdtempSync(join(tmpdir(), "report-unverified-"));
+  const store = AssessmentStore.open(join(dir, "state.sqlite"));
+  try {
+    store.createAssessment({ id: "coverage", target: { kind: "single_url", url: "https://shop.test", followLinks: true, maxDepth: 1 }, scope: deriveScopeFromSingleUrl("https://shop.test") });
+    store.upsertScreen("coverage", screen("s-0", "/a"));
+    store.upsertScreen("coverage", screen("s-1", "/b"));
+    store.upsertScreen("coverage", screen("s-2", "/c"));
+    // s-0: diagnosis ran, ended inconclusive → still real execution.
+    store.upsertCheck("coverage", {
+      id: "c-1", screenId: "s-0", target: "GET /a", subject: "", checkClass: "sqli",
+      status: "unverified", reason: "baseline never established", evidenceIds: [], findingIds: [],
+      updatedAt: new Date().toISOString(),
+    });
+    store.setScreenScanStatus("coverage", "s-0", "unverified");
+    // s-1: raw observation rows only — unattributed traffic cannot gap a screen, and a conclusive
+    // status backed ONLY by observations is a claim (unknown detail), not tested evidence.
+    store.upsertCheck("coverage", {
+      id: "c-2", screenId: "s-1", target: "GET /b", subject: "", checkClass: "http-request",
+      status: "unverified", reason: "raw fetch", evidenceIds: [], findingIds: [],
+      updatedAt: new Date().toISOString(),
+    });
+    store.setScreenScanStatus("coverage", "s-1", "clean");
+    // s-2 stays queued.
+    const model = buildReportModel(store.loadAssessment("coverage")!);
+    assert.equal(model.stats.screens.scanned, 1, "the executed-but-inconclusive screen counts");
+    assert.equal(model.stats.screens.claimed, 1, "clean backed only by observations is a claim, not tested");
+    // The http-request row is excluded from the check-gap total.
+    assert.equal(model.stats.checks.gaps, 1, "only the real probe row is a gap — raw traffic never is");
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
