@@ -1255,11 +1255,18 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
   console.log(`  roles: ${allRoles.map(roleLabel).join(", ") || "none"} | max-turns ${maxTurns}${surveyOnly ? " | survey only (no diagnosis)" : resume ? " | resuming undiagnosed screens only" : ""}\n`);
 
   // attended human-operation wait: print a message and resolve on Enter (a sync point for manual login/re-login).
+  // A spawned child has stdin:"ignore" → process.stdin is destroyed and rl.question throws ERR_USE_AFTER_CLOSE
+  // (the error that once cascaded into dropping live attended sessions). No readline on a dead stream — and never
+  // silently RESOLVE a manual-login gate either (that would "establish" an empty session); reject honestly so the
+  // caller (keepalive/respawn) keeps the role and surfaces the missing input channel.
   const { createInterface } = await import("node:readline");
-  const rl = attended ? createInterface({ input: process.stdin, output: process.stdout }) : null;
+  const rl = attended && !process.stdin.destroyed ? createInterface({ input: process.stdin, output: process.stdout }) : null;
   const promptOperator = (message: string): Promise<void> =>
-    new Promise((resolve) => {
-      if (!rl) return resolve();
+    new Promise((resolve, reject) => {
+      if (!rl) {
+        if (attended) return reject(new Error("no operator input channel (stdin is unavailable — run attended through the WebUI Sessions tab)"));
+        return resolve();
+      }
       rl.question(`\n${message} `, () => resolve());
     });
 

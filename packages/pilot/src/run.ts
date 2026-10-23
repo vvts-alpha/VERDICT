@@ -1348,6 +1348,9 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
             if (lastWarmUrl && (rs.cookie || rs.bearer)) {
               const r = await warmTouch(lastWarmUrl, rs.cookie, role === activeRole ? sess.currentBearer || (rs.bearer ?? "") : (rs.bearer ?? ""));
               dead = r?.dead ?? false;
+              // The touch's own Set-Cookie rotation merges back — the jar only reflects rotation when the
+              // role's page happens to make a request, so an idle page would keep handing tools a stale cookie.
+              if (r?.cookie) rs.cookie = r.cookie;
             }
             if (dead) {
               // creds 保持ロールは機械再ログインで復旧(ledger 優先 = VERDICT が回した後の最新パスワード)。
@@ -1986,8 +1989,11 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
             for (const [role, rs] of roleSessions) {
               const jar = await rs.driver.sessionCookieHeader().catch(() => "");
               if (jar) rs.cookie = jar;
-              const r = await warmTouch(lastWarmUrl, rs.cookie, role === session.currentRole ? session.currentBearer : "");
-              if (r && role === session.currentRole) session.currentCookie = r.cookie;
+              // Bearer-only sessions (localStorage JWT, e.g. Juice Shop) need rs.bearer on EVERY role's
+              // touch — sending "" for the non-current role made its keepalive unauthenticated.
+              const r = await warmTouch(lastWarmUrl, rs.cookie, role === session.currentRole ? session.currentBearer : (rs.bearer ?? ""));
+              if (r?.cookie) rs.cookie = r.cookie; // keep the rotated Set-Cookie the touch itself returned
+              if (r && role === session.currentRole) session.currentCookie = rs.cookie;
             }
           } else if (session.currentCookie || session.currentBearer) {
             const r = await warmTouch(lastWarmUrl, session.currentCookie, session.currentBearer);

@@ -247,8 +247,25 @@ export class Supervisor {
     return this.procs.get(id)?.status === "running";
   }
 
+  /** Stop every running child AND wait for each to exit (bounded). Without the wait, app quit raced ahead of the
+   *  SIGTERM→SIGKILL escalation timer — a child that stalled on SIGTERM (Playwright attaches its own handler)
+   *  was orphaned holding its browser-profile dir, and the next launch/restart failed to open it. */
   async closeAll(): Promise<void> {
-    for (const rec of this.procs.values()) if (rec.status === "running") this.stop(rec.id);
+    const exits = [...this.procs.values()]
+      .filter((rec) => rec.status === "running")
+      .map(
+        (rec) =>
+          new Promise<void>((resolve) => {
+            const t = setTimeout(resolve, 7_000); // SIGKILL lands at +5s in stop(); never hang app quit past that
+            t.unref?.();
+            rec.child.once("exit", () => {
+              clearTimeout(t);
+              resolve();
+            });
+            this.stop(rec.id);
+          }),
+      );
+    await Promise.all(exits);
   }
 
   private spawnChild(id: string, command: string, args: string[]): void {
