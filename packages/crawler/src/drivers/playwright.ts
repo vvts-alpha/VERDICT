@@ -76,6 +76,12 @@ export interface PlaywrightDriverOptions {
 const MARKER_HEADER = "x-verdict";
 const MARKER_VALUE = "assessment";
 
+const dialogAlreadyClosed = (error: unknown): boolean =>
+  error instanceof Error &&
+  error.name === "ProtocolError" &&
+  (error as Error & { method?: string }).method === "Page.handleJavaScriptDialog" &&
+  error.message === "Protocol error (Page.handleJavaScriptDialog): No dialog is showing";
+
 interface SettledOptions {
   navTimeoutMs: number;
   settleMs: number;
@@ -115,40 +121,6 @@ const STEALTH_INIT = (): void => {
       const orig = perms.query.bind(perms);
       perms.query = (p: any): any => (p && p.name === "notifications" ? Promise.resolve({ state: N.permission }) : orig(p));
     }
-  } catch {
-    /* ignore */
-  }
-};
-
-/** Neuter window.alert/confirm/prompt — a real CDP dialog is never allowed to open. Playwright's
- *  auto-dismiss races dialogs that close themselves ("Page.handleJavaScriptDialog: No dialog is
- *  showing") and crashes the whole process. Instead we capture the message into __verdict_dialogs
- *  (still observable as an XSS-execution signal) and return the dismiss-equivalent value, matching
- *  what auto-dismiss would have answered anyway. */
-const DIALOG_NEUTER_INIT = (): void => {
-  const g = globalThis as any;
-  const seen = (m: unknown): void => {
-    try {
-      (g.__verdict_dialogs ??= []).push(String(m));
-    } catch {
-      /* ignore */
-    }
-  };
-  try {
-    g.alert = (m: unknown) => seen(m);
-    g.confirm = (m: unknown) => (seen(m), false);
-    g.prompt = (m: unknown) => (seen(m), null);
-  } catch {
-    /* readonly window in exotic embeds — leave it */
-  }
-  // beforeunload dialogs race the same way on navigation-away — block the app from registering one.
-  try {
-    const origAdd = g.addEventListener?.bind(g);
-    if (origAdd) {
-      g.addEventListener = (type: string, listener: unknown, opts?: unknown) =>
-        type === "beforeunload" ? undefined : origAdd(type, listener as any, opts as any);
-    }
-    Object.defineProperty(g, "onbeforeunload", { get: () => null, set: () => {}, configurable: true });
   } catch {
     /* ignore */
   }
@@ -286,6 +258,15 @@ export class PlaywrightDriver implements Driver {
       ...(options.proxy ? { proxy: { server: options.proxy }, ignoreHTTPSErrors: true } : {}), // via Burp (only when set)
       ...(options.httpCredentials ? { httpCredentials: options.httpCredentials } : {}), // site-wide Basic/Digest (only when set)
     });
+    // Handle dialogs once per context, including popups and other open tabs. This avoids
+    // Playwright's internal auto-response race after the context is available.
+    context.on("dialog", (dialog: Dialog) => {
+      const handling = dialog.type() === "beforeunload" ? dialog.accept() : dialog.dismiss();
+      void handling.catch((error: unknown) => {
+        if (dialogAlreadyClosed(error)) return;
+        console.error(`[veritas] failed to handle ${dialog.type()} dialog:`, error);
+      });
+    });
     const page = context.pages()[0] ?? (await context.newPage());
     const driver = new PlaywrightDriver(context, page, {
       navTimeoutMs: options.navTimeoutMs ?? 20_000,
@@ -293,7 +274,6 @@ export class PlaywrightDriver implements Driver {
       maxBodySample: options.maxBodySample ?? 4096,
     });
     await context.addInitScript(STEALTH_INIT); // fingerprint-reduction first, then the route-capture hooks
-    await context.addInitScript(DIALOG_NEUTER_INIT); // no real JS dialogs ever — see DIALOG_NEUTER_INIT
     await context.addInitScript(INIT_SCRIPT);
     // The x-verdict marker is added only to **same-origin (+ document navigation)** requests. Never to cross-origin
     // at all (= even if scope includes other domains/APIs, the browser won't break third parties via a CORS preflight).
@@ -549,43 +529,36 @@ export class PlaywrightDriver implements Driver {
    * or (2) surfaces the marker via `alert/confirm/prompt`. Either one confirms execution.
    */
   async detectXssExecution(url: string, marker: string): Promise<{ executed: boolean; signal: string }> {
+    const page = await this.ensurePage();
     let dialog = "";
     const onDialog = (d: Dialog) => {
-      dialog = d.message();
-      void d.dismiss().catch(() => {});
+      if (d.type() !== "beforeunload" && d.message().includes(marker)) dialog = d.message();
     };
-    this.page.on("dialog", onDialog);
+    page.on("dialog", onDialog);
     try {
       try {
-        await this.page.goto(url, { waitUntil: "domcontentloaded", timeout: this.opts.navTimeoutMs });
+        await page.goto(url, { waitUntil: "domcontentloaded", timeout: this.opts.navTimeoutMs });
       } catch {
         /* SPA hash routes may not count as navigation completion → continue and wait for render */
       }
       // wait for the SPA to evaluate the route and reflect q into innerHTML → img.onerror / svg.onload fires.
       await new Promise<void>((resolve) => setTimeout(resolve, Math.max(this.opts.settleMs, 900)));
-      const seen = await this.page
-        .evaluate(() => {
-          const g = globalThis as { __verdict_xss?: unknown; __verdict_dialogs?: unknown };
-          return {
-            marker: String(g.__verdict_xss ?? ""),
-            dialogs: Array.isArray(g.__verdict_dialogs) ? g.__verdict_dialogs.map(String).join("\n") : "",
-          };
-        })
-        .catch(() => ({ marker: "", dialogs: "" }));
-      const g = seen.marker;
+      const g = await page
+        .evaluate(() => String((globalThis as { __verdict_xss?: unknown }).__verdict_xss ?? ""))
+        .catch(() => "");
       const viaGlobal = g.includes(marker);
-      const viaDialog = dialog.includes(marker) || seen.dialogs.includes(marker);
+      const viaDialog = dialog.includes(marker);
       const executed = viaGlobal || viaDialog;
       return {
         executed,
         signal: executed
           ? viaGlobal
             ? `XSS EXECUTED — sink fired (onerror/onload set window.__verdict_xss=${g})`
-            : `XSS EXECUTED — dialog(alert/confirm/prompt): ${dialog || seen.dialogs}`
+            : `XSS EXECUTED — dialog(alert/confirm/prompt): ${dialog}`
           : "no execution — payload was not run by the browser (escaped / not a live sink)",
       };
     } finally {
-      this.page.off("dialog", onDialog);
+      page.off("dialog", onDialog);
     }
   }
 
