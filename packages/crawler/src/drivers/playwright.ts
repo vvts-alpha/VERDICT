@@ -120,6 +120,40 @@ const STEALTH_INIT = (): void => {
   }
 };
 
+/** Neuter window.alert/confirm/prompt — a real CDP dialog is never allowed to open. Playwright's
+ *  auto-dismiss races dialogs that close themselves ("Page.handleJavaScriptDialog: No dialog is
+ *  showing") and crashes the whole process. Instead we capture the message into __verdict_dialogs
+ *  (still observable as an XSS-execution signal) and return the dismiss-equivalent value, matching
+ *  what auto-dismiss would have answered anyway. */
+const DIALOG_NEUTER_INIT = (): void => {
+  const g = globalThis as any;
+  const seen = (m: unknown): void => {
+    try {
+      (g.__verdict_dialogs ??= []).push(String(m));
+    } catch {
+      /* ignore */
+    }
+  };
+  try {
+    g.alert = (m: unknown) => seen(m);
+    g.confirm = (m: unknown) => (seen(m), false);
+    g.prompt = (m: unknown) => (seen(m), null);
+  } catch {
+    /* readonly window in exotic embeds — leave it */
+  }
+  // beforeunload dialogs race the same way on navigation-away — block the app from registering one.
+  try {
+    const origAdd = g.addEventListener?.bind(g);
+    if (origAdd) {
+      g.addEventListener = (type: string, listener: unknown, opts?: unknown) =>
+        type === "beforeunload" ? undefined : origAdd(type, listener as any, opts as any);
+    }
+    Object.defineProperty(g, "onbeforeunload", { get: () => null, set: () => {}, configurable: true });
+  } catch {
+    /* ignore */
+  }
+};
+
 const INIT_SCRIPT = (): void => {
   const g = globalThis as any;
   g.__veritasRoutes = g.__veritasRoutes || [];
@@ -259,6 +293,7 @@ export class PlaywrightDriver implements Driver {
       maxBodySample: options.maxBodySample ?? 4096,
     });
     await context.addInitScript(STEALTH_INIT); // fingerprint-reduction first, then the route-capture hooks
+    await context.addInitScript(DIALOG_NEUTER_INIT); // no real JS dialogs ever — see DIALOG_NEUTER_INIT
     await context.addInitScript(INIT_SCRIPT);
     // The x-verdict marker is added only to **same-origin (+ document navigation)** requests. Never to cross-origin
     // at all (= even if scope includes other domains/APIs, the browser won't break third parties via a CORS preflight).
@@ -528,18 +563,25 @@ export class PlaywrightDriver implements Driver {
       }
       // wait for the SPA to evaluate the route and reflect q into innerHTML → img.onerror / svg.onload fires.
       await new Promise<void>((resolve) => setTimeout(resolve, Math.max(this.opts.settleMs, 900)));
-      const g = await this.page
-        .evaluate(() => String((globalThis as { __verdict_xss?: unknown }).__verdict_xss ?? ""))
-        .catch(() => "");
+      const seen = await this.page
+        .evaluate(() => {
+          const g = globalThis as { __verdict_xss?: unknown; __verdict_dialogs?: unknown };
+          return {
+            marker: String(g.__verdict_xss ?? ""),
+            dialogs: Array.isArray(g.__verdict_dialogs) ? g.__verdict_dialogs.map(String).join("\n") : "",
+          };
+        })
+        .catch(() => ({ marker: "", dialogs: "" }));
+      const g = seen.marker;
       const viaGlobal = g.includes(marker);
-      const viaDialog = dialog.includes(marker);
+      const viaDialog = dialog.includes(marker) || seen.dialogs.includes(marker);
       const executed = viaGlobal || viaDialog;
       return {
         executed,
         signal: executed
           ? viaGlobal
             ? `XSS EXECUTED — sink fired (onerror/onload set window.__verdict_xss=${g})`
-            : `XSS EXECUTED — dialog(alert/confirm/prompt): ${dialog}`
+            : `XSS EXECUTED — dialog(alert/confirm/prompt): ${dialog || seen.dialogs}`
           : "no execution — payload was not run by the browser (escaped / not a live sink)",
       };
     } finally {
