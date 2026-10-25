@@ -10,7 +10,6 @@ import { createProviderHeaders } from "@veritas/llm";
 // injection cannot reach Bash/Task/etc. (they are never in the tool list, and an invented name is rejected).
 
 import { z } from "zod";
-import { zodToJsonSchema } from "zod-to-json-schema";
 import { chatCompletionsUrl, extractJson, type FetchLike } from "@veritas/llm";
 import { AgentContext, ContextBudgetError, isContextLimitError, type ChatMessage, type ContextUsage, type ToolCall } from "./agent-context.js";
 export type { FetchLike } from "@veritas/llm";
@@ -117,9 +116,9 @@ function parseToolArgs(raw: unknown): Record<string, unknown> {
 /** Convert a ZodRawShape to a JSON Schema object suitable for an OpenAI function's `parameters`. */
 export function toolParametersSchema(inputSchema: Record<string, unknown>): Record<string, unknown> {
     const obj = z.object(inputSchema as z.ZodRawShape);
-    const schema = zodToJsonSchema(obj, { $refStrategy: "none", target: "jsonSchema7" }) as Record<string, unknown>;
+    const schema = z.toJSONSchema(obj, { target: "draft-07", reused: "inline", io: "input" }) as Record<string, unknown>;
     delete schema.$schema; // OpenAI wants a bare parameters object
-    if (schema.type !== "object") return { type: "object", properties: {} };
+    if (schema.type !== "object") throw new Error("Tool input schema must be an object");
     return schema;
 }
 

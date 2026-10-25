@@ -14,12 +14,19 @@ function assistantWithTools(tool_calls: unknown[]) {
 }
 
 test("toolParametersSchema converts a zod shape to an object JSON Schema", () => {
-    const s = toolParametersSchema({ url: z.string().describe("target"), n: z.number().optional(), kind: z.enum(["a", "b"]) });
+    const s = toolParametersSchema({
+        url: z.string().describe("target"),
+        n: z.number().optional(),
+        kind: z.enum(["a", "b"]),
+        headers: z.record(z.string(), z.string()).optional(),
+    });
     assert.equal(s.type, "object");
-    const props = s.properties as Record<string, { type?: string; enum?: string[] }>;
+    const props = s.properties as Record<string, { type?: string; enum?: string[]; additionalProperties?: { type?: string } }>;
     assert.equal(props.url?.type, "string");
     assert.deepEqual(props.kind?.enum, ["a", "b"]);
+    assert.equal(props.headers?.additionalProperties?.type, "string", "record values retain their type");
     assert.ok(Array.isArray(s.required) && (s.required as string[]).includes("url"));
+    assert.ok(!(s.required as string[]).includes("headers"), "optional fields stay optional");
     assert.equal((s as { $schema?: unknown }).$schema, undefined, "no $schema key for OpenAI");
 });
 

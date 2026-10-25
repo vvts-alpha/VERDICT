@@ -2652,7 +2652,7 @@ export function buildTools(s: PilotSession) {
         maxBodyBytes: z.number().int().min(1).max(8 * 1024 * 1024).optional(),
         method: z.string(),
         url: z.string(),
-        headers: z.record(z.string()).optional(),
+        headers: z.record(z.string(), z.string()).optional(),
         body: z.string().optional(),
         note: z.string().optional(),
         kind: z
@@ -2661,7 +2661,7 @@ export function buildTools(s: PilotSession) {
           .describe("evidence role: 'negative_control' = a benign/baseline request that MUST fail (no payload / non-existent id); 'positive_replay' (default) = an attack request that should succeed. Label the control so the evidence discipline is visible in the report/UI."),
         victimId: z.string().optional().describe("for IDOR: the other user's id you are requesting (cross-user impact check)"),
         selfId: z.string().optional().describe("for IDOR: your own session's id (so your own data isn't mistaken for cross-user access)"),
-        fields: z.record(z.string()).optional().describe("form fields to send alongside file(s) in a multipart upload"),
+        fields: z.record(z.string(), z.string()).optional().describe("form fields to send alongside file(s) in a multipart upload"),
         files: z
           .array(z.object({ name: z.string(), filename: z.string(), contentType: z.string().optional(), content: z.string().optional(), base64: z.string().optional() }))
           .optional()
@@ -4212,14 +4212,14 @@ export function buildTools(s: PilotSession) {
         operationName: z.string().optional(),
         operationKey: z.string().optional(),
         document: z.string().optional(),
-        variables: z.record(z.unknown()).optional(),
+        variables: z.record(z.string(), z.unknown()).optional(),
         setVariable: z.object({ path: z.string(), value: z.string() }).optional(),
         addVariables: z.array(z.object({ path: z.string(), value: z.string() })).optional(),
         baselineRole: z.string().optional(),
         compareRole: z.string().optional(),
         unauthControl: z.boolean().optional(),
         mutationAck: z.string().optional(),
-        verifyQuery: z.object({ document: z.string(), operationName: z.string().optional(), variables: z.record(z.unknown()).optional() }).optional(),
+        verifyQuery: z.object({ document: z.string(), operationName: z.string().optional(), variables: z.record(z.string(), z.unknown()).optional() }).optional(),
         verifyPath: z.string().optional(),
         verifyExpect: z.string().optional(),
         note: z.string().optional(),
@@ -4501,8 +4501,8 @@ export function buildTools(s: PilotSession) {
       "probe_logic",
       'Confirm a BUSINESS-LOGIC flaw by differential test: sends a BASELINE (legitimate) request once and a MUTATED (manipulated) request twice, and checks whether the server ACCEPTED the manipulation via `effectMarker` — a string that appears in the response ONLY when the manipulation took effect (e.g. the injected price/total, "role":"admin", an out-of-order step succeeding). Use for price/quantity tampering, mass-assignment (extra role/isAdmin field in the body), workflow/step skipping. Returns evidenceIds (baseline=negativeControl, mutated=positiveReplays) ready for record_finding.',
       {
-        baseline: z.object({ method: z.string(), url: z.string(), headers: z.record(z.string()).optional(), body: z.string().nullable().optional() }),
-        mutated: z.object({ method: z.string(), url: z.string(), headers: z.record(z.string()).optional(), body: z.string().nullable().optional() }),
+        baseline: z.object({ method: z.string(), url: z.string(), headers: z.record(z.string(), z.string()).optional(), body: z.string().nullable().optional() }),
+        mutated: z.object({ method: z.string(), url: z.string(), headers: z.record(z.string(), z.string()).optional(), body: z.string().nullable().optional() }),
         effectMarker: z.string(),
         note: z.string().optional(),
         /** Plan class this test exercises (e.g. price-tampering / mass-assignment) — attributes the coverage-ledger row. */
@@ -4563,7 +4563,7 @@ export function buildTools(s: PilotSession) {
       "probe_stored_xss",
       "Confirm STORED / cross-context XSS: injects a marker payload at a STORE point (a request that PERSISTS input — comment, profile, filename, ticket, review) then reads it back at a RENDER point to see if it comes back UNESCAPED (or EXECUTES in a browser). The render point can be a DIFFERENT endpoint/screen and can be viewed AS ANOTHER ROLE (`renderAsRole`) to prove cross-user stored XSS (store as the attacker, it fires in a victim/admin view). `store`: {method,url,headers?,body?} with a {{XSS}} placeholder where the input lands. `renderUrl`: where to read it back (GET). Set `renderBrowser:true` to drive a real browser at renderUrl and detect ACTUAL execution (client-rendered stores). Returns negativeControl + positiveReplays evidenceIds + effectMarker, ready for record_finding(category xss-stored).",
       {
-        store: z.object({ method: z.string(), url: z.string(), headers: z.record(z.string()).optional(), body: z.string().nullable().optional() }),
+        store: z.object({ method: z.string(), url: z.string(), headers: z.record(z.string(), z.string()).optional(), body: z.string().nullable().optional() }),
         renderUrl: z.string(),
         renderBrowser: z.boolean().optional(),
         renderAsRole: z.string().optional(),
@@ -4652,7 +4652,7 @@ export function buildTools(s: PilotSession) {
     tool(
       "probe_csrf",
       "Confirm CSRF on a state-changing request. Only meaningful for COOKIE-based sessions — Bearer/Authorization is NOT auto-sent cross-site, so Bearer-auth endpoints are not CSRF-able (the tool returns not-applicable). Give a request that currently SUCCEEDS with the session ({method,url,headers?,body?}); the tool (1) sends it with NO auth (must FAIL → proves auth is enforced), then (2) sends it with the COOKIE ONLY (no Authorization, like a browser cross-site request), the anti-CSRF token STRIPPED, and a cross-site Origin/Referer — twice; if it still SUCCEEDS, CSRF protection is missing/ineffective. `stripFields`/`stripHeaders` override which token names are removed (defaults cover csrf/_csrf/authenticity_token/X-CSRF-Token/X-Requested-With). Returns negativeControl(no-auth) + positiveReplays(stripped) evidenceIds for record_finding(category csrf). IMPORTANT: also confirm the session cookie is NOT SameSite=Strict/Lax (use analyze_session) — if it is, it is NOT cross-site exploitable.",
-      { method: z.string(), url: z.string(), headers: z.record(z.string()).optional(), body: z.string().nullable().optional(), stripFields: z.array(z.string()).optional(), stripHeaders: z.array(z.string()).optional() },
+      { method: z.string(), url: z.string(), headers: z.record(z.string(), z.string()).optional(), body: z.string().nullable().optional(), stripFields: z.array(z.string()).optional(), stripHeaders: z.array(z.string()).optional() },
       async ({ method, url, headers, body, stripFields, stripHeaders }) => {
         if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} out of scope`);
         if (!s.currentCookie)
@@ -4730,7 +4730,7 @@ export function buildTools(s: PilotSession) {
     tool(
       "probe_oob",
       "Confirm a BLIND / out-of-band vuln via Interactsh or Burp Collaborator: blind SSRF, blind XXE, blind SQLi (DNS/HTTP exfil), OS command injection, header SSRF (X-Forwarded-Host / Referer / Host), email/webhook SSRF — anything where the EFFECT is the SERVER making an external request, not a visible response. Requires OOB enabled (Settings → OOB → Interactsh, or BURP_AUDIT_API + Collaborator). Put a {{OOB}} placeholder where the callback host belongs (a URL field, an XXE SYSTEM entity `<!ENTITY x SYSTEM \"http://{{OOB}}/\">`, a hostname, a header value, OR inside an uploaded file's text content — see `files`). The tool generates a unique callback host, injects it (in-scope target request), and polls ~waitSec for a DNS/HTTP/SMTP callback FROM the target; a callback = the server reached our host out-of-band = confirmed. FILE-BORNE OOB: for a blind SSRF/XXE that must live INSIDE an uploaded file (FFmpeg/HLS video-SSRF, ImageMagick, an uploaded SVG/DOCX with a SYSTEM entity), pass `files` (each {name, filename, contentType?, and `content` text OR `base64` bytes}) with {{OOB}} in a file's text `content` — it is sent as multipart/form-data and the callback confirms the file-borne case. Records a benign control + the injected request → negativeControl + positiveReplays evidenceIds for record_finding(category ssrf / rce as appropriate). NOTE: callbacks can lag seconds; nothing back after waitSec = not confirmed (try other params/headers/schemes).",
-      { method: z.string(), url: z.string(), headers: z.record(z.string()).optional(), body: z.string().nullable().optional(), files: z.array(z.object({ name: z.string(), filename: z.string(), contentType: z.string().optional(), content: z.string().optional(), base64: z.string().optional() })).optional(), waitSec: z.number().optional(), note: z.string().optional(), checkClass: z.string().optional().describe("plan class under test (ssrf / xxe / rce / sqli blind) — attributes the coverage-ledger row") },
+      { method: z.string(), url: z.string(), headers: z.record(z.string(), z.string()).optional(), body: z.string().nullable().optional(), files: z.array(z.object({ name: z.string(), filename: z.string(), contentType: z.string().optional(), content: z.string().optional(), base64: z.string().optional() })).optional(), waitSec: z.number().optional(), note: z.string().optional(), checkClass: z.string().optional().describe("plan class under test (ssrf / xxe / rce / sqli blind) — attributes the coverage-ledger row") },
       async ({ method, url, headers, body, files, waitSec, note }) => {
         if (!s.oob) return txt(JSON.stringify({ result: "blocked", verdict: "OOB not available: enable OOB in Settings (Interactsh) or set BURP_AUDIT_API (Burp Collaborator). Without it, blind SSRF/XXE/SQLi cannot be confirmed out-of-band. In-band probe_ssrf still applies." }));
         const oob = s.oob;
@@ -4908,7 +4908,7 @@ export function buildTools(s: PilotSession) {
         url: z.string(),
         field: z.string().optional(),
         method: z.string().optional(),
-        fields: z.record(z.string()).optional(),
+        fields: z.record(z.string(), z.string()).optional(),
       },
       async ({ url, field, method, fields }) => {
         if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} is out of scope`);
@@ -5048,8 +5048,8 @@ export function buildTools(s: PilotSession) {
       "probe_scenario",
       'Confirm a MULTI-STEP business-logic abuse that spans endpoints (coupon stacking/forging, negative quantity/price reaching checkout, skipping a payment/approval/ownership step, mass-assignment escalation, double-spend). You give an ordered `control` flow (legitimate) and an ordered `exploit` flow (manipulated). Each step: {method,url,headers?,body?,capture?}. `capture` maps varName→a JSON path (e.g. data.id, basket.0.id) OR regex applied to THAT step\'s response; later steps reference it as {{varName}} in url/body/headers (thread ids/tokens through the chain). The current session cookie+Bearer are attached automatically. `effectMarker` is a string that appears in a response ONLY when the manipulation is ACCEPTED (the injected total/price, an out-of-order step returning 200, a coupon applied twice). The control flow runs once (must NOT show the marker); the exploit flow runs twice (must show it, stably). Returns evidenceIds (control=negativeControl, exploit=positiveReplays) ready for record_finding with a price-tampering/qty-tampering/workflow-bypass/mass-assignment category.',
       {
-        control: z.array(z.object({ method: z.string(), url: z.string(), headers: z.record(z.string()).optional(), body: z.string().nullable().optional(), capture: z.record(z.string()).optional() })).min(1),
-        exploit: z.array(z.object({ method: z.string(), url: z.string(), headers: z.record(z.string()).optional(), body: z.string().nullable().optional(), capture: z.record(z.string()).optional() })).min(1),
+        control: z.array(z.object({ method: z.string(), url: z.string(), headers: z.record(z.string(), z.string()).optional(), body: z.string().nullable().optional(), capture: z.record(z.string(), z.string()).optional() })).min(1),
+        exploit: z.array(z.object({ method: z.string(), url: z.string(), headers: z.record(z.string(), z.string()).optional(), body: z.string().nullable().optional(), capture: z.record(z.string(), z.string()).optional() })).min(1),
         effectMarker: z.string(),
         note: z.string().optional(),
         checkClass: z.string().optional().describe("plan class under test (price-tampering / workflow-bypass / mass-assignment …) — attributes the coverage-ledger row"),
@@ -5145,7 +5145,7 @@ export function buildTools(s: PilotSession) {
         url: z.string(),
         method: z.string().optional().describe("default POST"),
         param: z.string().optional().describe("form field carrying the XML (url-encoded body)"),
-        fields: z.record(z.string()).optional().describe("extra form fields alongside param"),
+        fields: z.record(z.string(), z.string()).optional().describe("extra form fields alongside param"),
         bodyTemplate: z.string().optional().describe("full request body with {{X}} where the XML document is substituted"),
         encode: z.enum(["raw", "url", "json"]).optional().describe("how {{X}} is embedded — default raw; json escapes quotes/backslashes"),
         contentType: z.string().optional().describe("default application/xml (or application/x-www-form-urlencoded when param is given)"),
@@ -6955,7 +6955,7 @@ export function buildTools(s: PilotSession) {
     tool(
       "probe_params",
       "Fuzz a URL with high-signal hidden parameters the app never sent — IDOR (id/userId/...), redirect (to/next/url/... → external marker), debug (debug/admin/...), file (path traversal). Reports params that changed behaviour (redirect/reflection of the marker, traversal signature, or a different response vs baseline). Confirm any hit with evidence discipline before record_finding. Optionally pass extra {param:value}.",
-      { url: z.string(), extra: z.record(z.string()).optional() },
+      { url: z.string(), extra: z.record(z.string(), z.string()).optional() },
       async ({ url, extra }) => {
         if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} is out of scope`);
         let base: HttpResponse;

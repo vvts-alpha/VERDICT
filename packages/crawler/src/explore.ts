@@ -27,7 +27,7 @@ export interface ExploreResult {
 
 const SUBMIT_SELECTORS = ['button[type="submit"]', 'input[type="submit"]', "form button", "button"];
 
-const ActionSchema = z.object({ formIndex: z.number().int().min(0), values: z.record(z.string()).optional() });
+const ActionSchema = z.object({ formIndex: z.number().int().min(0), values: z.record(z.string(), z.string()).optional() });
 const PlanSchema = z.object({ actions: z.array(ActionSchema).max(8) });
 export type ExplorePlan = z.infer<typeof ActionSchema>[];
 

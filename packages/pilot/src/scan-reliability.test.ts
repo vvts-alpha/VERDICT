@@ -10,7 +10,7 @@ import { EvidenceStore, FetchHttpClient, type HttpRequest } from "@veritas/scann
 import { analyzePageJs, buildTools, type PilotSession } from "./tools.js";
 import { judgeConfirmedFinding } from "./findings-qa.js";
 import { runPilot } from "./run.js";
-import { runOpenAiAgentLoop, type PilotToolDef } from "./agent-loop.js";
+import { runOpenAiAgentLoop, toolParametersSchema, type PilotToolDef } from "./agent-loop.js";
 
 const BASE = "https://app.test/";
 const screen = (i: number): Screen => ({ screenId: `s-${String(i).padStart(4, "0")}`, urlTemplate: `/page-${i}`, observedUrls: [`${BASE}page-${i}`], authState: "unauth", screenType: "detail", description: "Static fixture", params: [], apis: [], screenshot: "", domSkeletonHash: `h-${i}`, labels: [] });
@@ -41,6 +41,18 @@ function modelEnv(t: TestContext, mode = "native") {
   t.mock.method(PlaywrightDriver, "launch", async () => driver as unknown as PlaywrightDriver);
 }
 const actionResponse = (mode: string, name: string, args: object) => Response.json({ choices: [{ message: mode === "text" ? { content: JSON.stringify({ tool: name, args }) } : { content: null, tool_calls: [{ id: "call-1", type: "function", function: { name, arguments: JSON.stringify(args) } }] } }] });
+
+test("every pilot tool retains its input fields in the OpenAI JSON Schema", (t) => {
+  const { s } = fixture(t);
+  const tools = buildTools(s) as unknown as PilotToolDef[];
+  assert.ok(tools.length > 20);
+  for (const tool of tools) {
+    const schema = toolParametersSchema(tool.inputSchema);
+    assert.equal(schema.type, "object", tool.name);
+    const properties = schema.properties as Record<string, unknown> | undefined;
+    assert.deepEqual(Object.keys(properties ?? {}).sort(), Object.keys(tool.inputSchema).sort(), tool.name);
+  }
+});
 
 for (const tool of ["probe_sqli", "probe_cmdi"] as const) {
   for (const mode of ["stable", "slow-control", "flaky", "blocked", "truncated"] as const) {

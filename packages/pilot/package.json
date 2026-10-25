@@ -28,8 +28,7 @@
     "@veritas/crawler": "workspace:*",
     "@veritas/llm": "workspace:*",
     "@veritas/scanner": "workspace:*",
-    "zod": "^3.24.0",
-    "zod-to-json-schema": "^3.24.0"
+    "zod": "^4.6.6"
   },
   "devDependencies": {
     "@types/node": "^22.10.6",
