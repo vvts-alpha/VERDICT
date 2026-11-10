@@ -61,10 +61,12 @@ commands:
             (target / in·out-of-scope hosts·path / rate / crawl / model / auth roles. password echo is masked)
   pilot   --manifest <file.json> | --url <url> [--model <m>] [--fast-model <m>] [--max-turns <n>] [--max-screens <n>] [--max-survey-screens <n>] [--rate <ms>] [--headed] [--focus "<text>"] [--context "<text>"] [--browser-path <bin>] [--browser-channel <name>] [--no-sandbox] [--out <dir>]
             --max-screens caps how many screens get diagnosed (default 120); --max-survey-screens caps how many the survey maps (default unlimited — stops exploring once reached)
+            --wordlist <standard|extended|path> picks the probe_paths forced-browse list — "standard" = the ~130-entry built-in (default), "extended" = the bundled SecLists common.txt (~4.7k), or a path to a custom list file
             --parallel <n> runs up to n diagnosis workers concurrently — one per role with session material + one unauth (default 4, 1 = sequential)
             ★Claude-led: Claude drives the tools (browser/http/login/record) to autonomously explore, verify, and record
             --focus "<text>": operator emphasis injected as the TOP priority of the A04 scenario stage (not per-screen diagnosis). e.g. "focus on the payment flow and IDOR in /api/orders"
             --context "<text>": standing target FACTS appended to EVERY stage's system prompt (survey→diagnosis→scenario), so they inform the whole run — unlike --focus (scenario-only). e.g. "auth = JWT in X-Auth header; tenant id = last path segment; API is GraphQL at /graphql". Additive only — cannot override the safety/scope/evidence rules.
+            --language "<lang>": output language for model-written prose — finding titles/descriptions, notes, plans (e.g. ja / Japanese / 日本語). Structural tokens (category tags, endpoints, payloads, quoted evidence) stay verbatim so dedup/QA are unaffected. Default English.
             uses the manifest's auth.roles via the login(role) tool. more flexible than the deterministic pipeline (no metered API / Max subscription)
             --fast-model enables model tiering: survey/methodology/login and low-value screens on fast, only high-value screen diagnosis on --model (e.g. --model opus --fast-model sonnet)
             after per-screen diagnosis, a SCENARIO stage (deep model) hunts multi-step A04 business-logic abuse across endpoints (coupon/price/qty tampering, step-skip, mass-assignment) — auto-skipped if no transactional surface. [--no-scenario] disables it. the stage also always runs built-in default scenarios (e.g. credential/secret hunting); [--no-default-scenarios] keeps A04 but drops those. [--focus "<text>"] adds an operator objective on top. after that, a FINGERPRINT stage (A06) collects tech/version banners (server, middleware, frontend libs) and flags components with known CVEs; [--no-fingerprint] skips it. [--cve-lookup] (opt-in, external egress) queries online CVE DBs — OSV.dev by exact version for libraries, NVD by keyword for servers/middleware — for authoritative CVE ids instead of model knowledge.
@@ -72,7 +74,9 @@ commands:
   pilot --survey-only --manifest <file.json> | --url <url> [...]
             survey only: maps screens + screenshots + API extraction only, no diagnosis/findings (cheap recon. diagnose later with --resume)
             ※ by default, during survey the model dynamically prunes low-value CMS content trees etc. via ignore_paths (curbs frontier explosion).
-              add [--exhaustive] to disable pruning and extract every screen (= full survey mode).
+              add [--exhaustive] to disable pruning and extract every screen (= full survey mode), and
+              to floor the full injection battery (sqli/xss/traversal/nosql/ssti/rce per param + cors/csrf/
+              headers/info-disclosure per surface) so check coverage no longer depends on the model's plan.
   pilot --spec <openapi.json> --url <base-url> [--manifest <file.json>] [--out <dir>]
             seed the API inventory from a JSON specification, then plan and diagnose in the same run
   pilot --resume --id <id> [--manifest <file.json>] [--browser-path <bin>] [--no-sandbox] [--out <dir>]
@@ -620,6 +624,9 @@ interface AssessManifest {
    *  diagnosis → scenario) so they inform the whole assessment — unlike focus, a scenario-only objective. Same as --context.
    *  Additive: it cannot override the safety/scope/evidence-discipline rules (see pilot operatorContextBlock). */
   context?: string;
+  /** Output language for model-written prose (finding titles/descriptions/notes), e.g. "ja" / "Japanese" / "日本語".
+   *  Same as --language. Structural tokens (category tags, endpoints, payloads, quoted evidence) stay verbatim. */
+  language?: string;
   /** Enabled skills (plugin capabilities) as { skillId: config }. Each contributes tools to the pilot (see
    *  packages/pilot/src/skills.ts). Config may hold secrets (mailbox creds etc.) — the manifest is gitignored. */
   skills?: Record<string, Record<string, unknown>>;
@@ -1112,15 +1119,19 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       rate: { type: "string" },
       "max-turns": { type: "string" },
       "max-screens": { type: "string" },
+      wordlist: { type: "string" }, // --wordlist <standard|extended|/path/to/list.txt>: probe_paths candidate source
+      "completion-passes": { type: "string" },
       parallel: { type: "string" }, // --parallel <n>: concurrent diagnosis workers (bound-role + unauth). 1 = sequential.
       "max-survey-screens": { type: "string" },
       focus: { type: "string" }, // operator focus hint (free text). Injected as the scenario stage's top-priority objective (not mixed into per-screen)
       context: { type: "string" }, // operator context (free text). Target facts appended to EVERY stage's system prompt (additive, cannot override safety/discipline)
+      language: { type: "string" }, // output language for model-written prose (finding titles/descriptions/notes), e.g. --language ja. Structural tokens (category tags, endpoints, payloads) stay verbatim
       "no-input-sweep": { type: "boolean" }, // submit each screen's input fields with benign values to discover new routes/APIs (default on). Set to disable
       "safe-forms": { type: "boolean" }, // in the input sweep, don't submit POST forms (GET/search only = don't write data to the target)
       "no-scenario": { type: "boolean" }, // by default runs the A04 scenario (cross-endpoint logic) after diagnosis. Set to skip
       "no-default-scenarios": { type: "boolean" }, // by default injects built-in scenarios (credential hunting, etc.). Set to disable just those (A04 stays)
       "no-fingerprint": { type: "boolean" }, // by default runs A06 fingerprinting (collect versions -> known-CVE assessment). Set to skip
+      "no-asset-review": { type: "boolean" }, // by default reads every fetched HTML/JS asset in full via the LLM and verifies its observations. Set to skip
       "cve-lookup": { type: "boolean" }, // in A06, query online CVE DBs (OSV/NVD) for detected versions (opt-in: third-party egress). Default off
       oob: { type: "string" }, // interactsh | burp | none — wins over VERDICT_OOB. Public Interactsh is opt-in egress.
       "burp-scan": { type: "boolean" },
@@ -1293,6 +1304,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       ...(oob ? { oob } : {}),
       ...((values.focus ?? manifest?.focus) ? { focus: values.focus ?? manifest?.focus } : {}),
       ...((values.context ?? manifest?.context) ? { operatorContext: values.context ?? manifest?.context } : {}), // target facts appended to every stage's system prompt
+      ...((values.language ?? manifest?.language) ? { outputLanguage: values.language ?? manifest?.language } : {}), // launch-time output language for findings/notes prose
       ...(manifest?.skills ? { skills: manifest.skills } : {}), // enabled plugin capabilities (skills.ts)
       ...(values["no-input-sweep"] ? { inputSweep: false } : {}),
       ...(values["safe-forms"] ? { aggressiveForms: false } : {}),
@@ -1318,6 +1330,8 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       ...(values["login-url"] ? { loginUrl: values["login-url"] } : {}),
       ...(values["control-url"] ? { controlUrl: values["control-url"] } : {}),
       ...(values["max-screens"] ? { maxScreens: Number.parseInt(values["max-screens"], 10) } : {}),
+      ...(values.wordlist ? { wordlist: values.wordlist } : {}),
+      ...(values["completion-passes"] ? { completionPasses: Number.parseInt(values["completion-passes"], 10) } : {}),
       ...(values.parallel ? { parallelWorkers: Number.parseInt(values.parallel, 10) } : {}),
       ...(values["max-survey-screens"] ? { maxSurveyScreens: Number.parseInt(values["max-survey-screens"], 10) } : {}),
       ...(roleCookieFiles.size ? { roleCookieFiles } : {}),
@@ -1331,6 +1345,7 @@ async function cmdPilot(rawArgs: string[]): Promise<void> {
       ...(values["no-scenario"] ? { scenarioPass: false } : {}), // ON by default. Set to drop the A04 scenario
       ...(values["no-default-scenarios"] ? { defaultScenarios: false } : {}), // ON by default. Set to drop only the built-in scenarios
       ...(values["no-fingerprint"] ? { fingerprintPass: false } : {}), // ON by default. Set to drop A06 fingerprinting
+      ...(values["no-asset-review"] ? { assetReview: false } : {}), // ON by default. Set to drop the full-asset LLM review
       ...(values["cve-lookup"] ? { cveLookup: true } : {}), // OFF by default. Set to enable online CVE DB lookups
       ...(proxy ? { proxy } : {}),
       ...(values["keepalive-min"] ? { keepAliveMinutes: Number.parseInt(values["keepalive-min"], 10) } : {}),

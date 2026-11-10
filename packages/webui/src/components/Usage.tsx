@@ -21,6 +21,8 @@ interface UsageRow {
     tokensUsed: number;
     inputTokens?: number;
     outputTokens?: number;
+    cacheReadTokens?: number;
+    cacheCreationTokens?: number;
     totalRequests: number;
   };
 }
@@ -40,6 +42,23 @@ function targetName(t: TargetInput): string {
 function num(n: number | undefined): string {
   return n === undefined ? "—" : n.toLocaleString();
 }
+
+/** Compact 1.4M/442k formatting for the summary cards. */
+function compact(n: number | undefined): string {
+  if (n === undefined) return "—";
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 10_000) return `${(n / 1_000).toFixed(1)}k`;
+  return n.toLocaleString();
+}
+
+type U = NonNullable<UsageRow["usage"]>;
+/** Prompt-side tokens served from cache — never below 0 even if a provider over-reports. */
+const cacheRead = (u: U): number => u.cacheReadTokens ?? 0;
+/** Uncached prompt work = all prompt-side tokens minus cache reads (Claude cache_creation counts as fresh work). */
+const uncachedIn = (u: U): number | undefined => u.inputTokens === undefined ? undefined : Math.max(0, u.inputTokens - cacheRead(u));
+/** cache_read / total prompt-side tokens — the "did the cache help" ratio. Undefined when no input was tracked. */
+const hitRate = (u: U): number | undefined => u.inputTokens ? cacheRead(u) / u.inputTokens : undefined;
+const pct = (v: number | undefined): string => v === undefined ? "—" : `${Math.round(v * 100)}%`;
 
 export function Usage() {
   const { multiUser } = useRole();
@@ -83,6 +102,28 @@ export function Usage() {
         <Button type="button" variant="outline" size="sm" onClick={load}><RefreshCw /> {t("Refresh")}</Button>
       </header>
       {err ? <p role="alert" className="text-xs text-destructive">{err}</p> : null}
+      {rows && rows.length > 0 ? (
+        <div className="grid grid-cols-3 gap-3 sm:grid-cols-6">
+          {(() => {
+            const inSum = sum((u) => u.inputTokens);
+            const crSum = sum((u) => u.cacheReadTokens);
+            const cards: Array<[string, string]> = [
+              [t("Total (input + output)"), compact(sum((u) => u.tokensUsed))],
+              [t("Tasks"), String(rows.length)],
+              [t("Input (uncached)"), compact(sum((u) => uncachedIn(u)))],
+              [t("Cache hit"), compact(crSum)],
+              [t("Output"), compact(sum((u) => u.outputTokens))],
+              [t("Hit rate"), pct(inSum && crSum !== undefined ? crSum / inSum : undefined)],
+            ];
+            return cards.map(([label, value]) => (
+              <div key={label} className="rounded-md border border-border bg-card px-3 py-2">
+                <div className="font-mono text-base font-semibold leading-tight">{value}</div>
+                <div className="mt-0.5 text-[11px] text-muted-foreground">{label}</div>
+              </div>
+            ));
+          })()}
+        </div>
+      ) : null}
       <Card>
         <CardContent className="p-4">
           {rows && rows.length > 0 ? (
@@ -92,7 +133,9 @@ export function Usage() {
                   <TableHead>{t("Project")}</TableHead>
                   <TableHead>{t("Phase")}</TableHead>
                   {multiUser ? <TableHead>{t("Owner")}</TableHead> : null}
-                  <TableHead className="text-right">{t("Input")}</TableHead>
+                  <TableHead className="text-right" title={t("prompt-side tokens excluding cache reads")}>{t("Input (uncached)")}</TableHead>
+                  <TableHead className="text-right" title={t("prompt-side tokens served from the provider cache")}>{t("Cache hit")}</TableHead>
+                  <TableHead className="text-right">{t("Hit rate")}</TableHead>
                   <TableHead className="text-right">{t("Output")}</TableHead>
                   <TableHead className="text-right">{t("Total tokens")}</TableHead>
                   <TableHead className="text-right">{t("Requests")}</TableHead>
@@ -107,7 +150,9 @@ export function Usage() {
                     </TableCell>
                     <TableCell><Badge variant="outline" className="text-muted-foreground">{r.phase}</Badge></TableCell>
                     {multiUser ? <TableCell className="font-mono text-muted-foreground">{r.owner ?? "—"}</TableCell> : null}
-                    <TableCell className="text-right font-mono">{num(r.usage?.inputTokens)}</TableCell>
+                    <TableCell className="text-right font-mono">{num(r.usage ? uncachedIn(r.usage) : undefined)}</TableCell>
+                    <TableCell className="text-right font-mono">{r.usage?.cacheReadTokens !== undefined ? num(r.usage.cacheReadTokens) : "—"}</TableCell>
+                    <TableCell className="text-right font-mono text-muted-foreground">{pct(r.usage ? hitRate(r.usage) : undefined)}</TableCell>
                     <TableCell className="text-right font-mono">{num(r.usage?.outputTokens)}</TableCell>
                     <TableCell className="text-right font-mono font-medium">{num(r.usage?.tokensUsed)}</TableCell>
                     <TableCell className="text-right font-mono text-muted-foreground">{num(r.usage?.totalRequests)}</TableCell>
@@ -119,7 +164,9 @@ export function Usage() {
                   <TableCell className="font-medium">{t("Total")}</TableCell>
                   <TableCell />
                   {multiUser ? <TableCell /> : null}
-                  <TableCell className="text-right font-mono font-semibold">{num(sum((u) => u.inputTokens))}</TableCell>
+                  <TableCell className="text-right font-mono font-semibold">{num(sum((u) => uncachedIn(u)))}</TableCell>
+                  <TableCell className="text-right font-mono font-semibold">{num(sum((u) => u.cacheReadTokens))}</TableCell>
+                  <TableCell className="text-right font-mono font-semibold">{(() => { const inSum = sum((u) => u.inputTokens); const crSum = sum((u) => u.cacheReadTokens); return pct(inSum && crSum !== undefined ? crSum / inSum : undefined); })()}</TableCell>
                   <TableCell className="text-right font-mono font-semibold">{num(sum((u) => u.outputTokens))}</TableCell>
                   <TableCell className="text-right font-mono font-semibold">{num(sum((u) => u.tokensUsed))}</TableCell>
                   <TableCell className="text-right font-mono">{num(sum((u) => u.totalRequests))}</TableCell>
@@ -132,7 +179,7 @@ export function Usage() {
             <p className="py-4 text-xs text-muted-foreground">{t("Loading…")}</p>
           )}
           <p className="mt-3 text-xs text-muted-foreground">
-            {t("Input/output are provider-reported (prompt vs completion; Claude cache buckets count as input). \"—\" = recorded before split tracking or estimated without provider usage.")}
+            {t("Input/output are provider-reported (prompt vs completion). Input (uncached) = prompt-side tokens minus cache reads; hit rate = cache read / total prompt-side. \"—\" = recorded before this tracking existed or no cache detail reported.")}
           </p>
         </CardContent>
       </Card>

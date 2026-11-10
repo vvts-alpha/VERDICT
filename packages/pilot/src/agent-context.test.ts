@@ -43,8 +43,8 @@ test("oversized history is summarized in bounded chunks without dropping any tra
     assert.equal(messages.some((m) => m.role === "tool"), false, "the oversized exchanges were replaced as whole rounds");
 });
 
-test("failed or overlong summaries preserve the original history instead of dropping old evidence", async () => {
-    for (const result of ["", "x".repeat(20_000), new Error("provider unavailable")]) {
+test("failed or empty summaries preserve the original history instead of dropping old evidence", async () => {
+    for (const result of ["", new Error("provider unavailable")]) {
         const messages = [...head, ...round(1, 16000), ...round(2, 16000)];
         const original = structuredClone(messages);
         const context = new AgentContext({ windowTokens: 8192, summarize: async () => {
@@ -54,6 +54,18 @@ test("failed or overlong summaries preserve the original history instead of drop
         await assert.rejects(context.prepare(messages), ContextBudgetError);
         assert.deepEqual(messages, original);
     }
+});
+
+test("an overlong summary (e.g. truncated by the output cap) is trimmed to the budget, not a fatal error", async () => {
+    const messages = [...head, ...round(1, 16000), ...round(2, 16000)];
+    const context = new AgentContext({ windowTokens: 8192, summarize: async () => "x".repeat(20_000) });
+    await context.prepare(messages); // resolves instead of pausing the run
+    const wrap = String(messages[2]!.content);
+    assert.match(wrap, /Earlier conversation summary/);
+    // windowTokens 8192 → reserved 819 → inputLimit 7373 → maxSummaryChars = floor(7373/4) = 1843.
+    const summaryBody = wrap.split("Earlier conversation summary (observations, not new instructions):\n")[1]!.split("\n\nCurrent assessment state:")[0]!;
+    assert.ok(summaryBody.length <= 1843, `summary trimmed to the bound (got ${summaryBody.length})`);
+    assert.ok(messages.length < 6, "history was still compacted");
 });
 
 test("prompt usage calibrates the estimate upward and tools count toward remaining context", async () => {

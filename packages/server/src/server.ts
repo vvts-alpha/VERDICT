@@ -78,7 +78,7 @@ interface AssessmentSummaryRow {
   createdAt: string;
   updatedAt: string;
   /** Provider-reported token usage (split fields absent on runs recorded before tracking existed). */
-  usage?: { tokensUsed: number; inputTokens?: number; outputTokens?: number; totalRequests: number };
+  usage?: { tokensUsed: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheCreationTokens?: number; totalRequests: number };
 }
 
 function listAssessments(runsDir: string): AssessmentSummaryRow[] {
@@ -112,6 +112,8 @@ function listAssessments(runsDir: string): AssessmentSummaryRow[] {
             tokensUsed: state.budget.tokensUsed,
             ...(state.budget.inputTokens !== undefined ? { inputTokens: state.budget.inputTokens } : {}),
             ...(state.budget.outputTokens !== undefined ? { outputTokens: state.budget.outputTokens } : {}),
+            ...(state.budget.cacheReadTokens !== undefined ? { cacheReadTokens: state.budget.cacheReadTokens } : {}),
+            ...(state.budget.cacheCreationTokens !== undefined ? { cacheCreationTokens: state.budget.cacheCreationTokens } : {}),
             totalRequests: state.budget.totalRequests,
           },
         });

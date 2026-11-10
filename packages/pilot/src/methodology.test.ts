@@ -55,3 +55,25 @@ test("methodology tools persist full plans and refuse premature completion", asy
     assert.equal(events.filter((e) => e.type === "methodology_completed").length, 1);
   } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("record_methodology warns when a declared class can never bind a coverage slot", async () => {
+  // A class name coarseClass can't map (translated prose, symbol-only text) writes NO plan slot —
+  // without the warning the model believes coverage exists while the screen can close untested.
+  const dir = mkdtempSync(join(tmpdir(), "verdict-plan-warn-"));
+  const store = AssessmentStore.open(join(dir, "state.sqlite"));
+  try {
+    store.createAssessment({ id: "a-1", target: { kind: "single_url", url: "https://app.test/", followLinks: true, maxDepth: 2 }, scope: deriveScopeFromSingleUrl("https://app.test/") });
+    const screens = [{ screenId: "s-0001", params: [], apis: [] }];
+    const session = { store, assessmentId: "a-1", inv: { screens: () => screens }, plans: new Map(), methodologyDone: false } as unknown as PilotSession;
+    const invoke = async (name: string, args: unknown) => {
+      const tool = buildTools(session).find((t) => t.name === name)!;
+      const res = (await tool.handler(args as never, {} as never)) as { content: { text?: string }[] };
+      return res.content[0]!.text ?? "";
+    };
+    const out = await invoke("record_methodology", { screenId: "s-0001", vulnClasses: ["idor", "認証回避"], plan: "plan" });
+    assert.match(out, /認証回避/);
+    assert.match(out, /can't bind a coverage slot/);
+    const clean = await invoke("record_methodology", { screenId: "s-0001", vulnClasses: ["idor"], plan: "plan" });
+    assert.doesNotMatch(clean, /can't bind a coverage slot/);
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});

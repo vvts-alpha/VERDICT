@@ -455,3 +455,178 @@ test("final QA retains duplicate audit rows while exports and reloads count one 
     assert.equal((await triagePilotFindings({ store, assessmentId: "a-1", evidence })).merged, 0);
   });
 });
+
+test("consolidateAppWideFindings folds per-endpoint duplicates of one server-wide defect", async () => {
+    const { consolidateAppWideFindings } = await import("./findings-qa.js");
+    const a = finding({ id: "f-1", title: "[headers] Missing CSP on /a", evidenceIds: ["e1"], description: "no CSP header", dedupKey: "headers::/a::csp", affectedEndpoints: ["/a"] });
+    const b = finding({ id: "f-2", title: "[headers] Missing CSP / Referrer-Policy on /b", evidenceIds: ["e2"], description: "no headers", dedupKey: "headers::/b::csp", affectedEndpoints: ["/b"] });
+    const c = finding({ id: "f-3", title: "[info-disclosure] Verbose Express stack trace on /c", evidenceIds: ["e3"], description: "stack trace leaked", dedupKey: "disclosure::/c::" });
+    const d = finding({ id: "f-4", title: "[info-disclosure] Express stack trace on /d", evidenceIds: ["e4"], description: "verbose error handler", dedupKey: "disclosure::/d::" });
+    const distinct = finding({ id: "f-5", title: "[info-disclosure] Unauthenticated /rest/memories exposes user photos", evidenceIds: ["e5"], description: "PII listing" });
+    const idor = finding({ id: "f-6", title: "[idor] Basket readable cross-user", evidenceIds: ["e6"], description: "BOLA" });
+    const burp = finding({ id: "f-7", title: "[headers] Missing CSP on /e", evidenceIds: ["e7"], description: "x", source: { kind: "validator", validatorName: "burp" } });
+    const list = [a, b, c, d, distinct, idor, burp];
+    const merged = consolidateAppWideFindings(list);
+    assert.equal(merged, 2, "one headers + one stack-trace absorbed; distinct/idor/burp untouched");
+    const canonicalHeaders = [a, b].find(f => !f.duplicateOf)!;
+    const dupHeaders = [a, b].find(f => f.duplicateOf)!;
+    assert.equal(dupHeaders.duplicateOf, canonicalHeaders.id);
+    assert.deepEqual([...canonicalHeaders.evidenceIds].sort(), ["e1", "e2"]);
+    const canonicalTrace = [c, d].find(f => !f.duplicateOf)!;
+    assert.equal([c, d].find(f => f.duplicateOf)!.duplicateOf, canonicalTrace.id);
+    assert.ok(canonicalTrace.description.includes("Same server-wide mechanism"));
+    // One finding = one root cause; the affected endpoint list accumulates instead of sibling rows.
+    assert.deepEqual([...canonicalTrace.affectedEndpoints ?? []].sort(), ["/c", "/d"]);
+    assert.ok((canonicalHeaders.affectedEndpoints ?? []).length === 2);
+    for (const f of [distinct, idor, burp]) assert.ok(!f.duplicateOf, `${f.id} must not merge`);
+    assert.equal(canonicalHeaders.id !== canonicalTrace.id, true, "headers and stack-trace are different root causes");
+});
+
+// ── forge-acceptance session evidence (a-mvpd1md3): "alg:none accepted" confirmed on a control that
+// never isolated the auth variable — different endpoint+method, a WAF 500, or a response that was
+// never a denial. The cited pair must be same-surface denial + forged replay accepted.
+
+function evAt(evidence: EvidenceStore, kind: "negative_control" | "positive_replay", method: string, url: string, status: number, body = "", validator = "test") {
+  return evidence.record({
+    screenId: "s-1",
+    validator,
+    kind,
+    request: { method, url, headers: {}, body: null },
+    response: { status, finalUrl: url, durationMs: 3, headers: {}, body },
+    note: kind,
+  });
+}
+
+test("judgeConfirmedFinding: alg:none claim with a cross-endpoint control is demoted (f-068 shape)", async () => {
+  await withDir(async (dir) => {
+    const { evidence } = setup(dir);
+    const ctl = evAt(evidence, "negative_control", "DELETE", BASE + "api/Users/999999", 401);
+    const p1 = evAt(evidence, "positive_replay", "GET", BASE + "api/Users/1", 200, `{"status":"success","data":{"id":1,"role":"admin"}}`);
+    const p2 = evAt(evidence, "positive_replay", "GET", BASE + "api/Users/1", 200, `{"status":"success","data":{"id":1,"role":"admin"}}`);
+    const f = finding({ id: "f-068", title: "[session] JWT signature verification bypass — unsigned alg:none token accepted as admin", evidenceIds: [ctl.id, p1.id, p2.id] });
+    const j = judgeConfirmedFinding(f, evidence);
+    assert.equal(j.demote, true);
+    if (j.demote) assert.match(j.reason, /isolating control|different surface/);
+  });
+});
+
+test("judgeConfirmedFinding: alg:none claim whose control is a WAF 500 is demoted (f-127 /profile shape)", async () => {
+  await withDir(async (dir) => {
+    const { evidence } = setup(dir);
+    const ctl = evAt(evidence, "negative_control", "GET", BASE + "profile", 500, "<title>Error: Blocked illegal activity</title>");
+    const p1 = evAt(evidence, "positive_replay", "GET", BASE + "profile", 200, "<html>profile</html>");
+    const p2 = evAt(evidence, "positive_replay", "GET", BASE + "profile", 200, "<html>profile</html>");
+    const f = finding({ id: "f-127", title: "[session] /profile serves authenticated profile content to an unsigned (alg:none) JWT", evidenceIds: [ctl.id, p1.id, p2.id] });
+    const j = judgeConfirmedFinding(f, evidence);
+    assert.equal(j.demote, true);
+    if (j.demote) assert.match(j.reason, /isolating control|not a denial/);
+  });
+});
+
+test("judgeConfirmedFinding: alg:none claim with a non-denied same-surface control is demoted (f-126 shape)", async () => {
+  await withDir(async (dir) => {
+    const { evidence } = setup(dir);
+    const ctl = evAt(evidence, "negative_control", "GET", BASE + "rest/user/whoami", 200, "{}");
+    const p1 = evAt(evidence, "positive_replay", "GET", BASE + "rest/user/whoami", 200, `{"user":"admin"}`);
+    const p2 = evAt(evidence, "positive_replay", "GET", BASE + "rest/user/whoami", 200, `{"user":"admin"}`);
+    const f = finding({ id: "f-126", title: "[session] Unsigned alg:none JWT accepted as a valid session → admin impersonation", evidenceIds: [ctl.id, p1.id, p2.id] });
+    assert.equal(judgeConfirmedFinding(f, evidence).demote, true);
+  });
+});
+
+test("judgeConfirmedFinding: a real forge pair (same surface, denied control) is kept (f-046 shape)", async () => {
+  await withDir(async (dir) => {
+    const { evidence } = setup(dir);
+    const ctl = evAt(evidence, "negative_control", "POST", BASE + "api/Quantitys", 401, `{"error":"Unauthorized"}`);
+    const p1 = evAt(evidence, "positive_replay", "POST", BASE + "api/Quantitys", 201, `{"status":"success","data":{"ProductId":3}}`);
+    const p2 = evAt(evidence, "positive_replay", "POST", BASE + "api/Quantitys", 201, `{"status":"success","data":{"ProductId":3}}`);
+    const f = finding({ id: "f-046", title: "[session] Unsigned JWT (alg:none) accepted — auth bypass on POST /api/Quantitys", evidenceIds: [ctl.id, p1.id, p2.id] });
+    assert.equal(judgeConfirmedFinding(f, evidence).demote, false);
+  });
+});
+
+test("judgeConfirmedFinding: a non-English title can't dodge the forge gate — evidence carries the claim", async () => {
+  await withDir(async (dir) => {
+    const { evidence } = setup(dir);
+    // Japanese title: sessionForgeClaim can't parse it, but a cited probe_jwt record IS the forge claim.
+    const ctl = evAt(evidence, "negative_control", "GET", BASE + "profile", 500, "<title>Error: Blocked</title>", "claude-pilot-jwt");
+    const p1 = evAt(evidence, "positive_replay", "GET", BASE + "profile", 200, "<html>profile</html>", "claude-pilot-jwt");
+    const p2 = evAt(evidence, "positive_replay", "GET", BASE + "profile", 200, "<html>profile</html>", "claude-pilot-jwt");
+    const f = finding({ id: "f-200", title: "[session] 署名未検証のJWTが受理された", evidenceIds: [ctl.id, p1.id, p2.id] });
+    const j = judgeConfirmedFinding(f, evidence);
+    assert.equal(j.demote, true);
+    if (j.demote) assert.match(j.reason, /isolating control/);
+  });
+});
+
+test("judgeConfirmedFinding: a forge claim under a sibling label (info-disclosure) is still gated (bug C)", async () => {
+  await withDir(async (dir) => {
+    const { evidence } = setup(dir);
+    // Same jwt-no-verify mechanism labeled info-disclosure — must not skip the denial check.
+    const ctl = evAt(evidence, "negative_control", "GET", BASE + "api/Users/1", 200, "{}", "claude-pilot-jwt");
+    const p1 = evAt(evidence, "positive_replay", "GET", BASE + "api/Users/1", 200, `{"role":"admin"}`, "claude-pilot-jwt");
+    const p2 = evAt(evidence, "positive_replay", "GET", BASE + "api/Users/1", 200, `{"role":"admin"}`, "claude-pilot-jwt");
+    const f = finding({ id: "f-201", title: "[info-disclosure] alg:none JWT accepted — user data served", evidenceIds: [ctl.id, p1.id, p2.id] });
+    assert.equal(judgeConfirmedFinding(f, evidence).demote, true);
+  });
+});
+
+test("judgeConfirmedFinding: jwt evidence under a NON-forge category (idor) does not trip the forge gate", async () => {
+  await withDir(async (dir) => {
+    const { evidence } = setup(dir);
+    // An idor claim cites probe_jwt evidence as supporting material — its own IDOR differential is what
+    // matters, not a forge denial. FORGE_CLAIM_CATS scopes the gate to forge-claim labels only.
+    const ctl = evAt(evidence, "negative_control", "GET", BASE + "api/Users/2", 200, `{"id":2}`, "claude-pilot-jwt");
+    const p1 = evAt(evidence, "positive_replay", "GET", BASE + "api/Users/1", 200, `{"id":1,"ssn":"x"}`, "claude-pilot-jwt");
+    const p2 = evAt(evidence, "positive_replay", "GET", BASE + "api/Users/1", 200, `{"id":1,"ssn":"x"}`, "claude-pilot-jwt");
+    const f = finding({ id: "f-202", title: "[idor] read another user's record", evidenceIds: [ctl.id, p1.id, p2.id] });
+    assert.equal(judgeConfirmedFinding(f, evidence).demote, false);
+  });
+});
+
+test("judgeConfirmedFinding: cookie-attribute session findings (non-forge titles) are untouched", async () => {
+  await withDir(async (dir) => {
+    const { evidence } = setup(dir);
+    const ctl = evAt(evidence, "negative_control", "GET", BASE + "rest/order-history", 401);
+    const p1 = evAt(evidence, "positive_replay", "GET", BASE + "rest/order-history", 200, "<html>app</html>");
+    const p2 = evAt(evidence, "positive_replay", "GET", BASE + "rest/order-history", 200, "<html>app</html>");
+    const f = finding({ id: "f-014", title: "[session] JS-readable (non-HttpOnly) session JWT cookie is the sole auth credential", evidenceIds: [ctl.id, p1.id, p2.id] });
+    assert.equal(judgeConfirmedFinding(f, evidence).demote, false);
+  });
+});
+
+test("consolidateAppWideFindings: non-English jwt-forge findings still fold via cited evidence", async () => {
+  await withDir(async (dir) => {
+    const { evidence } = setup(dir);
+    const { consolidateAppWideFindings } = await import("./findings-qa.js");
+    // Japanese titles — the title regex can't see "alg:none", but every cited record came from probe_jwt.
+    const a1 = evAt(evidence, "negative_control", "POST", BASE + "api/Quantitys", 401, "", "claude-pilot-jwt");
+    const a2 = evAt(evidence, "positive_replay", "POST", BASE + "api/Quantitys", 201, "", "claude-pilot-jwt");
+    const b1 = evAt(evidence, "negative_control", "GET", BASE + "rest/order-history", 401, "", "claude-pilot-jwt");
+    const b2 = evAt(evidence, "positive_replay", "GET", BASE + "rest/order-history", 200, "", "claude-pilot-jwt");
+    const f1 = finding({ id: "f-10", title: "[session] 署名なしJWTが受理された — POST /api/Quantitys", evidenceIds: [a1.id, a2.id], affectedEndpoints: ["/api/Quantitys"] });
+    const f2 = finding({ id: "f-11", title: "[info-disclosure] JWT未検証で注文履歴が読める", evidenceIds: [b1.id, b2.id], affectedEndpoints: ["/rest/order-history"] });
+    const list = [f1, f2];
+    assert.equal(consolidateAppWideFindings(list, evidence), 1);
+    const canonical = list.find((f) => !f.duplicateOf)!;
+    assert.deepEqual([...(canonical.affectedEndpoints ?? [])].sort(), ["/api/Quantitys", "/rest/order-history"]);
+  });
+});
+
+test("consolidateAppWideFindings: an unproven row never joins a CONFIRMED canonical's endpoint list", async () => {
+    const { consolidateAppWideFindings } = await import("./findings-qa.js");
+    const strong = finding({ id: "f-1", title: "[session] Unsigned JWT (alg:none) accepted on /api/Quantitys", evidenceIds: ["e1"], dedupKey: "app:jwt-no-verify", affectedEndpoints: ["/api/Quantitys"] });
+    const weak = finding({ id: "f-2", title: "[session] /profile serves authenticated content to an unsigned alg:none JWT", evidenceIds: ["e2"], dedupKey: "app:jwt-no-verify", affectedEndpoints: ["/profile"], verdict: "suspected" });
+    const strong2 = finding({ id: "f-3", title: "[session] Unsigned alg:none JWT accepted by /rest/basket/{id}", evidenceIds: ["e3"], dedupKey: "app:jwt-no-verify", affectedEndpoints: ["/rest/basket/{id}"] });
+    const weak2 = finding({ id: "f-4", title: "[session] /profile asset accepts an unsigned alg:none JWT", evidenceIds: ["e4"], dedupKey: "app:jwt-no-verify", affectedEndpoints: ["/profile"], verdict: "suspected" });
+    const list = [strong, weak, strong2, weak2];
+    consolidateAppWideFindings(list);
+    // confirmed tier merges → one canonical with ONLY the two proven endpoints
+    const confCanon = [strong, strong2].find(f => !f.duplicateOf)!;
+    assert.deepEqual([...confCanon.affectedEndpoints ?? []].sort(), ["/api/Quantitys", "/rest/basket/{id}"]);
+    assert.equal([strong, strong2].find(f => f.duplicateOf)!.duplicateOf, confCanon.id);
+    // suspected tier merges separately — never into the confirmed row
+    const suspCanon = [weak, weak2].find(f => !f.duplicateOf)!;
+    assert.equal([weak, weak2].find(f => f.duplicateOf)!.duplicateOf, suspCanon.id);
+    assert.notEqual(suspCanon.id, confCanon.id);
+});

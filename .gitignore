@@ -52,6 +52,13 @@ ScanPolicy.json
 *.log
 dist-renderer/
 
+# ローカル検証用スクリーンショット・レビュー作業メモ(実行成果物 — コミットしない)
+shots/
+/review/
+v-*.png
+tools/i18n-shot.cjs
+verify-*.mjs
+
 # Local release staging and installer outputs
 /bundle/
 /dist-windows/

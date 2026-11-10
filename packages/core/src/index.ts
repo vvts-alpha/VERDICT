@@ -42,7 +42,11 @@ export type {
   JsAsset,
   JsSecret,
   JsSink,
+  AssetReview,
+  AssetObservation,
+  AssetKind,
   CheckExecution,
+  CheckReasonCode,
   CheckStatus,
   AuthzAction,
   AuthzComparison,
@@ -94,7 +98,7 @@ export { hostMatches, isInScope, parseTargetUrl } from "./scope-check.js";
 export { buildSiteTree } from "./tree.js";
 export type { TreeNode } from "./tree.js";
 export { buildStateView, deriveRoleProgress } from "./view.js";
-export type { StateView, WsMessage, RoleProgress } from "./view.js";
+export type { StateView, WsMessage, RoleProgress, ScreenHonesty, ScreenCheckSummary, ScreenCheckClassSummary } from "./view.js";
 
 // Budget / stop conditions / report (M7)
 export { recordRequests, recordTokens, elapsedMs, evaluateStop, evaluateBudget } from "./budget-guard.js";

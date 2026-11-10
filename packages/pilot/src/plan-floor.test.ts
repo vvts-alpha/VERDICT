@@ -100,6 +100,35 @@ test("floor: jwt-shaped values and xml endpoints get session / xxe slots; static
   assert.deepEqual(classes(screen([P("q", "query")], [])), []);
 });
 
+test("floor: exhaustive mode fans the generic injection battery over every injectable param", () => {
+  const ex = { targetUrl: TARGET, exhaustive: true } as PilotSession;
+  const exClasses = (sc: Screen) => floorRowsFor(ex, sc).map((r) => r.checkClass);
+
+  const post = { method: "POST", urlTemplate: "/api/thing", auth: "cookie", reqSchema: null, resSchema: null } as ApiCall;
+  const sc = screen([P("q", "query"), P("note", "body"), P("x-auth", "header")], [post]);
+  const got = exClasses(sc);
+  // Generic battery on both injectable params (header skipped).
+  for (const cls of ["sqli", "xss-reflected", "path-traversal", "nosql", "ssti", "rce"]) {
+    assert.ok(got.filter((c) => c === cls).length >= 2, `${cls} should be floored on both injectable params`);
+  }
+  // Mutating API → cors + csrf slots; screen one-shots floored too.
+  assert.ok(got.includes("cors-misconfig"));
+  assert.ok(got.includes("csrf"));
+  for (const cls of ["headers", "info-disclosure", "misconfig"]) assert.ok(got.includes(cls));
+
+  // Balanced mode is unchanged: no generic battery on signal-free params.
+  assert.deepEqual(classes(sc), []);
+});
+
+test("floor: exhaustive rows are still deduped and capped", () => {
+  const ex = { targetUrl: TARGET, exhaustive: true } as PilotSession;
+  const params = Array.from({ length: 40 }, (_, i) => P(`p${i}`, "query"));
+  const rows = floorRowsFor(ex, screen(params));
+  const ids = new Set(rows.map((r) => r.id));
+  assert.equal(ids.size, rows.length);
+  assert.ok(rows.length <= 160);
+});
+
 // ── store-backed: floor rows land in the ledger, are skipped when the plan covers the slot,
 //    never clobber a real outcome, and hold the screen_done gate ──
 let dir = "";
@@ -138,7 +167,7 @@ function session(): PilotSession {
     currentCookie: "", currentBearer: "", currentRole: "userA",
     roleSessions: undefined, roleCookieFiles: new Map(), roleCreds: new Map(), roleDescriptions: new Map(),
     roleIdentityUrls: new Map(), rolePrincipals: new Map(), roleTenants: new Map(), expectedAccess: [],
-    sessionPrincipals: new Map(), visitedByRole: new Map(), roleSurveyBlocked: new Map(),
+    sessionPrincipals: new Map(), visitedByRole: new Map(), roleLoginAttempts: new Map(),
     findings: [], findingsByKey: new Map(), findCounter: 0, accessVerdicts: new Map(),
     httpProbes: 0, screenProbes: 1, httpAuthWall: 0, httpThrough: 0,
     plans: new Map(), visited: new Set(), frontier: new Set(), refererGated: new Set(), ignorePaths: [],

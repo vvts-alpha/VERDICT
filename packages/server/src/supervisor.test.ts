@@ -29,7 +29,7 @@ test("resume restores start-time run options into CLI args", async () => {
       options: {
         model: "deep", fastModel: "light", rate: 1, maxTurns: 5, exhaustive: true,
         loginUrl: "http://localhost:3000/#/login", maxScreens: 300,
-        focus: "audit the checkout", context: "tenant=acme", keepAliveMin: 2, parallel: 4,
+        focus: "audit the checkout", context: "tenant=acme", language: "Japanese", keepAliveMin: 2, parallel: 4,
       },
     }));
     const argvOut = join(runsDir, "argv.json");
@@ -49,7 +49,7 @@ test("resume restores start-time run options into CLI args", async () => {
       "--rate", "1", "--max-turns", "5", "--exhaustive",
       "--login-url", "http://localhost:3000/#/login",
       "--max-screens", "300", "--focus", "audit the checkout",
-      "--context", "tenant=acme", "--keepalive-min", "2", "--parallel", "4",
+      "--context", "tenant=acme", "--language", "Japanese", "--keepalive-min", "2", "--parallel", "4",
     ]) assert.ok(argv.includes(flag), `missing ${flag} in ${argv.join(" ")}`);
 
     // Burp-side launches restore the run's model too — the AI re-verify must not fall back to the env default.

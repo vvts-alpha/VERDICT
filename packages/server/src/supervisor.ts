@@ -46,12 +46,16 @@ export interface StartRunInput {
     loginUrl?: string;
     /** Upper bound on the number of screens to diagnose (default 40). 0/unset = default. */
     maxScreens?: number;
+    /** probe_paths wordlist: "standard" (default) | "extended" (bundled ~4.7k) | absolute path to a custom list. */
+    wordlist?: string;
     /** Upper bound on the number of screens survey maps. Stop exploring when reached. Unset = unlimited. */
     maxSurveyScreens?: number;
     /** Operator's focus hint (free text). Injected as the top-priority objective of the scenario stage (--focus). */
     focus?: string;
     /** Operator context (free text). Standing target facts appended to EVERY stage's system prompt (--context). */
     context?: string;
+    /** pilot only: output language for model-written prose (finding titles/descriptions/notes) — --language. */
+    language?: string;
     /** pilot only: keepalive interval in minutes (0 = off). For sites whose session dies on a cold `/` hit / full reload. */
     keepAliveMin?: number;
     /** pilot only: concurrent diagnosis workers (bound-role + unauth). Default 4, cap 8; 1 = sequential. */
@@ -141,9 +145,11 @@ export class Supervisor {
       if (o.attended) args.push("--attended");
       if (o.loginUrl) args.push("--login-url", o.loginUrl);
       if (o.maxScreens != null) args.push("--max-screens", String(o.maxScreens));
+      if (o.wordlist) args.push("--wordlist", o.wordlist);
       if (o.maxSurveyScreens != null) args.push("--max-survey-screens", String(o.maxSurveyScreens));
       if (o.focus) args.push("--focus", o.focus);
       if (o.context) args.push("--context", o.context);
+      if (input.command === "pilot" && o.language) args.push("--language", o.language); // pilot-only flag (assess parseArgs would reject it)
       if (o.keepAliveMin != null) args.push("--keepalive-min", String(o.keepAliveMin));
       if (o.parallel != null) args.push("--parallel", String(o.parallel));
       if (o.anchorUrl) args.push("--anchor-url", o.anchorUrl);
@@ -182,8 +188,10 @@ export class Supervisor {
     if (o.proxy) args.push("--proxy", o.proxy); // general upstream proxy (any proxy)
     if (o.loginUrl) args.push("--login-url", o.loginUrl);
     if (o.maxScreens != null) args.push("--max-screens", String(o.maxScreens));
+    if (o.wordlist) args.push("--wordlist", o.wordlist);
     if (o.focus) args.push("--focus", o.focus);
     if (o.context) args.push("--context", o.context);
+    if (o.language) args.push("--language", o.language);
     if (o.keepAliveMin != null) args.push("--keepalive-min", String(o.keepAliveMin));
     if (o.parallel != null) args.push("--parallel", String(o.parallel));
     if (o.anchorUrl) args.push("--anchor-url", o.anchorUrl);

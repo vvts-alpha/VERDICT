@@ -72,6 +72,8 @@ export class ClaudeCliClient implements LlmClient {
             ...(tokensUsed !== undefined ? { tokensUsed } : {}),
             ...(inputTokens !== undefined ? { inputTokens } : {}),
             ...(outputTokens !== undefined ? { outputTokens } : {}),
+            ...(env.usage?.cache_read_input_tokens !== undefined ? { cacheReadTokens: env.usage.cache_read_input_tokens } : {}),
+            ...(env.usage?.cache_creation_input_tokens !== undefined ? { cacheCreationTokens: env.usage.cache_creation_input_tokens } : {}),
           });
         },
       );

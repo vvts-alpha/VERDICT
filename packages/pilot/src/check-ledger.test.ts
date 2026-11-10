@@ -58,7 +58,7 @@ function session(opts: { roles?: string[] } = {}): PilotSession {
     currentCookie: "", currentBearer: "", currentRole: opts.roles?.[0] ?? "userA",
     roleSessions: undefined, roleCookieFiles: new Map(), roleCreds, roleDescriptions: new Map(),
     roleIdentityUrls: new Map(), rolePrincipals: new Map(), roleTenants: new Map(), expectedAccess: [],
-    sessionPrincipals: new Map(), visitedByRole: new Map(), roleSurveyBlocked: new Map(),
+    sessionPrincipals: new Map(), visitedByRole: new Map(), roleLoginAttempts: new Map(),
     findings: [], findingsByKey: new Map(), findCounter: 0, accessVerdicts: new Map(),
     httpProbes: 0, screenProbes: 1, httpAuthWall: 0, httpThrough: 0,
     plans: new Map(), visited: new Set(), frontier: new Set(), refererGated: new Set(), ignorePaths: [],
@@ -157,6 +157,59 @@ test("a tool's unverified row does not close the slot — it comes back for reme
   assert.equal(rows[0]!.tool, "screen_done", "the surviving row is the model's declaration");
 });
 
+test("a leftover failed attempt outside plan slots still owes a decision at screen_done", async () => {
+  const s = session();
+  await run(s, "record_methodology", METHODOLOGY(s, ["sqli"]));
+  // A probe on an UNPLANNED class failed — no slot owns it, and before this fold it silently
+  // dragged the screen to unverified even when the model judged every planned class clean.
+  recordCheck(s, { tool: "probe_nosql", checkClass: "nosql", target: "POST /login", status: "unverified", reason: "baseline refused with 500" });
+  const cov = (nosql?: { class: string; result: string; note?: string }) => ({
+    verdict: "clean",
+    coverage: [
+      { class: "sqli", result: "unverified", note: "every payload shape refused — declared gap" },
+      { class: "idor", result: "not-applicable", note: "single tenant — no second principal to cross" },
+      ...(nosql ? [nosql] : []),
+    ],
+  });
+  // The class absent from coverage → the stray row refuses the close.
+  const r1 = await run(s, "screen_done", cov());
+  assert.match(String(r1.raw ?? JSON.stringify(r1)), /NOT DONE.*nosql/);
+  assert.ok(!s.screenDone);
+  // A class-level conclusive claim cannot launder the scoped failure either.
+  const r2 = await run(s, "screen_done", cov({ class: "nosql", result: "tested-clean" }));
+  assert.match(String(r2.raw ?? JSON.stringify(r2)), /NOT DONE.*cannot close a scoped failure/);
+  assert.ok(!s.screenDone);
+  // Declaring the gap folds the row itself — one decision, no duplicate gap row.
+  const r3 = await run(s, "screen_done", cov({ class: "nosql", result: "unverified", note: "login baseline refused the operator bodies" }));
+  assert.match(String(r3.raw ?? JSON.stringify(r3)), /^screen s-0001/);
+  const rows = s.store.checks("a-1").filter((c) => c.checkClass === "nosql");
+  assert.equal(rows.length, 1, "the declaration folds into the failed-attempt row");
+  assert.equal(rows[0]!.tool, "screen_done");
+  assert.equal(rows[0]!.status, "unverified");
+});
+
+test("a conclusive retry supersedes the failed attempt — no decision needed at screen_done", async () => {
+  const s = session();
+  await run(s, "record_methodology", METHODOLOGY(s, ["sqli"]));
+  // Same subject/session/target/param: the evidenced retry supersedes the failed attempt —
+  // the leftover fold must not demand a decision for an already-resolved row.
+  const failed = recordCheck(s, { tool: "probe_sqli", checkClass: "sqli", target: "GET /search", param: "q", status: "unverified", reason: "baseline 500" });
+  const row = s.store.checks("a-1").find((c) => c.id === failed)!;
+  s.store.upsertCheck("a-1", { ...row, finishedAt: new Date(Date.now() - 60_000).toISOString() });
+  recordCheck(s, { tool: "probe_sqli", checkClass: "sqli", target: "GET /search", param: "q", status: "tested-clean", reason: "no differential", evidenceIds: ["e-9"], startedAt: new Date(Date.now() - 30_000).toISOString() });
+  const r = await run(s, "screen_done", {
+    verdict: "clean",
+    coverage: [
+      { class: "sqli", result: "tested-clean" },
+      { class: "idor", result: "not-applicable", note: "single tenant — no second principal" },
+    ],
+  });
+  // id/uid sqli slots are still unfulfilled → close must refuse on the slots, NOT on the superseded row.
+  const msg = String(r.raw ?? JSON.stringify(r));
+  assert.match(msg, /NOT DONE/);
+  assert.doesNotMatch(msg, /cannot close a scoped failure/, "the superseded row is already decided");
+});
+
 test("a recorded finding satisfies its own slot via the ledger (not via note text)", async () => {
   const s = session();
   await run(s, "record_methodology", METHODOLOGY(s, ["sqli"]));
@@ -197,7 +250,7 @@ test("legacy plan (no slot rows) materializes on demand at screen_done", async (
   assert.ok(s.store.checks("a-1").some((c) => c.status === "planned"), "slots materialized from the legacy plan");
 });
 
-test("survey_done refuses until EVERY configured role mapped under its own session (or blocked)", async () => {
+test("survey_done refuses until EVERY configured role is mapped or at least login()-attempted", async () => {
   const s = session({ roles: ["userA", "userB"] });
   s.frontier.clear();
   // Only role A navigated.
@@ -205,8 +258,9 @@ test("survey_done refuses until EVERY configured role mapped under its own sessi
   const r1 = await run(s, "survey_done", { summary: "done" });
   assert.match(String(r1.raw ?? JSON.stringify(r1)), /survey_done REFUSED.*userB/);
   assert.ok(!s.surveyDone);
-  // An explicit block reason lets the gate pass — the gap stays on record.
-  s.roleSurveyBlocked.set("userB", "login failed: invalid credentials");
+  // A recorded login attempt lets the gate pass — the uncovered role stays on record via the warning note.
+  s.roleLoginAttempts ??= new Map();
+  s.roleLoginAttempts.set("userB", 1);
   const r2 = await run(s, "survey_done", { summary: "done" });
   assert.match(String(r2.raw ?? JSON.stringify(r2)), /survey complete/);
   assert.ok(s.surveyDone);

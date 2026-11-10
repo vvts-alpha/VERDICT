@@ -1,75 +1,22 @@
-import type { CheckExecution, ScreenScanStatus, StateView } from "@veritas/core";
+import type { StateView } from "@veritas/core";
 
-// Honest per-screen display status. The scan-status word is a CLAIM — it only headlines as
-// tested/clean when the structured check ledger (or an actual finding) backs it. Two corrections
-// keep summary/tree/detail consistent with the ledger:
-//   - "unknown-records": a conclusive claim (clean/finding/suspected) with ZERO ledger rows and no
-//     backing finding — legacy or log-note provenance; truth unknown, shown neutral not green.
-//   - "unverified" (demoted): a "clean" claim whose ledger still holds inconclusive outcome rows
-//     (unverified/blocked/running) or planned slots no terminal execution satisfied — never clean.
+export type ScreenHonesty = StateView["screenHonesty"][string];
+export type EffectiveStatus = ScreenHonesty["status"];
 
-export type EffectiveStatus = ScreenScanStatus | "unknown-records";
-
-export interface ScreenHonesty {
-  /** The status the UI should headline. */
-  status: EffectiveStatus;
-  /** The scan status as recorded. */
-  raw: ScreenScanStatus;
-  /** Conclusive claim with no ledger rows (and no finding to back it). */
-  legacy: boolean;
-  /** Terminal-but-inconclusive execution rows (unverified / blocked / running). */
-  gaps: number;
-  /** Planned rows no matching terminal execution satisfied. */
-  unfulfilled: number;
-}
-
-// Mirrors core TERMINAL_CHECK_STATUSES / planSatisfiedBy / OBSERVATION_CHECK_CLASSES — webui stays
-// types-only on core, so the rollup is ported faithfully: a plan slot is satisfied ONLY by a terminal
-// execution matching every explicitly bound dimension (target/param/subject/principal/tenant/origin/
-// session/resource). Observation rows (raw fetches) record traffic but carry no verdict — they can
-// never be a screen's "gap".
-const TERMINAL: ReadonlySet<string> = new Set(["found", "suspected", "tested-clean", "not-applicable", "unverified", "blocked"]);
-const OBSERVATION_CLASSES: ReadonlySet<string> = new Set(["http-request"]);
-export function planSatisfied(plan: CheckExecution, e: CheckExecution): boolean {
-  if (e.status === "planned" || !TERMINAL.has(e.status)) return false;
-  if (plan.screenId !== e.screenId || plan.checkClass !== e.checkClass) return false;
-  if (plan.target !== "*" && plan.target !== e.target) return false;
-  if (plan.param && plan.param !== e.param) return false;
-  if (plan.subject && plan.subject !== e.subject) return false;
-  if (plan.principal && plan.principal !== e.principal) return false;
-  if (plan.tenant && plan.tenant !== e.tenant) return false;
-  if (plan.origin && plan.origin !== e.origin) return false;
-  if (plan.session && plan.session !== e.session) return false;
-  if (plan.resource && plan.resource !== e.resource) return false;
-  return true;
-}
-
-/** screenId → honesty record for every scanned screen. Single pass over the ledger — callers use
- *  this for badges/counts instead of re-deriving per render. Screens absent from `screenScans`
- *  (e.g. rows without a scan-status entry) simply get no map entry — callers keep their raw status. */
+/** Read the core projection; the browser never reimplements screenChecks or plan matching.
+ * Older servers without this field have no trustworthy verdict projection. Fail closed rather
+ * than treating their raw "clean" scan status (or a coverage note) as verified execution. */
 export function screenHonestyMap(view: StateView): Map<string, ScreenHonesty> {
-  const rowsByScreen = new Map<string, CheckExecution[]>();
-  for (const c of view.checkExecutions) {
-    const arr = rowsByScreen.get(c.screenId) ?? [];
-    arr.push(c);
-    rowsByScreen.set(c.screenId, arr);
-  }
-  const findingScreens = new Set(view.findings.map((f) => f.screenId).filter((x): x is string => Boolean(x)));
-  const out = new Map<string, ScreenHonesty>();
-  for (const s of view.screenScans) {
-    const rows = rowsByScreen.get(s.screenId) ?? [];
-    const plans = rows.filter((r) => r.status === "planned");
-    const execs = rows.filter((r) => r.status !== "planned");
-    const unfulfilled = plans.filter((p) => !execs.some((e) => planSatisfied(p, e))).length;
-    const gaps = execs.filter((e) => (e.status === "unverified" || e.status === "blocked" || e.status === "running") && !OBSERVATION_CLASSES.has(e.checkClass)).length;
-    const conclusive = s.status === "clean" || s.status === "finding" || s.status === "suspected";
-    // Legacy = no VERDICT-BEARING rows — a conclusive status backed only by raw traffic observations is
-    // a claim (unknown detail), not tested evidence.
-    const legacy = conclusive && !rows.some((r) => !OBSERVATION_CLASSES.has(r.checkClass)) && (s.status === "clean" || !findingScreens.has(s.screenId));
-    let status: EffectiveStatus = s.status;
-    if (legacy) status = "unknown-records";
-    else if (s.status === "clean" && (gaps > 0 || unfulfilled > 0)) status = "unverified";
-    out.set(s.screenId, { status, raw: s.status, legacy, gaps, unfulfilled });
-  }
-  return out;
+  if (view.screenHonesty) return new Map(Object.entries(view.screenHonesty));
+  return new Map(view.screenScans.map((scan) => [
+    scan.screenId,
+    {
+      raw: scan.status,
+      status: scan.status === "clean" || scan.status === "finding" || scan.status === "suspected"
+        ? "unknown-records" as const : scan.status,
+      legacy: false,
+      gaps: 0,
+      unfulfilled: 0,
+    },
+  ]));
 }

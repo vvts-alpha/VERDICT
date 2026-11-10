@@ -125,11 +125,35 @@ test("boundRole worker: login() to another role is rejected with compare-leg gui
   }
 });
 
-test("unauth worker (boundRole \"\"): any login is rejected", async () => {
-  const s = session({ boundRole: "", roleCreds: new Map([["alice", { username: "a", password: "p" }]]) });
+test("unauth worker (boundRole \"\"): login into a PEER-OWNED role is rejected", async () => {
+  const s = session({ boundRole: "", peerBoundRoles: new Set(["alice"]), roleCreds: new Map([["alice", { username: "a", password: "p" }]]) });
   try {
     const out = await runTool(s, "login", { role: "alice" });
-    assert.match(out, /bound to role '\(unauthenticated\)'/);
+    assert.match(out, /dedicated worker owns/, "a peer worker owns alice — a second live login would race it");
+  } finally {
+    close(s);
+  }
+});
+
+test("unauth worker (boundRole \"\"): login into an UNOWNED role proceeds past the gate", async () => {
+  const s = session({ boundRole: "", peerBoundRoles: new Set(["alice"]), roleNames: new Set(["bob"]), roleCreds: new Map() }); // bob configured, no material, no owning worker
+  try {
+    const out = await runTool(s, "login", { role: "bob" });
+    assert.doesNotMatch(out, /bound to role|dedicated worker owns|unknown role/);
+    assert.match(out, /no credentials\/cookie/, "reaches the credentials step — neither gate fired");
+  } finally {
+    close(s);
+  }
+});
+
+test("login(\"unauth\") drops the session and unbinds the worker", async () => {
+  const s = session({ boundRole: "alice", currentRole: "alice", currentCookie: "sess=1", currentBearer: "tok", peerBoundRoles: new Set(["alice"]) });
+  try {
+    const out = await runTool(s, "login", { role: "unauth" });
+    assert.match(out, /unauthenticated/);
+    assert.equal(s.currentCookie, "");
+    assert.equal(s.currentBearer, "");
+    assert.equal(s.boundRole, "", "worker is unbound after dropping the session");
   } finally {
     close(s);
   }

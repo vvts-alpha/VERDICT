@@ -149,6 +149,8 @@ export function renderMarkdown(m: ReportModel): string {
     out.push(`- Screen: \`${f.screenId ?? "(cross-screen)"}\``);
     out.push(`- Source: ${f.sourceKind === "validator" ? `validator \`${f.sourceName}\`` : `hypothesis \`${f.sourceName}\``}`);
     if (f.related && f.related.length > 0) out.push(`- Related findings: ${f.related.map((i) => `#${i}`).join(", ")} _(same endpoint mechanism — distinct issues, not merged)_`);
+    if (f.affectedEndpoints && f.affectedEndpoints.length > 1)
+      out.push(`- Affected endpoints (one root cause): ${f.affectedEndpoints.map((e) => `\`${e}\``).join(", ")}`);
     out.push(`- Scope basis: ${f.scopeBasis}`, "");
     if (f.anomaly) out.push(`**Anomaly (why this is a lead):** ${f.anomaly}`, "");
     out.push(f.description, "");

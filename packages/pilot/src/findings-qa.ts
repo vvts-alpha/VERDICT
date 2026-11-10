@@ -18,7 +18,8 @@ import type { LlmClient } from "@veritas/llm";
 import { extractJson } from "@veritas/llm";
 import type { EvidenceRecord, EvidenceStore } from "@veritas/scanner";
 import { checkTimingEvidence, classifyCrossUserBody, impactOracle, isPublicByDesignClientCredential, isVersionlessComponentLead } from "@veritas/scanner";
-import { looksBlocked, sqliHtmlLengthOnlyFp } from "./tools.js";
+import { appWideSignature, citesForgeEvidence, FORGE_CLAIM_CATS, looksBlocked, sessionForgeClaim, sqliHtmlLengthOnlyFp } from "./tools.js";
+import { isAuthRedirect, isAuthWallBody } from "./checks.js";
 import { looksLikePublicWebFile } from "./disclosure.js";
 import { consolidateFindings, qualifyFinding } from "./finding-review.js";
 
@@ -51,7 +52,8 @@ const HIGH_PLUS = new Set<Severity>(["high", "critical"]);
 const WEAK_ORACLE_CATEGORIES = new Set(["idor", "idor-write", "sqli", "rce", "session", "csrf"]);
 
 export function categoryOfFinding(f: Finding): string {
-  const m = /^\[([a-z0-9-]+)\]/i.exec(f.title);
+  // demote() prepends "[qa?] " before the category tag — skip it so QA-tagged rows still classify.
+  const m = /^(?:\[qa[?✓]\]\s*)?\[([a-z0-9-]+)\]/i.exec(f.title);
   return (m?.[1] ?? "").toLowerCase();
 }
 
@@ -127,6 +129,30 @@ export function judgeConfirmedFinding(f: Finding, evidence: EvidenceStore): QaJu
 
   if (got.recs.every((r) => looksBlocked(r.response)))
     return { demote: true, reason: "cited responses are WAF/bot-challenge pages, not the application — length/status on a block page is not a finding." };
+
+  // Forge-acceptance session claims: every surface where the claim was made needs an isolating control —
+  // a denied request (401/403/login redirect/auth wall) on the SAME method+path as the accepted forged
+  // material. A merged app-wide finding legitimately spans several surfaces (each absorbed row brought its
+  // own proven pair), so the check is per-surface, not per-finding: a surface with accepted responses but
+  // no denial proves nothing there. Judge by what each record IS, never its stored kind (a-mvpd1md3 f-046
+  // logged the 401 denial as 'positive_replay' and a 201-accepted forge as 'negative_control').
+  if (FORGE_CLAIM_CATS.has(cat) && (sessionForgeClaim(f.title) || citesForgeEvidence(got.recs))) {
+    const denied = (r: EvidenceRecord): boolean =>
+      r.response.status === 401 || r.response.status === 403 || isAuthRedirect(r.response) || isAuthWallBody(r.response);
+    const groups = new Map<string, { surface: string; accepted: number; denied: number }>();
+    for (const r of got.recs) {
+      let path = "?";
+      try { path = new URL(r.request.url ?? "", "http://x").pathname; } catch { /* keep ? */ }
+      const surface = `${(r.request.method ?? "").toUpperCase()} ${path}`;
+      const g = groups.get(surface) ?? { surface, accepted: 0, denied: 0 };
+      if (denied(r)) g.denied += 1;
+      else if (r.response.status < 400) g.accepted += 1;
+      groups.set(surface, g);
+    }
+    const unproven = [...groups.values()].filter((g) => g.accepted > 0 && g.denied === 0).map((g) => g.surface);
+    if (unproven.length > 0)
+      return { demote: true, reason: `forge-acceptance claim without an isolating control: ${unproven.join(", ")} has accepted responses but no denied request on the same surface — nothing proved the endpoint refuses without the forged material` };
+  }
 
   return { demote: false };
 }
@@ -261,6 +287,52 @@ function demote(store: AssessmentStore, assessmentId: string, f: Finding, reason
   store.appendEvent(assessmentId, { type: "note", payload: { message: `⚠ findings QA ${f.id}: demoted — ${reason.slice(0, 200)}` } });
 }
 
+/** One server-wide defect (error handler, response-header policy, directory listing) is often reported once
+ *  per endpoint — diagnosis sees one screen at a time, so each observation lands as its own row. The record-time
+ *  dedup key already folds NEW reports into `app:<sig>`; this is the same signature applied at QA so legacy rows
+ *  and sibling-label variants collapse too. The canonical row keeps its verdict and absorbs every evidence id;
+ *  absorbed rows are marked duplicateOf (retained, hidden from the report) — never deleted. */
+export function consolidateAppWideFindings(list: Finding[], evidence?: EvidenceStore): number {
+    const evById = new Map((evidence?.records ?? []).map((r) => [r.id, r]));
+    const groups = new Map<string, Finding[]>();
+    for (const f of list) {
+        if (f.duplicateOf || f.source.kind !== "validator" || f.source.validatorName !== "claude-pilot") continue;
+        const recs = f.evidenceIds.map((id) => evById.get(id)).filter((r): r is EvidenceRecord => r !== undefined);
+        const sig = appWideSignature(categoryOfFinding(f), f.title, recs);
+        if (!sig) continue;
+        const g = groups.get(sig) ?? [];
+        g.push(f);
+        groups.set(sig, g);
+    }
+    /** Every endpoint a finding was observed on — its own list plus the endpoint baked into its dedup key. */
+    const endpointsOf = (f: Finding): string[] => {
+        const parts = (f.dedupKey ?? "").split("::");
+        return [...(f.affectedEndpoints ?? []), ...(parts.length >= 3 ? [parts[1]!] : [])];
+    };
+    let merged = 0;
+    for (const group of groups.values()) {
+        if (group.length < 2) continue;
+        // Never let an UNPROVEN row's endpoint join a CONFIRMED canonical: affectedEndpoints must list
+        // only surfaces where the mechanism was actually proven. Merge within the same verdict tier —
+        // confirmed absorbs confirmed, non-confirmed (suspected/demoted) absorbs non-confirmed; a lone
+        // suspected row stays a standalone suspected finding (honest: unproven claim, still visible).
+        for (const tier of [group.filter(f => findingVerdict(f) === "confirmed"), group.filter(f => findingVerdict(f) !== "confirmed")]) {
+            if (tier.length < 2) continue;
+            const canonical = tier[0]!;
+            canonical.affectedEndpoints = [...new Set(tier.flatMap(endpointsOf))];
+            for (const f of tier) {
+                if (f === canonical) continue;
+                canonical.evidenceIds = [...new Set([...canonical.evidenceIds, ...f.evidenceIds])];
+                if (!canonical.description.includes(`"${f.title}"`))
+                    canonical.description += `\n\n[+] Same server-wide mechanism also observed as "${f.title}"${f.screenId ? ` (screen ${f.screenId})` : ""}.`;
+                f.duplicateOf = canonical.id;
+                merged++;
+            }
+        }
+    }
+    return merged;
+}
+
 /** QA the agent's confirmed findings. Mechanical first, then skeptical AI on remaining High+. */
 export async function triagePilotFindings(deps: FindingsQaDeps): Promise<FindingsQaResult> {
   const state = deps.store.loadAssessment(deps.assessmentId);
@@ -275,15 +347,11 @@ export async function triagePilotFindings(deps: FindingsQaDeps): Promise<Finding
       deps.store.appendEvent(deps.assessmentId, { type: "note", payload: { message: `Findings review ${f.id}: ${reason}` } });
     }
   }
-  const merged = consolidateFindings(list, deps.evidence);
-  if (merged) {
-    // Persist merged evidence before hiding any superseded row, including when the canonical row came later.
-    for (const f of list.filter(f => !f.duplicateOf)) deps.store.upsertFinding(deps.assessmentId, f);
-    for (const f of list.filter(f => f.duplicateOf)) deps.store.upsertFinding(deps.assessmentId, f);
-  }
   let checked = 0;
   let demoted = 0;
   const leftover: Finding[] = [];
+  // Judge BEFORE consolidation: a weak "confirmed" row demoted here lands in the non-confirmed merge tier,
+  // so its unproven endpoint can never inflate a confirmed canonical's affectedEndpoints.
   for (const f of list) {
     if (f.duplicateOf || isBurp(f) || alreadyQad(f) || SKIP_CATEGORIES.has(categoryOfFinding(f))) continue;
     const v = findingVerdict(f);
@@ -296,6 +364,12 @@ export async function triagePilotFindings(deps: FindingsQaDeps): Promise<Finding
       demoted += 1;
       deps.onText?.(`⚠ findings QA ${f.id}: ${j.reason.slice(0, 160)}`);
     } else if ((HIGH_PLUS.has(f.severity) || WEAK_ORACLE_CATEGORIES.has(categoryOfFinding(f))) && (v === "confirmed" || categoryOfFinding(f) === "vulnerable-component")) leftover.push(f);
+  }
+  const merged = consolidateFindings(list, deps.evidence) + consolidateAppWideFindings(list, deps.evidence);
+  if (merged) {
+    // Persist merged evidence before hiding any superseded row, including when the canonical row came later.
+    for (const f of list.filter(f => !f.duplicateOf)) deps.store.upsertFinding(deps.assessmentId, f);
+    for (const f of list.filter(f => f.duplicateOf)) deps.store.upsertFinding(deps.assessmentId, f);
   }
   if (deps.llm) {
     for (const f of leftover) {

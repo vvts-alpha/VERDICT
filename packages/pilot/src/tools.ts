@@ -6,7 +6,7 @@ import { MAX_TOOL_RESULT_CHARS } from "./tool-output.js";
 // to narrow which tools are visible per stage (= don't show Claude everything at once → prevent it from eliding work).
 
 import type { ApiCall, AssessmentStore, CheckExecution, CheckStatus, ExpectedAccessRule, Finding, FindingVerdict, Param, Screen, ScopePolicy, Severity } from "@veritas/core";
-import { findingVerdict, isInScope, screenChecks } from "@veritas/core";
+import { checkKey, findingVerdict, isInScope, screenChecks } from "@veritas/core";
 import type { LoginCreds, Observation, PlaywrightDriver } from "@veritas/crawler";
 import { InventoryBuilder, normalizePath, smartLogin, guessParamType, extractApiRefs, apiCallToBuiltScreen, describeGraphqlOperation } from "@veritas/crawler";
 import type { LlmClient } from "@veritas/llm";
@@ -27,6 +27,7 @@ import { SSRF_CONTROL, SSRF_PAYLOADS, placeSsrfTarget, ssrfHit } from "./ssrf.js
 import { NOSQL_OP_OBJECTS, NOSQL_OP_QUERY, NOSQL_CONTROL_VALUE, nosqlTimeObject, nosqlErrorSignature, nosqlBypassConfirms, nosqlQueryUrl } from "./nosql.js";
 import { detectUrlWrapper } from "./encoding.js";
 import { effectiveCreds } from "./mutations.js";
+import { safeAssetUrl } from "./asset-review.js";
 import { XXE_ENTITY_URLS, controlSvg, extractFetchUrls, xssSvg, xxeSvg } from "./upload.js";
 import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
@@ -118,6 +119,10 @@ export interface PilotSession {
    *  work through compare legs (probe_authz/probe_graphql_op/probe_idor replay under the other role's stored
    *  session material). Unset = single-worker mode, login switches roles freely. */
   boundRole?: string;
+  /** Roles that OWN a dedicated bound worker this run — a second live login into one would race that
+   *  worker's server-side session, so login(role) refuses it. Set only on spawned worker sessions
+   *  (absent on the main/sequential session, which keeps legacy free login). */
+  peerBoundRoles?: Set<string>;
   /** Shared finding-id allocator across parallel worker sessions — without it each worker's own findCounter
    *  would produce colliding f-ids. Present ⇒ used instead of findCounter. */
   fidSeq?: { n: number };
@@ -169,6 +174,15 @@ export interface PilotSession {
   screenDone: boolean;
   /** Completion signal for the scenario (A04 cross-cutting logic) stage. */
   scenarioDone: boolean;
+  /** Completion signal for the asset-review follow-up stage (LLM full-read of HTML/JS → verify observations). */
+  assetReviewDone: boolean;
+  /** Observations from the full-asset LLM read, enrolled as planned check rows — the follow-up stage
+   *  resolves them via resolve_asset_review(n, verdict); leftovers stay planned for the completion pass. */
+  pendingAssetObs?: { obs: { url: string; type: string; detail: string; evidence?: string; location?: string; investigation?: string }; checkId: string; screenId: string }[];
+  /** Evidence-record watermark for probe_paths' body harvesting — records before this index were already mined. */
+  pathsHarvestedFrom?: number;
+  /** Resolved probe_paths wordlist (--wordlist). Undefined = the in-code PATH_WORDLIST default. */
+  wordlist?: string[];
   /** Completion signal for the fingerprint (A06 known-vulnerable component) stage. */
   fingerprintDone: boolean;
   /** Connection to OOB infrastructure (Interactsh or Burp Collaborator). If set, probe_oob is usable.
@@ -221,9 +235,10 @@ export interface PilotSession {
   /** Role label → visit count restored from `survey_role_progress` events on resume (the URL sets themselves
    *  can't be rebuilt — a restored count honestly says "this role mapped N urls before the restart"). */
   roleSurveyCounts?: Map<string, number>;
-  /** Role label → concrete block reason (login failed / session expired / no creds). Cleared when that
-   *  role's session is (re)established. Reported by survey_done; blocks "fully covered" claims. */
-  roleSurveyBlocked: Map<string, string>;
+  /** Role label → how many times login(role) was invoked. An observation (the attempt happened), not a
+   *  verdict — survey_done lets a role pass on attempted-but-unmapped instead of deadlocking when its
+   *  credentials simply don't work. There is NO role "blocked" state: a failed login just fails. */
+  roleLoginAttempts?: Map<string, number>;
   /** Set by analyze_session's cookie-flag audit when it could NOT establish an independent denied
    *  control (the unauthenticated request also reached the page): the flag observation is then
    *  fileable as suspected only — never confirmed. Cleared when a run produces a denied control. */
@@ -234,13 +249,15 @@ export interface PilotSession {
 export const STAGE_TOOLS = {
   survey: ["browser_navigate", "browser_fill", "browser_click", "login", "probe_paths", "analyze_js", "ignore_paths", "survey_status", "survey_done"],
   // recon extrapolation: after survey, read the mapped surface and forced-browse LLM-predicted unlinked endpoints.
-  reconGuess: ["get_inventory", "probe_guesses", "browser_navigate", "guess_done"],
+  reconGuess: ["get_inventory", "probe_guesses", "probe_paths", "browser_navigate", "guess_done"],
   methodology: ["get_inventory", "record_methodology", "record_methodologies", "methodology_done"],
-  diagnose: ["get_screen", "login", "http_request", "probe_params", "probe_xss", "probe_dom_xss", "probe_stored_xss", "probe_ssti", "probe_sqli", "probe_nosql", "probe_cmdi", "probe_traversal", "probe_redirect", "probe_cors", "probe_graphql", "probe_graphql_op", "probe_proto", "probe_jwt", "probe_csrf", "probe_oob", "probe_ssrf", "probe_upload", "probe_logic", "probe_race", "probe_reset_poison", "probe_user_enum", "probe_secrets", "probe_headers", "analyze_session", "verify_access", "probe_idor", "probe_authz", "analyze_js", "probe_parser", "probe_xxe", "probe_websocket", "probe_cache", "probe_cache_poison", "probe_smuggling", "probe_crlf", "probe_host_header", "probe_oauth", "probe_method_bypass", "probe_rate_limit", "analyze_saml", "probe_deser", "browser_navigate", "browser_fill", "browser_click", "browser_upload", "record_finding", "coverage_status", "screen_done", "skip_screen"],
+  diagnose: ["get_screen", "login", "http_request", "compose_check", "probe_params", "probe_xss", "probe_dom_xss", "probe_stored_xss", "probe_ssti", "probe_sqli", "probe_nosql", "probe_cmdi", "probe_traversal", "probe_redirect", "probe_cors", "probe_graphql", "probe_graphql_op", "probe_proto", "probe_jwt", "probe_csrf", "probe_oob", "probe_ssrf", "probe_upload", "probe_logic", "probe_race", "probe_reset_poison", "probe_user_enum", "probe_secrets", "probe_headers", "analyze_session", "verify_access", "probe_idor", "probe_authz", "analyze_js", "probe_parser", "probe_xxe", "probe_websocket", "probe_cache", "probe_cache_poison", "probe_smuggling", "probe_crlf", "probe_host_header", "probe_oauth", "probe_method_bypass", "probe_rate_limit", "analyze_saml", "probe_deser", "browser_navigate", "browser_fill", "browser_click", "browser_upload", "record_finding", "resolve_asset_review", "coverage_status", "screen_done", "skip_screen"],
   // scenario (A04 cross-cutting logic): overview the inventory + fire multi-step request chains via probe_scenario. Once, after per-screen diagnosis.
-  scenario: ["get_inventory", "login", "http_request", "browser_navigate", "browser_fill", "browser_click", "probe_scenario", "probe_race", "probe_reset_poison", "probe_user_enum", "probe_secrets", "record_finding", "scenario_done"],
+  scenario: ["get_inventory", "login", "http_request", "compose_check", "browser_navigate", "browser_fill", "browser_click", "probe_scenario", "probe_race", "probe_reset_poison", "probe_user_enum", "probe_secrets", "record_finding", "scenario_done"],
   // fingerprint (A06 known-vulnerable components): fingerprint_scan to collect versions, evaluate known CVEs (cve_lookup opt-in) and record.
-  fingerprint: ["fingerprint_scan", "probe_parser", "cve_lookup", "http_request", "record_finding", "fingerprint_done"],
+  fingerprint: ["fingerprint_scan", "probe_parser", "cve_lookup", "http_request", "compose_check", "record_finding", "fingerprint_done"],
+  // assetReview: verify the observations the full-asset LLM read produced — bounded follow-up requests only.
+  assetReview: ["get_inventory", "login", "http_request", "compose_check", "probe_secrets", "verify_access", "record_finding", "resolve_asset_review", "asset_review_done"],
 } as const;
 
 const txt = (s: string): { content: { type: "text"; text: string }[] } => ({ content: [{ type: "text", text: s }] });
@@ -359,10 +376,50 @@ const CLASS_FAMILY: Record<string, string> = {
   "path-traversal": "disclosure",
 };
 
-/** finding dedup key = (category family × normalized endpoint × param). Coalesces duplicate reports of the same hole into one. */
-export function dedupKey(vulnClass: string, endpoint: string, param: string | undefined, base: string): string {
+/** App-wide defect signature: some findings describe ONE server-side property, not a per-endpoint hole — a
+ *  missing security-header policy, a global verbose-error handler that leaks stack traces, directory-listing
+ *  middleware. Recording each endpoint as its own finding inflates the ledger with duplicates (a-mvor6nuu:
+ *  ~30 lows that were really 2 issues). A recognized signature replaces the endpoint in the dedup key so such
+ *  reports fold into one finding whose description accumulates every affected endpoint. Categories/titles that
+ *  don't match a known app-wide mechanism keep the endpoint-scoped key — distinct holes never merge.
+ *  Match the finding's CLAIM (its title) only — a description routinely mentions other mechanisms as supporting
+ *  detail ("the allow-list", "the listing", "framework version"), which would wrongly swallow a distinct hole
+ *  (a null-byte file read or a quarantine bypass is NOT "stack traces" or "directory listing"). */
+/** Category labels under which a forge-acceptance claim ("forged/unsigned session material was accepted")
+ *  can legitimately be recorded — the model picks the label, but the underlying mechanism (the server does
+ *  not verify the credential) is the same whichever it picks. Used by the app-wide signature, the
+ *  record-time forge gate, and findings-QA — one set, one truth. */
+export const FORGE_CLAIM_CATS = new Set(["session", "auth-bypass", "info-disclosure", "secret-exposure"]);
+
+export function appWideSignature(category: string, title: string, recs?: ReadonlyArray<{ validator?: string }>): string | null {
+  const cat = coarseClass(category);
+  if (cat === "headers") return "security-headers"; // one response-header policy for the whole app
+  // JWT signature non-verification is a single middleware property: every endpoint that accepts an
+  // unsigned/alg:none/forged token is the SAME root cause, so sibling labels (session/auth-bypass/
+  // info-disclosure) and endpoints must not split it. Match the CLAIM in the title OR the cited evidence —
+  // a probe_jwt record is itself a forged-token-accepted observation, so a non-English title can't dodge
+  // the fold (language-independent). A "JS-readable session cookie" or "weak HMAC secret" finding — no
+  // acceptance claim and no forge evidence — is a different mechanism and stays endpoint-scoped.
+  if (FORGE_CLAIM_CATS.has(cat)) {
+    if (/alg[:\s_-]?none|unsigned\s+[a-z0-9(:\s_-]{0,20}(?:jwt|token)|signature\s+(?:never\s+|not\s+)?verif|\bforged\b[^.]{0,30}\baccepted/i.test(title) || citesForgeEvidence(recs ?? []))
+      return "jwt-no-verify";
+  }
+  if (cat !== "info-disclosure" && cat !== "secret-exposure" && cat !== "misconfig") return null;
+  if (/stack[\s_-]?trace|verbose\s+\w*\s*(?:error|exception)|unhandled\s+\w*\s*error|error\s+(?:page|message|response|handler)|sequelize|x-powered-by|framework (?:name|version)/i.test(title)) return "stack-trace";
+  if (/directory listing|index of|serve-?index|auto-?index|autoindex/i.test(title)) return "dir-listing";
+  // One catch-all handler that answers unknown paths with a 200 shell — reported once per prefix.
+  if (cat === "misconfig" && /soft.?404|catch.?all|spa.?shell|spa\b[^.]{0,25}shell/i.test(title)) return "soft-404";
+  return null;
+}
+
+/** finding dedup key = (category family × normalized endpoint × param). Coalesces duplicate reports of the same
+ *  hole into one. `appSig` (an app-wide mechanism signature) IS the whole key — the mechanism is a server
+ *  property, so the model's category label (info-disclosure vs misconfig) and endpoint must not split it. */
+export function dedupKey(vulnClass: string, endpoint: string, param: string | undefined, base: string, appSig?: string | null): string {
+  if (appSig) return `app:${appSig}`;
   const coarse = coarseClass(vulnClass);
-  return `${CLASS_FAMILY[coarse] ?? coarse}::${normEndpoint(endpoint, base)}::${param ?? ""}`;
+  const fam = CLASS_FAMILY[coarse] ?? coarse;
+  return `${fam}::${normEndpoint(endpoint, base)}::${param ?? ""}`;
 }
 
 /** Canonical classes for record_finding (classification consistency + stable dedup key). */
@@ -431,12 +488,54 @@ export const SUSPECT_EXCLUDED_CATEGORIES = new Set<string>(["rate-limit", "heade
 const PATH_WORDLIST = [
   "/admin", "/administrator", "/api", "/api/profile", "/api/users", "/api/user", "/api/orders", "/api/admin", "/api/config",
   "/account", "/account/edit", "/profile", "/settings", "/users", "/user", "/dashboard",
-  "/status", "/health", "/healthz", "/metrics", "/debug", "/server-status", "/actuator", "/info", "/version",
-  "/config", "/.env", "/.git/config", "/backup", "/robots.txt", "/sitemap.xml",
-  "/login", "/register", "/signup", "/upload", "/uploads", "/files", "/download",
-  "/search", "/orders", "/cart", "/checkout", "/support", "/continue", "/redirect", "/go",
-  "/swagger", "/api-docs", "/graphql", "/.well-known/security.txt",
+  "/status", "/health", "/healthz", "/metrics", "/debug", "/server-status", "/server-info", "/actuator", "/actuator/health", "/actuator/env", "/actuator/metrics", "/info", "/version",
+  "/config", "/config.js", "/env.js", "/settings.json", "/.env", "/.env.local", "/.env.production", "/.git/config", "/.git/HEAD", "/.svn/entries", "/.hg/", "/.DS_Store",
+  "/backup", "/backups", "/backup.zip", "/backup.tar.gz", "/db", "/dump", "/database", "/data",
+  "/robots.txt", "/sitemap.xml", "/security.txt", "/.well-known/security.txt", "/.well-known/change-password", "/.well-known/openid-configuration",
+  "/login", "/register", "/signup", "/upload", "/uploads", "/files", "/download", "/downloads", "/export", "/archive",
+  "/search", "/orders", "/cart", "/checkout", "/support", "/support/logs", "/continue", "/redirect", "/go",
+  "/swagger", "/swagger-ui", "/swagger-ui/", "/api-docs", "/openapi.json", "/graphql", "/graphiql",
+  "/logs", "/log", "/tmp", "/temp", "/old", "/test", "/dev", "/development", "/internal", "/hidden", "/private",
+  "/secret", "/secrets", "/keys", "/key", "/certs", "/certificates", "/ssl", "/.ssh/id_rsa", "/keystore",
+  "/console", "/management", "/monitor", "/monitoring", "/phpinfo.php", "/info.php", "/elmah.axd", "/trace.axd",
+  "/proxy", "/cgi-bin/", "/scripts", "/static", "/assets", "/public", "/shared", "/common",
+  "/error", "/errors", "/exception", "/trace", "/debug/default/view", "/_profiler", "/wp-admin", "/wp-login.php",
 ];
+
+/** Second-level names tried under a discovered DIRECTORY-looking hit — mounts like express's
+ *  app.use("/support/logs/", …) return 404 for the parent, so a bare /support miss is never evidence
+ *  the subtree is absent; the children below are the highest-frequency mount/file names. */
+const DIR_WORDLIST_2 = [
+  "logs", "log", "backup", "backups", "db", "dump", "dumps", "data", "private", "secret", "secrets",
+  "keys", "key", "config", "conf", ".git", ".env", "old", "tmp", "test", "dev", "internal", "admin",
+  "uploads", "files", "download", "downloads", "export", "archive", "src", "dist", "docs", "doc",
+];
+
+/** Root-relative path references harvested from response bodies — a leaked config/challenge/error body
+ *  that names "/support/logs" or "/encryptionkeys" is itself the map to the next unlinked endpoint.
+ *  Server-internal absolute paths (stack-trace FS paths) are noise for GET probing → excluded. */
+const BODY_PATH_RE = /["'`\s(=](\/(?:[A-Za-z0-9_\-~.]+\/)*[A-Za-z0-9_\-~.]{1,60})["'`\s)?<;,]|$/gm;
+const BODY_PATH_NOISE = /^\/(?:home|usr|var|opt|srv|etc|proc|sys|dev(?!\/api)|private|tmp|root|node_modules|mnt|media|boot|lib|lib64|bin|sbin|run|snap|windows|users|program files|juice-shop\/build|juice-shop\/node_modules)\//i;
+/** Harvested paths are UNTRUSTED input — a leaked body can name a GET-mutating route (/admin/delete/5)
+ *  and blind enumeration would fire it. Skip mutation-verb-shaped segments for harvested candidates;
+ *  curated wordlist entries and explicit `extra` args stay probeable (operator/model intent). */
+const MUTATING_SEG_RE = /(?:^|\/)(?:delete|remove|destroy|drop|purge|clear|empty|reset|revoke|disable|enable|ban|suspend|edit|update|create|register|checkout|order|pay|purchase|transfer|send|post|comment|review|vote|flag|approve|reject|cancel|refund|charge|execute|run|eval|import|install|uninstall|deploy|restart|shutdown|stop|kill|wipe|format|truncate|commit|merge|publish|invite|grant|assign|promote|demote|lock|unlock|verify|confirm|activate|deactivate)(?=$|\/|\.|\?|-)/i;
+
+/** Mine path-shaped tokens from a response body. Capped — a minified bundle emits thousands of strings. */
+export function harvestBodyPaths(body: string): string[] {
+  const out = new Set<string>();
+  for (const m of body.matchAll(BODY_PATH_RE)) {
+    const p = m[1];
+    if (!p || p.length > 80 || p === "/") continue;
+    if (BODY_PATH_NOISE.test(p + "/")) continue;
+    if (/\.(map|css|png|jpe?g|gif|ico|svg|woff2?|ttf|eot|webp|mp4|webm|avif)$/i.test(p)) continue;
+    if (isSessionDestroyingPath(p)) continue;
+    if (MUTATING_SEG_RE.test(p)) continue;
+    out.add(p);
+    if (out.size >= 120) break;
+  }
+  return [...out];
+}
 
 /** Paths with a session-destroying side effect (logout/signout/SSO logout etc.). Auto-traversing them in an authenticated
  *  assessment wipes the server-side session and kills all subsequent auth diagnosis, so probe_paths must never hit them. */
@@ -1275,7 +1374,7 @@ export function frontierLinks(
  *  `active` (default true) = a real vuln probe that counts toward the screen_done coverage gate. PASSIVE/hygiene probes
  *  (probe_headers) pass active:false so a screen can't be closed "tested-clean" on header checks alone (mapped, never
  *  attacked). httpProbes/httpThrough still tally every request — the auth-wall breaker wants the full sample. */
-function bumpHttp(s: PilotSession, status: number, opts: { active?: boolean } = {}): void {
+export function bumpHttp(s: PilotSession, status: number, opts: { active?: boolean } = {}): void {
   s.httpProbes += 1;
   if (opts.active !== false) s.screenProbes += 1; // active per-screen diagnosis activity (cross-checks the screen_done gate)
   if (status === 401) s.httpAuthWall += 1;
@@ -1298,7 +1397,7 @@ export function plannedClassesFor(plan: string | undefined): string[] {
   if (!m) return [];
   const raw = (m[1] ?? "").split(",").map((c) => c.trim()).filter(Boolean);
   // Classes found passively/opportunistically (not forced into active coverage even if written into the plan).
-  const EXCLUDED = new Set(["other", "headers", "info-disclosure", "misconfig", "session"]);
+  const EXCLUDED = new Set(["other", "recon", "headers", "info-disclosure", "misconfig", "session"]);
   const out = new Set<string>();
   for (const c of raw) {
     const cc = coarseClass(c);
@@ -1321,6 +1420,16 @@ const MAX_PLAN_SLOTS_PER_CLASS = 24;
  *  (param | API surface), object-bound classes one slot per id-bearing location / GraphQL operation leaf,
  *  screen-level classes one slot. Every slot is a ledger row (status "planned") that an execution must
  *  satisfy — a single probe cannot answer for other params, endpoints, roles, or objects. */
+/** Plan class names the coverage gate can NEVER bind: anything coarseClass degrades to "other" writes no
+ *  slot at all (translated or symbol-only names strip to nothing), so a plan that declares such a class is
+ *  silently unenforced — the screen can close without that class ever being tested. Surface the loss so the
+ *  model renames to a canonical class instead of believing coverage exists. */
+function unboundPlanClasses(vulnClasses: string[]): string[] {
+  return vulnClasses.filter((c) => c.trim() && coarseClass(c) === "other");
+}
+const unboundClassesWarning = (unbound: string[]): string =>
+  ` — ⚠ class name(s) ${unbound.map((c) => JSON.stringify(c)).join(", ")} can't bind a coverage slot (they don't map to a canonical check class — write class names verbatim: idor, idor-write, sqli, xss-reflected, xss-stored, dom-xss, auth-bypass, ssrf, path-traversal, open-redirect, ssti, rce, nosql, xxe, csrf, prototype-pollution, mass-assignment, price-tampering, qty-tampering, workflow-bypass, user-enumeration, secret-exposure, rate-limit, cors-misconfig, session, headers, misconfig, info-disclosure, vulnerable-component, or a custom [a-z0-9-_] name). Re-record the plan with a bound name or that surface is never enforced.`;
+
 function writePlanSlots(s: PilotSession, screenId: string, vulnClasses: string[]): number {
   const sc = s.inv.screens().find((x) => x.screenId === screenId);
   if (!sc) return 0;
@@ -1400,8 +1509,11 @@ const FLOOR_XML_API_RE = /\.(xml|asmx|svc|ashx|wsdl)\b|\/soap/i;
 const MUTATING_METHOD_RE = /^(POST|PUT|PATCH|DELETE)$/i;
 
 /** Hard cap on floor rows per screen — bounded like plan slots; the floor must never become an
- *  unbounded sweep. Signals are sparse by design so this is a safety valve, not a normal limit. */
+ *  unbounded sweep. Signals are sparse by design so this is a safety valve, not a normal limit.
+ *  Exhaustive mode gets its own (larger, still finite) bound: ~24 params × 6 injection classes
+ *  plus API/screen one-shots. */
 const MAX_FLOOR_SLOTS_PER_SCREEN = 16;
+const MAX_FLOOR_SLOTS_EXHAUSTIVE = 160;
 
 /** Build the deterministic floor rows for a screen (pure — no store writes). Each row is a bounded
  *  param- or target-scoped plan slot carrying tool "plan-floor". */
@@ -1447,8 +1559,27 @@ export function floorRowsFor(s: PilotSession, sc: Screen): CheckExecution[] {
   for (const a of sc.apis)
     if (FLOOR_XML_API_RE.test(a.urlTemplate)) floor("xxe", checkTargetOf(a.method, a.urlTemplate, s.targetUrl, a.graphql?.operationKey));
 
+  // Exhaustive mode (--exhaustive): scanner-grade fan-out. The generic injection battery is
+  // materialized for EVERY injectable param — not only signal-matched ones — so coverage no
+  // longer depends on the model electing each class into its methodology. The cheap screen/API
+  // one-shots (cors/csrf/headers/info-disclosure/misconfig) are floored likewise; they are exempt
+  // from the coverage gate but still bind screen_done as slots. Cost is deliberately high: this
+  // trades turn budget for the deterministic exhaustiveness a scanner gets by construction.
+  if (s.exhaustive) {
+    for (const p of sc.params.slice(0, 24)) {
+      if (p.in === "header") continue;
+      for (const cls of ["sqli", "xss-reflected", "path-traversal", "nosql", "ssti", "rce"]) floor(cls, "*", p.name);
+    }
+    for (const a of sc.apis.slice(0, 16)) {
+      const t = checkTargetOf(a.method, a.urlTemplate, s.targetUrl, a.graphql?.operationKey);
+      floor("cors-misconfig", t);
+      if (MUTATING_METHOD_RE.test(a.method)) floor("csrf", t);
+    }
+    for (const cls of ["headers", "info-disclosure", "misconfig"]) floor(cls, "*", undefined);
+  }
+
   const dedup = new Map(rows.map((r) => [r.id, r]));
-  return [...dedup.values()].slice(0, MAX_FLOOR_SLOTS_PER_SCREEN);
+  return [...dedup.values()].slice(0, s.exhaustive ? MAX_FLOOR_SLOTS_EXHAUSTIVE : MAX_FLOOR_SLOTS_PER_SCREEN);
 }
 
 /** Persist the floor for a screen. Any slot a plan/execution row already covers (same checkKey) is
@@ -1522,6 +1653,53 @@ export function checkEvidenceDiscipline(
   return { ok: true };
 }
 
+/** Titles that claim forged material was accepted as a session — the claim shape that needs the isolating
+ *  forge control (same-surface denial). Used identically at record time (reject) and QA time (demote).
+ *  Matched to ACCEPTANCE phrasing only: bare "signature"/"bypass" words would pull in unrelated session
+ *  findings ("Session fixation bypass" is forge-shaped and SHOULD gate; "weak signature secret" or
+ *  "CSRF bypass" is not). */
+export function sessionForgeClaim(title: string): boolean {
+  return /alg[:\s_-]?none|unsigned\s+[a-z0-9(:\s_-]{0,24}(?:jwt|token|credential)|signature\s+(?:never\s+|not\s+)?verif|\bforged\b|impersonat|\b(?:jwt|tokens?|credentials?|sessions?|authentication|auth)\b[^.]{0,20}\bbypass\b|\b(?:jwt|tokens?|credentials?)\b[^.]{0,40}\baccepted\b|\baccepted\b[^.]{0,40}\b(?:jwt|tokens?|credentials?)\b/i.test(title);
+}
+
+/** Evidence produced by a forge-material probe — a session finding that cites these records IS a
+ *  forge-acceptance claim by construction, regardless of the title's language (title matching alone
+ *  misses non-English prose, and Authorization headers are redacted in persisted evidence so the token
+ *  can't be re-inspected). probe_jwt only ever mints forged tokens, so its evidence is never cited for
+ *  an unrelated claim. */
+const FORGE_EVIDENCE_VALIDATORS = new Set(["claude-pilot-jwt"]);
+export function citesForgeEvidence(recs: ReadonlyArray<{ validator?: string }>): boolean {
+  return recs.some((r) => r.validator !== undefined && FORGE_EVIDENCE_VALIDATORS.has(r.validator));
+}
+
+/** Forge-acceptance claims ("unsigned/alg:none/forged token was accepted at E") need a control that ISOLATES
+ *  the auth variable: the SAME request surface (method + path) denied WITHOUT the forged material. A control
+ *  on a different endpoint/method, or a WAF 500 / soft-404 on the same path, never demonstrated the endpoint
+ *  refuses a missing/invalid credential — and if the endpoint serves everyone anyway, "forgery accepted" is
+ *  vacuous (the real hole is missing auth → verify_access / idor, not a session forgery). */
+export function sessionForgeControlOk(
+  control: { request: { method?: string; url?: string }; response: { status: number; headers?: Record<string, string>; body: string } },
+  positives: ReadonlyArray<{ request: { method?: string; url?: string } }>,
+): { ok: true } | { ok: false; reason: string } {
+  const pathOf = (u?: string): string | null => {
+    try { return u ? new URL(u, "http://x").pathname : null; } catch { return null; }
+  };
+  const cPath = pathOf(control.request.url);
+  const cMethod = (control.request.method ?? "").toUpperCase();
+  if (!cPath || !cMethod) return { ok: false, reason: "the cited negative control has no request surface to compare" };
+  const denied =
+    control.response.status === 401 ||
+    control.response.status === 403 ||
+    isAuthRedirect(control.response as never) ||
+    isAuthWallBody(control.response as never);
+  if (!denied)
+    return { ok: false, reason: `the cited negative control was not a denial (status ${control.response.status}) — a forge-acceptance claim needs the SAME request refused without the forged material (401/403/login redirect), not a WAF/error page or a success` };
+  const mismatch = positives.find((p) => (p.request.method ?? "").toUpperCase() !== cMethod || pathOf(p.request.url) !== cPath);
+  if (mismatch)
+    return { ok: false, reason: `the negative control is a different surface (${cMethod} ${cPath}) than a positive replay (${mismatch.request.method} ${mismatch.request.url}) — it never demonstrated THIS endpoint refuses without the forged material` };
+  return { ok: true };
+}
+
 /** Business-logic evidence discipline (pure, marker-based). Judged by "a sign the manipulation took effect (effectMarker)", not length delta:
  *  ok if the marker appears in the manipulated request (positive), is absent in the legitimate request (control), and positives are ≥2, stable & accepted (<400).
  *  Captures semantic diffs like price=1 going through / role=admin being reflected, even when status/length are nearly identical. */
@@ -1568,10 +1746,16 @@ function roleNavigated(s: PilotSession): Set<string> {
   if (!s.navigatedByRole) s.navigatedByRole = new Map([[activeRoleKey(s), new Set(s.visited)]]);
   return roleSet(s.navigatedByRole, activeRoleKey(s));
 }
-/** Union of EVERY role's pending frontier — "work remaining" for survey_done/status across all sessions. */
+/** Union of EVERY role's pending frontier — "work remaining" for survey_done/status across all sessions.
+ *  A URL that role already navigated is filtered out: pending ∩ navigated is bookkeeping drift (e.g. a
+ *  redirect hop whose requested URL was never cleared before the landing-guard fix), not remaining work. */
 function unionFrontier(s: PilotSession): Set<string> {
-  const out = new Set<string>(s.frontier);
-  for (const set of s.frontierByRole?.values() ?? []) for (const u of set) out.add(u);
+  const out = new Set<string>();
+  const active = activeRoleKey(s);
+  const navOf = (role: string): Set<string> | undefined =>
+    s.navigatedByRole?.get(role) ?? (role === active ? s.visited : undefined);
+  for (const u of s.frontier) if (!navOf(active)?.has(u)) out.add(u);
+  for (const [role, set] of s.frontierByRole ?? []) for (const u of set) if (!navOf(role)?.has(u)) out.add(u);
   return out;
 }
 /** Swap the ACTIVE role: stash the outgoing role's frontier/gated, install the incoming role's sets
@@ -1605,21 +1789,17 @@ function roleSurveySnapshot(s: PilotSession, role: string) {
 }
 /** Persist the role's full survey state (visited + pending + gated + navigated) append-only — a resume
  *  restores all of it, so pending links discovered before a pause never silently disappear. */
-export function emitRoleProgress(s: PilotSession, role: string, state: "mapped" | "blocked", reason?: string): void {
+export function emitRoleProgress(s: PilotSession, role: string): void {
   s.store.appendEvent(s.assessmentId, {
     type: "survey_role_progress",
-    payload: { role, ...roleSurveySnapshot(s, role), state, ...(reason ? { reason: reason.slice(0, 200) } : {}) },
+    payload: { role, ...roleSurveySnapshot(s, role), state: "mapped", loginAttempts: s.roleLoginAttempts?.get(role) ?? 0 },
   });
 }
 
-/** Record a role's survey state as blocked with a concrete reason — appended as survey_role_progress so a
- *  resume restores the block instead of re-refusing forever, and a note so the reason stays visible. */
-function markRoleSurveyBlocked(s: PilotSession, role: string, why: string): void {
-  if (!role || role === "unauth") return;
-  if (s.roleSurveyBlocked?.get(role) === why) return; // already recorded this exact state
-  s.roleSurveyBlocked?.set(role, why);
-  s.store.appendEvent(s.assessmentId, { type: "note", payload: { message: `⛔ role '${role}' auth blocked: ${why}` } });
-  emitRoleProgress(s, role, "blocked", why);
+/** A failed login is a fact worth keeping visible in the run log — but it is NOT a role verdict.
+ *  Notes only; nothing is marked, nothing accumulates, the role can be retried freely. */
+function noteLoginFailed(s: PilotSession, role: string, why: string): void {
+  s.store.appendEvent(s.assessmentId, { type: "note", payload: { message: `⚠ role '${role}' login failed: ${why.slice(0, 200)}` } });
 }
 
 /** Sign-out / log-out chrome — a control that only renders when the server believes the session is
@@ -1655,20 +1835,33 @@ function sessionBoundEvidence(_s: PilotSession, o: Observation): boolean {
   return hasSignoutChrome(o) || identityApi;
 }
 
-/** Persist one observation to screens (auto-enrolls it as queued in the coverage ledger) and update the frontier. */
-function recordObservation(s: PilotSession, o: Observation): { screen: Screen; isNew: boolean } {
+/** Persist one observation to screens (auto-enrolls it as queued in the coverage ledger) and update the frontier.
+ *  Returns null when the LANDING page is out of scope (an open-redirect / affiliate hop bounced the browser to an
+ *  external host): that page is not the application — it must never be enrolled as a screen, and its links must
+ *  never seed the frontier. The caller owns clearing the requested URL's pending frontier/navigated state. */
+function recordObservation(s: PilotSession, o: Observation): { screen: Screen; isNew: boolean } | null {
+  if (!isInScope(o.finalUrl, s.scope)) return null;
   const authState = s.currentRole ? "post-login" : "unauth";
   const { screen, isNew } = s.inv.ingest(o, authState);
   s.store.upsertScreen(s.assessmentId, screen);
   const here = stripHash(o.finalUrl);
   s.visited.add(here);
   s.frontier.delete(here);
+  const req = stripHash(o.requestedUrl);
+  if (req !== here) {
+    // A redirect: the requested URL was exercised too — it just bounced to `here`. Clear its pending
+    // frontier entry as well: only `here` was deleted before, so redirect hops stayed pending forever
+    // and unionFrontier never emptied (the survey_done deadlock the a-mvor6nuu run hit).
+    s.visited.add(req);
+    s.frontier.delete(req);
+  }
   const who = activeRoleKey(s);
   // Per-role navigation tracking: the active role's own dedupe set (frontier/enrol/probe candidates), so
   // role B is still OFFERED URLs A already walked while neither re-offers a URL that session already saw.
   const nav = roleNavigated(s);
   const firstSeen = !nav.has(here);
   nav.add(here);
+  if (req !== here) nav.add(req); // this role navigated the requested URL — don't re-offer it
   // Per-role survey progress: role A's visited set must not satisfy role B's surface. Track who observed what —
   // and persist it through survey_role_progress so a resume restores honest per-role coverage instead of a
   // blank slate (or worse, one role's cookie satisfying them all). For a NAMED role a visit only counts when
@@ -1689,10 +1882,10 @@ function recordObservation(s: PilotSession, o: Observation): { screen: Screen; i
         }
       }
     }
-    // NOTE: an observation NEVER marks a role blocked — a 403 may be a scope gap, a 401 a per-resource
-    // decision, and login-ish page content is unreliable (register/i18n assets false-fired on live
-    // sessions). A dead session simply stops accumulating session-bound visits, so the role stays
-    // unfinished; survey_done names it, and login() is the only authoritative blocked source.
+    // NOTE: an observation NEVER marks anything about the role — a 403 may be a scope gap, a 401 a
+    // per-resource decision, and login-ish page content is unreliable (register/i18n assets false-fired
+    // on live sessions). A dead session simply stops accumulating session-bound visits, so the role
+    // stays unfinished; survey_done names it and login() can retry whenever.
   }
   // Exploration cap (--max-survey-screens): on reaching it, empty the frontier and add no further discovered links
   //   (map no more → survey_status's frontier goes empty and the model calls survey_done).
@@ -1709,10 +1902,9 @@ function recordObservation(s: PilotSession, o: Observation): { screen: Screen; i
   }
   // Persist AFTER frontier seeding so the snapshot carries the pending links this page discovered — a pause
   // right after this visit still restores them on resume. Emitted on a counted visit or a first-seen URL
-  // (which is also when pending/gated change), keeping event volume bounded to real navigation. A role that
-  // is currently BLOCKED keeps that state — a public-page visit must not resurrect it on restore.
+  // (which is also when pending/gated change), keeping event volume bounded to real navigation.
   if (counted || firstSeen)
-    emitRoleProgress(s, who, s.roleSurveyBlocked?.has(who) ? "blocked" : "mapped", s.roleSurveyBlocked?.get(who));
+    emitRoleProgress(s, who);
   return { screen, isNew };
 }
 
@@ -1767,6 +1959,7 @@ async function reachViaAnchor(s: PilotSession, targetUrl: string): Promise<{ scr
     };
     if (looksLikeErrorCatchAll(o)) return null; // the click still bounced to the error page
     const rec = recordObservation(s, o);
+    if (!rec) return null; // the click landed out of scope — nothing enrolled
     await captureScreenshot(s, rec.screen);
     s.refererGated.delete(stripHash(targetUrl));
     s.refererGated.delete(stripHash(snap.url));
@@ -1891,12 +2084,15 @@ export async function enrolByNavigate(
   const o = await s.driver.visit(url);
   s.visited.add(key); // probed — never retry, whatever the result
   nav.add(key);
+  s.frontier.delete(key); // probed — a pending frontier entry must not survive the visit either
   if (o.status >= 400 || looksLikeErrorCatchAll(o)) {
     const who = activeRoleKey(s);
-    emitRoleProgress(s, who, s.roleSurveyBlocked?.has(who) ? "blocked" : "mapped", s.roleSurveyBlocked?.get(who));
+    emitRoleProgress(s, who);
     return { outcome: o.status >= 400 ? "not_found" : "bounced", status: o.status, finalUrl: o.finalUrl }; // 404 page / login-bounce = not real
   }
-  const { screen, isNew } = recordObservation(s, o);
+  const rec = recordObservation(s, o);
+  if (!rec) return { outcome: "out_of_scope", status: o.status, finalUrl: o.finalUrl }; // redirect bounced off-target
+  const { screen, isNew } = rec;
   await captureScreenshot(s, screen);
   return { outcome: isNew ? "enrolled" : "duplicate", screenId: screen.screenId, status: o.status, finalUrl: o.finalUrl };
 }
@@ -2256,6 +2452,36 @@ function probeArgsMethod(args: Record<string, unknown>): string {
   return typeof m === "string" ? m.toUpperCase() : args.body || obj("baseline")?.body ? "POST" : "GET";
 }
 
+/** EvidenceStore keeps raw responses under this assessment's artifacts directory. The new session's
+ * in-memory records are empty on resume, so validate IDs against the on-disk record, never against
+ * a model-supplied string alone (and never persist the response body or model prose in a check). */
+function assetReviewEvidence(s: PilotSession, id: string, screenIds: readonly string[], scope: ScopePolicy):
+  { id: string; method: string; url: string; status: number; truncated: boolean; validator: string; assetAnswer: boolean } | null {
+  if (!/^ev-[a-z0-9]+-[a-z0-9]+$/.test(id) || !s.artifactsDir) return null;
+  for (const screenId of screenIds) {
+    if (!/^(?:pilot|s-[\w-]+)$/.test(screenId)) continue;
+    try {
+      const dir = join(s.artifactsDir, screenId, id);
+      const meta = JSON.parse(readFileSync(join(dir, "meta.json"), "utf8")) as Record<string, unknown>;
+      const req = JSON.parse(readFileSync(join(dir, "request.json"), "utf8")) as Record<string, unknown>;
+      const res = JSON.parse(readFileSync(join(dir, "response.json"), "utf8")) as Record<string, unknown>;
+      if (meta.id !== id || meta.screenId !== screenId || typeof meta.validator !== "string" ||
+          typeof req.url !== "string" || typeof req.method !== "string" ||
+          typeof res.status !== "number" || !Number.isInteger(res.status) ||
+          !isInScope(req.url, scope) || !isInScope(req.url, s.scope)) continue;
+      // A 200 login/proxy interstitial or a redirect to another path is not a re-fetch of
+      // the asset. Inspect only a bounded prefix, and never return/persist response text.
+      const body = readFileSync(join(dir, "response.body.txt"), "utf8").slice(0, 32_000);
+      const finalUrl = typeof res.finalUrl === "string" ? res.finalUrl : "";
+      const assetAnswer = isInScope(finalUrl, scope) && safeAssetUrl(finalUrl) === safeAssetUrl(req.url) &&
+        validAppBaseline({ status: res.status, headers: res.headers as Record<string, string> | undefined, body });
+      return { id, method: req.method.toUpperCase(), url: req.url, status: res.status,
+        truncated: res.truncated === true, validator: meta.validator, assetAnswer };
+    } catch { /* An absent or malformed artifact is not evidence. */ }
+  }
+  return null;
+}
+
 export function buildTools(s: PilotSession) {
   const defs = [
     // ───────────────────────── survey (STAGE 1) ─────────────────────────
@@ -2270,12 +2496,35 @@ export function buildTools(s: PilotSession) {
           return txt(`SKIPPED: ${url} is a logout/sign-out path. Navigating to it would break the auth session and wipe out all subsequent diagnosis, so it is not visited.`);
         try {
           const o = await s.driver.visit(url);
+          // ── out-of-scope landing guard ── an open redirect / affiliate hop bounced the browser to an
+          //   external host. That page is NOT the application: never enroll it as a screen, never seed its
+          //   links. But the requested URL WAS exercised — clear its pending frontier entry and mark it
+          //   navigated for this role, else it stays pending forever and survey_done can never pass.
+          if (!isInScope(o.finalUrl, s.scope)) {
+            s.visited.add(stripHash(url));
+            s.frontier.delete(stripHash(url));
+            const who = activeRoleKey(s);
+            roleNavigated(s).add(stripHash(url));
+            emitRoleProgress(s, who);
+            s.store.appendEvent(s.assessmentId, {
+              type: "note",
+              payload: { message: `↪ ${url} redirected out of scope → ${o.finalUrl} — external landing not enrolled; hop marked navigated` },
+            });
+            return txt(
+              JSON.stringify({
+                outOfScope: true,
+                requested: url,
+                finalUrl: o.finalUrl,
+                note: "The request bounced to an out-of-scope URL (open redirect / external link). The external page was not enrolled. This hop counts as exercised — do not navigate it again.",
+                frontierRemaining: s.frontier.size,
+              }),
+            );
+          }
           // ── error/login catch-all guard ── if the cold navigation bounced to an ASP.NET aspxerrorpath / ErrX / login
           //   page, do NOT enroll it as a screen and do NOT seed its links to the frontier (that derails the crawl onto
           //   the error page). Flag the route referer-gated so it's reached by an in-app browser_click instead.
           if (looksLikeErrorCatchAll(o)) {
-            // No role-blocked verdict here: a bounced navigation is a routing failure, not proof of session
-            // death (the only authoritative blocked source is a failed login()).
+            // No role verdict here: a bounced navigation is a routing failure, not proof of session death.
             // Anchor auto-recovery (opt-in via --anchor-url): the cold GET bounced, but the route may be reachable by
             // clicking its link from the goto-safe anchor hub. With no anchor set this whole block is skipped = unchanged.
             if (s.anchorUrl) {
@@ -2302,7 +2551,7 @@ export function buildTools(s: PilotSession) {
             // Gated state changed without an observation — persist it so resume keeps the gate (per-role).
             const who = activeRoleKey(s);
             roleNavigated(s).add(stripHash(url));
-            emitRoleProgress(s, who, s.roleSurveyBlocked?.has(who) ? "blocked" : "mapped", s.roleSurveyBlocked?.get(who));
+            emitRoleProgress(s, who);
             s.store.appendEvent(s.assessmentId, {
               type: "note",
               payload: { message: `🚧 ${url} bounced to an error/login page (${o.finalUrl}) — referer-gated, not enrolled. Reach it via browser_click from a page that links to it.` },
@@ -2317,7 +2566,9 @@ export function buildTools(s: PilotSession) {
               }),
             );
           }
-          const { screen, isNew } = recordObservation(s, o);
+          const rec = recordObservation(s, o); // non-null — finalUrl is scope-checked above
+          if (!rec) return txt(`ERROR: ${url} → ${o.finalUrl} left scope mid-check`); // unreachable: OOS branch returns first
+          const { screen, isNew } = rec;
           await captureScreenshot(s, screen);
           // ── input sweep ── submit this screen's forms/searches with benign values and add any new routes/APIs to the frontier.
           const { exercised: swept, added: sweptAdded } = await runInputSweep(s, screen, isNew);
@@ -2380,13 +2631,16 @@ export function buildTools(s: PilotSession) {
         };
         if (clicked && isInScope(snap.url, s.scope) && !isSessionDestroyingPath(snap.url) && !looksLikeErrorCatchAll(o)) {
           const wasGated = s.refererGated.has(stripHash(snap.url));
-          const { screen, isNew } = recordObservation(s, o);
-          await captureScreenshot(s, screen);
-          s.refererGated.delete(stripHash(snap.url)); // reachable after all (via in-app click)
-          enrolled = { screenId: screen.screenId, isNew };
-          // Run the discovery engine on click-reached screens too (parity with browser_navigate) — skip only a KNOWN
-          // referer-gated leaf, whose the sweep's cold-goto restore would bounce. Most click-reached screens are goto-safe.
-          if (!wasGated) swept = await runInputSweep(s, screen, isNew);
+          const rec = recordObservation(s, o); // non-null — snap.url is scope-checked above
+          if (rec) {
+            const { screen, isNew } = rec;
+            await captureScreenshot(s, screen);
+            s.refererGated.delete(stripHash(snap.url)); // reachable after all (via in-app click)
+            enrolled = { screenId: screen.screenId, isNew };
+            // Run the discovery engine on click-reached screens too (parity with browser_navigate) — skip only a KNOWN
+            // referer-gated leaf, whose the sweep's cold-goto restore would bounce. Most click-reached screens are goto-safe.
+            if (!wasGated) swept = await runInputSweep(s, screen, isNew);
+          }
         }
         return txt(
           JSON.stringify({
@@ -2442,7 +2696,9 @@ export function buildTools(s: PilotSession) {
                   rolesMapped: roles
                     .map((r) => `${r.name}(${Math.max(s.visitedByRole?.get(r.name)?.size ?? 0, s.roleSurveyCounts?.get(r.name) ?? 0)})`)
                     .filter((x) => !x.endsWith("(0)")),
-                  rolesBlocked: [...(s.roleSurveyBlocked?.entries() ?? [])].map(([r, w]) => `${r}: ${w}`),
+                  rolesUnmapped: roles
+                    .filter((r) => Math.max(s.visitedByRole?.get(r.name)?.size ?? 0, s.roleSurveyCounts?.get(r.name) ?? 0) === 0)
+                    .map((r) => `${r.name}${s.roleLoginAttempts?.get(r.name) ? ` (login attempted ${s.roleLoginAttempts.get(r.name)}x, still unauthenticated)` : " (never attempted)"}`),
                 }
               : {}),
             screensDiscovered: screens.length,
@@ -2496,38 +2752,39 @@ export function buildTools(s: PilotSession) {
           return txt(`survey_done REFUSED — ${pendingAll.size} in-scope URL(s) remain unvisited${perRole ? ` (${perRole})` : ""}. Continue mapping the frontier reported by survey_status before completing.`);
         }
         // Structural auth gate, PER-ROLE: every configured role must have actually navigated at least one URL
-        // under ITS OWN session (visitedByRole), or carry an explicit block reason recorded when its login failed
-        // (roleSurveyBlocked). One role's cookie must not silently satisfy an all-role exploration, and a blocked
-        // role stays visible instead of converting to "covered". Unmapped roles refuse the close.
+        // under ITS OWN session (visitedByRole), or have at least ATTEMPTED login (roleLoginAttempts — an
+        // observation, not a verdict). One role's cookie must not silently satisfy an all-role exploration.
+        // A role never even attempted refuses the close; a tried-but-unmapped role passes with a warning —
+        // there is no "blocked" state to deadlock on.
         const roles = availableRoles(s);
         if (roles.length > 0) {
-          const unmapped: string[] = [];
-          const blocked: string[] = [];
+          const neverTried: string[] = [];
+          const failed: string[] = [];
           const mapped: string[] = [];
           for (const r of roles) {
             const seen = Math.max(s.visitedByRole?.get(r.name)?.size ?? 0, s.roleSurveyCounts?.get(r.name) ?? 0);
-            const block = s.roleSurveyBlocked?.get(r.name);
+            const tries = s.roleLoginAttempts?.get(r.name) ?? 0;
             if (seen > 0) mapped.push(`${r.name}(${seen})`);
-            else if (block) blocked.push(`${r.name}: ${block}`);
-            else unmapped.push(r.name);
+            else if (tries > 0) failed.push(`${r.name} (${tries} login attempt(s), no authenticated page mapped)`);
+            else neverTried.push(r.name);
           }
-          if (unmapped.length > 0) {
-            const names = unmapped.join(", ");
+          if (neverTried.length > 0) {
+            const names = neverTried.join(", ");
             s.store.appendEvent(s.assessmentId, {
               type: "note",
-              payload: { message: `⛔ survey_done refused — role(s) not yet mapped under their own session: ${names}` },
+              payload: { message: `⛔ survey_done refused — role(s) never even attempted: ${names}` },
             });
             return txt(
-              `survey_done REFUSED — configured role(s) ${names} have not visited ANY url under their own session, so their authenticated surface is unmapped (this is how a run silently drops from ~60 to ~30 screens). ` +
+              `survey_done REFUSED — configured role(s) ${names} have not visited ANY url under their own session AND were never login()-attempted, so their authenticated surface is unmapped (this is how a run silently drops from ~60 to ~30 screens). ` +
                 `For EACH such role: call login(role) — in attended mode this switches to the operator's live session; verify a cookie/bearer is present — then browser_navigate the authenticated pages it unlocks so they enter the inventory. ` +
-                `If a role genuinely cannot authenticate, a failed login() records it as blocked and this gate lets it pass with that reason on record. ` +
-                `Only call survey_done again once each role's authenticated surface is mapped or explicitly blocked. (Mapped: ${mapped.join(", ") || "none"}${blocked.length ? `; blocked: ${blocked.join("; ")}` : ""})`,
+                `If the configured credentials don't work, bind proven ones via login(role, {username, password}). ` +
+                `Only call survey_done again once each role's authenticated surface is mapped or at least attempted. (Mapped: ${mapped.join(", ") || "none"}${failed.length ? `; failed: ${failed.join("; ")}` : ""})`,
             );
           }
-          if (blocked.length > 0) {
+          if (failed.length > 0) {
             s.store.appendEvent(s.assessmentId, {
               type: "note",
-              payload: { message: `⚠️ survey completing with ${blocked.length} role(s) BLOCKED (not covered): ${blocked.join("; ")}` },
+              payload: { message: `⚠️ survey completing with ${failed.length} role(s) unauthenticated despite login attempt(s): ${failed.join("; ")} — their authenticated surface is NOT covered` },
             });
           }
         }
@@ -2570,13 +2827,15 @@ export function buildTools(s: PilotSession) {
         if (plans.some((p) => !ids.has(p.screenId)) || new Set(plans.map((p) => p.screenId)).size !== plans.length)
           return txt("REJECTED: use distinct mapped screenIds from get_inventory. No plans were changed.");
         let floors = 0;
+        const unbound: string[] = [];
         for (const { screenId, vulnClasses, plan } of plans) {
           s.store.appendEvent(s.assessmentId, { type: "methodology_recorded", payload: { screenId, vulnClasses, plan } });
           s.plans.set(screenId, `classes=[${vulnClasses.join(",")}] ${plan}`);
           writePlanSlots(s, screenId, vulnClasses); // persist the bounded per-(target,param) check slots
           floors += writeFloorSlots(s, screenId); // deterministic minimum coverage the plan can't shrink
+          unbound.push(...unboundPlanClasses(vulnClasses));
         }
-        return txt(`planned ${plans.length} screens (${s.plans.size}/${ids.size} screens planned${floors ? `, +${floors} floor slot(s)` : ""})`);
+        return txt(`planned ${plans.length} screens (${s.plans.size}/${ids.size} screens planned${floors ? `, +${floors} floor slot(s)` : ""})${unbound.length ? unboundClassesWarning(unbound) : ""}`);
       },
     ),
     tool(
@@ -2598,7 +2857,8 @@ export function buildTools(s: PilotSession) {
           type: "note",
           payload: { message: `📋 PLAN ${screenId}: [${vulnClasses.join(",")}] ${plan.slice(0, 200)}${slots ? ` — ${slots} check slot(s)` : ""}${floors ? ` +${floors} floor` : ""}` },
         });
-        return txt(`planned ${screenId} (${s.plans.size}/${s.inv.screens().length} screens planned${floors ? `, +${floors} floor slot(s)` : ""})`);
+        const unbound = unboundPlanClasses(vulnClasses);
+        return txt(`planned ${screenId} (${s.plans.size}/${s.inv.screens().length} screens planned${floors ? `, +${floors} floor slot(s)` : ""})${unbound.length ? unboundClassesWarning(unbound) : ""}`);
       },
     ),
     tool(
@@ -2746,31 +3006,186 @@ export function buildTools(s: PilotSession) {
       },
     ),
     tool(
+      "compose_check",
+      "Run a verification YOU designed when no dedicated probe fits — the general-purpose counterpart of the probe catalog. Declare the whole check as an ordered list of legs (control = must-fail negative control, attack = the manipulated request, verify = an independent leg proving the effect landed — a read-back of changed state, a whoami under a forged token, another account's view) plus the EXPECTATIONS that make it a discriminating check. Legs execute in order under per-leg sessions: `role` selects whose material a leg sends ('unauth' strips the session, a configured role replays under its stored session — same reach as probe_authz's compare legs, omitted = current session). Every leg is recorded as evidence; the tool evaluates your expectations deterministically and records ONE check-ledger row under your `checkClass` — a composed verification COUNTS toward the plan slot, a raw http_request sequence does not. Expectations: controlMustDeny (every control leg refused: 401/403/login-wall), marker + markerIn (the proof string that must appear in the attack/verify legs and be ABSENT from control legs — e.g. the landed write, the forged identity), verifyDiffersFromControl (a verify leg must observably differ from the control — status flip or changed body). 'matched' + at least one control leg → ledger 'found'; 'refuted' → tested-clean; anything else → unverified with the reason. Bounds: <=8 legs, each isInScope-gated. This does NOT confirm findings by itself — cite the returned evidenceIds in record_finding; its category gates still apply (a composed check-ledger 'found' is capped at 'suspected' for idor/idor-write/auth-bypass — those need their dedicated verifier: probe_authz / verify_access).",
+      {
+        checkClass: z.string().regex(/^[a-z0-9][a-z0-9-_]{0,39}$/i, "short ledger class name e.g. idor, jwt, csrf, custom").describe("the plan-slot class this check satisfies"),
+        target: z.string().describe("'METHOD /path' — what is under test"),
+        param: z.string().optional(),
+        legs: z
+          .array(
+            z.object({
+              kind: z.enum(["control", "attack", "verify"]),
+              method: z.string(),
+              url: z.string(),
+              headers: z.record(z.string(), z.string()).optional(),
+              body: z.string().nullable().optional(),
+              role: z.string().optional().describe("'unauth' | a configured role | omitted = current session"),
+              note: z.string().optional(),
+            }),
+          )
+          .min(1)
+          .max(8),
+        expect: z
+          .object({
+            controlMustDeny: z.boolean().optional(),
+            marker: z.string().optional(),
+            markerIn: z.enum(["attack", "verify", "any"]).optional(),
+            verifyDiffersFromControl: z.boolean().optional(),
+          })
+          .optional(),
+        note: z.string().optional(),
+      },
+      async ({ checkClass, target, param, legs, expect, note }) => {
+        const cls = checkClass.toLowerCase();
+        // Scope-gate every leg up front — refuse the whole check before anything leaves.
+        const oos = legs.filter((l) => !isInScope(l.url, s.scope));
+        if (oos.length > 0) return txt(`BLOCKED: leg(s) out of scope: ${oos.map((l) => l.url).join(", ")}`);
+        // Role material must exist BEFORE firing — a mid-check session failure would make the verdict ambiguous.
+        for (const l of legs) {
+          if (l.role && l.role !== "unauth" && !(await roleAuthHeaders(s, l.role)))
+            return txt(`blocked: leg role '${l.role}' has no replayable session material — sessions usable now: ${usableRoles(s).join(", ")}. login('${l.role}') first, or compose the check without it.`);
+        }
+        const denied = (res: { status: number; body?: string; headers?: Record<string, string> }) =>
+          res.status === 401 || res.status === 403 || isAuthRedirect(res) || isAuthWallBody(res);
+        interface LegOut { kind: string; role: string; method: string; url: string; status?: number; denied?: boolean; bodyLen?: number; evidenceId?: string; error?: string; body: string }
+        const outs: LegOut[] = [];
+        let legError: string | null = null;
+        for (const [i, l] of legs.entries()) {
+          const roleHdrs = l.role === "unauth" ? {} : l.role ? ((await roleAuthHeaders(s, l.role)) ?? {}) : authHeaders(s);
+          const req: HttpRequest = { method: l.method.toUpperCase(), url: l.url, headers: { ...roleHdrs, ...(l.headers ?? {}) }, body: l.body ?? null };
+          try {
+            const res = await s.http.send(req);
+            bumpHttp(s, res.status);
+            const ev = s.evidence.record({
+              screenId: s.currentScreenId ?? "pilot",
+              validator: "claude-pilot-compose",
+              kind: l.kind === "control" ? "negative_control" : "positive_replay",
+              request: { ...req, headers: s.http.effectiveHeaders(req.headers, true) },
+              response: res,
+              note: `compose_check[${cls}] leg ${i + 1}/${legs.length} (${l.kind}${l.role ? `, ${l.role}` : ""}): ${l.note ?? l.method + " " + l.url}`,
+            });
+            outs.push({ kind: l.kind, role: l.role ?? (s.currentRole || "unauth"), method: req.method, url: l.url, status: res.status, denied: denied(res), bodyLen: res.body.length, evidenceId: ev.id, body: res.body });
+          } catch (e) {
+            legError = String(e).slice(0, 160);
+            outs.push({ kind: l.kind, role: l.role ?? (s.currentRole || "unauth"), method: req.method, url: l.url, error: legError, body: "" });
+            break; // a mid-check transport failure makes the remaining legs' absence misleading — stop here
+          }
+        }
+        // Evaluate ONLY the declared expectations — an undeclared property is never asserted.
+        const controls = outs.filter((o) => o.kind === "control" && !o.error);
+        const markersOf = (o: LegOut) => !!expect?.marker && o.body.includes(expect.marker);
+        const markerLegs = outs.filter((o) => !o.error && (expect?.markerIn === "verify" ? o.kind === "verify" : expect?.markerIn === "any" ? true : o.kind === "attack" || o.kind === "verify"));
+        const firstCtrl = controls[0];
+        const verifies = outs.filter((o) => o.kind === "verify" && !o.error);
+        const expectations: Array<{ name: string; hold: boolean; detail: string }> = [];
+        if (expect?.controlMustDeny) expectations.push({ name: "controlMustDeny", hold: controls.length > 0 && controls.every((o) => o.denied), detail: controls.length ? controls.map((o) => `ctrl→${o.status}`).join(",") : "no control leg sent" });
+        if (expect?.marker) expectations.push({ name: "marker", hold: markerLegs.length > 0 && markerLegs.every(markersOf) && controls.every((o) => !markersOf(o)), detail: `marker ${expect.marker.slice(0, 60)} in ${markerLegs.filter(markersOf).length}/${markerLegs.length} marked legs, absent in ${controls.filter((o) => !markersOf(o)).length}/${controls.length} controls` });
+        if (expect?.verifyDiffersFromControl) expectations.push({ name: "verifyDiffersFromControl", hold: !!firstCtrl && verifies.length > 0 && verifies.some((v) => v.status !== firstCtrl.status || v.body !== firstCtrl.body), detail: firstCtrl ? `${verifies.length} verify leg(s) vs control status ${firstCtrl.status}` : "no control leg to diff against" });
+        const verdict = legError
+          ? "inconclusive"
+          : expectations.length === 0
+            ? "executed"
+            : expectations.every((e) => e.hold)
+              ? "matched"
+              : "refuted";
+        const gated = verdict === "matched" && (cls === "idor" || cls === "idor-write" || cls === "auth-bypass");
+        const checkStatus: CheckStatus =
+          verdict === "refuted" && !legError && outs.every((o) => !o.error)
+            ? "tested-clean"
+            : verdict === "matched" && controls.length > 0
+              ? gated
+                ? "suspected"
+                : "found"
+              : "unverified";
+        const reason =
+          checkStatus === "suspected"
+            ? `matched — but a composed check can only be a LEAD for ${cls}: it needs the dedicated verifier (probe_authz / verify_access) for a confirmed finding`
+            : checkStatus === "unverified"
+              ? legError ?? (verdict === "matched" ? "matched but no discriminating control leg — result is a lead, not proof" : verdict === "executed" ? "no expectations declared — legs ran but nothing was discriminated" : `expectation(s) failed: ${expectations.filter((e) => !e.hold).map((e) => e.name).join(", ")}`)
+              : undefined;
+        const checkId = recordCheck(s, {
+          target,
+          param,
+          checkClass: cls,
+          status: checkStatus,
+          reason,
+          tool: "compose_check",
+          evidenceIds: outs.map((o) => o.evidenceId).filter((x): x is string => !!x),
+          detail: `${verdict}${expectations.length ? ` (${expectations.map((e) => `${e.name}:${e.hold ? "hold" : "FAIL"}`).join(", ")})` : ""}${note ? ` — ${note.slice(0, 160)}` : ""}`,
+        });
+        return txt(
+          JSON.stringify({
+            checkId,
+            verdict,
+            checkStatus,
+            ...(reason ? { reason } : {}),
+            expectations,
+            legs: outs.map(({ body: _b, ...o }) => o),
+            evidenceIds: {
+              control: outs.filter((o) => o.kind === "control").map((o) => o.evidenceId).filter(Boolean),
+              attack: outs.filter((o) => o.kind === "attack").map((o) => o.evidenceId).filter(Boolean),
+              verify: outs.filter((o) => o.kind === "verify").map((o) => o.evidenceId).filter(Boolean),
+            },
+            next:
+              verdict === "matched"
+                ? "Expectations held — cite control as negativeControl + >=2 distinct attack/verify evidenceIds as positiveReplays in record_finding (its category gates still apply — idor/idor-write need probe_authz, auth-bypass needs verify_access)."
+                : verdict === "refuted"
+                  ? "The check ran and the expectation was contradicted — this class is tested-clean for this shape."
+                  : "No discriminating verdict — see 'reason'. Add a control leg / declared expectations, or record the lead as verdict:'suspected' with an anomaly.",
+          }),
+        );
+      },
+    ),
+    tool(
       "login",
-      "Log in as one of the provided roles to reach authenticated surface. Updates the browser + http session to that role.",
-      { role: z.string() },
-      async ({ role }) => {
-        // Parallel workers are bound to one role — a same-process login into ANOTHER role's material would
-        // race that role's own worker. Cross-role checks use compare legs (stored material) instead.
-        if (s.boundRole != null && role !== s.boundRole) {
-          return txt(`this worker is bound to role '${s.boundRole || "(unauthenticated)"}' — cannot login as '${role}'. Cross-role checks go through probe_authz(compareRole:"${role}"), probe_graphql_op(compareRole:"${role}") or probe_idor — they replay under '${role}'s stored session material without swapping this session.`);
+      "Log in as one of the provided roles to reach authenticated surface. Updates the browser + http session to that role. Optional username/password override binds credentials you discovered during the run (e.g. an account you minted or credentials proven by a 200 login response) to that role — use it when the configured creds are wrong or absent. A failed login never locks the role: retry with better material whenever you have it.",
+      { role: z.string(), username: z.string().optional(), password: z.string().optional() },
+      async ({ role, username, password }) => {
+        // A bound worker may only drive ITS role (a login into another role's material would race the
+        // dedicated worker that owns it). An UNBOUND worker (boundRole "" — the unauth worker) may login
+        // as any role with no dedicated worker, and any worker may drop back to 'unauth'. boundRole tracks
+        // the CURRENT identity on spawned workers: successful login binds, login("unauth") unbinds.
+        const bound = s.boundRole || "";
+        if (bound ? role !== bound && role !== "unauth" : role !== "unauth" && (s.peerBoundRoles?.has(role) ?? false)) {
+          return txt(`this worker is bound to role '${bound || "(unauthenticated)"}' — cannot login as '${role}' (a dedicated worker owns that role's live session; a second login would race it). Cross-role checks go through probe_authz(compareRole:"${role}"), probe_graphql_op(compareRole:"${role}") or probe_idor — they replay under '${role}'s stored session material without swapping this session.${bound ? ` To drop back to unauthenticated, call login("unauth") first.` : ""}`);
+        }
+        // Explicit unbind: strip ambient session material so the worker is genuinely unauthenticated.
+        if (role === "unauth") {
+          if (s.driver) await s.driver.clearSession().catch(() => {});
+          s.currentCookie = "";
+          s.currentBearer = "";
+          if (s.peerBoundRoles) s.boundRole = "";
+          setActiveRole(s, "");
+          return txt("session cleared — now unauthenticated (no cookie, no bearer).");
         }
         const desc = s.roleDescriptions.get(role);
         const tag = desc ? ` [${desc}]` : ""; // attach the privilege description (if any) to the response
         // Refuse names that aren't configured roles — a typo'd/hallucinated name would otherwise spawn a
-        // real browser context (attended respawn) and park a worker for minutes, then pollute the blocked
-        // ledger with a role that never existed.
+        // real browser context (attended respawn) and park a worker for minutes for a role that never existed.
         if (role !== "unauth" && !availableRoles(s).some((r) => r.name === role)) {
           const avail = availableRoles(s).map((r) => (r.description ? `${r.name} (${r.description})` : r.name)).join(", ") || "none";
           return txt(`unknown role '${role}'. Configured roles: ${avail}`);
         }
+        // Discovered-credential override: the operator's configured creds may be wrong/stale while the agent
+        // has already proven working ones (a 200 login response, a freshly-minted account). The override is
+        // TRIED first but binds to the role only when its own login SUCCEEDS — a wrong guess must never
+        // poison the configured credentials. The configured creds then run as an automatic fallback in the
+        // same call, so a bad guess costs one attempt, not the role.
+        const overrideCreds =
+          username || password
+            ? {
+                username: username ?? s.roleCreds.get(role)?.username ?? role,
+                password: password ?? s.roleCreds.get(role)?.password ?? "",
+              }
+            : undefined;
+        // Count the attempt — an observation, not a verdict. survey_done uses it to distinguish "never tried"
+        // (refused) from "tried and couldn't authenticate" (passes with a warning). No blocked state exists.
+        s.roleLoginAttempts ??= new Map();
+        s.roleLoginAttempts.set(role, (s.roleLoginAttempts.get(role) ?? 0) + 1);
         // ⓪ attended (manual multi-session): each role already has a live context.
         //    Don't re-login; just swap the active driver / cookie to that role.
-        const markBlocked = (why: string) => markRoleSurveyBlocked(s, role, why);
         const markAuthed = async (): Promise<void> => {
-          const hadBlock = s.roleSurveyBlocked?.has(role);
-          s.roleSurveyBlocked?.delete(role);
-          if (hadBlock) emitRoleProgress(s, role, "mapped");
           await establishPrincipal(s, role); // whoami-style identity binding when an identityUrl was configured
         };
         let live = s.roleSessions?.get(role);
@@ -2789,7 +3204,7 @@ export function buildTools(s: PilotSession) {
             live = (await s.respawnAttended(role)) ?? undefined;
             if (live) s.roleSessions?.set(role, live);
           } catch {
-            /* respawn failed — fall through to the material paths / blocked */
+            /* respawn failed — fall through to the material paths / an honest login failure */
           }
         }
         if (live) {
@@ -2800,6 +3215,7 @@ export function buildTools(s: PilotSession) {
           s.currentBearer = (await live.driver.bearerToken().catch(() => null)) ?? "";
           if (s.currentBearer) live.bearer = s.currentBearer;
           setActiveRole(s, role); // swap frontier/gated to this role's own sets before any navigation
+          if (s.peerBoundRoles) s.boundRole = role;
           if (live.cookie || s.currentBearer) {
             await markAuthed();
             return txt(`switched to live attended session for role '${role}'${tag} (manual login; cookie ${live.cookie ? "present" : "empty"}${s.currentBearer ? ", bearer present" : ""}).`);
@@ -2808,8 +3224,8 @@ export function buildTools(s: PilotSession) {
           // configured cookieFile/creds must still get its machine login — don't die on the empty
           // operator session, fall through to the material paths (they act on s.driver == live.driver).
           if (!s.roleCookieFiles.has(role) && !s.roleCreds.has(role)) {
-            markBlocked(`attended session for '${role}' carries no session material (empty cookie, no bearer)`);
-            return txt(`switched to live attended session for role '${role}'${tag} — WARNING: the session has no cookie/bearer, its visits will NOT count as authenticated mapping and the role is recorded BLOCKED until a real session is established.`);
+            noteLoginFailed(s, role, "attended session carries no session material (empty cookie, no bearer) — operator login pending");
+            return txt(`switched to live attended session for role '${role}'${tag} — WARNING: the session has no cookie/bearer, its visits will NOT count as authenticated mapping until a real session is established (operator logs in, or call login again later).`);
           }
         }
         // ① If there's a pre-captured Cookie file, inject it without logging in (for walls that can't be auto-logged-in).
@@ -2818,7 +3234,7 @@ export function buildTools(s: PilotSession) {
           try {
             const loaded = loadCookieFile(cookieFile, s.targetUrl);
             if (!loaded.header && !loaded.bearer && loaded.origins.length === 0) {
-              markBlocked(`cookie file empty/unparseable: ${cookieFile}`);
+              noteLoginFailed(s, role, `cookie file empty/unparseable: ${cookieFile}`);
               return txt(`cookie file for '${role}' is empty/unparseable: ${cookieFile}`);
             }
             await s.driver.clearSession();
@@ -2827,6 +3243,7 @@ export function buildTools(s: PilotSession) {
             s.currentBearer = applied.bearer;
             if (live) { live.cookie = s.currentCookie; live.bearer = s.currentBearer; } // sync the shared role session
             setActiveRole(s, role);
+            if (s.peerBoundRoles) s.boundRole = role;
             await markAuthed();
             const bits = [
               loaded.browserCookies.length ? `${loaded.browserCookies.length} cookie(s)` : "",
@@ -2835,18 +3252,26 @@ export function buildTools(s: PilotSession) {
             ].filter(Boolean);
             return txt(`role '${role}'${tag}: injected ${bits.join(", ") || "session"} from file (no login).`);
           } catch (e) {
-            markBlocked(`cookie file error: ${String(e).slice(0, 150)}`);
+            noteLoginFailed(s, role, `cookie file error: ${String(e).slice(0, 150)}`);
             return txt(`cookie file error for '${role}': ${String(e).slice(0, 150)}`);
           }
         }
         // ② smartLogin with credentials. The manifest password may be stale — VERDICT itself changes
-        // passwords during probes — so the mutation ledger's latest (username, password) wins.
-        const rawCreds = s.roleCreds.get(role);
-        const creds = rawCreds ? effectiveCreds(s.store.loadAssessment(s.assessmentId)?.events ?? [], rawCreds) : undefined;
-        if (!creds) {
-          markBlocked("no credentials or cookie file configured for this role");
+        // passwords during probes — so the mutation ledger's latest (username, password) wins. An explicit
+        // override is tried verbatim (the model asserts those exact creds); configured creds follow as the
+        // automatic fallback when they differ.
+        const configuredCreds = s.roleCreds.get(role);
+        const credsList: { creds: LoginCreds; via: "override" | "configured" }[] = [];
+        if (overrideCreds) credsList.push({ creds: overrideCreds, via: "override" });
+        if (configuredCreds) {
+          const eff = effectiveCreds(s.store.loadAssessment(s.assessmentId)?.events ?? [], configuredCreds);
+          if (!overrideCreds || eff.username !== overrideCreds.username || eff.password !== overrideCreds.password)
+            credsList.push({ creds: eff, via: "configured" });
+        }
+        if (!credsList.length) {
+          noteLoginFailed(s, role, "no credentials or cookie file configured for this role");
           const avail = availableRoles(s).map((r) => (r.description ? `${r.name} (${r.description})` : r.name)).join(", ") || "none";
-          return txt(`no credentials/cookie for '${role}'. Available roles: ${avail}`);
+          return txt(`no credentials/cookie for '${role}'. Available roles: ${avail}. If you discovered or minted working credentials, call login('${role}', {username, password}) to bind them.`);
         }
         // Already-live session? An authenticated SPA bounces /login back to the app — destroying a working
         // session to "re-login" then fails on the missing form and lands on a spurious block. The identity
@@ -2860,27 +3285,40 @@ export function buildTools(s: PilotSession) {
             return txt(`role '${role}'${tag}: session already authenticated (identity endpoint answered) — re-login skipped.`);
           }
         }
-        try {
-          await s.driver.clearSession();
-          const r = await smartLogin(s.driver, s.loginLlm, creds, {
-            targetUrl: s.targetUrl,
-            ...(s.roleLoginUrls?.get(role) ? { loginScreenUrl: s.roleLoginUrls.get(role)! } : {}),
-            ...(s.model ? { model: s.model } : {}),
-          });
-          if (r.ok) {
+        let lastReason = "no response";
+        for (const { creds, via } of credsList) {
+          try {
+            await s.driver.clearSession();
+            const r = await smartLogin(s.driver, s.loginLlm, creds, {
+              targetUrl: s.targetUrl,
+              ...(s.roleLoginUrls?.get(role) ? { loginScreenUrl: s.roleLoginUrls.get(role)! } : {}),
+              ...(s.model ? { model: s.model } : {}),
+            });
+            if (!r.ok) {
+              lastReason = r.reason ?? lastReason;
+              continue;
+            }
+            s.roleCreds.set(role, creds); // the credentials that just proved themselves are bound for reuse
             s.currentCookie = await s.driver.sessionCookieHeader();
             s.currentBearer = (await s.driver.bearerToken().catch(() => null)) ?? "";
             if (live) { live.cookie = s.currentCookie; live.bearer = s.currentBearer; } // sync the shared role session
             setActiveRole(s, role);
+            if (s.peerBoundRoles) s.boundRole = role;
             await markAuthed();
-            return txt(`logged in as '${role}'${tag}; now at ${s.driver.currentUrl()}${s.currentBearer ? " (bearer JWT captured)" : ""}`);
+            const viaNote =
+              via === "override" ? " (discovered credentials bound to this role)" : overrideCreds ? " (the supplied credentials failed — configured credentials worked)" : "";
+            return txt(`logged in as '${role}'${tag}${viaNote}; now at ${s.driver.currentUrl()}${s.currentBearer ? " (bearer JWT captured)" : ""}`);
+          } catch (e) {
+            lastReason = `login error: ${String(e).slice(0, 150)}`;
           }
-          markBlocked(`login did not complete: ${r.reason}`);
-          return txt(`login as '${role}' did not complete: ${r.reason}`);
-        } catch (e) {
-          markBlocked(`login error: ${String(e).slice(0, 150)}`);
-          return txt(`login error: ${String(e).slice(0, 200)}`);
         }
+        const triedConfigured = credsList.length > 1;
+        noteLoginFailed(s, role, `login did not complete: ${lastReason}`);
+        return txt(
+          `login as '${role}' did not complete: ${lastReason}` +
+            (triedConfigured ? " — both the supplied and the configured credentials failed." : "") +
+            ` If you have proven other credentials (200 login response, minted account), retry login('${role}', {username, password}) to bind them.`,
+        );
       },
     ),
     tool(
@@ -3271,6 +3709,7 @@ export function buildTools(s: PilotSession) {
             positiveReplays: [p1.evId, p2.evId],
             effectMarker: tok,
             result: confirmed ? "confirmed" : ctrl.executed ? "unverified" : "clean",
+            ...(ctrl.executed ? { reasonCode: "unstable-response" } : {}),
             control: { executed: ctrl.executed },
             payload: [{ executed: p1.executed, signal: p1.signal }, { executed: p2.executed, signal: p2.signal }],
             verdict: confirmed
@@ -3579,7 +4018,7 @@ export function buildTools(s: PilotSession) {
           const res = await s.http.send(req);
           bumpHttp(s, res.status);
           const ev = s.evidence.record({ screenId: s.currentScreenId ?? "pilot", validator: "claude-pilot-cors", kind, request: { ...req, headers: s.http.effectiveHeaders(req.headers, req.inheritDefaultHeaders !== false) }, response: res, note: `cors ${tag}` });
-          return { evId: ev.id, acao: (res.headers["access-control-allow-origin"] ?? "").trim().toLowerCase(), acac: (res.headers["access-control-allow-credentials"] ?? "").trim().toLowerCase(), status: res.status };
+          return { evId: ev.id, acao: (res.headers["access-control-allow-origin"] ?? "").trim().toLowerCase(), acac: (res.headers["access-control-allow-credentials"] ?? "").trim().toLowerCase(), status: res.status, headers: res.headers, body: res.body };
         };
         try {
           const control = await fire(null, "negative_control", "no-origin");
@@ -3591,8 +4030,8 @@ export function buildTools(s: PilotSession) {
             const withCreds = p1.acac === "true";
             return txt(JSON.stringify({ confirmed: true, negativeControl: control.evId, positiveReplays: [p1.evId, p2.evId], effectMarker: evil, severity: withCreds ? "high" : "low", result: "confirmed", verdict: `CORS MISCONFIG CONFIRMED — Access-Control-Allow-Origin reflects an arbitrary origin ${withCreds ? "WITH credentials (cross-origin theft of AUTHENTICATED responses = HIGH)" : "without credentials (LOW)"}. record_finding(category cors-misconfig, ${withCreds ? "high" : "low"}) with these evidenceIds + effectMarker "${evil}".` }));
           }
-          const baseOk = validAppBaseline({ status: control.status });
-          return txt(JSON.stringify({ confirmed: false, negativeControl: control.evId, result: baseOk ? "clean" : "unverified", verdict: baseOk ? "not confirmed: the arbitrary Origin was not reflected into Access-Control-Allow-Origin (static '*' or no ACAO is not a finding)." : `UNVERIFIED: the no-origin control did not reach a valid app response (status ${control.status}) — "no reflection" is silence, not a negative.${baselineRetryHint(s, url, control.status)}` }));
+          const baseOk = validAppBaseline(control);
+          return txt(JSON.stringify({ confirmed: false, negativeControl: control.evId, baselineEvidenceId: control.evId, result: baseOk ? "clean" : "unverified", verdict: baseOk ? "not confirmed: the arbitrary Origin was not reflected into Access-Control-Allow-Origin (static '*' or no ACAO is not a finding)." : `UNVERIFIED: the no-origin control did not reach a valid app response (status ${control.status}) — "no reflection" is silence, not a negative.${baselineRetryHint(s, url, control.status)}` }));
         } catch (e) {
           return txt(`ERROR: ${String(e).slice(0, 180)}`);
         }
@@ -3720,7 +4159,7 @@ export function buildTools(s: PilotSession) {
       "Confirm a JWT forgery: (1) weak HMAC secret — cracks the live Bearer against a small default-secret wordlist and mints a new token; (2) alg:none / None / NONE (signature not verified); (3) RS256->HS256 KEY CONFUSION — if the token is RS/PS/ES-signed, fetches the JWKS (jwksUrl or /.well-known/jwks.json) and re-signs the token as HS256 using the RSA PUBLIC KEY as the HMAC secret (a naive verifier accepts it → admin forgery). Requires login() so the session holds a Bearer JWT. Replays each candidate against an identity-returning authed `url`; garbage token is the negative control (must be rejected) and the forged token is sent twice (accepted = the server took a token we minted). Returns negativeControl + positiveReplays evidenceIds → record_finding(category session). Optionally mutate a claim via `claimKey`/`claimValue` for privilege escalation. Does not cover jku/x5u or kid injection.",
       { url: z.string(), claimKey: z.string().optional(), claimValue: z.string().optional(), jwksUrl: z.string().optional() },
       async ({ url, claimKey, claimValue, jwksUrl }) => {
-        if (!s.currentBearer) return txt(JSON.stringify({ result: "blocked", verdict: "no Bearer JWT in the current session — login(role) first (this probe forges from the live token)." }));
+        if (!s.currentBearer) return txt(JSON.stringify({ result: "blocked", reasonCode: "missing-prerequisite", verdict: "no Bearer JWT in the current session — login(role) first (this probe forges from the live token)." }));
         if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} is out of scope`);
         const mutate = (c: Record<string, unknown>): void => {
           bumpJwtExp(c);
@@ -4732,7 +5171,7 @@ export function buildTools(s: PilotSession) {
       "Confirm a BLIND / out-of-band vuln via Interactsh or Burp Collaborator: blind SSRF, blind XXE, blind SQLi (DNS/HTTP exfil), OS command injection, header SSRF (X-Forwarded-Host / Referer / Host), email/webhook SSRF — anything where the EFFECT is the SERVER making an external request, not a visible response. Requires OOB enabled (Settings → OOB → Interactsh, or BURP_AUDIT_API + Collaborator). Put a {{OOB}} placeholder where the callback host belongs (a URL field, an XXE SYSTEM entity `<!ENTITY x SYSTEM \"http://{{OOB}}/\">`, a hostname, a header value, OR inside an uploaded file's text content — see `files`). The tool generates a unique callback host, injects it (in-scope target request), and polls ~waitSec for a DNS/HTTP/SMTP callback FROM the target; a callback = the server reached our host out-of-band = confirmed. FILE-BORNE OOB: for a blind SSRF/XXE that must live INSIDE an uploaded file (FFmpeg/HLS video-SSRF, ImageMagick, an uploaded SVG/DOCX with a SYSTEM entity), pass `files` (each {name, filename, contentType?, and `content` text OR `base64` bytes}) with {{OOB}} in a file's text `content` — it is sent as multipart/form-data and the callback confirms the file-borne case. Records a benign control + the injected request → negativeControl + positiveReplays evidenceIds for record_finding(category ssrf / rce as appropriate). NOTE: callbacks can lag seconds; nothing back after waitSec = not confirmed (try other params/headers/schemes).",
       { method: z.string(), url: z.string(), headers: z.record(z.string(), z.string()).optional(), body: z.string().nullable().optional(), files: z.array(z.object({ name: z.string(), filename: z.string(), contentType: z.string().optional(), content: z.string().optional(), base64: z.string().optional() })).optional(), waitSec: z.number().optional(), note: z.string().optional(), checkClass: z.string().optional().describe("plan class under test (ssrf / xxe / rce / sqli blind) — attributes the coverage-ledger row") },
       async ({ method, url, headers, body, files, waitSec, note }) => {
-        if (!s.oob) return txt(JSON.stringify({ result: "blocked", verdict: "OOB not available: enable OOB in Settings (Interactsh) or set BURP_AUDIT_API (Burp Collaborator). Without it, blind SSRF/XXE/SQLi cannot be confirmed out-of-band. In-band probe_ssrf still applies." }));
+        if (!s.oob) return txt(JSON.stringify({ result: "blocked", reasonCode: "missing-prerequisite", verdict: "OOB not available: enable OOB in Settings (Interactsh) or set BURP_AUDIT_API (Burp Collaborator). Without it, blind SSRF/XXE/SQLi cannot be confirmed out-of-band. In-band probe_ssrf still applies." }));
         const oob = s.oob;
         const inPlaceholder = url.includes("{{OOB}}") || (body?.includes("{{OOB}}") ?? false) || Object.values(headers ?? {}).some((v) => v.includes("{{OOB}}")) || filesHaveOobPlaceholder(files, "{{OOB}}");
         if (!inPlaceholder) return txt(JSON.stringify({ result: "unverified", verdict: "put a {{OOB}} placeholder where the callback host should be injected (in url, body, a header value, or an uploaded file's text content via `files`)." }));
@@ -5136,6 +5575,118 @@ export function buildTools(s: PilotSession) {
         s.scenarioDone = true;
         s.store.appendEvent(s.assessmentId, { type: "note", payload: { message: `🧩 SCENARIO done: ${summary.slice(0, 300)}` } });
         return txt("scenario stage complete.");
+      },
+    ),
+    tool(
+      "resolve_asset_review",
+      "Resolve ONE persisted asset-review lead. Use checkId from the completion goal (works after restart), or n from the initial follow-up goal. First re-fetch the scoped asset with http_request; for verified cite a confirmed record_finding about this asset and its findingId. Refuted requires an instrumented tested-clean check bound to THIS lead's resource, not a clean result on another endpoint. Unsupported verdicts stay unverified; duplicates are NOT clean. reason is accepted for compatibility but never saved.",
+      {
+        checkId: z.string().optional().describe("Exact persisted asset-review check ID from the completion goal; preferred on resume"),
+        n: z.number().int().positive().optional().describe("1-based index of the initial follow-up goal list (not available on resume)"),
+        verdict: z.enum(["verified", "refuted", "unverified", "not-applicable"]),
+        reason: z.string().optional().describe("Legacy field; not persisted or used as evidence (may contain secrets)"),
+        findingId: z.string().optional().describe("Persisted confirmed record_finding id for verified"),
+        evidenceIds: z.array(z.string()).optional().describe("Evidence IDs from a scoped http_request GET of this asset, plus tested-clean probe evidence for refuted"),
+      },
+      async ({ n, checkId, verdict, findingId, evidenceIds }) => {
+        const fromList = n === undefined ? undefined : s.pendingAssetObs?.[n - 1]?.checkId;
+        if ((!checkId && !fromList) || (n !== undefined && (!fromList || (checkId && checkId !== fromList))))
+          return txt("Rejected: supply a valid checkId, or an n from the current follow-up goal.");
+        const id = checkId ?? fromList!;
+        const state = s.store.loadAssessment(s.assessmentId);
+        const rows = s.store.checks(s.assessmentId);
+        const row = rows.find((c) => c.id === id);
+        // Only enrollment's own asset-review row is addressable. The key includes resource, origin,
+        // subject, principal, tenant AND session: never reconstruct it with the worker's defaults.
+        if (!state || !row || row.checkClass !== "asset-review" || row.tool !== "asset-review" ||
+            row.id !== checkKey(row) || !/^asset-review:[a-f0-9]{24}$/.test(row.resource ?? "") ||
+            row.subject !== "asset-review" || row.principal || row.tenant || row.session ||
+            row.param || !row.target.startsWith("ASSET "))
+          return txt("Rejected: no enrolled asset-review row with that identity in this assessment.");
+        const assetUrl = row.target.slice("ASSET ".length);
+        if (assetUrl !== safeAssetUrl(assetUrl) || !isInScope(assetUrl, state.scope) ||
+            !isInScope(assetUrl, s.scope) || row.origin !== new URL(assetUrl).origin ||
+            (row.screenId !== "pilot" && !state.screens.some((sc) => sc.screenId === row.screenId)) ||
+            (s.currentScreenId !== null && s.currentScreenId !== row.screenId))
+          return txt("Rejected: asset-review lead is outside this screen or authorized scope.");
+        if (!["planned", "unverified", "blocked"].includes(row.status))
+          return txt("Already resolved; the recorded outcome was not changed.");
+
+        const cited = [...new Set(evidenceIds ?? [])];
+        const screenIds = [row.screenId, "pilot"];
+        const proofs = cited.map((eid) => assetReviewEvidence(s, eid, screenIds, state.scope));
+        const validCitations = cited.length > 0 && proofs.every((ev) => ev !== null);
+        const assetRead = validCitations && proofs.some((ev) =>
+          ev!.validator === "claude-pilot" && ev!.method === "GET" &&
+          safeAssetUrl(ev!.url) === assetUrl && ev!.assetAnswer && !ev!.truncated &&
+          rows.some((c) => c.tool === "http_request" && c.checkClass === "http-request" &&
+            screenIds.includes(c.screenId) && c.evidenceIds.includes(ev!.id)));
+        let status: CheckStatus = "unverified";
+        let fixedReason = "asset-review lead not independently verified; further testing required";
+        let confirmedFinding: Finding | undefined;
+        // Bad/foreign IDs never become check evidence, even when the verdict stays unverified.
+        let acceptedIds: string[] = assetRead ? cited : row.evidenceIds;
+
+        if (verdict === "verified" && assetRead && findingId) {
+          const f = state.findings.find((item) => item.id === findingId);
+          // A confirmed finding is necessary but not sufficient: it must refer to THIS asset,
+          // belong to this screen (or the screenless follow-up), and not have closed a sibling slot.
+          if (f && f.verdict === "confirmed" && !f.duplicateOf &&
+              f.source.kind === "validator" && f.source.validatorName === "claude-pilot" &&
+              (f.screenId === row.screenId || f.screenId === null) &&
+              `${f.description}\n${f.reproSteps}`.includes(assetUrl) &&
+              f.evidenceIds.length >= 3 && new Set(f.evidenceIds).size === f.evidenceIds.length &&
+              f.evidenceIds.every((eid) => assetReviewEvidence(s, eid, screenIds, state.scope) !== null) &&
+              !rows.some((other) => other.id !== row.id && other.checkClass === "asset-review" && other.findingIds.includes(f.id))) {
+            confirmedFinding = f;
+            status = "found";
+            fixedReason = "asset-review lead confirmed by a recorded finding";
+            acceptedIds = [...new Set([...cited, ...f.evidenceIds])];
+          }
+        } else if (verdict === "refuted" && assetRead) {
+          // A clean check elsewhere on this screen says nothing about this particular JS lead.
+          // Only a verifier explicitly bound to the enrolled lead can refute it.
+          const tested = rows.find((c) => c.id !== row.id && c.id === checkKey(c) && c.status === "tested-clean" &&
+            c.checkClass === "asset-review" && c.resource === row.resource &&
+            c.tool && !["http_request", "record_finding", "screen_done", "asset-review"].includes(c.tool) &&
+            (c.screenId === row.screenId || c.screenId === "pilot") &&
+            c.origin === row.origin && c.target !== "*" && c.baselineOk !== false &&
+            c.evidenceIds.some((eid) => cited.includes(eid)) &&
+            c.evidenceIds.every((eid) => cited.includes(eid)));
+          if (tested && !rows.some((other) => other.id !== row.id && other.checkClass === "asset-review" &&
+              other.status === "tested-clean" && other.evidenceIds.some((eid) => tested.evidenceIds.includes(eid)))) {
+            status = "tested-clean";
+            fixedReason = "asset-review lead refuted by a recorded scoped test";
+          }
+        } else if (verdict === "not-applicable") {
+          fixedReason = "asset-review duplicate not independently verified";
+        } else if (verdict === "refuted" || verdict === "verified") {
+          fixedReason = "asset-review outcome lacks recorded verification evidence";
+        }
+        const findingIds = confirmedFinding ? [confirmedFinding.id] : [];
+        if (row.status === status && row.reason === fixedReason &&
+            JSON.stringify(row.evidenceIds) === JSON.stringify(acceptedIds) &&
+            JSON.stringify(row.findingIds) === JSON.stringify(findingIds))
+          return txt(`asset-review remains ${status}; no new evidence was recorded.`);
+        const now = new Date().toISOString();
+        s.store.upsertCheck(s.assessmentId, {
+          ...row, status, reason: fixedReason, reasonCode: status === "unverified" ? "missing-evidence" : undefined,
+          evidenceIds: acceptedIds, findingIds,
+          finishedAt: now, updatedAt: now,
+        });
+        return txt(`asset-review → ${status}${status === "unverified" ? "; further verification is required" : ""}.`);
+      },
+    ),
+    tool(
+      "asset_review_done",
+      "Finish the asset-review follow-up stage. Unresolved ledger rows remain visible for the completion pass. The summary is not saved; never put secrets in it.",
+      { summary: z.string() },
+      async () => {
+        s.assetReviewDone = true;
+        const pending = s.store.checks(s.assessmentId).filter((c) => c.checkClass === "asset-review" &&
+          ["planned", "unverified", "blocked"].includes(c.status)).length;
+        s.store.appendEvent(s.assessmentId, { type: "note", payload: { message: `📄 ASSET REVIEW stage ended; ${pending} lead(s) unresolved` } });
+        return txt("asset-review stage complete.");
       },
     ),
     tool(
@@ -6368,10 +6919,14 @@ export function buildTools(s: PilotSession) {
           };
           if (v === "confirmed") s.screenVerdict = "finding";
           else if (s.screenVerdict !== "finding") s.screenVerdict = "suspected"; // finding は上書きしない
-          const key = dedupKey(category, endpoint, param, s.targetUrl);
+          const citedRecs = evidenceIds
+            .map((id) => s.evidence.records.find((r) => r.id === id))
+            .filter((r): r is NonNullable<typeof r> => r !== undefined);
+          const key = dedupKey(category, endpoint, param, s.targetUrl, appWideSignature(category, title, citedRecs));
           const existing = s.findingsByKey.get(key);
           if (existing) {
             existing.evidenceIds = [...new Set([...existing.evidenceIds, ...evidenceIds])];
+            existing.affectedEndpoints = [...new Set([...(existing.affectedEndpoints ?? []), normEndpoint(endpoint, s.targetUrl)])];
             if (v === "confirmed") existing.severity = maxSev(existing.severity, normSev); // an unproven SUSPECTED re-report must not inflate a confirmed finding's severity
             if (v === "confirmed" && findingVerdict(existing) === "suspected") {
               existing.verdict = "confirmed"; // 後から証明 → 昇格(降格は無い)
@@ -6384,7 +6939,7 @@ export function buildTools(s: PilotSession) {
               payload: { message: `↩ DEDUP ${existing.id} += "${title}" (${key}; ${existing.evidenceIds.length} ev, sev ${existing.severity}, ${findingVerdict(existing)})` },
             });
             recordFindingRow(existing.id, findingVerdict(existing) === "confirmed" ? "found" : "suspected", existing.title);
-            return `merged into ${existing.id} (same ${key}); now ${existing.evidenceIds.length} evidence, severity ${existing.severity}, verdict ${findingVerdict(existing)}. Do not re-report this endpoint+param.`;
+            return `merged into ${existing.id} (same ${key}); now ${existing.evidenceIds.length} evidence, severity ${existing.severity}, verdict ${findingVerdict(existing)}. Do not re-report THIS endpoint+param${key.startsWith("app:") ? ", but DO record the same root cause once per NEWLY-observed endpoint — each joins this finding's affectedEndpoints" : ""}. Mark this screen's coverage class 'found' — the canonical finding already covers it (suppressing it as 'unverified' leaves a false gap).`;
           }
           const fidN = s.fidSeq ? (s.fidSeq.n += 1) : (s.findCounter += 1);
           const fid = `f-${String(fidN).padStart(3, "0")}`;
@@ -6422,6 +6977,7 @@ export function buildTools(s: PilotSession) {
             description,
             reproSteps,
             evidenceIds,
+            affectedEndpoints: [normEndpoint(endpoint, s.targetUrl)],
             scopeBasis: `authorized target ${s.targetUrl}`,
             ...(shot ? { screenshot: shot } : {}),
           };
@@ -6640,6 +7196,21 @@ export function buildTools(s: PilotSession) {
               return txt(`REJECTED: '${param}' is present (or the rule does not apply, e.g. Secure on non-TLS) on the session cookie(s) ${scSession.map((l) => l.name).join(", ")} in a cited replay.`);
           }
         } else if (category !== "auth-bypass") {
+          // Forge-acceptance session claims: the control must isolate the auth variable — the SAME request
+          // surface refused without the forged material. A different-endpoint denial or a WAF/error page
+          // cannot prove "the forged token was accepted HERE"; if the endpoint serves everyone anyway the
+          // claim is vacuous (the real hole is missing auth → verify_access / idor, not a session forgery).
+          // (Cookie-attribute findings take the absence-class branch above and are unaffected. The claim
+          // fires on the title OR on cited forge-probe evidence — language-independent — under any label a
+          // forge claim can legitimately carry; an auth-bypass label exits earlier via verify_access.)
+          if (FORGE_CLAIM_CATS.has(category) && (sessionForgeClaim(title) || citesForgeEvidence([negRec, ...posRecs].filter((r): r is NonNullable<typeof r> => r !== undefined)))) {
+            const fc = sessionForgeControlOk(
+              { request: { method: negRec.request.method, url: negRec.request.url }, response: negRec.response },
+              posRecs.map((r) => ({ request: { method: r!.request.method, url: r!.request.url } })),
+            );
+            if (!fc.ok)
+              return txt(`REJECTED (forge evidence): ${fc.reason}. Fire the SAME request (method+path) with NO credential or a garbage token — it must be refused 401/403/login-redirect — then replay the forged material twice on that surface. probe_jwt produces exactly this pair. If the endpoint serves unauthenticated requests too, there is no forgery to prove: the hole is missing auth — run verify_access and record idor/info-disclosure/auth-bypass instead.`);
+          }
           if (category === "sqli" && sqliHtmlLengthOnlyFp(negRec.response.body, posRecs.map((r) => r!.response.body), negRec.response.status, posRecs.map((r) => r!.response.status)))
             return txt("REJECTED: cited SQLi evidence is HTML/text length (search/result-page variance), not a JSON/XML boolean differential, a SQL error, or measured timing experiment. That is the Drupal/marketing-search false positive — do NOT confirm. Re-run probe_sqli and record only if it returns SQLi CONFIRMED.");
           if ((category === "idor" || category === "idor-write") && !idorLedgerMatch && posRecs.every((r) => classifyCrossUserBody(r!.response.body).class === "public-directory"))
@@ -6698,10 +7269,11 @@ export function buildTools(s: PilotSession) {
             plannedClasses: planned,
             classes: ledger.classes.map((c) => `${c.checkClass}: ${c.status}${c.unfulfilled.length ? ` (${c.unfulfilled.length} slot(s) unfulfilled)` : ""}`),
             unfulfilled: ledger.unstarted.map((c) => `${c.checkClass}@${c.target}${c.param ? `:${c.param}` : ""}`),
+            undecided: ledger.gaps.map((g) => `${g.checkClass}@${g.target}${g.param ? `:${g.param}` : ""}${g.subject ? ` (${g.subject})` : ""} → ${g.status}${g.reason ? ` — ${String(g.reason).slice(0, 100)}` : ""}`),
             hint:
-              ledger.unstarted.length > 0
-                ? "Each unfulfilled slot needs a conclusive execution row — a probe's unverified/blocked result does NOT close it. Fix the cause and re-run (different request shape / login() / another object id), or declare it not-applicable/unverified/blocked WITH a concrete reason at screen_done."
-                : "Every planned slot has an execution row — screen_done should pass with a coverage entry per planned class.",
+              ledger.unstarted.length > 0 || ledger.gaps.length > 0
+                ? "Each unfulfilled slot needs a conclusive execution row — a probe's unverified/blocked result does NOT close it. Fix the cause and re-run (different request shape / login() / another object id), or declare it not-applicable/unverified/blocked WITH a concrete reason at screen_done. Every UNDECIDED row is a failed/in-flight attempt that also owes a coverage decision — a class-level tested-clean/found claim does NOT close it."
+                : "Every planned slot has an execution row and no attempt is undecided — screen_done should pass with a coverage entry per planned class.",
           }),
         );
       },
@@ -6718,6 +7290,14 @@ export function buildTools(s: PilotSession) {
         note: z.string().max(160).optional().describe("≤160 chars — one-line close summary"),
       },
       async ({ verdict, coverage, note }) => {
+        // Completion re-drives enrolled asset leads on their owning screen. Generic coverage notes
+        // are model prose and MUST NOT replace the asset row's safe detail/reason or turn an
+        // unverified lead into a model-declared not-applicable/clean result. Only the persisted-ID
+        // resolver may close these leads; leave the screen queued while any remain open.
+        if (s.currentScreenId && s.store.checks(s.assessmentId).some((c) =>
+          c.screenId === s.currentScreenId && c.checkClass === "asset-review" &&
+          ["planned", "unverified", "blocked"].includes(c.status)))
+          return txt("NOT DONE — unresolved asset-review leads on this screen. Re-fetch the scoped asset and use resolve_asset_review(checkId) with recorded evidence; unproven leads remain open.");
         // ── カバレッジ・ゲート ── プランが挙げた攻撃クラスを全部 coverage で説明できるまで画面を閉じさせない。
         //   「1個見つけて screen_done」を構造的に封じる(non-terminal nudge: screenDone は立てずに差し戻す)。
         const planned = plannedClassesFor(s.plans.get(s.currentScreenId ?? ""));
@@ -6742,8 +7322,28 @@ export function buildTools(s: PilotSession) {
         const scrId = s.currentScreenId ?? "";
         ensurePlanSlots(s, scrId);
         const ledger = screenChecks({ checkExecutions: s.store.checks(s.assessmentId) }, scrId);
+        const byClass = new Map((coverage ?? []).map((c) => [coarseClass(c.class), c]));
+        // A bare 'not-applicable' label is NOT a decision — without a concrete reason it collapses
+        // to `unverified` so the gap stays visible and the class never reads as conclusive.
+        const declaredGap = (entry: { result: string; note?: string }): "not-applicable" | "unverified" | "blocked" | null =>
+          entry.result === "not-applicable" || entry.result === "unverified" || entry.result === "blocked"
+            ? entry.result === "not-applicable" && !(entry.note ?? "").trim()
+              ? "unverified"
+              : (entry.result as "not-applicable" | "unverified" | "blocked")
+            : null;
+        // Fold the declaration into a failed-attempt row: one gap row per attempt, and flipping
+        // tool→screen_done is what makes it a model-declared gap instead of tool exhaust.
+        const foldFailedRow = (row: CheckExecution, status: "not-applicable" | "unverified" | "blocked", noteText?: string): void => {
+          s.store.upsertCheck(s.assessmentId, {
+            ...row,
+            status,
+            tool: "screen_done",
+            reason: (noteText?.trim() || row.reason || status).slice(0, 300),
+            detail: `${row.detail ? `${row.detail} — ` : ""}declared at screen_done${row.reason ? ` (attempt: ${row.reason.slice(0, 140)})` : ""}`,
+            updatedAt: new Date().toISOString(),
+          });
+        };
         if (ledger.unstarted.length > 0) {
-          const byClass = new Map((coverage ?? []).map((c) => [coarseClass(c.class), c]));
           const execs = ledger.classes.flatMap((c) => c.checks);
           for (const slot of ledger.unstarted) {
             const entry = byClass.get(slot.checkClass);
@@ -6764,21 +7364,10 @@ export function buildTools(s: PilotSession) {
                   (prior ? ` A previous attempt failed: ${String(prior.reason ?? "").slice(0, 160)}` : "") +
                   ` Fix the cause and re-run (different request shape / login() another role / another object id), or mark it not-applicable/unverified/blocked with a concrete reason.`,
               );
-            if (entry.result === "not-applicable" || entry.result === "unverified" || entry.result === "blocked") {
-              // A bare 'not-applicable' label is NOT a decision — without a concrete reason it collapses
-              // to `unverified` so the gap stays visible and the class never reads as conclusive.
-              const status = entry.result === "not-applicable" && !(entry.note ?? "").trim() ? "unverified" : entry.result;
+            const status = declaredGap(entry);
+            if (status) {
               if (prior) {
-                // Fold the declaration into the failed-attempt row: one gap row per slot, and flipping
-                // tool→screen_done is what makes the row satisfy the slot (a model-declared gap).
-                s.store.upsertCheck(s.assessmentId, {
-                  ...prior,
-                  status,
-                  tool: "screen_done",
-                  reason: (entry.note?.trim() || prior.reason || status).slice(0, 300),
-                  detail: `${prior.detail ? `${prior.detail} — ` : ""}declared at screen_done${prior.reason ? ` (attempt: ${prior.reason.slice(0, 140)})` : ""}`,
-                  updatedAt: new Date().toISOString(),
-                });
+                foldFailedRow(prior, status, entry.note);
               } else {
                 // An honest-gap row satisfies THIS slot's scope (target+param) without claiming a verdict.
                 recordCheck(s, {
@@ -6801,6 +7390,28 @@ export function buildTools(s: PilotSession) {
               `NOT DONE — plan slot ${where} is UNFULFILLED: coverage declares '${entry.result}' but no execution row exists for it (a coverage array alone cannot mark it ${entry.result}). Run the real probe for this input, or declare it not-applicable/unverified/blocked with a reason.`,
             );
           }
+        }
+        // ── Failed-attempt fold — every CURRENT unverified/blocked/running row is an undecided attempt
+        //   that owes coverage a decision, the same contract a plan slot gets. These are the rows
+        //   plan slots never owned (a probe the plan didn't name, a scope the slot didn't bind): left
+        //   alone they drag the screen to unverified at close even when the class was judged clean.
+        //   A class-level conclusive claim cannot launder a scoped failure — remediate it at that
+        //   scope (re-run the probe / compose_check replaying that attempt's role) or declare the gap.
+        for (const g of screenChecks({ checkExecutions: s.store.checks(s.assessmentId) }, scrId).gaps) {
+          const entry = byClass.get(coarseClass(g.checkClass));
+          const where = `${g.checkClass} @${g.target}${g.param ? ` param:${g.param}` : ""}${g.subject ? ` (${g.subject})` : ""}`;
+          if (!entry)
+            return txt(
+              `NOT DONE — a ${g.status} attempt on ${where} was never resolved and its class has no coverage entry. Remediate it to a conclusive row (re-run the probe / compose_check under the same role), or declare it not-applicable/unverified/blocked in coverage with a concrete reason.`,
+            );
+          const status = declaredGap(entry);
+          if (status) {
+            foldFailedRow(g, status, entry.note);
+            continue;
+          }
+          return txt(
+            `NOT DONE — coverage declares '${g.checkClass}' ${entry.result} but a ${g.status} attempt on ${where} was never resolved — a class-level claim cannot close a scoped failure. Re-run it to a conclusive row (compose_check can carry a role per leg — replay it under this attempt's actor), or declare the attempt's gap in coverage.`,
+          );
         }
         // screenVerdict は record_finding が維持する(commit、upgrade-only)。モデルの自己申告 verdict では上書きしない
         //   — 記録された実体(confirmed/suspected/無し)が screen status の権威。verdict はログ/返却にのみ使う。
@@ -6830,9 +7441,9 @@ export function buildTools(s: PilotSession) {
     // ───────────────────────── 能動探索(A): paths ─────────────────────────
     tool(
       "probe_paths",
-      "Forced-browse a built-in wordlist of common/hidden paths within scope (e.g. /status, /admin, /api/profile, /continue, /.env). Finds UNLINKED endpoints that link-following misses; in-scope HTML hits are queued for mapping. Soft-404 baseline is auto-filtered. Optionally pass extra paths.",
-      { extra: z.array(z.string()).optional() },
-      async ({ extra }) => {
+      "Forced-browse a built-in wordlist of common/hidden paths within scope (e.g. /status, /admin, /api/profile, /continue, /.env). Finds UNLINKED endpoints that link-following misses; in-scope HTML hits are queued for mapping. Soft-404 baseline is auto-filtered. Directory-looking entries are tried WITH and WITHOUT a trailing slash (mount-style routes like /support/logs/ 404 their bare parent), and root-relative paths harvested from already-recorded response bodies are probed automatically too. Optionally pass extra paths — and pass parents=[...] to run a bounded child-name sweep (logs/keys/.git/backup…, bare+slash) UNDER directory prefixes you judge worth descending into (e.g. a discovered /admin or /support). Descent is never automatic — you choose the parents.",
+      { extra: z.array(z.string()).optional(), parents: z.array(z.string()).optional() },
+      async ({ extra, parents }) => {
         let base = { status: 404, len: -1 };
         try {
           const r = await s.http.send({ method: "GET", url: new URL(`/veritas-404-${Date.now()}`, s.targetUrl).toString(), headers: authHeaders(s), body: null });
@@ -6840,40 +7451,116 @@ export function buildTools(s: PilotSession) {
         } catch {
           /* ignore */
         }
-        const list = [...PATH_WORDLIST, ...(extra ?? [])];
+        const isSoft = (res: { status: number; body: string }): boolean =>
+          res.status === base.status && Math.abs(res.body.length - base.len) <= 16; // catch-all
+        // ── Path harvesting: every recorded response body is a candidate source — configs, catalog
+        //    payloads, error pages, JS already in evidence. A leaked path becomes a probe without
+        //    needing the model to notice the reference.
+        s.pathsHarvestedFrom ??= 0;
+        const harvested = new Set<string>();
+        for (const rec of s.evidence.records.slice(s.pathsHarvestedFrom)) {
+          for (const p of harvestBodyPaths(rec.response.body)) harvested.add(p);
+          if (harvested.size >= 150) break;
+        }
+        s.pathsHarvestedFrom = s.evidence.records.length;
+        const list = [...new Set([...(s.wordlist ?? PATH_WORDLIST), ...(extra ?? []), ...harvested])];
         const hits: Array<Record<string, unknown>> = [];
         let skippedLogout = 0;
-        for (const path of list) {
+        // Hard caps so enumeration can't run away: a per-call send budget + a WAF-challenge streak
+        // detector (a WAF answering every probe with the same 403 page would otherwise eat the whole list).
+        const SEND_BUDGET = 12_000;
+        let sent = 0;
+        let wafStreak = 0;
+        let wafLen = -1;
+        let aborted: string | null = null;
+        const tryOne = async (path: string): Promise<{ res: HttpResponse; ct: string } | null> => {
+          if (aborted) return null;
           let url: string;
           try {
             url = new URL(path, s.targetUrl).toString();
           } catch {
-            continue;
+            return null;
           }
-          if (!isInScope(url, s.scope)) continue;
-          if (pathIsIgnored(url, s.ignorePaths, s.targetUrl)) continue; // モデルが間引いたパスはプローブしない
-          // logout/signout 系は絶対に GET しない(認証セッションを破棄して以降の診断を全滅させるため)。
+          if (!isInScope(url, s.scope)) return null;
+          if (pathIsIgnored(url, s.ignorePaths, s.targetUrl)) return null;
           if (isSessionDestroyingPath(url)) {
             skippedLogout += 1;
-            continue;
+            return null;
           }
+          if (sent >= SEND_BUDGET) {
+            aborted ??= `send budget ${SEND_BUDGET} exhausted`;
+            return null;
+          }
+          sent += 1;
           let res: HttpResponse;
           try {
-            res = await s.http.send({ method: "GET", url, headers: authHeaders(s), body: null });
+            // bulk lane: wordlist enumeration paces on the faster bulk clock (~rate/8) — the polite
+            // minDelay still governs every normal probe, and 429/503 pushback backs the lane off.
+            res = await s.http.send({ method: "GET", url, headers: authHeaders(s), body: null, bulk: true });
           } catch {
-            continue;
+            return null;
           }
-          if (res.status === 404) continue;
-          if (res.status === base.status && Math.abs(res.body.length - base.len) <= 16) continue; // catch-all 除外
+          // Identical-403 streak → almost certainly a WAF challenge, not real endpoints: abort the whole
+          // enumeration instead of hammering the remaining thousands of candidates (and report it honestly).
+          if (res.status === 403) {
+            wafStreak = wafLen >= 0 && Math.abs(res.body.length - wafLen) <= 32 ? wafStreak + 1 : 1;
+            wafLen = res.body.length;
+            if (wafStreak >= 25) aborted ??= `probable WAF challenge — ${wafStreak} consecutive near-identical 403s`;
+          } else {
+            wafStreak = 0;
+            wafLen = -1;
+          }
+          if (res.status === 404 || isSoft(res)) return null;
           const ct = (res.headers["content-type"] ?? "").split(";")[0] ?? "";
           hits.push({ path, status: res.status, type: ct, len: res.body.length, location: res.headers["location"] });
           if (res.status < 400 && /html/.test(ct) && !roleNavigated(s).has(stripHash(url))) s.frontier.add(stripHash(url));
+          return { res, ct };
+        };
+        // Bounded concurrency pool — bulk sends serialize at ~rate/8 on the wire, the pool overlaps
+        // response latency so a 4.7k list doesn't take an hour. Returns the subset of paths that hit.
+        const runPool = async (paths: string[]): Promise<Set<string>> => {
+          const queue = [...paths];
+          const hit = new Set<string>();
+          await Promise.all(
+            Array.from({ length: 8 }, async () => {
+              let p: string | undefined;
+              while (!aborted && (p = queue.shift()) !== undefined) {
+                if (await tryOne(p)) hit.add(p);
+              }
+            }),
+          );
+          return hit;
+        };
+        // Pass 1: every candidate in the bare form.
+        const hitBare = await runPool(list);
+        // Pass 2: trailing-slash variants of extensionless misses — app.use("/x/") mounts 404 the bare
+        // parent but serve /x/, so a 404 bare form is never evidence the directory is absent.
+        const slashCands = list
+          .filter((p) => !hitBare.has(p) && !/\.[a-z0-9]{1,8}$/i.test(p) && !p.endsWith("/"))
+          .map((p) => `${p}/`);
+        await runPool(slashCands);
+        // Model-directed descent: the CALLER names the directory prefixes worth a child-name sweep —
+        // post-survey judgment instead of blind descent under every hit. ≤16 parents × 24 curated
+        // names × (bare + trailing-slash variant); the same scope/logout/mutation gates apply per
+        // generated path, and the send budget covers all passes.
+        const probed = new Set([...list, ...slashCands]);
+        const childCands = new Set<string>();
+        for (const rawParent of (parents ?? []).slice(0, 16)) {
+          const parent = `${rawParent.startsWith("/") ? rawParent : `/${rawParent}`}`.replace(/\/+$/, "");
+          if (!parent) continue;
+          for (const child of DIR_WORDLIST_2) {
+            for (const suffix of ["", "/"]) {
+              const c = `${parent}/${child}${suffix}`;
+              if (!probed.has(c)) childCands.add(c);
+            }
+          }
         }
+        if (!aborted && childCands.size) await runPool([...childCands]);
         s.store.appendEvent(s.assessmentId, {
           type: "note",
-          payload: { message: `🔍 probe_paths: ${hits.length} hit(s)/${list.length}, frontier=${s.frontier.size}${skippedLogout ? `, skipped ${skippedLogout} logout-path(s)` : ""}` },
+          payload: { message: `🔍 probe_paths: ${hits.length} hit(s)/${list.length} (+${harvested.size} body-harvested), frontier=${s.frontier.size}${skippedLogout ? `, skipped ${skippedLogout} logout-path(s)` : ""}${aborted ? `, ABORTED (${aborted})` : ""}` },
         });
-        return txt(JSON.stringify({ hits, queuedToFrontier: s.frontier.size, ...(skippedLogout ? { skippedLogoutPaths: skippedLogout } : {}) }));
+        return txt(JSON.stringify({ hits, sent, harvestedPaths: harvested.size, queuedToFrontier: s.frontier.size, ...(skippedLogout ? { skippedLogoutPaths: skippedLogout } : {}), ...(aborted ? { aborted } : {}) }));
       },
     ),
 
@@ -7058,7 +7745,7 @@ export function buildTools(s: PilotSession) {
         const cookieHeader = s.currentCookie || "";
         const bearer = s.currentBearer || "";
         const authorization = bearer ? `Bearer ${bearer}` : "";
-        if (!cookieHeader && !bearer) return txt(JSON.stringify({ result: "blocked", verdict: "no session: login(role) first (no Cookie, no Bearer)." }));
+        if (!cookieHeader && !bearer) return txt(JSON.stringify({ result: "blocked", reasonCode: "missing-prerequisite", verdict: "no session: login(role) first (no Cookie, no Bearer)." }));
         // The 3-request battery is deterministic for the same session+URL — a repeat call gets the
         // cached dump instead of re-firing two authed GETs and a control.
         s.sessionGlanceCache ??= new Map();
@@ -7561,7 +8248,7 @@ export function buildTools(s: PilotSession) {
     // ───────────────────────── evidence-backed A/B authorization comparison ─────────────────────────
     tool(
       "probe_authz",
-      "Run a BOUNDED, evidence-backed A/B authorization test on ONE concrete object — the only path that can produce a CONFIRMABLE idor/idor-write finding. `ownerRole` = the subject that legitimately owns the object (its session sends the baseline read), `compareRole` = the non-owner/lower-privileged subject under test. The tool: establishes each role's principal (identityUrl when configured), reads the object AS THE OWNER (baseline must succeed and carry the object), sends a denied control (a non-existent id as the compare role — proves the endpoint discriminates), then replays the access AS THE COMPARE ROLE twice (stability). Confirms ONLY when: ownership is verified (owner field in the owner baseline binds to the owner's established principal — OR an operator expectedAccess rule), the compare principal is established and differs from the owner, the denied control actually denied, and both compare replays returned the private object. Everything else is recorded honestly: unexpected-looking access without verified ownership/expectation = 'inconclusive' (a LEAD, cite it as suspected at most); a missing/expired comparison session NEVER falls back to another session — the run is recorded 'unverified'/'blocked'. Same-principal A/B (two aliases for one account) is REJECTED. `objectId` must appear in `url` (path/query) or `body`; a {{ID}} placeholder is also accepted (the tool swaps objectId in) — OR pass `objectId:'auto'`: the tool tries observed ids (this screen's id examples first, then ids seen in real traffic) as the owner baseline and adopts the first one '${ownerRole}' can actually read — use it when you know the roles to compare but not a concrete owned object. `action` 'write' marks the comparison a mutating test (idor-write) — use only for requests that actually mutate, a search/query POST is a READ.",
+      "Run a BOUNDED, evidence-backed A/B authorization test on ONE concrete object — the only path that can produce a CONFIRMABLE idor/idor-write finding. `ownerRole` = the subject that legitimately owns the object (its session sends the baseline read), `compareRole` = the non-owner/lower-privileged subject under test. The tool: establishes each role's principal (identityUrl when configured), reads the object AS THE OWNER (baseline must succeed and carry the object), sends a denied control (a non-existent id as the compare role — proves the endpoint discriminates), then replays the access AS THE COMPARE ROLE twice (stability). Confirms ONLY when: ownership is verified (owner field in the owner baseline binds to the owner's established principal — OR an operator expectedAccess rule), the compare principal is established and differs from the owner, the denied control actually denied, and both compare replays returned the private object. Everything else is recorded honestly: unexpected-looking access without verified ownership/expectation = 'inconclusive' (a LEAD, cite it as suspected at most); a missing/expired comparison session NEVER falls back to another session — the run is recorded 'unverified'/'blocked'. Same-principal A/B (two aliases for one account) is REJECTED. `objectId` must appear in `url` (path/query) or `body`; a {{ID}} placeholder is also accepted (the tool swaps objectId in) — OR pass `objectId:'auto'`: the tool tries observed ids (this screen's id examples first, then ids seen in real traffic) as the owner baseline and adopts the first one '${ownerRole}' can actually read — use it when you know the roles to compare but not a concrete owned object. `action` 'write' runs the bounded mutation contract (idor-write): owner PRE-STATE GET → compare role mutates a NON-EXISTENT id (must deny) → compare role sends YOUR mutation on the owner's object → an independent GET readback must show the change actually landed (pass `marker` = a distinctive value you put in the body, e.g. a negative quantity, to make the landed check exact). Use it for requests that actually mutate — a search/query POST is a READ. The owner pre-state GET must reach the object on the same URL; endpoints with no readback path can't prove a write and stay unverified.",
       {
         url: z.string(),
         method: z.string().optional(),
@@ -7572,10 +8259,12 @@ export function buildTools(s: PilotSession) {
         ownerRole: z.string().describe("role that legitimately owns/reads this object (baseline leg)"),
         compareRole: z.string().describe("the non-owner / lower-privileged role under test ('unauth' allowed = anonymous leg)"),
         action: z.enum(["read", "write"]).optional(),
+        marker: z.string().optional().describe("action:'write' only — a distinctive value you place in the mutation body (e.g. '-5', a forged field); the post-mutation readback must contain it to prove the write landed"),
         tenant: z.string().optional().describe("the object's tenant — only meaningful when operator-established (ignored for boundary claims otherwise)"),
         note: z.string().optional(),
       },
-      async ({ url: urlArg, method, body, objectId: objectIdArg, resourceType, param, ownerRole, compareRole, action, note }) => {
+      async ({ url: urlArg, method, body, objectId: objectIdArg, resourceType, param, ownerRole, compareRole, action, marker, note }) => {
+        const startedAt = new Date().toISOString();
         // `let` — objectId:'auto' may rewrite the url's {id} template into a {{ID}} placement and adopt a
         // discovered object id; placeId/send/carriesId/readLeg all read these variables at call time.
         let url = urlArg;
@@ -7596,6 +8285,7 @@ export function buildTools(s: PilotSession) {
         let objectTenant: string | undefined;
         // The compare role's effective session — stamped onto the check row, never the current session's.
         let cmpSessionHeaders: Record<string, string> | undefined;
+        let ownerSessionHeaders: Record<string, string> | undefined;
         // Persist one comparison record no matter how it ends — the honest trail IS the point.
         const finish = async (
           outcome: "unexpected-access" | "denied-as-expected" | "allowed" | "inconclusive" | "unverified",
@@ -7614,8 +8304,8 @@ export function buildTools(s: PilotSession) {
           },
         ): Promise<ReturnType<typeof txt>> => {
           const cmpId = `azc-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`;
-          const ownerCtx = subjectCtx(s, ownerRole);
-          const cmpCtx = subjectCtx(s, compareRole);
+          const ownerCtx = subjectCtx(s, ownerRole, ownerSessionHeaders ? sessionRefOf(ownerSessionHeaders) : undefined);
+          const cmpCtx = subjectCtx(s, compareRole, cmpSessionHeaders ? sessionRefOf(cmpSessionHeaders) : undefined);
           s.store.recordAuthzComparison(s.assessmentId, {
             id: cmpId,
             objectKey,
@@ -7644,6 +8334,7 @@ export function buildTools(s: PilotSession) {
             resource: objectKey,
             subject: compareRole,
             sessionHeaders: cmpSessionHeaders,
+            startedAt,
             url,
             status: fields.checkStatus,
             reason: fields.reason,
@@ -7675,19 +8366,13 @@ export function buildTools(s: PilotSession) {
         if (!isInScope(url, s.scope)) return txt(`BLOCKED: ${url} is out of scope`);
         if (ownerRole === compareRole)
           return finish("unverified", { reason: "ownerRole === compareRole — an A/B test needs two distinct subjects", checkStatus: "unverified" });
-        // A write label is not a mutation contract: there is no independent before/after state verifier and no
-        // mutation safety gate, so a relabelled request would bypass the GraphQL mutation no-send protections.
-        // Refuse WITHOUT sending — a POST that only reads is action:'read'. Equally, action:'read' can never
-        // authorize mutating traffic: DELETE/PUT/PATCH methods and GraphQL mutation documents are refused the
-        // same way — BEFORE a single request leaves.
-        if (act === "write")
+        // action:'read' can never authorize mutating traffic: DELETE/PUT/PATCH methods and GraphQL mutation
+        // documents are refused BEFORE a single request leaves. action:'write' is allowed through — it runs
+        // the bounded mutation contract below (owner pre-state → denied control → mutation → readback), which
+        // is the only path that can CONFIRM an idor-write.
+        if (act === "read" && (/^(DELETE|PUT|PATCH)$/i.test(m) || gqlOpType === "mutation"))
           return finish("unverified", {
-            reason: "action:'write' is unsupported — mutating authorization checks need a bounded mutation contract + independent state verification (not implemented); nothing was sent. Read-only POSTs stay action:'read' (idor, not idor-write).",
-            checkStatus: "blocked",
-          });
-        if (/^(DELETE|PUT|PATCH)$/i.test(m) || gqlOpType === "mutation")
-          return finish("unverified", {
-            reason: `action:'read' cannot authorize mutating traffic (${gqlOpType === "mutation" ? "a GraphQL mutation document" : `method ${m}`}) — nothing was sent. A read comparison only ever issues GET/HEAD/POST-query legs.`,
+            reason: `action:'read' cannot authorize mutating traffic (${gqlOpType === "mutation" ? "a GraphQL mutation document" : `method ${m}`}) — nothing was sent. A read comparison only ever issues GET/HEAD/POST-query legs. Re-run with action:'write' to run the mutation contract (or compose_check with control/attack/verify legs + a role per leg for a custom mutation sequence).`,
             checkStatus: "blocked",
           });
 
@@ -7698,6 +8383,8 @@ export function buildTools(s: PilotSession) {
           return finish("unverified", { reason: `no usable session for ownerRole '${ownerRole}' (no live/cookie-file session and it is not the active role) — cannot take an owner baseline. Sessions usable now: ${usableRoles(s).join(", ")} — login('${ownerRole}') first, or pick an owner among them`, checkStatus: "blocked" });
         if (cmpH === null)
           return finish("unverified", { reason: `no usable session for compareRole '${compareRole}' — missing/expired comparison session (no fallback to another role's credentials). Sessions usable now: ${usableRoles(s).join(", ")} — login('${compareRole}') first, or pick a compare role among them`, checkStatus: "blocked" });
+        ownerSessionHeaders = s.http.effectiveHeaders(ownerH, false);
+        cmpSessionHeaders = s.http.effectiveHeaders(cmpH, false);
 
         // ── principals (whoami identity binding when identityUrl configured; evidence-linked, session-bound) ──
         const identityEvidenceIds: string[] = [];
@@ -7719,14 +8406,16 @@ export function buildTools(s: PilotSession) {
         // material is the truth for this comparison's traffic); a declaration applies only when no identity
         // endpoint exists to observe. A cached principal binds to the session material that produced it —
         // after credential rotation the stale identity never establishes the new session's principal.
-        const ownerSessRef = sessionRefOf(s.http.effectiveHeaders(ownerH, false));
-        const cmpSessRef0 = sessionRefOf(s.http.effectiveHeaders(cmpH, false));
+        const ownerSessRef = sessionRefOf(ownerSessionHeaders);
+        const cmpSessRef0 = sessionRefOf(cmpSessionHeaders);
         const boundP = (role: string, ref: string): string | undefined => {
           const b = s.sessionPrincipals?.get(role);
           return b?.sessionRef === ref ? b.principal : undefined;
         };
-        const ownerP = boundP(ownerRole, ownerSessRef) ?? s.rolePrincipals?.get(ownerRole);
-        const cmpP = compareRole === "unauth" ? "__anonymous__" : (boundP(compareRole, cmpSessRef0) ?? s.rolePrincipals?.get(compareRole));
+        const ownerP = boundP(ownerRole, ownerSessRef) ??
+          (!s.roleIdentityUrls?.has(ownerRole) ? s.rolePrincipals?.get(ownerRole) : undefined);
+        const cmpP = compareRole === "unauth" ? "__anonymous__" : (boundP(compareRole, cmpSessRef0) ??
+          (!s.roleIdentityUrls?.has(compareRole) ? s.rolePrincipals?.get(compareRole) : undefined));
         // Tenant context is operator-established only — the `tenant` tool argument is model input and never
         // authoritative. Principal identity is a (tenant, principal) tuple: the same local id under a
         // different established tenant is a different subject.
@@ -7742,7 +8431,6 @@ export function buildTools(s: PilotSession) {
         const tenantBoundary = !!(ownerTenant && cmpTenant && ownerTenant !== cmpTenant);
         objectTenant = ownerTenant;
         objectKey = JSON.stringify([rtype, origin, target, objectTenant ?? "", objectId]);
-        cmpSessionHeaders = s.http.effectiveHeaders(cmpH, false);
         // A 403/denied verdict is only an AUTHORIZATION decision when the compare session is proven live:
         // an anonymous leg needs no proof (its refusal IS the discrimination); a credentialed leg needs a
         // whoami binding on THIS material or a demonstrated successful read under the same ref. A declared
@@ -7816,11 +8504,11 @@ export function buildTools(s: PilotSession) {
           return null;
         };
 
-        const send = async (idVal: string, baseHeaders: Record<string, string>, kind: "negative_control" | "positive_replay", tag: string) => {
+        const send = async (idVal: string, baseHeaders: Record<string, string>, kind: "negative_control" | "positive_replay", tag: string, methodOv?: string) => {
           const placed = placeId(idVal);
           if (!placed) return null;
           if (!isInScope(placed.url, s.scope)) return null;
-          const req: HttpRequest = { method: m, url: placed.url, headers: { ...baseHeaders, ...placed.headers }, body: placed.body, inheritDefaultHeaders: false };
+          const req: HttpRequest = { method: methodOv ?? m, url: placed.url, headers: { ...baseHeaders, ...placed.headers }, body: /^(GET|HEAD)$/i.test(methodOv ?? "") ? null : placed.body, inheritDefaultHeaders: false };
           const res = await s.http.send(req);
           bumpHttp(s, res.status);
           const eff = s.http.effectiveHeaders(req.headers, false);
@@ -7968,7 +8656,8 @@ export function buildTools(s: PilotSession) {
             const tried: string[] = [];
             let adopted: string | null = null;
             for (const cand of cands.slice(0, 6)) {
-              const leg = await send(cand, ownerH, "negative_control", `auto owner-baseline '${cand}'`);
+              // Write comparisons adopt objects by READING them — the baseline probe never mutates.
+              const leg = await send(cand, ownerH, "negative_control", `auto owner-baseline '${cand}'`, act === "write" ? "GET" : undefined);
               if (!leg) {
                 tried.push(`${cand}→unplaced`);
                 continue;
@@ -7995,14 +8684,16 @@ export function buildTools(s: PilotSession) {
             objectKey = JSON.stringify([rtype, origin, target, ownerTenant ?? "", objectId]);
           }
 
-          // ── leg 1: owner baseline — must actually carry the object ──
-          const base = await send(objectId, ownerH, "negative_control", `owner baseline as '${ownerRole}'`);
+          // ── leg 1: owner baseline — must actually carry the object. For write comparisons this is a
+          //    PRE-STATE READ (GET on the same URL): it proves ownership AND captures the object before
+          //    the mutation so the readback diff is meaningful. The mutation itself is never the baseline. ──
+          const base = await send(objectId, ownerH, "negative_control", `owner ${act === "write" ? "pre-state read" : "baseline"} as '${ownerRole}'`, act === "write" ? "GET" : undefined);
           if (!base)
             return finish("unverified", { reason: "could not build the owner request (objectId not locatable in url/body/param)", checkStatus: "unverified" });
           const baseLeg = readLeg(base);
           if (baseLeg !== "access")
             return finish("unverified", {
-              reason: `owner baseline failed: '${ownerRole}' read of its own ${rtype} ${objectId} → ${baseLeg === "denied" ? "denied" : `invalid (status ${base.status})`} — the claimed owner cannot read the object, so the ownership premise is wrong. Establish a real owned object first: list '${ownerRole}'s own resources via http_request (an endpoint that returns THEIR records) and retry with an id it actually owns — or pass objectId:'auto' to try observed ids`,
+              reason: `owner baseline failed: '${ownerRole}' read of its own ${rtype} ${objectId} → ${baseLeg === "denied" ? "denied" : `invalid (status ${base.status})`} — the claimed owner cannot read the object, so the ownership premise is wrong. Establish a real owned object first: list '${ownerRole}'s own resources via http_request (an endpoint that returns THEIR records) and retry with an id it actually owns — or pass objectId:'auto' to try observed ids${act === "write" ? ". NOTE: a write check needs a GET-readback path on this URL — a mutation-only endpoint with no object read can never confirm a landed write" : ""}`,
               checkStatus: "unverified",
               ownerEvidenceId: base.evId,
               identityEvidenceIds,
@@ -8091,6 +8782,91 @@ export function buildTools(s: PilotSession) {
           const ctrl = await send(fakeId, cmpH, "negative_control", `denied control (non-existent id) as '${compareRole}'`);
           const deniedEvidenceIds = ctrl ? [ctrl.evId] : [];
           const controlDenied = !!ctrl && readLeg(ctrl) === "denied";
+
+          // ══ WRITE contract (idor-write): compare mutation on the owner's object → independent GET
+          //    readback must show the change LANDED. A 2xx mutation alone is never proof — post-state is:
+          //    readback carries the marker the model sent (or a real diff vs the pre-state baseline), or
+          //    for DELETE the object becomes unreadable where the baseline carried it. ══
+          if (act === "write") {
+            const mut = await send(objectId, cmpH, "positive_replay", `compare mutation as '${compareRole}'`);
+            const compareEvidenceIds: string[] = mut ? [mut.evId] : [];
+            if (!mut)
+              return finish("unverified", { reason: "could not build the compare mutation request", checkStatus: "unverified", ownerEvidenceId: base.evId, deniedEvidenceIds, identityEvidenceIds });
+            const mutLeg: Leg = mut.status === 401 ? (mut.authed ? "invalid" : "denied") : mut.status === 403 || mut.status === 404 ? "denied" : mut.status >= 200 && mut.status < 400 ? "access" : "invalid";
+
+            // readback — compare role first (cross-visibility strengthens the evidence), owner as fallback.
+            let rb = await send(objectId, cmpH, "positive_replay", `post-mutation readback as '${compareRole}'`, "GET");
+            if (!rb || readLeg(rb) !== "access") rb = await send(objectId, ownerH, "positive_replay", `post-mutation readback as '${ownerRole}'`, "GET");
+            if (rb) compareEvidenceIds.push(rb.evId);
+            const rbLeg = rb ? readLeg(rb) : "invalid";
+
+            const markerHit = marker ? `${rb?.body ?? ""}${mut.body}`.includes(marker) : false;
+            const deleteLanded = m === "DELETE" && mutLeg === "access" && rb !== null && rbLeg === "denied";
+            const diffLanded = rb !== null && rbLeg === "access" && (markerHit || (rb.body !== base.body && carriesId(rb)));
+            // no GET readback exists at all — the mutation response itself has to carry the changed object.
+            const selfCarried = rb === null && mutLeg === "access" && carriesId(mut) && (markerHit || mut.body !== base.body);
+            const landed = mutLeg === "access" && (deleteLanded || diffLanded || selfCarried);
+
+            s.store.recordAuthzObject(s.assessmentId, {
+              key: objectKey,
+              resourceType: rtype,
+              objectId,
+              endpoint,
+              operationKey: gqlOp,
+              tenant: objectTenant,
+              observedBy: [ownerRole, ...(mutLeg === "access" ? [compareRole] : [])],
+              deniedFor: mutLeg === "denied" && cmpSessionLive() ? [compareRole] : [],
+              ...(owner && ownerBasis ? { owner, ownerBasis, ownerEvidenceIds: [base.evId] } : {}),
+              evidenceIds: [base.evId, ...deniedEvidenceIds, ...compareEvidenceIds],
+              updatedAt: new Date().toISOString(),
+            });
+
+            const verifiedCtx = !!(owner && cmpP && !sameSubject);
+            if (mutLeg === "invalid")
+              return finish("unverified", {
+                reason: `compare mutation was not conclusive (status ${mut.status}) — transport/input/schema failure is neither a landed write nor a denial`,
+                checkStatus: "unverified", ownerEvidenceId: base.evId, deniedEvidenceIds, compareEvidenceIds, identityEvidenceIds, expectation, expectationBasis, tenantBoundary, owner, ownerBasis,
+              });
+            if (mutLeg === "denied") {
+              if (verifiedCtx && expectation === "deny" && cmpSessionLive())
+                return finish("denied-as-expected", {
+                  reason: `'${compareRole}' (principal ${cmpP}) was denied mutating verified owner '${ownerRole}'s ${rtype} ${objectId} — matches the established deny expectation`,
+                  checkStatus: "tested-clean", ownerEvidenceId: base.evId, deniedEvidenceIds: [ctrl ? ctrl.evId : mut.evId], compareEvidenceIds, identityEvidenceIds, expectation, expectationBasis, tenantBoundary, owner, ownerBasis,
+                });
+              const why: string[] = [];
+              if (!cmpSessionLive()) why.push(`compare session liveness unproven — a denial under an unvalidated session can be session rejection, not object authorization`);
+              if (!owner) why.push("owner unverified — denial can't be attributed to an owned object");
+              if (!cmpP) why.push(`compare principal for '${compareRole}' not established (session/identity unvalidated)`);
+              if (expectation !== "deny") why.push("no deny expectation (no operator rule / ACL exclusion / prior denial) — 'as expected' is unknowable");
+              return finish("inconclusive", {
+                reason: `mutation denied but NOT conclusive: ${why.join("; ")}`,
+                checkStatus: "unverified", ownerEvidenceId: base.evId, deniedEvidenceIds: [ctrl ? ctrl.evId : mut.evId], compareEvidenceIds, identityEvidenceIds, expectation, expectationBasis, tenantBoundary, owner, ownerBasis,
+              });
+            }
+            // mutation leg accepted:
+            if (expectation === "allow")
+              return finish("allowed", {
+                reason: `'${compareRole}' mutating ${rtype} ${objectId} is expected (${expectationBasis === "operator" ? "operator-declared allow" : "object ACL includes this principal"}) — not an IDOR`,
+                checkStatus: "tested-clean", ownerEvidenceId: base.evId, deniedEvidenceIds, compareEvidenceIds, identityEvidenceIds, expectation, expectationBasis, tenantBoundary, owner, ownerBasis,
+              });
+            const confirmable = verifiedCtx && expectation === "deny" && controlDenied && landed;
+            if (confirmable)
+              return finish("unexpected-access", {
+                reason: `'${compareRole}' (principal ${cmpP}${cmpTenant ? `, tenant ${cmpTenant}` : ""}) MUTATED '${ownerRole}'s ${rtype} ${objectId} against the established DENY expectation (${expectationBasis})${marker ? ` — marker '${marker}' landed in post-state` : " — post-state readback confirms the write landed"}${m === "DELETE" ? " (object unreadable after delete)" : ""}; owner verified by ${ownerBasis}, non-existent id denied ⇒ the endpoint discriminates`,
+                checkStatus: "found", ownerEvidenceId: base.evId, deniedEvidenceIds, compareEvidenceIds, identityEvidenceIds, expectation, expectationBasis, tenantBoundary, owner, ownerBasis,
+              });
+            const why: string[] = [];
+            if (!owner) why.push("ownership unverified (no owner field on the object's own record binding to an established principal)");
+            if (!cmpP) why.push(`compare principal for '${compareRole}' not established (no identityUrl/operator principal)`);
+            if (expectation === "unknown") why.push(ruleConflict ? "conflicting operator allow+deny rules for this object/role — expectation ambiguous" : "no deny expectation — legitimate admin/shared/same-tenant grants can't be told from an exposure (declare expectedAccess or an object ACL)");
+            if (!controlDenied) why.push("the non-existent-id control was NOT denied — the endpoint may be a catch-all");
+            if (!landed) why.push(`the ${m} returned ${mut.status} but the post-mutation readback did NOT prove the write landed${marker ? ` (marker '${marker}' absent)` : " (no marker passed and no body diff vs the pre-state)"} — send a distinctive value and pass it as 'marker'`);
+            return finish("inconclusive", {
+              reason: `mutation accepted but NOT confirmable: ${why.join("; ")}`,
+              checkStatus: !landed ? "unverified" : "suspected",
+              ownerEvidenceId: base.evId, deniedEvidenceIds, compareEvidenceIds, identityEvidenceIds, expectation, expectationBasis, tenantBoundary, owner, ownerBasis,
+            });
+          }
 
           // ── leg 3: compare replays ×2 — EACH must independently carry the object ──
           const c1 = await send(objectId, cmpH, "positive_replay", `compare read #1 as '${compareRole}'`);
@@ -8362,9 +9138,9 @@ export function buildTools(s: PilotSession) {
   // ── check-ledger instrumentation ── every probe's REAL outcome lands in the per-check ledger.
   //   Explicitly-instrumented tools (probe_idor / probe_authz / record_finding / screen_done / methodology)
   //   write their own fine-grained rows and are NOT in this map. For the rest, a conservative classifier
-  //   reads the tool's own result text and writes one row per call — an ambiguous result writes NO row
-  //   (never a fabricated clean). The row records the tool, target, param, subject, session ref, and
-  //   any evidence ids the probe itself emitted.
+  //   reads the tool's structured result/evidence and writes one row per call — an ambiguous exit
+  //   writes an unverified gap (never a fabricated clean). The row records the tool, target, param,
+  //   subject, session ref, and the reason code derived from the contract/evidence.
   return defs.map((d) => {
     const cls = GENERIC_PROBE_CLASS[d.name];
     if (!cls) return d;
@@ -8372,6 +9148,7 @@ export function buildTools(s: PilotSession) {
     return {
       ...d,
       handler: async (args: Record<string, unknown>, extra: unknown) => {
+        const startedAt = new Date().toISOString();
         const res = await orig(args as never, extra);
         try {
           const text = res.content?.[0]?.type === "text" ? (res.content[0] as { text: string }).text : "";
@@ -8389,8 +9166,10 @@ export function buildTools(s: PilotSession) {
             // `param` would misattribute which location was actually exercised.
             param: typeof args.location === "string" ? args.location : typeof args.param === "string" ? args.param : undefined,
             url,
+            startedAt,
             status: outcome.status,
             reason: outcome.reason,
+            reasonCode: outcome.reasonCode,
             baselineOk: outcome.baselineOk,
             evidenceIds: outcome.evidenceIds,
           });

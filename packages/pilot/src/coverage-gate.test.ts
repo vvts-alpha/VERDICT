@@ -9,8 +9,8 @@ test("plannedClassesFor parses the classes=[...] prefix and canonicalizes", () =
     plannedClassesFor("classes=[IDOR/BOLA,SQL-injection,stored-XSS] 1. test ... 2. ...").sort(),
     ["idor", "sqli", "xss-stored"].sort(),
   );
-  // info-disclosure / headers / free-text other are exempt from coverage enforcement
-  assert.deepEqual(plannedClassesFor("classes=[info-disclosure,headers,session] ..."), []);
+  // Observations and passive checks cannot become verdict-bearing plan slots.
+  assert.deepEqual(plannedClassesFor("classes=[recon,info-disclosure,headers,session] ..."), []);
   assert.deepEqual(plannedClassesFor("(no recorded plan — use judgement)"), []);
   assert.deepEqual(plannedClassesFor(undefined), []);
 });

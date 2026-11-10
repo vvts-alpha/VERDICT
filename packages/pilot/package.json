@@ -13,7 +13,8 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "wordlists"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",

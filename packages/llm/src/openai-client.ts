@@ -26,7 +26,16 @@ export interface OpenAiClientOptions {
 }
 
 interface ChatCompletionsResponse {
-    usage?: { total_tokens?: number; prompt_tokens?: number; completion_tokens?: number };
+    usage?: {
+        total_tokens?: number;
+        prompt_tokens?: number;
+        completion_tokens?: number;
+        /** DeepSeek-style cache buckets (opencode-go passes them through verbatim). */
+        prompt_cache_hit_tokens?: number;
+        prompt_cache_miss_tokens?: number;
+        /** OpenAI-style nested cache detail. */
+        prompt_tokens_details?: { cached_tokens?: number };
+    };
     model?: string;
     choices?: Array<{ message?: { role?: string; content?: string } }>;
 }
@@ -78,12 +87,14 @@ export class OpenAiClient implements LlmClient {
                 throw new Error(`OpenAI-compatible response from ${url} had no choices[0].message.content: ${JSON.stringify(json).slice(0, 300)}`);
             }
             const tokensUsed = json.usage?.total_tokens ?? (json.usage ? (json.usage.prompt_tokens ?? 0) + (json.usage.completion_tokens ?? 0) : undefined);
+            const cacheRead = json.usage?.prompt_cache_hit_tokens ?? json.usage?.prompt_tokens_details?.cached_tokens;
             return {
                 text,
                 model: json.model ?? model,
                 ...(tokensUsed !== undefined ? { tokensUsed } : {}),
                 ...(json.usage?.prompt_tokens !== undefined ? { inputTokens: json.usage.prompt_tokens } : {}),
                 ...(json.usage?.completion_tokens !== undefined ? { outputTokens: json.usage.completion_tokens } : {}),
+                ...(cacheRead !== undefined ? { cacheReadTokens: cacheRead } : {}),
             };
         } catch (e) {
             if (ac.signal.aborted) throw new Error(`OpenAI-compatible request to ${url} timed out after ${timeout}ms`);

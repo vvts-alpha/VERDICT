@@ -9,6 +9,7 @@ import type { HypoStatus } from "./hypothesis.js";
 import type { HandoffReason } from "./handoff.js";
 import type { ScreenScanStatus } from "./screen-scan.js";
 import type { JsAsset } from "./js-asset.js";
+import type { AssetReview } from "./asset-review.js";
 import type { CheckExecution } from "./check.js";
 import type { AuthzComparison, AuthzObject } from "./authz.js";
 import type { Mutation } from "./mutation.js";
@@ -46,6 +47,7 @@ export type StateEvent =
   | EventEnvelope<"control_command", ControlCommand>
   | EventEnvelope<"target_injected", { url: string }>
   | EventEnvelope<"js_analyzed", JsAsset>
+  | EventEnvelope<"asset_reviewed", AssetReview>
   | EventEnvelope<"methodology_recorded", { screenId: string; vulnClasses: string[]; plan: string }>
   | EventEnvelope<"methodology_completed", { screenIds: string[]; summary: string }>
   | EventEnvelope<"recon_completed", { screenIds: string[] }>
@@ -54,7 +56,7 @@ export type StateEvent =
   | EventEnvelope<"authz_comparison_recorded", { comparison: AuthzComparison }>
   | EventEnvelope<
       "survey_role_progress",
-      { role: string; visited: number; urls?: string[]; pending?: string[]; gated?: string[]; seen?: string[]; state: "mapped" | "blocked"; reason?: string }
+      { role: string; visited: number; urls?: string[]; pending?: string[]; gated?: string[]; seen?: string[]; state: "mapped" | "blocked"; reason?: string; loginAttempts?: number }
     >
   | EventEnvelope<"mutation_recorded", { mutation: Mutation }>
   | EventEnvelope<"note", { message: string }>;

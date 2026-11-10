@@ -135,8 +135,15 @@ export class AgentContext {
                     else hi = mid - 1;
                 }
                 if (lo === 0) throw new Error("The summary instructions and goal do not fit the configured context window.");
-                const next = (await this.options.summarize(request(transcript.slice(offset, offset + lo)), summaryOutputTokens)).trim();
-                if (!next || next.length > maxSummaryChars) throw new Error("The model did not return a complete, bounded summary.");
+                let next = (await this.options.summarize(request(transcript.slice(offset, offset + lo)), summaryOutputTokens)).trim();
+                // An over-length handoff (incl. one truncated by the output cap) is still usable — cut
+                // it at the last paragraph/sentence boundary inside the budget instead of pausing the run.
+                if (next.length > maxSummaryChars) {
+                    const cut = next.slice(0, maxSummaryChars);
+                    const boundary = Math.max(cut.lastIndexOf("\n\n"), cut.lastIndexOf("\n"), cut.lastIndexOf(". "));
+                    next = boundary > maxSummaryChars / 2 ? cut.slice(0, boundary) : cut;
+                }
+                if (!next) throw new Error("The model did not return a complete, bounded summary.");
                 summary = next;
                 offset += lo;
             }

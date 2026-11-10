@@ -68,9 +68,15 @@ export function consolidateFindings(findings: Finding[], evidence: EvidenceStore
     group.push(f);
     groups.set(key, group);
   }
+  /** Every endpoint a finding was observed on — its own list plus the endpoint baked into its dedup key. */
+  const endpointsOf = (f: Finding): string[] => {
+    const parts = (f.dedupKey ?? "").split("::");
+    return [...(f.affectedEndpoints ?? []), ...(parts.length >= 3 ? [parts[1]!] : [])];
+  };
   let merged = 0;
   for (const group of groups.values()) {
     const canonical = group.find(f => findingVerdict(f) === "confirmed") ?? group[0]!;
+    canonical.affectedEndpoints = [...new Set(group.flatMap(endpointsOf))];
     for (const f of group) {
       if (f === canonical) continue;
       canonical.evidenceIds = [...new Set([...canonical.evidenceIds, ...f.evidenceIds])];

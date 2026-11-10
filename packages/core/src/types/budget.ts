@@ -16,6 +16,10 @@ export interface BudgetState {
   inputTokens?: number;
   /** Provider-reported completion-side tokens. Absent on older runs. */
   outputTokens?: number;
+  /** Prompt-side tokens served from the provider cache (Claude cache_read / DeepSeek cache_hit). Included in inputTokens. */
+  cacheReadTokens?: number;
+  /** Prompt-side tokens written into the provider cache (Claude cache_creation). Included in inputTokens. */
+  cacheCreationTokens?: number;
   totalRequests: number;
   /** host -> number of requests sent to this target */
   requestsPerTarget: Record<string, number>;

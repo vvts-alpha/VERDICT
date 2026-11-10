@@ -23,7 +23,7 @@ function fixture(t: TestContext, base = BASE) {
   const s = { store, assessmentId: "a-1", scope, targetUrl: base, evidence: new EvidenceStore(join(dir, "artifacts")), inv: new InventoryBuilder(),
     roleCreds: new Map(), roleCookieFiles: new Map(), roleDescriptions: new Map(), currentCookie: "", currentBearer: "", currentRole: "", currentScreenId: "s-0001",
     httpProbes: 0, screenProbes: 0, httpAuthWall: 0, httpThrough: 0, findings: [], findingsByKey: new Map(), accessVerdicts: new Map(), recordCalls: 0, findCounter: 0, plans: new Map() } as unknown as PilotSession;
-  const options = { store, assessmentId: "a-1", targetUrl: base, scope, profileDir: join(dir, "profile"), artifactsDir: join(dir, "artifacts"), roleCreds: new Map(), resume: true, rateMs: 0, maxTurns: 300, scenarioPass: false, fingerprintPass: false, keepAliveMinutes: 0 };
+  const options = { store, assessmentId: "a-1", targetUrl: base, scope, profileDir: join(dir, "profile"), artifactsDir: join(dir, "artifacts"), roleCreds: new Map(), resume: true, rateMs: 0, maxTurns: 300, scenarioPass: false, fingerprintPass: false, assetReview: false, keepAliveMinutes: 0 };
   return { s, store, options };
 }
 async function call(s: PilotSession, name: string, args: object): Promise<string> {

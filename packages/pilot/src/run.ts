@@ -8,8 +8,8 @@ import { restoreMethodologyPlans } from "./methodology.js";
 
 import { createSdkMcpServer, query } from "@anthropic-ai/claude-agent-sdk";
 import type { HookCallback } from "@anthropic-ai/claude-agent-sdk";
-import type { AssessmentStore, ControlCommand, Screen, ScopePolicy } from "@veritas/core";
-import { isInScope, isScannable, recordTokens, recordRequests, evaluateBudget, screenChecks } from "@veritas/core";
+import type { AssessmentStore, CheckExecution, ControlCommand, Screen, ScopePolicy } from "@veritas/core";
+import { checkKey, isInScope, isScannable, recordTokens, recordRequests, evaluateBudget, screenChecks } from "@veritas/core";
 import type { ScreenCheckView, ScreenScanStatus } from "@veritas/core";
 import { modelContextWindows } from "@veritas/core/llm-context";
 import type { LoginCreds } from "@veritas/crawler";
@@ -26,7 +26,9 @@ import { detectMutation, effectiveCreds } from "./mutations.js";
 import { resolveSkills, buildSkillTools, skillToolNamesForStage, type Stage } from "./skills.js";
 import type { PilotSession, RoleSession } from "./tools.js";
 import { LiveControl } from "./live-control.js";
-import { DEFAULT_SCENARIOS, DIAGNOSE_PROMPT, FINGERPRINT_PROMPT, METHODOLOGY_PROMPT, operatorContextBlock, RECON_GUESS_PROMPT, SCENARIO_PROMPT, SURVEY_PROMPT } from "./system.js";
+import { ASSET_FOLLOWUP_PROMPT, DEFAULT_SCENARIOS, DIAGNOSE_PROMPT, FINGERPRINT_PROMPT, METHODOLOGY_PROMPT, operatorContextBlock, outputLanguageBlock, RECON_GUESS_PROMPT, SCENARIO_PROMPT, SURVEY_PROMPT } from "./system.js";
+import { collectAssets, enrollObservations, reviewAssets, safeAssetUrl } from "./asset-review.js";
+import { loadWordlist } from "./wordlists.js";
 
 export interface RunPilotOptions {
   store: AssessmentStore;
@@ -88,6 +90,16 @@ export interface RunPilotOptions {
   noSandbox?: boolean;
   /** Cap on the number of screens to diagnose (default 120). */
   maxScreens?: number;
+  /** Bounded passes over unresolved check slots (up to 20 per diagnosis stage). New slots get a later pass;
+   *  an unchanged ledger stops early. Default 2, maximum 8; 0 disables. */
+  completionPasses?: number;
+  /** Whether to run the post-diagnosis full-asset review: every reachable HTML document + first-party JS
+   *  bundle is chunked and read by the LLM, then a bounded stage verifies the observations. Default true.
+   *  Off with --no-asset-review. */
+  assetReview?: boolean;
+  /** probe_paths wordlist: a bundled id ("standard" | "extended") or a filesystem path to a custom list.
+   *  Unset/"standard" = the in-code PATH_WORDLIST. Resolved once at session start (wordlists.ts). */
+  wordlist?: string;
   /** Max concurrent diagnosis workers (bound-role + unauth). Default 4, capped at 8. Set 1 to force the legacy
    *  sequential diagnosis loop. Parallelism needs ≥1 role with session material to add bound workers. */
   parallelWorkers?: number;
@@ -152,6 +164,10 @@ export interface RunPilotOptions {
    *  e.g. "auth is a JWT in the X-Auth header; tenant id is the last path segment; the API is GraphQL at /graphql."
    *  Additive only — it cannot override the safety/scope/evidence-discipline rules (see operatorContextBlock). */
   operatorContext?: string;
+  /** Launch-time output language (e.g. "ja", "Japanese", "日本語") for all model-written prose — finding
+   *  titles/descriptions, notes, plans. Structural tokens (category tags, endpoints, payloads, quoted evidence)
+   *  stay verbatim so dedup/QA parsing is unaffected (see outputLanguageBlock). Unset = English. */
+  outputLanguage?: string;
   /** Input sweep: on every browser_navigate, submit forms/searches with benign values to discover new routes/APIs (default on). */
   inputSweep?: boolean;
   /** In the input sweep, also submit POST forms (= writes data to the target). Default true. If false, GET/search only. */
@@ -185,6 +201,50 @@ export function closeScreenScanStatus(args: {
             ? "unverified"
             : "clean";
   return { status, divergent };
+}
+
+const COMPLETION_BATCH_SIZE = 20;
+
+/** The ledger is the sole authority: IDs (checkKey), not status text, timestamps or aggregate counts,
+ * identify pending work. Take a frozen snapshot per pass so new rows cannot extend one pass indefinitely. */
+export function completionWork(
+  screens: ReadonlyArray<Screen>,
+  rows: ReadonlyArray<CheckExecution>,
+  onlyIds?: ReadonlySet<string>,
+): { unresolved: Set<string>; batches: Array<{ screen: Screen; checks: CheckExecution[] }> } {
+  const unresolved = new Set<string>();
+  const batches: Array<{ screen: Screen; checks: CheckExecution[] }> = [];
+  // screenChecks filters its input by screenId. Give it only that screen's rows rather
+  // than re-filtering the entire ledger for every screen in the pass.
+  const byScreen = new Map<string, CheckExecution[]>();
+  for (const row of rows) {
+    const id = row.screenId;
+    const mine = byScreen.get(id);
+    if (mine) mine.push(row);
+    else byScreen.set(id, [row]);
+  }
+  for (const screen of screens) {
+    const view = screenChecks({ checkExecutions: byScreen.get(screen.screenId) ?? [] }, screen.screenId);
+    const pending = new Map([...view.unstarted, ...view.gaps].map((c) => [c.id, c]));
+    for (const id of pending.keys()) unresolved.add(id);
+    const eligible = [...pending.values()].filter((c) => !onlyIds || onlyIds.has(c.id));
+    for (let i = 0; i < eligible.length; i += COMPLETION_BATCH_SIZE)
+      batches.push({ screen, checks: eligible.slice(i, i + COMPLETION_BATCH_SIZE) });
+  }
+  return { unresolved, batches };
+}
+
+/** A resolved identity is progress even if newly enrolled checks keep the total unchanged. Additions
+ * alone merit a pass too, but exclude previously attempted unchanged tasks from that pass. */
+export function completionProgress(before: ReadonlySet<string>, after: ReadonlySet<string>): {
+  resolved: number;
+  added: Set<string>;
+  retry: ReadonlySet<string> | undefined;
+  continue: boolean;
+} {
+  const resolved = [...before].filter((id) => !after.has(id)).length;
+  const added = new Set([...after].filter((id) => !before.has(id)));
+  return { resolved, added, retry: resolved > 0 ? undefined : added, continue: resolved > 0 || added.size > 0 };
 }
 
 export interface PilotResult {
@@ -366,7 +426,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
   let driver: PlaywrightDriver;
   const extraWorkerDrivers: PlaywrightDriver[] = []; // parallel-diagnosis worker contexts (closed in finally)
   let roleSessions: Map<string, RoleSession> | undefined;
-  const liveOnResume = new Set<string>(); // roles whose persisted session probed LIVE — supersedes stale blocked progress
+  const liveOnResume = new Set<string>(); // roles whose persisted session probed LIVE — worth a fresh mapped snapshot
   let primaryRole = "";
   let primaryCookie = "";
   let liveControl: LiveControl | undefined;
@@ -482,7 +542,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       if (!deferred) {
         const cookie = await d.sessionCookieHeader();
         roleSessions.set(role, { driver: d, cookie, ...(await bearerOf(d)) });
-        liveOnResume.add(role); // a session established at startup supersedes any stale blocked mark too
+        liveOnResume.add(role); // a session established at startup gets a fresh mapped snapshot too
         opts.onText?.(`✅ role ${roleLabel(role, opts.roleDescriptions)} session established (cookie ${cookie ? "present" : "absent"})`);
       }
     }
@@ -598,6 +658,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     }
   };
 
+  const probeWordlist = loadWordlist(opts.wordlist); // throws on an unreadable custom path — fail fast, not silent downgrade
   const session: PilotSession = {
     driver,
     http,
@@ -628,6 +689,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     httpAuthWall: 0,
     httpThrough: 0,
     screenProbes: 0,
+    ...(probeWordlist ? { wordlist: probeWordlist } : {}),
     done: false,
     doneSummary: "",
     paused: false,
@@ -652,6 +714,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     methodologyDone: false,
     screenDone: false,
     scenarioDone: false,
+    assetReviewDone: false,
     fingerprintDone: false,
     ...(opts.oob ? { oob: opts.oob } : {}),
     ...(roleSessions ? { roleSessions } : {}),
@@ -666,7 +729,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     frontierByRole: new Map(),
     gatedByRole: new Map(),
     roleSurveyCounts: new Map(),
-    roleSurveyBlocked: new Map(),
+    roleLoginAttempts: new Map(),
     sessionPrincipals: new Map(),
     invalidRoleSessions: new Set(),
     sessionLiveReads: new Set(),
@@ -682,13 +745,13 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
   // Attended: a role whose context was dropped/closed can be re-spawned on demand — login(role) calls this
   // instead of reporting "no credentials" on roles that only ever authenticate by hand. The persistent
   // userDataDir is reused, so a still-valid session may not even need operator input. A respawned context is
-  // sent straight to the login page and kept highlighted in the Sessions tab — "blocked" therefore always
+  // sent straight to the login page and kept highlighted in the Sessions tab — a failed login always
   // leaves a live recovery door: whenever the operator does log in + Done, the Done hook refreshes the
-  // session material and clears the blocked mark (no second login() call required).
+  // session material and re-emits progress (no second login() call required).
   if (opts.attended) {
     const respawnDir = (role: string): string => join(opts.attendedProfilesDir ?? join(opts.profileDir, "..", "profiles"), role);
     /** Bounded wait for the operator's Done — an absent operator must not stall the worker forever.
-     *  On timeout the material-less session still returns → login() marks the role blocked while the
+     *  On timeout the material-less session still returns → login() reports the failure while the
      *  persistent Done hook below keeps the recovery door open. */
     const RESPAWN_LOGIN_WAIT_MS = 5 * 60_000;
     session.respawnAttended = async (role) => {
@@ -711,9 +774,9 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
             if (fresh) rs.cookie = fresh;
             const nb = await rs.driver.bearerToken().catch(() => null);
             if (nb) rs.bearer = nb;
-            if ((rs.cookie || rs.bearer) && session.roleSurveyBlocked.delete(role)) {
-              emitRoleProgress(session, role, "mapped");
-              session.store.appendEvent(session.assessmentId, { type: "note", payload: { message: `🔓 role '${role}' re-authenticated via Sessions tab — unblocked` } });
+            if (rs.cookie || rs.bearer) {
+              emitRoleProgress(session, role);
+              session.store.appendEvent(session.assessmentId, { type: "note", payload: { message: `🔓 role '${role}' re-authenticated via Sessions tab` } });
             }
           })
           .catch(() => {});
@@ -865,7 +928,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     session.currentRole = [...opts.roleCreds.keys()][0] ?? [...(opts.roleCookieFiles?.keys() ?? [])][0] ?? "";
     for (const [screenId, plan] of restoreMethodologyPlans(prev.events)) session.plans.set(screenId, plan);
     // Per-role survey progress: replay the persisted survey_role_progress events — a role that mapped N urls
-    // (or was explicitly blocked) keeps that honest state across the restart instead of losing it (or letting
+    // keeps that honest state across the restart instead of losing it (or letting
     // one resumed role's session silently satisfy them all). Visited sets, PENDING frontiers, referer-gated
     // routes, and the navigated dedupe set all rebuild from the last snapshot per role — links discovered
     // before the pause do not silently disappear.
@@ -873,9 +936,11 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     const asUrls = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : []);
     for (const e of prev.events) {
       if (e.type !== "survey_role_progress") continue;
-      const p = e.payload as { role?: unknown; visited?: unknown; urls?: unknown; pending?: unknown; gated?: unknown; seen?: unknown; state?: unknown; reason?: unknown };
+      const p = e.payload as { role?: unknown; visited?: unknown; urls?: unknown; pending?: unknown; gated?: unknown; seen?: unknown; state?: unknown; reason?: unknown; loginAttempts?: unknown };
       if (typeof p.role !== "string" || typeof p.visited !== "number") continue;
       session.roleSurveyCounts?.set(p.role, Math.max(session.roleSurveyCounts.get(p.role) ?? 0, p.visited));
+      if (typeof p.loginAttempts === "number")
+        session.roleLoginAttempts?.set(p.role, Math.max(session.roleLoginAttempts.get(p.role) ?? 0, p.loginAttempts));
       const urls = asUrls(p.urls);
       const seen = asUrls(p.seen);
       if (urls.length) {
@@ -894,8 +959,6 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         if (Array.isArray(p.gated)) snap.gated = new Set(asUrls(p.gated));
         lastSnap.set(p.role, snap);
       }
-      if (p.state === "blocked") session.roleSurveyBlocked.set(p.role, typeof p.reason === "string" ? p.reason : "blocked (restored)");
-      else if (p.state === "mapped") session.roleSurveyBlocked.delete(p.role);
     }
     // Materialize each role's pending/gated: the LAST snapshot, minus what that session has since navigated,
     // and minus anything the operator later pruned via ignore_paths.
@@ -917,16 +980,10 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       for (const [k, v] of session.frontierByRole ?? []) if (k !== active && v === session.frontier) session.frontierByRole!.delete(k);
       for (const [k, v] of session.gatedByRole ?? []) if (k !== active && v === session.refererGated) session.gatedByRole!.delete(k);
     }
-    // Self-heal stale blocked marks: a role whose persisted session just probed LIVE was wrongly recorded
-    // dead (a register/i18n-asset false positive) — clear it and supersede the stale event with a mapped one.
-    // Runs AFTER pending/gated materialization: emitRoleProgress snapshots the live maps, so emitting earlier
-    // would persist an empty pending list and the NEXT resume would restore a wiped frontier.
-    for (const role of liveOnResume) {
-      if (session.roleSurveyBlocked.delete(role)) {
-        emitRoleProgress(session, role, "mapped");
-        session.store.appendEvent(session.assessmentId, { type: "note", payload: { message: `🔓 role '${role}' unblocked — persisted session verified live on resume` } });
-      }
-    }
+    // A role whose persisted session probed LIVE on resume still earns a mapped snapshot — but this
+    // runs AFTER pending/gated materialization: emitRoleProgress snapshots the live maps, so emitting
+    // earlier would persist an empty pending list and the NEXT resume would restore a wiped frontier.
+    for (const role of liveOnResume) emitRoleProgress(session, role);
     // Carry over existing findings (continue id numbering + best-effort dedup key to suppress double-reporting)
     for (const f of prev.findings) {
       const num = Number.parseInt(f.id.replace(/^f-/, ""), 10);
@@ -1026,7 +1083,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       opts.store.updateBudget(opts.assessmentId, budget);
     }
   };
-  const addTokens = (delta: number, usage?: { inputTokens?: number; outputTokens?: number }): void => {
+  const addTokens = (delta: number, usage?: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheCreationTokens?: number }): void => {
     if (!Number.isFinite(delta) || delta <= 0) return;
     runTokens += delta;
     if (budget) {
@@ -1051,6 +1108,24 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       return response;
     } };
   }
+
+  // Operator tool-call logging is a separate sink from the check ledger. The model may put a raw
+  // credential in a legacy reason/summary (or even an invented checkId); do not forward those fields
+  // to the CLI/WebUI callback, on either provider path.
+  const emitToolUse = (name: string, input: unknown): void => {
+    const bare = name.replace(/^mcp__veritas__/, "");
+    if (bare === "asset_review_done") { opts.onTool?.(name, {}); return; }
+    if (bare === "resolve_asset_review") {
+      const args = input && typeof input === "object" ? input as Record<string, unknown> : {};
+      opts.onTool?.(name, {
+        ...(typeof args.n === "number" ? { n: args.n } : {}),
+        ...(["verified", "refuted", "unverified", "not-applicable"].includes(String(args.verdict))
+          ? { verdict: args.verdict } : {}),
+      });
+      return;
+    }
+    opts.onTool?.(name, input);
+  };
 
   // A stage may stop early, but only its accepted completion tool makes it complete.
   const runStage = async (p: {
@@ -1078,7 +1153,11 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     if (checkBudget()) return 0;
     // Operator context (target facts) is appended to EVERY stage's system prompt — additive, never a replacement
     // (the SAFETY/discipline text in p.system still governs; see operatorContextBlock). One choke point covers all stages.
-    const sys = opts.operatorContext?.trim() ? `${p.system}\n\n${operatorContextBlock(opts.operatorContext)}` : p.system;
+    const sys = [
+      p.system,
+      ...(opts.operatorContext?.trim() ? [operatorContextBlock(opts.operatorContext)] : []),
+      ...(opts.outputLanguage?.trim() ? [outputLanguageBlock(opts.outputLanguage)] : []),
+    ].join("\n\n");
     // OpenAI-compatible provider (OpenCodeGo etc.): drive the SAME veritas tools via a chat/completions tool-calling
     // loop instead of the Claude Agent SDK. The stage allowlist (p.allowed) is the locked toolbox — enforced by the loop.
     if (useOpenAi) {
@@ -1123,7 +1202,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
           opts.onText?.(t);
           opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: t.slice(0, 400) } });
         },
-        onToolUse: (n: string, i: unknown) => opts.onTool?.(n, i),
+        onToolUse: emitToolUse,
         onTokens: addTokens,
         shouldStop: () => checkBudget() || p.shouldStop() || sess.done,
       };
@@ -1156,6 +1235,9 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     let assistantTokens = 0;
     let resultTokens = 0;
     let sawResult = false;
+    // Per-message usage accumulators — the result's CUMULATIVE usage minus these yields the remainder's split.
+    let accIn = 0, accOut = 0, accCacheR = 0, accCacheC = 0;
+    let lastResultUsage: Record<string, number> | undefined;
     let q: ReturnType<typeof query> | undefined;
     try {
       q = query({
@@ -1181,9 +1263,22 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         const structuredLimit = usageLimitFromMessage(msg);
         if (structuredLimit) pauseRun(structuredLimit.slice(0, 160));
         if (msg.type === "assistant") {
-          const spent = tally((msg.message as unknown as { usage?: Record<string, number> }).usage);
+          const mu = (msg.message as unknown as { usage?: Record<string, number> }).usage;
+          const spent = tally(mu);
           assistantTokens += spent;
-          addTokens(spent);
+          // Per-message usage detail → the in/out + cache split accumulates call-accurately.
+          if (mu) {
+            const mIn = (mu.input_tokens ?? 0) + (mu.cache_creation_input_tokens ?? 0) + (mu.cache_read_input_tokens ?? 0);
+            accIn += mIn; accOut += mu.output_tokens ?? 0; accCacheR += mu.cache_read_input_tokens ?? 0; accCacheC += mu.cache_creation_input_tokens ?? 0;
+            addTokens(spent, {
+              ...(mIn ? { inputTokens: mIn } : {}),
+              ...(mu.output_tokens !== undefined ? { outputTokens: mu.output_tokens } : {}),
+              ...(mu.cache_read_input_tokens !== undefined ? { cacheReadTokens: mu.cache_read_input_tokens } : {}),
+              ...(mu.cache_creation_input_tokens !== undefined ? { cacheCreationTokens: mu.cache_creation_input_tokens } : {}),
+            });
+          } else {
+            addTokens(spent);
+          }
           for (const block of msg.message.content) {
             if (block.type === "text" && block.text.trim()) {
               turns += 1;
@@ -1191,13 +1286,14 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
               opts.onText?.(t);
               opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: t.slice(0, 400) } });
             } else if (block.type === "tool_use") {
-              opts.onTool?.(block.name, block.input);
+              emitToolUse(block.name, block.input);
             }
           }
         } else if (msg.type === "result") {
           const r = msg as unknown as { usage?: Record<string, number>; total_cost_usd?: number; subtype?: string; is_error?: boolean; result?: string };
           sawResult = true;
           resultTokens = tally(r.usage);
+          lastResultUsage = r.usage;
           costUsd += r.total_cost_usd ?? 0;
           // Error result (returned via result rather than a throw). error_max_turns is a normal cutoff, so excluded.
           if ((r.is_error || (r.subtype && r.subtype !== "success")) && r.subtype !== "error_max_turns") {
@@ -1225,8 +1321,17 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     }
     // Tally once after the stage ends (never dropped on early break / maxTurns / normal finish).
     // If the result is readable use its cumulative; otherwise fall back to the assistant accumulation.
+    // The remainder (result.total − Σassistant) carries the REMAINING usage detail only — passing the
+    // cumulative numbers here would double-count what the per-message adds already recorded.
     const delta = stageTokenDelta(assistantTokens, resultTokens, sawResult);
-    addTokens(Math.max(0, delta - assistantTokens));
+    const rem = Math.max(0, delta - assistantTokens);
+    const ru = sawResult ? lastResultUsage : undefined;
+    addTokens(rem, ru ? {
+      inputTokens: Math.max(0, ((ru.input_tokens ?? 0) + (ru.cache_creation_input_tokens ?? 0) + (ru.cache_read_input_tokens ?? 0)) - accIn) || undefined,
+      outputTokens: Math.max(0, (ru.output_tokens ?? 0) - accOut) || undefined,
+      cacheReadTokens: Math.max(0, (ru.cache_read_input_tokens ?? 0) - accCacheR) || undefined,
+      cacheCreationTokens: Math.max(0, (ru.cache_creation_input_tokens ?? 0) - accCacheC) || undefined,
+    } : undefined);
     if (!p.shouldStop() && !sess.paused && p.onIncomplete !== "continue") pauseRun("Stage ended without its completion tool", "incomplete");
     return turns;
   };
@@ -1397,6 +1502,28 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     // ── STAGE 3: diagnosis (one screen at a time; drive every queued ledger entry to done) ── skipped if survey-only
     if (!opts.surveyOnly && !session.done) {
       opts.store.setPhase(opts.assessmentId, "phase2_scan");
+      // ── out-of-scope screens ── enrolled by a pre-guard redirect bounce (the landing page was an
+      //   external host). Every observed URL is out of scope, so there is nothing testable: mark them
+      //   excluded (terminal, honest) instead of stranding them queued and burning a diagnosis turn on
+      //   probes the scope gate would block anyway.
+      {
+        const scanNow = new Map((opts.store.loadAssessment(opts.assessmentId)?.screenScans ?? []).map((x) => [x.screenId, x.status] as const));
+        let oos = 0;
+        for (const sc of session.inv.screens()) {
+          const urls = sc.observedUrls ?? [];
+          const st = scanNow.get(sc.screenId) ?? "queued";
+          if (urls.length > 0 && urls.every((u) => !isInScope(u, session.scope)) && (st === "queued" || st === "scanning")) {
+            opts.store.setScreenScanStatus(opts.assessmentId, sc.screenId, "excluded");
+            resumeStatus?.set(sc.screenId, "excluded");
+            oos += 1;
+          }
+        }
+        if (oos > 0)
+          opts.store.appendEvent(opts.assessmentId, {
+            type: "note",
+            payload: { message: `↪ excluded ${oos} out-of-scope screen(s) — every observed URL is external (redirect-bounce enrollment); nothing in scope to test` },
+          });
+      }
       // On resume, skip terminal (clean/finding/excluded) **first**, then run only the un-diagnosed up to maxScreens.
       // Note: slicing first ends with 0 without looking at queued when the head is all terminal (this was a bug).
       const TERMINAL = new Set(["clean", "finding", "suspected", "excluded"]);
@@ -1491,11 +1618,10 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
                           if (fresh) rs.cookie = fresh;
                           const nb = await rs.driver.bearerToken().catch(() => null);
                           if (nb) rs.bearer = nb;
-                          // An operator re-login lifts the blocked mark too — the role must not stay
-                          // labelled blocked until some future login() happens to clear it.
-                          if ((rs.cookie || rs.bearer) && sess.roleSurveyBlocked.delete(role)) {
-                            emitRoleProgress(sess, role, "mapped");
-                            session.store.appendEvent(session.assessmentId, { type: "note", payload: { message: `🔓 role '${role}' re-authenticated via Sessions tab — unblocked` } });
+                          // An operator re-login immediately refreshes the role's progress snapshot.
+                          if (rs.cookie || rs.bearer) {
+                            emitRoleProgress(sess, role);
+                            session.store.appendEvent(session.assessmentId, { type: "note", payload: { message: `🔓 role '${role}' re-authenticated via Sessions tab` } });
                           }
                         })
                         .catch(() => {})
@@ -1650,7 +1776,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         queue: Screen[];
       }
       // Diagnose one screen (shared body called from both the primary path and the drain). "break" stops the outer loop.
-      const diagnoseOne = async (w: DiagWorker, sc: Screen): Promise<"continue" | "break"> => {
+      const diagnoseOne = async (w: DiagWorker, sc: Screen, goalOverride?: string): Promise<"continue" | "break"> => {
         const sess = w.sess;
         // ── between-screens checkpoint ── flush queued reconfigure/inject, then honor an operator (WebUI) pause.
         await applyPendingControls();
@@ -1683,7 +1809,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         opts.store.setScreenScanStatus(opts.assessmentId, sc.screenId, "scanning");
         turns += await runStage({
           system: DIAGNOSE_PROMPT,
-          goal: `Diagnose screen ${sc.screenId} (${sc.urlTemplate}). Call get_screen for its detail and plan, test that plan with evidence discipline, then screen_done.`,
+          goal: goalOverride ?? `Diagnose screen ${sc.screenId} (${sc.urlTemplate}). Call get_screen for its detail and plan, test that plan with evidence discipline, then screen_done.`,
           allowed: allowedFor("diagnose"),
           maxTurns: perScreen,
           onIncomplete: "continue",
@@ -1752,6 +1878,9 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       };
 
       const handled = new Set<string>();
+      // Completion may return a formerly terminal screen to queued on a turn cap. Its batches, not
+      // drainQueued's default diagnosis goal, own that retry for the rest of this process.
+      const completionAttempted = new Set<string>();
       /** Screens returned to queued by a PAUSE (infra failure, not the screen's fault). A successful transient
        *  auto-resume un-handles them so the drain actually retries them — otherwise a 429 mid-run would leave
        *  every interrupted screen abandoned even though the provider recovered. Bounded by autoResumes. */
@@ -1909,6 +2038,14 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       }
       // Sequential fallback: no bound roles or nothing parallelizable → one worker on the main session (unchanged).
       if (workers.length === 0) workers.push({ name: session.currentRole || "primary", sess: session, toolDefs, server, queue: [] });
+      // Session-binding contract: roles that own a bound worker are off-limits to a second live login
+      // (it would race their server-side session). The unauth worker (boundRole "") is UNBOUND — it may
+      // login as any non-owned role, and any worker may login("unauth") to drop its session. peerBoundRoles
+      // stays unset on the main/sequential session, which keeps legacy free login (multi-role surveys).
+      {
+        const owned = new Set(workers.filter((w) => w.sess.boundRole).map((w) => w.sess.boundRole!));
+        for (const w of workers) if (w.sess !== session) w.sess.peerBoundRoles = owned;
+      }
       if (workers.length > 1) {
         opts.onText?.(`⚡ parallel diagnosis: ${workers.length} workers (${workers.map((w) => w.name).join(", ")})`);
         opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: `⚡ parallel diagnosis: ${workers.map((w) => w.name).join(", ")}` } });
@@ -1960,7 +2097,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
           if (!live) break;
           const scanById = new Map(live.screenScans.map((s) => [s.screenId, s] as const));
           const next = live.screens.find((s) => {
-            if (handled.has(s.screenId)) return false;
+            if (handled.has(s.screenId) || completionAttempted.has(s.screenId)) return false;
             const scan = scanById.get(s.screenId);
             return !!scan && isScannable(scan);
           });
@@ -1982,10 +2119,24 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       await drainQueued();
       session.currentScreenId = null;
 
+      const requestedPasses = opts.completionPasses ?? 2;
+      const completionPasses = Number.isFinite(requestedPasses)
+        ? Math.max(0, Math.min(8, Math.floor(requestedPasses)))
+        : 2;
+      // Startup/resume: reconstruct from persisted rows rather than replaying an in-memory cursor. Excluded
+      // screens remain excluded; neither a crash nor a completion-only resume turns them into clean verdicts.
+      const completionSnapshot = (onlyIds?: ReadonlySet<string>) => {
+        const live = opts.store.loadAssessment(opts.assessmentId);
+        if (!live) return null;
+        const excluded = new Set(live.screenScans.filter((s) => s.status === "excluded").map((s) => s.screenId));
+        return completionWork(live.screens.filter((sc) => !excluded.has(sc.screenId)), live.checkExecutions, onlyIds);
+      };
+      const completedReportResume = !!(opts.resume && handled.size === 0 && (prev?.phase === "report" || prev?.phase === "done"));
+      const completionOnlyResume = completedReportResume && completionPasses > 0 && !!completionSnapshot()?.unresolved.size;
       // Resume of a FINISHED run with nothing left: the drain above already replayed injected targets (any new work
       // would have grown `handled`). Zero handled + the previous process reached report = every screen already has a
-      // verdict — re-running the LLM stages (scenario / fingerprint / findings-QA) would only re-buy the same results.
-      if (opts.resume && handled.size === 0 && (prev?.phase === "report" || prev?.phase === "done")) {
+      // verdict. Unresolved ledger rows, however, can be explicitly resumed without rebuying other stages.
+      if (completedReportResume && !completionOnlyResume) {
         const msg = "✔ nothing to resume — every screen already has a verdict (the previous run reached report)";
         opts.onText?.(msg);
         opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: msg } });
@@ -1997,7 +2148,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       //    Leave the contextual call "is there a transactional flow" **to the LLM** (no brittle lexical regex): the model reads
       //    get_inventory, finds workflows, and if there are none closes immediately with scenario_done. Disable with --no-scenario.
       afterAutoResume(await tryAutoResume()); // a transient pause that survived diagnosis clears before the next stage
-      if (opts.scenarioPass !== false && !session.done) {
+      if (opts.scenarioPass !== false && !session.done && !completionOnlyResume) {
         session.scenarioDone = false;
         // The operator emphasis hint (--focus) is **carried out in this scenario stage** (cross-cutting/objective-driven, so here rather than per-screen diagnosis is right).
         const focusClause = opts.focus
@@ -2028,7 +2179,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       //    Collection is deterministic (fingerprint_scan extracts versions from headers/cookies/meta/script), CVE assessment relies on the deep model's knowledge.
       //    WebFetch is banned, so no external CVE DB is queried; findings are recorded honestly as "version-based, needs confirmation".
       afterAutoResume(await tryAutoResume());
-      if (opts.fingerprintPass !== false && !session.done) {
+      if (opts.fingerprintPass !== false && !session.done && !completionOnlyResume) {
         session.fingerprintDone = false;
         opts.onText?.(`🔎 fingerprint stage: collecting tech/version banners → ${session.cveLookup ? "online CVE-DB (OSV/NVD)" : "model-knowledge"} CVE assessment (A06)`);
         // When CVE DB lookup is off, don't offer cve_lookup (avoids wasted turns).
@@ -2052,6 +2203,128 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       //    (The post-diagnosis drain can't catch screens dug up by the later navigation. e.g. --focus's TOCTOU probing
       //     found /admin_panel etc. -> it fell to report still queued and became "scanned 2/5".)
       await drainQueued();
+
+      // ── Full-asset review ── every reachable HTML document + first-party JS bundle is read by the LLM
+      //    in chunks (one completion per chunk — no agent-context blow-up), then a bounded follow-up stage
+      //    verifies each observation with real requests. Coverage is honest per asset: what the model never
+      //    saw stays complete:false in the asset_reviewed ledger — never reported as "nothing found".
+      //    Disable with --no-asset-review.
+      if (opts.assetReview !== false && !session.done && !completionOnlyResume) {
+        const { assets, skipped } = await collectAssets(session);
+        opts.onText?.(`📄 asset review: ${assets.length} asset(s) to read (${assets.reduce((n, a) => n + a.bytes, 0)} bytes)${skipped.length ? `, ${skipped.length} skipped by queue cap` : ""}`);
+        const rev = await reviewAssets({
+          session,
+          llm: session.loginLlm,
+          model: fastModel,
+          assets,
+          skipped,
+          onText: opts.onText,
+          shouldAbort: () => session.done || checkBudget(),
+        });
+        if (rev.observations.length > 0 && !session.done) {
+          session.assetReviewDone = false;
+          // Enroll every observation as a planned "asset-review" check so the ledger — not the turn
+          // budget — decides what's finished. The stage resolves them via resolve_asset_review;
+          // leftovers stay planned and the completion pass below picks them up.
+          enrollObservations(session, rev.observations);
+          const obsList = rev.observations
+            .slice(0, 40)
+            .map((o, i) => `${i + 1}. [${o.type}] ${o.url} — ${o.detail} checkId=${session.pendingAssetObs![i]!.checkId}`)
+            .join("\n");
+          turns += await runStage({
+            system: ASSET_FOLLOWUP_PROMPT,
+            goal: `The full-asset LLM read produced ${rev.observations.length} observation(s) to verify${rev.observations.length > 40 ? ` (first 40 listed — the rest are in the asset_reviewed ledger events)` : ""}:\n${obsList}\n\nFor each lead, re-fetch its in-scope asset with http_request(GET), inspect the live response, and call resolve_asset_review(checkId, verdict, evidenceIds:[asset GET evidenceId, ...]). For 'verified', record_finding first with real confirmation evidence and cite this asset URL in its description; pass findingId. For 'refuted', include evidenceIds from an instrumented tested-clean check (e.g. compose_check or probe_secrets) as well as the asset GET; a raw fetch or an unsupported duplicate is NOT tested-clean. Unproven leads stay unverified, not clean. Then asset_review_done.`,
+            allowed: allowedFor("assetReview"),
+            maxTurns: Math.min(maxTurns, 48),
+            model: deepModel,
+            contextWindowTokens: contextWindows.deep,
+            shouldStop: () => session.assetReviewDone,
+            onIncomplete: "continue",
+          });
+        }
+      }
+
+      // ── Completion pass ── The ledger is authoritative. Each pass snapshots ALL unresolved identities,
+      //    then drives each screen in batches of 20 (rather than silently dropping slot 21). New rows/screens
+      //    created during a pass wait for the next one, so concurrent enrollment cannot prolong this pass.
+      //    The diagnosis/tool safety gates still control every request; this scheduler writes NO check verdicts,
+      //    runs NO probes itself and does not auto-declare a slot clean/not-applicable.
+      let onlyIds: ReadonlySet<string> | undefined;
+      let completionStages = 0;
+      const MAX_COMPLETION_STAGES = 256; // second ceiling even if many screens/classes grow during diagnosis
+      for (let pass = 0; pass < completionPasses && !session.done; pass++) {
+        await drainQueued(); // also consumes injected targets; never retries a handled, capped diagnosis screen
+        const before = completionSnapshot(onlyIds);
+        if (!before || before.batches.length === 0) break;
+        const scheduled = before.batches.reduce((n, b) => n + b.checks.length, 0);
+        const unfinishedScreens = new Set(before.batches.map((b) => b.screen.screenId)).size;
+        opts.onText?.(`♻ completion pass ${pass + 1}/${completionPasses}: ${scheduled}/${before.unresolved.size} unfinished check(s) scheduled across ${unfinishedScreens} screen(s) — ${before.batches.length} bounded batch(es)`);
+        opts.store.appendEvent(opts.assessmentId, {
+          type: "note",
+          payload: { message: `♻ completion pass ${pass + 1}: ${scheduled}/${before.unresolved.size} unfinished check(s) across ${unfinishedScreens} screen(s)` },
+        });
+        const bound = workers.filter((w) => w.sess.boundRole);
+        let wi = 0;
+        for (const batch of before.batches) {
+          if (session.done || completionStages >= MAX_COMPLETION_STAGES) break;
+          // Concurrent workers may have resolved a row since the snapshot. Never re-drive it or let a
+          // stale check status/old attempt reason into the next goal; new rows wait for the next pass.
+          // There is no public per-screen read in AssessmentStore: read the full check ledger once per
+          // batch for freshness, but project ONLY this screen. Never cache across an awaited diagnosis,
+          // which (or another worker) can update these rows in the meantime.
+          const liveChecks = opts.store.checks(opts.assessmentId).filter((c) => c.screenId === batch.screen.screenId);
+          const view = screenChecks({ checkExecutions: liveChecks }, batch.screen.screenId);
+          const pending = new Map([...view.unstarted, ...view.gaps].map((c) => [c.id, c]));
+          const todo = batch.checks.flatMap((c) => pending.has(c.id) ? [pending.get(c.id)!] : []);
+          if (todo.length === 0) continue;
+          // Screen metadata/exclusions remain pass-scoped; the store has no cheap per-screen scan read.
+          const sc = batch.screen;
+          const list = todo.map((c, i) => {
+            if (c.checkClass === "asset-review") {
+              // Older check detail/reason can contain model prose. Never echo them (or a URL with
+              // userinfo/query credentials) into a completion prompt. Only an enrollment-shaped
+              // identity is safe to show to the model as a resolvable checkId.
+              const asset = c.target.startsWith("ASSET ") ? c.target.slice(6) : "";
+              const safe = asset && safeAssetUrl(asset) === asset && isInScope(asset, session.scope) &&
+                /^asset-review:[a-f0-9]{24}$/.test(c.resource ?? "") &&
+                c.tool === "asset-review" && c.subject === "asset-review" &&
+                !c.session && !c.principal && !c.tenant && !c.param &&
+                c.origin === new URL(asset).origin && c.id === checkKey(c);
+              return safe
+                ? `${i + 1}. asset-review @${asset} [${c.status}] checkId=${c.id} — re-fetch via scoped http_request(GET), then resolve_asset_review(checkId, verdict, evidenceIds:[asset GET evidenceId, ...]). Verified needs a confirmed recorded finding about this asset (findingId); refuted needs a lead-bound tested-clean check, not an unrelated negative probe. Without proof leave unverified; a duplicate is not clean.`
+                : `${i + 1}. asset-review [${c.status}] — invalid or legacy identity; leave unresolved, never mark clean.`;
+            }
+            return `${i + 1}. ${c.checkClass} @${c.target}${c.param ? ` param:${c.param}` : ""}${c.subject ? ` role:${c.subject}` : ""}${c.resource ? ` object:${c.resource}` : ""} [${c.status}] id=${c.id}${c.detail ? ` — ${c.detail.slice(0, 160)}` : ""}${c.reason ? ` (last attempt: ${c.reason.slice(0, 120)})` : ""}`;
+          }).join("\n");
+          const w = sc.authState === "post-login" && bound.length ? bound[wi++ % bound.length]! : (unauthWorker ?? workers[0]!);
+          const goal = `FINISH THESE ${todo.length} UNRESOLVED CHECK SLOTS on screen ${sc.screenId} (${sc.urlTemplate}):\n${list}\nCall get_screen / coverage_status for the live plan. Work each named target, param and role with evidence discipline. If no dedicated safe probe fits, compose_check requires a failing control, attack replays and independent verification. Do NOT issue unsafe state-changing requests (transfers, payments, destructive writes), infer clean/not-applicable from a turn cap, or mark other untested slots done. Call screen_done ONLY after all of this screen's plan slots have actually been accounted for; otherwise leave it queued. Report genuinely blocked/unverified checks with concrete reasons, never as clean.`;
+          let r: "continue" | "break";
+          completionAttempted.add(sc.screenId);
+          do {
+            completionStages++;
+            r = await diagnoseOne(w, sc, goal);
+            if (r === "break") afterAutoResume(await tryAutoResume()); // bounded transient retry; manual pause stays resumable
+          } while (r === "break" && !session.done && completionStages < MAX_COMPLETION_STAGES);
+          if (r === "break") break;
+        }
+        if (session.done) break; // budget/provider/auth pause: retain ledger and queued screen for --resume
+        if (completionStages >= MAX_COMPLETION_STAGES) {
+          const msg = `♻ completion stage cap (${MAX_COMPLETION_STAGES}) reached — remaining checks stay unresolved`;
+          opts.onText?.(msg);
+          opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: msg } });
+          break;
+        }
+        const after = completionSnapshot();
+        if (!after) break;
+        const progress = completionProgress(before.unresolved, after.unresolved);
+        if (!progress.continue) {
+          opts.onText?.(`♻ completion pass made no ledger progress (${after.unresolved.size} still open) — unchanged tasks are not retried`);
+          break;
+        }
+        // No resolved tasks but fresh ones? Only the NEW identities are eligible next pass, not the
+        // failed unchanged checks. A resolved task is progress even when additions offset its count.
+        onlyIds = progress.retry;
+      }
       session.currentScreenId = null;
     }
 

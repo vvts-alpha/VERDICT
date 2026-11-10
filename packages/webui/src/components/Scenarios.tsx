@@ -1,5 +1,5 @@
-import type { CheckExecution, StateView } from "@veritas/core";
-import { planSatisfied } from "./screen-status";
+import type { StateView } from "@veritas/core";
+import { screenHonestyMap } from "./screen-status";
 import { SeverityBadge } from "./SeverityBadge";
 import { useT } from "../i18n";
 import { Badge } from "./ui/badge";
@@ -13,7 +13,7 @@ import { Card } from "./ui/card";
 // Note: a PLAN note's body is truncated at 200 chars, so the plan is shown partially.
 
 const PLAN_RE = /^📋 PLAN (s-\d+): \[([^\]]*)\]\s*([\s\S]*)$/;
-const COV_RE = /^✓ (s-\d+) → (finding|clean) \[([^\]]*)\]/;
+const COV_RE = /^✓ (s-\d+) → (?:finding|clean) \[([^\]]*)\]/;
 const FOCUS_RE = /^🧩 scenario stage: operator focus → ([\s\S]*)$/;
 
 // A04 (cross-screen logic) categories — shown separately as the output of the scenario stage.
@@ -33,57 +33,59 @@ type Entry = {
 };
 type Cov = { verdict: string; entries: Entry[]; provenance: "ledger" | "note" };
 
-// Dominant-status precedence for a per-class rollup — a real hole outranks a clean run, and a gap
-// (unverified/blocked) outranks "tested-clean" so incomplete checks never read as verified coverage.
-const CHECK_RANK: Record<string, number> = {
-  found: 7, suspected: 6, unverified: 5, blocked: 4,
-  "tested-clean": 3, "not-applicable": 2, planned: 1, running: 0,
-};
-
-/** Per-screen coverage derived from the structured check ledger (the source of truth). Any recorded
- *  ledger row — even an unattributed one — suppresses the ✓ note's verdict: rows exist but no class
- *  verdict reads "unverified", never the note's self-reported clean. Per-class chips preserve
- *  outcome multiplicity: a found plus an unverified on the same class shows BOTH, and a
- *  tested-clean plus an unsatisfied plan slot can never read as fully clean. */
-function ledgerCoverage(rows: CheckExecution[]): Cov {
-  const byClass = new Map<string, CheckExecution[]>();
-  for (const r of rows) {
-    if (r.checkClass === "http-request") continue; // unattributed raw requests cover nothing
-    const arr = byClass.get(r.checkClass) ?? [];
-    arr.push(r);
-    byClass.set(r.checkClass, arr);
+/** Projected core class rollups win over self-reported coverage notes. This selector never
+ * interprets plan slots, failed attempts, or historical retries in the browser. */
+export function scenarioCoverage(view: StateView): Map<string, Cov> {
+  const covs = new Map<string, Cov>();
+  for (const e of view.events) {
+    if (e.type !== "note") continue;
+    const r = COV_RE.exec(e.payload.message);
+    if (!r) continue;
+    covs.set(r[1]!, {
+      verdict: "unknown-records", // note claims are breadcrumbs, never coverage verdicts
+      entries: r[2]!
+        .split(",")
+        .map((x) => x.trim())
+        .filter(Boolean)
+        .map((x) => {
+          const i = x.indexOf(":");
+          return { cls: (i < 0 ? x : x.slice(0, i)).trim(), status: (i < 0 ? "" : x.slice(i + 1)).trim(), others: [], gaps: 0, unfulfilled: 0 };
+        }),
+      provenance: "note",
+    });
   }
-  if (byClass.size === 0) return { verdict: "unverified", entries: [], provenance: "ledger" };
-  const cells = [...byClass.entries()].map(([cls, rs]) => {
-    const plans = rs.filter((r) => r.status === "planned");
-    const execs = rs.filter((r) => r.status !== "planned");
-    const counts = new Map<string, number>();
-    for (const e of execs) counts.set(e.status, (counts.get(e.status) ?? 0) + 1);
-    const dominant = execs.length
-      ? execs.reduce((a, b) => ((CHECK_RANK[b.status] ?? 0) > (CHECK_RANK[a.status] ?? 0) ? b : a)).status
-      : "planned";
-    counts.delete(dominant);
-    return {
-      cls,
-      status: dominant,
-      ran: execs.length,
-      gaps: execs.filter((e) => e.status === "unverified" || e.status === "blocked" || e.status === "running").length,
-      unfulfilled: plans.filter((p) => !execs.some((e) => planSatisfied(p, e))).length,
-      others: [...counts.entries()].map(([status, count]) => ({ status, count })),
-    };
-  });
-  const dominant = cells.reduce((a, b) => ((CHECK_RANK[b.status] ?? 0) > (CHECK_RANK[a.status] ?? 0) ? b : a)).status;
-  const ran = cells.reduce((n, c) => n + c.ran, 0);
-  const gaps = cells.reduce((n, c) => n + c.gaps, 0);
-  const unfulfilled = cells.reduce((n, c) => n + c.unfulfilled, 0);
-  const verdict =
-    dominant === "found" ? "finding"
-      : dominant === "suspected" ? "suspected"
-        : gaps > 0 ? "unverified"
-          : unfulfilled > 0 ? (ran > 0 ? "unverified" : "planned")
-            : ran === 0 ? "planned"
-              : "clean";
-  return { verdict, entries: cells, provenance: "ledger" };
+  // Even a lone http-request row displaces a "clean" note, but can never create a clean verdict.
+  for (const sid of new Set(view.checkExecutions.map((row) => row.screenId))) {
+    const summary = view.screenCheckSummaries?.[sid];
+    const honesty = view.screenHonesty?.[sid];
+    covs.set(sid, summary
+      ? {
+        verdict: honesty?.status ?? summary.verdict,
+        entries: summary.classes.map((cell) => ({
+          cls: cell.checkClass,
+          status: cell.status,
+          others: cell.outcomes.filter((o) => o.status !== cell.status),
+          gaps: cell.gaps,
+          unfulfilled: cell.unfulfilled,
+        })),
+        provenance: "ledger",
+      }
+      : { verdict: "unverified", entries: [], provenance: "ledger" }); // old server: do not trust note/guess a plan match
+  }
+  // A legacy note is useful as a plan breadcrumb, not an authoritative verdict.
+  // Use the core projection or its fail-closed fallback when there are no ledger rows.
+  const honesty = screenHonestyMap(view);
+  const findingScreens = new Set(view.findings.map((f) => f.screenId));
+  for (const [sid, cov] of covs) {
+    if (cov.provenance !== "note") continue;
+    const scan = honesty.get(sid);
+    // Older servers lack the projection. A raw "finding" survives only with a
+    // structured finding on this screen; the note itself cannot supply one.
+    const verdict = !view.screenHonesty && scan?.raw === "finding" && findingScreens.has(sid)
+      ? "finding" : scan?.status ?? "unknown-records";
+    covs.set(sid, { ...cov, verdict });
+  }
+  return covs;
 }
 
 const ENTRY_CLS: Record<string, string> = {
@@ -97,7 +99,7 @@ const ENTRY_CLS: Record<string, string> = {
 export function Scenarios({ view, onJump }: { view: StateView; onJump: (screenId: string) => void }) {
   const t = useT();
   const plans = new Map<string, Plan>();
-  const covs = new Map<string, Cov>();
+  const covs = scenarioCoverage(view);
   let focus = "";
   for (const e of view.events) {
     if (e.type !== "note") continue;
@@ -105,33 +107,10 @@ export function Scenarios({ view, onJump }: { view: StateView; onJump: (screenId
     let r: RegExpExecArray | null;
     if ((r = PLAN_RE.exec(m))) {
       plans.set(r[1]!, { screenId: r[1]!, classes: r[2]!.split(",").map((s) => s.trim()).filter(Boolean), plan: (r[3] ?? "").trim() });
-    } else if ((r = COV_RE.exec(m))) {
-      covs.set(r[1]!, {
-        verdict: r[2]!,
-        entries: r[3]!
-          .split(",")
-          .map((x) => x.trim())
-          .filter(Boolean)
-          .map((x) => {
-            const i = x.indexOf(":");
-            return { cls: (i < 0 ? x : x.slice(0, i)).trim(), status: (i < 0 ? "" : x.slice(i + 1)).trim(), others: [], gaps: 0, unfulfilled: 0 };
-          }),
-        provenance: "note",
-      });
     } else if ((r = FOCUS_RE.exec(m))) {
       focus = r[1]!.trim();
     }
   }
-
-  // Structured ledger wins over the ✓ note: a self-reported "tested-clean" note must never override
-  // real check executions (it can claim clean while the ledger still shows unverified/blocked gaps).
-  const ledgerByScreen = new Map<string, CheckExecution[]>();
-  for (const c of view.checkExecutions) {
-    const arr = ledgerByScreen.get(c.screenId) ?? [];
-    arr.push(c);
-    ledgerByScreen.set(c.screenId, arr);
-  }
-  for (const [sid, rows] of ledgerByScreen) covs.set(sid, ledgerCoverage(rows)); // ledger-derived coverage replaces any note-derived claim
 
   const urlOf = new Map(view.screens.map((s) => [s.screenId, s.urlTemplate]));
   const screenIds = [...new Set([...plans.keys(), ...covs.keys()])].sort();
@@ -186,15 +165,25 @@ export function Scenarios({ view, onJump }: { view: StateView; onJump: (screenId
                         <Badge
                           variant="outline"
                           title={c.provenance === "note" ? t("self-reported note — no structured check records; detail unknown") : undefined}
-                          className={c.provenance === "note" ? "text-muted-foreground" : (ENTRY_CLS[e.status] ?? "text-muted-foreground")}
+                          className={c.provenance === "note" ? "text-muted-foreground" : (e.gaps > 0 || e.unfulfilled > 0) && e.status === "tested-clean" ? "border-warning text-warning" : (ENTRY_CLS[e.status] ?? "text-muted-foreground")}
                         >
                           {e.cls}{e.status ? `: ${t(e.status)}` : ""}{c.provenance === "note" ? t(" (note)") : ""}
                         </Badge>
-                        {e.others.map((o) => (
-                          <Badge key={o.status} variant="outline" className={ENTRY_CLS[o.status] ?? "text-muted-foreground"}>
-                            +{o.count} {t(o.status)}
+                        {e.others.map((o) => {
+                          const resolved = e.gaps === 0 && ["unverified", "blocked", "running"].includes(o.status);
+                          return (
+                            <Badge key={o.status} variant="outline"
+                              title={resolved ? t("resolved historical attempt") : t("other recorded outcomes (including historical attempts)")}
+                              className={resolved ? "text-muted-foreground" : (ENTRY_CLS[o.status] ?? "text-muted-foreground")}>
+                              {resolved ? `${t("history")}: ` : ""}+{o.count} {t(o.status)}
+                            </Badge>
+                          );
+                        })}
+                        {e.gaps > 0 ? (
+                          <Badge variant="outline" className="border-warning text-warning" title={t("unresolved check attempt(s)")}>
+                            +{e.gaps} {t("gaps")}
                           </Badge>
-                        ))}
+                        ) : null}
                         {e.unfulfilled > 0 ? (
                           <Badge variant="outline" className="text-muted-foreground" title={t("plan slot(s) with no satisfying terminal execution")}>
                             +{e.unfulfilled} {t("plan")}

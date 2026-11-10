@@ -35,4 +35,7 @@ export interface Finding {
   /** Relative path (under artifacts/) to a browser screenshot captured when the finding was recorded — visual
    *  context beyond the raw request/response. e.g. "findings/f-003.png". Absent when no browser page was available. */
   screenshot?: string;
+  /** Every endpoint this root cause was observed on (normalized templates). One finding = one root cause; reports
+   *  of the same defect on other endpoints merge here instead of becoming sibling rows. */
+  affectedEndpoints?: string[];
 }

@@ -333,3 +333,77 @@ test("OpenCode session survives native-to-text fallback and all turns", async ()
     assert.match(ids[0]!, /^[a-f0-9-]{36}$/);
     assert.equal(ids[0], ids[1]);
 });
+
+test("native mode: finish_reason=length does not kill the run — complete tool calls still run and the model is nudged to continue", async () => {
+    const calls: string[] = [];
+    const bodies: string[] = [];
+    let done = false;
+    const tools: PilotToolDef[] = [
+        { name: "probe", description: "p", inputSchema: {}, handler: async () => { calls.push("probe"); return { content: [{ type: "text", text: "r" }] }; } },
+        { name: "fin", description: "f", inputSchema: {}, handler: async () => { calls.push("fin"); done = true; return { content: [{ type: "text", text: "ok" }] }; } },
+    ];
+    const lengthResp = (msg: unknown) => new Response(JSON.stringify({ choices: [{ message: msg, finish_reason: "length" }], usage: { total_tokens: 10 } }), { status: 200, headers: { "content-type": "application/json" } });
+    let turn = 0;
+    const fetchImpl: FetchLike = async (_u, init) => {
+        bodies.push(String(init.body));
+        turn += 1;
+        // Turn 1: truncated mid-reply but carries a COMPLETE tool_call — it must still dispatch.
+        if (turn === 1) return lengthResp({ content: "planning a huge payload…", tool_calls: [toolCall("c1", "probe", {})] });
+        // Turn 2: truncated with no usable tool call — nudge and continue, don't pause.
+        if (turn === 2) return lengthResp({ content: '{"tool":"record_metho' });
+        return assistantWithTools([toolCall("c2", "fin", {})]);
+    };
+    const res = await runOpenAiAgentLoop({
+        baseURL: "http://x/v1", model: "m", system: "s", goal: "g",
+        tools, allowed: ["probe", "fin"], maxTurns: 8, shouldStop: () => done, fetchImpl,
+    });
+    assert.equal(res.stopped, "shouldStop", `length responses recover instead of erroring (got ${res.stopped}: ${res.error ?? ""})`);
+    assert.deepEqual(calls, ["probe", "fin"], "the tool_call that arrived before truncation still ran");
+    // The model was told the reply was truncated and to split work smaller.
+    const lastReq = JSON.parse(bodies.at(-1)!) as { messages: Array<{ role: string; content?: string | null }> };
+    const nudge = lastReq.messages.find((m) => m.role === "user" && typeof m.content === "string" && m.content.includes("truncated"));
+    assert.ok(nudge, "a truncation nudge was injected for the next turn");
+    assert.equal(res.contextFailure, undefined, "a recovered length hit is not a context failure");
+});
+
+test("native mode: three consecutive truncated responses with zero usable tool calls still fail honestly", async () => {
+    let fetches = 0;
+    const fetchImpl: FetchLike = async () => {
+        fetches += 1;
+        return new Response(JSON.stringify({ choices: [{ message: { content: "an endless monologue with no tool call…" }, finish_reason: "length" }] }), {
+            status: 200, headers: { "content-type": "application/json" },
+        });
+    };
+    const res = await runOpenAiAgentLoop({
+        baseURL: "http://x/v1", model: "m", system: "s", goal: "g",
+        tools: [], allowed: [], maxTurns: 10, shouldStop: () => false, fetchImpl,
+    });
+    assert.equal(res.stopped, "error");
+    assert.equal(res.contextFailure, true, "a genuinely-stuck model still surfaces as a resumable context failure");
+    assert.match(res.error ?? "", /exceeded the reserved output budget/);
+    assert.equal(fetches, 3, "bounded — gave up after exactly three stalled length hits");
+});
+
+test("text mode: finish_reason=length is recovered with a nudge instead of an error", async () => {
+    const calls: string[] = [];
+    const bodies: string[] = [];
+    let done = false;
+    const tools: PilotToolDef[] = [
+        { name: "fin", description: "f", inputSchema: {}, handler: async () => { calls.push("fin"); done = true; return { content: [{ type: "text", text: "ok" }] }; } },
+    ];
+    let turn = 0;
+    const fetchImpl: FetchLike = async (_u, init) => {
+        bodies.push(String(init.body));
+        turn += 1;
+        if (turn === 1) return new Response(JSON.stringify({ choices: [{ message: { content: '{"tool":"record_metho' }, finish_reason: "length" }] }), { status: 200, headers: { "content-type": "application/json" } });
+        return new Response(JSON.stringify({ choices: [{ message: { content: '{"tool":"fin"}' } }] }), { status: 200, headers: { "content-type": "application/json" } });
+    };
+    const res = await runOpenAiAgentLoop({
+        baseURL: "http://x/v1", model: "m", system: "s", goal: "g",
+        tools, allowed: ["fin"], maxTurns: 6, mode: "text", shouldStop: () => done, fetchImpl,
+    });
+    assert.equal(res.stopped, "shouldStop");
+    assert.deepEqual(calls, ["fin"], "the model recovered and finished the stage");
+    const secondReq = JSON.parse(bodies[1]!) as { messages: Array<{ role: string; content?: string }> };
+    assert.ok(secondReq.messages.some((m) => m.role === "user" && (m.content ?? "").includes("truncated")), "nudge present");
+});

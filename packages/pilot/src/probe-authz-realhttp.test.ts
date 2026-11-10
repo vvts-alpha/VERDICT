@@ -39,6 +39,11 @@ const TENANT_DOCS: Record<string, Record<string, { owner: string; secret: string
   t1: { "doc-1": { owner: "u-a", secret: "t1-private-doc" } },
   t2: { "doc-1": { owner: "u-c", secret: "t2-private-doc" } },
 };
+// Mutable objects for the idor-write mutation contract: GET reads the state, PUT mutates it.
+const WORDERS: Record<string, { owner: string; note: string }> = {
+  "w-a1": { owner: "u-a", note: "orig-a1" },
+  "w-b1": { owner: "u-b", note: "orig-b1" },
+};
 
 interface WireHit { path: string; auth: string; }
 const wire: WireHit[] = [];
@@ -120,6 +125,38 @@ before(async () => {
       // vulnOrder: returns the object plus an unrelated field error (HTTP200 partial data)
       return json(res, 200, { data: { order: { id, ownerId: o.owner || "shared", total: o.total } }, errors: vuln ? [{ message: "deprecated field", path: ["note"] }] : [] });
     }
+    m = /^\/api\/vuln\/worders\/([^/]+)$/.exec(u.pathname);
+    if (m) {
+      const o = WORDERS[m[1]!];
+      if (!o) return json(res, 404, { error: "not found" });
+      if (!who) return json(res, 401, { error: "unauthenticated" });
+      if (req.method === "PUT") {
+        const b = await readBody(req).catch(() => "{}");
+        try { Object.assign(o, JSON.parse(b)); } catch { /* keep state */ }
+        return json(res, 200, { id: m[1], ownerId: o.owner, note: o.note }); // BUG: no owner check on write
+      }
+      return json(res, 200, { id: m[1], ownerId: o.owner, note: o.note }); // BUG: no owner check on read either
+    }
+    m = /^\/api\/worders\/([^/]+)$/.exec(u.pathname);
+    if (m) {
+      const o = WORDERS[m[1]!];
+      if (!o) return json(res, 404, { error: "not found" });
+      if (!who) return json(res, 401, { error: "unauthenticated" });
+      if (o.owner !== who.id) return json(res, 403, { error: "forbidden" }); // SAFE: owner-only read+write
+      if (req.method === "PUT") {
+        const b = await readBody(req).catch(() => "{}");
+        try { Object.assign(o, JSON.parse(b)); } catch { /* keep state */ }
+      }
+      return json(res, 200, { id: m[1], ownerId: o.owner, note: o.note });
+    }
+    m = /^\/api\/noop\/worders\/([^/]+)$/.exec(u.pathname);
+    if (m) {
+      const o = WORDERS[m[1]!];
+      if (!o) return json(res, 404, { error: "not found" });
+      if (!who) return json(res, 401, { error: "unauthenticated" });
+      if (req.method === "PUT") return json(res, 200, { ok: true }); // accepts but applies NOTHING — write never lands
+      return json(res, 200, { id: m[1], ownerId: o.owner, note: o.note });
+    }
     res.statusCode = 404; res.end("nf");
   });
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
@@ -175,7 +212,7 @@ function session(opts: {
     roleTenants: new Map(Object.entries(opts.tenants ?? {})),
     expectedAccess: opts.expectedAccess ?? [],
     sessionPrincipals: new Map(), invalidRoleSessions: new Set(),
-    visitedByRole: new Map(), roleSurveyBlocked: new Map(),
+    visitedByRole: new Map(), roleLoginAttempts: new Map(),
     findings: [], findingsByKey: new Map(), findCounter: 0, accessVerdicts: new Map(),
     httpProbes: 0, screenProbes: 0, httpAuthWall: 0, httpThrough: 0,
     plans: new Map(), visited: new Set(), frontier: new Set(), refererGated: new Set(), ignorePaths: [],
@@ -571,4 +608,66 @@ test("access observed on a PUBLIC-directory card without proven ownership is tes
   assert.equal(r.outcome, "inconclusive", JSON.stringify(r));
   const row = s.store.checks("a-1").find((c) => c.checkClass === "idor");
   assert.equal(row?.status, "tested-clean", JSON.stringify(s.store.checks("a-1")));
+});
+
+// ───────────────────────── idor-write (bounded mutation contract) ─────────────────────────
+
+test("probe_authz action:'write' confirms a cross-user mutation ONLY when the readback proves it landed", async () => {
+  const s = session({
+    roles: FULL_ROLES, tenants: FULL_TENANTS, currentRole: "userB", bearer: "tok-b",
+    expectedAccess: [{ object: "w-a1", role: "userB", allow: false }], // operator policy: B must not write w-a1
+  });
+  const r = await run(s, "probe_authz", {
+    url: `${base}api/vuln/worders/{{ID}}`, method: "PUT", body: JSON.stringify({ note: "verdict-pwned-7" }),
+    objectId: "w-a1", resourceType: "worder", ownerRole: "userA", compareRole: "userB",
+    action: "write", marker: "verdict-pwned-7",
+  });
+  assert.equal(r.outcome, "unexpected-access", JSON.stringify(r));
+  const cmps = s.store.authzComparisons("a-1");
+  assert.equal(cmps.length, 1);
+  assert.equal(cmps[0]!.action, "write");
+  assert.equal(cmps[0]!.compareEvidenceIds.length, 2, "mutation + readback are the two compare legs");
+  // The comparison legs are exactly the evidence record_finding requires for idor-write.
+  const ev = r.evidence as { deniedControl: string[]; compareReplays: string[] };
+  const ep = (r.object as { endpoint: string }).endpoint;
+  const fr = await run(s, "record_finding", {
+    title: "BOLA write: any user mutates any worder", severity: "high", category: "idor-write",
+    endpoint: ep, param: "id", description: "x".repeat(30), reproSteps: "y".repeat(30),
+    verdict: "confirmed", negativeControl: ev.deniedControl[0], positiveReplays: ev.compareReplays,
+  });
+  assert.match(String(fr.raw ?? JSON.stringify(fr)), /recorded f-\d+/, JSON.stringify(fr));
+  const checks = s.store.checks("a-1");
+  assert.ok(checks.some((c) => c.checkClass === "idor-write" && c.status === "found"));
+});
+
+test("probe_authz action:'write' on an owner-enforced route is denied-as-expected", async () => {
+  const s = session({
+    roles: FULL_ROLES, tenants: FULL_TENANTS, currentRole: "userB", bearer: "tok-b",
+    expectedAccess: [{ object: "w-a1", role: "userB", allow: false }],
+  });
+  const r = await run(s, "probe_authz", {
+    url: `${base}api/worders/{{ID}}`, method: "PUT", body: JSON.stringify({ note: "verdict-pwned-8" }),
+    objectId: "w-a1", resourceType: "worder", ownerRole: "userA", compareRole: "userB",
+    action: "write", marker: "verdict-pwned-8",
+  });
+  assert.equal(r.outcome, "denied-as-expected", JSON.stringify(r));
+  const row = s.store.checks("a-1").find((c) => c.checkClass === "idor-write");
+  assert.equal(row?.status, "tested-clean", JSON.stringify(s.store.checks("a-1")));
+});
+
+test("probe_authz action:'write' does NOT confirm an accepted-but-unlanded write (no marker, no diff)", async () => {
+  // The no-op endpoint returns 200 to any authenticated PUT but applies nothing — "accepted" is not "landed".
+  const s = session({
+    roles: FULL_ROLES, tenants: FULL_TENANTS, currentRole: "userB", bearer: "tok-b",
+    expectedAccess: [{ object: "w-b1", role: "userB", allow: false }],
+  });
+  const r = await run(s, "probe_authz", {
+    url: `${base}api/noop/worders/{{ID}}`, method: "PUT", body: JSON.stringify({ note: "orig-b1" }),
+    objectId: "w-b1", resourceType: "worder", ownerRole: "userB", compareRole: "userA",
+    action: "write",
+  });
+  assert.equal(r.outcome, "inconclusive", JSON.stringify(r));
+  assert.match(String(r.reason), /readback did not prove|did NOT prove the write landed/i);
+  const row = s.store.checks("a-1").find((c) => c.checkClass === "idor-write");
+  assert.equal(row?.status, "unverified", JSON.stringify(s.store.checks("a-1")));
 });

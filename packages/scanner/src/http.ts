@@ -27,6 +27,11 @@ export interface HttpRequest {
    *  on the wire; scope, proxy, rate and budget handling are unchanged. Note: an AMBIENT identity that isn't a header
    *  (IP allowlist, mTLS, NTLM) cannot be excluded this way — treat such results as inconclusive for "public". */
   inheritDefaultHeaders?: boolean;
+  /** Bulk lane: high-volume low-risk enumeration GETs (forced-browse wordlists). Bulk sends reserve slots on a
+   *  separate, faster clock (~minDelay/8, floor 25ms) instead of the polite lane's minDelay — and back off
+   *  exponentially when the target pushes back (429/503). Scope gate, write serialization, budget and
+   *  evidence handling are all unchanged; only send pacing differs. Opt-in per request. */
+  bulk?: boolean;
 }
 
 export interface HttpResponse {
@@ -80,6 +85,11 @@ export class FetchHttpClient implements HttpClient {
   private dispatcherInit = false;
   /** Live rate override (ms). When set, takes precedence over opts.minDelayMs — lets a running scan be re-throttled. */
   private rateOverrideMs?: number;
+  /** Bulk-lane clock + adaptive escalation. bulkDelayMs starts unset (= minDelay/8, floor 25ms) and doubles on
+   *  pushback (429/503) up to the polite minDelay — a target that tolerates enumeration gets speed, one that
+   *  rate-limits converges back to the polite rate automatically. */
+  private bulkLastSentAt = 0;
+  private bulkDelayMs?: number;
   /** Per-session-material write mutex — parallel workers may read concurrently, but state-changing requests
    *  under the SAME account (own session or a cross-role replay with identical material) are chained so a
    *  mutation can't interleave with another mutation on that account. Keyed by a digest of auth headers. */
@@ -157,8 +167,18 @@ export class FetchHttpClient implements HttpClient {
     const minDelay = this.rateOverrideMs ?? this.opts.minDelayMs ?? 0;
     // Reserve the send slot synchronously (read+write without an await in between) — under parallel workers
     // multiple sends race on lastSentAt; reserving keeps ≥minDelay between send STARTS globally.
+    // Bulk requests reserve on their own faster clock instead — the polite lane is untouched by enumeration.
     let slotWait = 0;
-    if (minDelay > 0) {
+    if (req.bulk) {
+      // minDelay 0 = no politeness configured → bulk unthrottled too (tests, --rate 0).
+      const eff = this.bulkDelayMs ?? (minDelay > 0 ? Math.max(25, Math.floor(minDelay / 8)) : 0);
+      if (eff > 0) {
+        const now = Date.now();
+        const sendAt = Math.max(this.bulkLastSentAt + eff, now);
+        this.bulkLastSentAt = sendAt;
+        slotWait = sendAt - now;
+      }
+    } else if (minDelay > 0) {
       const now = Date.now();
       const sendAt = Math.max(this.lastSentAt + minDelay, now);
       this.lastSentAt = sendAt;
@@ -236,7 +256,14 @@ export class FetchHttpClient implements HttpClient {
       }
     };
     // Mutating sends chain through the per-session write queue; reads go straight through.
-    return this.looksMutating(req) ? await this.enqueueWrite(this.sessionKey(reqHeaders), dispatch) : await dispatch();
+    const out = this.looksMutating(req) ? await this.enqueueWrite(this.sessionKey(reqHeaders), dispatch) : await dispatch();
+    // Bulk pushback → exponential backoff toward (at most) the polite lane's rate. A target that starts
+    // rate-limiting enumeration slows the wordlist to normal speed instead of getting hammered or blocked.
+    if (req.bulk && (out.status === 429 || out.status === 503)) {
+      const eff = this.bulkDelayMs ?? (minDelay > 0 ? Math.max(25, Math.floor(minDelay / 8)) : 25);
+      this.bulkDelayMs = Math.min(Math.max(minDelay, 250), eff * 2);
+    }
+    return out;
   }
 }
 

@@ -156,6 +156,9 @@ export function App() {
     if (!desktop) return; // plain browser: the plain <a href> just works
     e.preventDefault();
     desktop.runGuarded(() => {
+      // An open overlay pane (Usage/Settings/Account/Users) is App-local state — a reload clears it, but
+      // the no-op "already at root" branch never re-mounts, so close it explicitly or it outlives Projects.
+      setPane(null);
       // A run is open → "?"" is a real navigation (also drops the desktop pane with the page). Already at
       // the root → assigning "?" is a same-document no-op, so leave the desktop view explicitly instead.
       if (id) window.location.assign("?");
@@ -207,7 +210,11 @@ export function App() {
           <button
             key={n.key}
             type="button"
-            onClick={() => void desktop.onNavigate(n.key)}
+            onClick={() => {
+              // An overlay pane must not survive into a desktop view and then back over main.
+              setPane(null);
+              void desktop.onNavigate(n.key);
+            }}
             aria-current={desktop.view === n.key ? "page" : undefined}
             className={topNavCls(desktop.view === n.key)}
           >

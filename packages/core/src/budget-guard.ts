@@ -11,7 +11,7 @@ export function recordRequests(budget: BudgetState, host: string, n = 1): Budget
   };
 }
 
-export function recordTokens(budget: BudgetState, n: number, usage?: { inputTokens?: number; outputTokens?: number }): BudgetState {
+export function recordTokens(budget: BudgetState, n: number, usage?: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheCreationTokens?: number }): BudgetState {
   return {
     ...budget,
     tokensUsed: budget.tokensUsed + n,
@@ -19,6 +19,8 @@ export function recordTokens(budget: BudgetState, n: number, usage?: { inputToke
     // (no usage) must not zero the accumulators of a pre-tracking run by writing 0s.
     ...(usage?.inputTokens !== undefined ? { inputTokens: (budget.inputTokens ?? 0) + usage.inputTokens } : {}),
     ...(usage?.outputTokens !== undefined ? { outputTokens: (budget.outputTokens ?? 0) + usage.outputTokens } : {}),
+    ...(usage?.cacheReadTokens !== undefined ? { cacheReadTokens: (budget.cacheReadTokens ?? 0) + usage.cacheReadTokens } : {}),
+    ...(usage?.cacheCreationTokens !== undefined ? { cacheCreationTokens: (budget.cacheCreationTokens ?? 0) + usage.cacheCreationTokens } : {}),
   };
 }
 

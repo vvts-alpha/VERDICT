@@ -60,21 +60,21 @@ for (const mode of ["native", "text"] as const) {
     });
 }
 
-test("summary truncation becomes a resumable context failure without retrying the tools via text fallback", async () => {
+test("a truncated summary still compacts history and the stage keeps running natively", async () => {
     let executed = 0;
     let summaryCalls = 0;
     const tools: PilotToolDef[] = [{ name: "probe", description: "p", inputSchema: {}, handler: async () => { executed++; return { content: [{ text: "x".repeat(16000) }] }; } }];
     const fetchImpl: FetchLike = async (_url, init) => {
         const r = JSON.parse(String(init.body)) as Request;
         if (isSummary(r)) { summaryCalls++; return reply({ content: "partial summary" }, "length"); }
-        assert.ok(r.tools, "never switches to text mode after a context error");
+        assert.ok(r.tools, "never switches to text mode after a summary");
         return reply(native(executed + 1));
     };
     const result = await runOpenAiAgentLoop({ baseURL: "http://model.test/v1", model: "m", system: "s", goal: "g", tools, allowed: ["probe"], maxTurns: 10, contextWindowTokens: 8192, shouldStop: () => false, fetchImpl });
-    assert.equal(result.stopped, "error");
-    assert.equal(result.contextFailure, true);
-    assert.equal(executed, 2);
-    assert.equal(summaryCalls, 1);
+    assert.equal(result.stopped, "max_turns", "a bounded summary handoff is accepted instead of pausing");
+    assert.equal(result.contextFailure, undefined);
+    assert.equal(executed, 10);
+    assert.ok(summaryCalls >= 1, `history compacted at least once (got ${summaryCalls})`);
 });
 
 test("oversized initial instructions stop before contacting the model", async () => {
@@ -128,13 +128,24 @@ test("completion reserve supports endpoints that require max_completion_tokens w
     assert.equal(bodies[1]!.max_tokens, undefined);
 });
 
-test("truncated model replies pause before executing potentially incomplete tool calls", async () => {
+test("a truncated reply still runs the complete tool call it carried, then continues", async () => {
     for (const mode of ["native", "text"] as const) {
         let executed = 0;
+        const bodies: string[] = [];
         const tools: PilotToolDef[] = [{ name: "probe", description: "p", inputSchema: {}, handler: async () => { executed++; return { content: [{ text: "ok" }] }; } }];
-        const result = await runOpenAiAgentLoop({ baseURL: "http://model.test/v1", model: "m", system: "s", goal: "g", tools, allowed: ["probe"], maxTurns: 1, mode, shouldStop: () => false,
-            fetchImpl: async () => reply(mode === "native" ? native(1) : { content: '{"tool":"probe","args":{}}' }, "length") });
-        assert.equal(result.contextFailure, true);
-        assert.equal(executed, 0);
+        let turn = 0;
+        const result = await runOpenAiAgentLoop({ baseURL: "http://model.test/v1", model: "m", system: "s", goal: "g", tools, allowed: ["probe"], maxTurns: 3, mode, shouldStop: () => false,
+            fetchImpl: async (_u, init) => {
+                bodies.push(String(init.body));
+                turn += 1;
+                // A reply truncated at the output cap — but the tool call itself arrived complete.
+                if (turn === 1) return reply(mode === "native" ? native(1) : { content: '{"tool":"probe","args":{}}' }, "length");
+                return reply(mode === "native" ? native(2) : { content: '{"tool":"probe","args":{}}' });
+            } });
+        assert.equal(result.stopped, "max_turns", `${mode}: the stage continued after the length hit`);
+        assert.equal(result.contextFailure, undefined);
+        assert.ok(executed >= 2, `${mode}: the complete call from the truncated reply ran (executed=${executed})`);
+        const nudged = bodies.some((b) => (JSON.parse(b) as Request).messages.some((m) => String(m.content).includes("truncated")));
+        assert.ok(nudged, `${mode}: the model was told its reply was truncated`);
     }
 });

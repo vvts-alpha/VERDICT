@@ -187,6 +187,10 @@ const JA: Record<string, string> = {
   "Findings (0)": "検出（0）",
   "Findings ({n})": "検出（{n}）",
   "Findings CSV": "検出 CSV",
+  "Findings language": "検出の言語",
+  "language for the findings' titles/descriptions and the agent's notes. technical tokens — endpoints, payloads, category tags, evidence quotes — stay verbatim.":
+    "検出のタイトル・説明とエージェントのノートに使う言語。エンドポイント・ペイロード・カテゴリタグ・証跡の引用などの技術トークンはそのまま保持されます。",
+  "English (default)": "英語（デフォルト）",
   "Findings on this screen ({n})": "この画面の検出（{n}）",
   "Fix the failed setup checks in Settings before starting.":
     "開始前に設定で失敗したセットアップチェックを直してください。",
@@ -201,6 +205,13 @@ const JA: Record<string, string> = {
   Input: "入力",
   "Input/output are provider-reported (prompt vs completion; Claude cache buckets count as input). \"—\" = recorded before split tracking or estimated without provider usage.":
     "input/output はプロバイダ報告値です（prompt vs completion。Claude のキャッシュ系は input に計上）。「—」= 分割記録導入前、または usage 未報告の推定値。",
+  "Input (uncached)": "入力（キャッシュなし）",
+  "Cache hit": "キャッシュヒット",
+  "Hit rate": "ヒット率",
+  "Tasks": "タスク",
+  "Total (input + output)": "合計（入力 + 出力）",
+  "prompt-side tokens excluding cache reads": "キャッシュ読み込みを除く prompt 側トークン",
+  "prompt-side tokens served from the provider cache": "プロバイダキャッシュから供給された prompt 側トークン",
   "Interactsh (free)": "Interactsh（無料）",
   "Interactsh server": "Interactsh サーバ",
   "Interactsh token": "Interactsh トークン",
@@ -493,6 +504,8 @@ const JA: Record<string, string> = {
     "設定時、このプレフィックスのいずれかに一致するパスのみスキャン",
   "import list": "リストをインポート",
   "inconclusive (check gaps)": "非確定（チェック欠落）",
+  history: "履歴",
+  "resolved historical attempt": "再試行で解消した過去の試行",
   input: "入力",
   "keepalive interval (minutes). touches a safe authed page (never /) to keep the session warm. set 0 to turn off for sites whose session dies on a cold / hit or a full reload.":
     "keepalive 間隔（分）。安全な認証済みページ（/ 以外）へアクセスしてセッションを維持。/ へのコールドアクセスやフルリロードでセッションが死ぬサイトでは 0 でオフ。",
@@ -504,6 +517,7 @@ const JA: Record<string, string> = {
   "logged in": "ログイン済み",
   "login URL (optional)": "ログイン URL（任意）",
   manual: "手動",
+  "username / email": "ユーザー名 / メール",
   map: "マップ",
   "max depth": "最大深度",
   "max replays": "最大リプレイ数",
@@ -551,6 +565,14 @@ const JA: Record<string, string> = {
   "concurrent diagnosis workers — one per role with session material + one unauth (default 4, max 8). each worker is bound to its own session; cross-role checks still run. set 1 for the sequential loop.":
     "診断の並列ワーカー数 — セッション情報を持つロールごとに1ワーカー + 未認証ワーカー（デフォルト4、最大8）。各ワーカーは自セッションにバインドされ、ロール間チェックもそのまま実行。1 で従来の逐次ループ。",
   "Parallel workers": "並列ワーカー数",
+  Wordlist: "ワードリスト",
+  "standard — ~130 curated paths (default)": "standard — 精選約130パス（デフォルト）",
+  "extended — SecLists common.txt ~4.7k (bulk lane)": "extended — SecLists common.txt 約4.7千件（バルクレーン）",
+  "custom — pick a list file…": "custom — リストファイルを選択…",
+  "forced-browse wordlist for unlinked/hidden paths. standard = ~130 curated entries (fast). extended = the bundled SecLists common.txt ~4.7k entries — much deeper; enumeration runs on a faster bulk lane (~rate/8) and backs off automatically if the target rate-limits. custom = your own list file, one path per line.":
+    "リンクされていない・隠しパスへの強制探索ワードリスト。standard = 精選約130件（高速）。extended = 同梱の SecLists common.txt 約4.7千件 — かなり深い。列挙は高速バルクレーン（レートの約1/8）で走り、ターゲットがレート制限すれば自動で減速。custom = 独自リストファイル（1行1パス）。",
+  "wordlist file — one path per line (blank lines and # comments ignored)": "ワードリストファイル — 1行1パス（空行と # コメントは無視）",
+  "Custom wordlist: pick a list file": "カスタムワードリスト: リストファイルを選択してください",
   paused: "一時停止中",
   pending: "保留",
   phase: "フェーズ",

@@ -15,6 +15,7 @@ type AuthMethod = "manual" | "credentials" | "cookie";
 interface Role {
   name: string;
   method: AuthMethod;
+  username: string;
   password: string;
   description: string;
   cookieFile: string;
@@ -73,6 +74,7 @@ export function NewAssessment({ onCancel, apiSpec = false, initial }: { onCancel
   const [maxTurns, setMaxTurns] = useState("");
   const [focus, setFocus] = useState(""); // operator's emphasis hint → top priority of the scenario stage
   const [context, setContext] = useState(""); // operator's standing target facts → appended to every stage's system prompt
+  const [language, setLanguage] = useState(""); // findings/notes prose language → --language (blank = English)
   const [headed, setHeaded] = useState(false);
   // The top-level choice: whole-site assessment / listed pages / survey only.
   // (survey-only × listed-pages is not offered — the two fold into one radio group.)
@@ -124,6 +126,8 @@ export function NewAssessment({ onCancel, apiSpec = false, initial }: { onCancel
   const [maxSurveyScreens, setMaxSurveyScreens] = useState(""); // cap on the number of screens the survey maps (blank = unlimited)
   const [keepAliveMin, setKeepAliveMin] = useState(""); // keepalive touch interval in minutes (blank = default 4, "0" = off)
   const [parallel, setParallel] = useState(""); // concurrent diagnosis workers (blank = default 4, "1" = sequential)
+  const [wordlist, setWordlist] = useState<"standard" | "extended" | "custom">("standard"); // probe_paths forced-browse list
+  const [wordlistFile, setWordlistFile] = useState(""); // custom wordlist path (wordlist==="custom")
   const [anchorUrl, setAnchorUrl] = useState(""); // goto-safe authed hub (menu) — reach cold-nav-bouncing routes by clicking from here (blank = off)
 
   const [busy, setBusy] = useState(false);
@@ -155,6 +159,7 @@ export function NewAssessment({ onCancel, apiSpec = false, initial }: { onCancel
       setRoles(auth.roles.map((r: any) => ({
         name: String(r.name ?? ""),
         method: r.pass ? "credentials" : r.cookieFile ? "cookie" : "manual",
+        username: r.username ?? "",
         password: r.pass ?? "",
         description: r.description ?? "",
         cookieFile: r.cookieFile ?? "",
@@ -180,9 +185,20 @@ export function NewAssessment({ onCancel, apiSpec = false, initial }: { onCancel
     if (o.maxSurveyScreens != null) setMaxSurveyScreens(String(o.maxSurveyScreens));
     if (o.keepAliveMin != null) setKeepAliveMin(String(o.keepAliveMin));
     if (o.parallel != null) setParallel(String(o.parallel));
+    if (o.wordlist) {
+      const w = String(o.wordlist);
+      if (w === "standard" || w === "extended") setWordlist(w);
+      else { setWordlist("custom"); setWordlistFile(w); }
+    }
     if (o.anchorUrl) setAnchorUrl(String(o.anchorUrl));
     if (o.focus) setFocus(String(o.focus));
     if (o.context) setContext(String(o.context));
+    if (o.language) {
+      // Runs launched via CLI may hold a code/native spelling — normalize to the select's canonical values.
+      const raw = String(o.language).trim().toLowerCase();
+      const canon: Record<string, string> = { ja: "Japanese", japanese: "Japanese", "日本語": "Japanese", zh: "Chinese", chinese: "Chinese", "中文": "Chinese", ko: "Korean", korean: "Korean", "한국어": "Korean", es: "Spanish", spanish: "Spanish", "español": "Spanish", fr: "French", french: "French", "français": "French", de: "German", german: "German", deutsch: "German", pt: "Portuguese", portuguese: "Portuguese", "português": "Portuguese" };
+      setLanguage(canon[raw] ?? String(o.language));
+    }
     if (apiSpec && initial.spec) { setSpecText(JSON.stringify(initial.spec)); setSpecName("openapi.json (from run)"); }
   }, []); // mount-only — the launch input never changes
 
@@ -214,7 +230,7 @@ export function NewAssessment({ onCancel, apiSpec = false, initial }: { onCancel
 
   const setRole = (i: number, patch: Partial<Role>): void =>
     setRoles((rs) => rs.map((r, j) => (j === i ? { ...r, ...patch } : r)));
-  const addRole = (): void => setRoles((rs) => [...rs, { name: "", method: "manual", password: "", description: "", cookieFile: "", loginUrl: "" }]);
+  const addRole = (): void => setRoles((rs) => [...rs, { name: "", method: "manual", username: "", password: "", description: "", cookieFile: "", loginUrl: "" }]);
   const rmRole = (i: number): void => setRoles((rs) => rs.filter((_, j) => j !== i));
 
   const checkSetup = async (): Promise<boolean> => {
@@ -273,7 +289,7 @@ export function NewAssessment({ onCancel, apiSpec = false, initial }: { onCancel
     const named = roles.filter((r) => r.name.trim());
     const authRoles = named.map((r) => {
       const base = { name: r.name.trim(), ...(r.description ? { description: r.description } : {}), ...(r.loginUrl.trim() ? { loginUrl: r.loginUrl.trim() } : {}) };
-      if (r.method === "credentials") return { ...base, ...(r.password ? { pass: r.password } : {}) };
+      if (r.method === "credentials") return { ...base, ...(r.username.trim() ? { username: r.username.trim() } : {}), ...(r.password ? { pass: r.password } : {}) };
       if (r.method === "cookie") return { ...base, ...(r.cookieFile ? { cookieFile: r.cookieFile } : {}) };
       return base; // manual: name(+description) only → logged in via the Sessions tab
     });
@@ -315,9 +331,14 @@ export function NewAssessment({ onCancel, apiSpec = false, initial }: { onCancel
     if (command === "pilot" && maxSurveyScreens && Number.isFinite(Number(maxSurveyScreens))) options.maxSurveyScreens = Number.parseInt(maxSurveyScreens, 10);
     if (command === "pilot" && keepAliveMin.trim() !== "" && Number.isFinite(Number(keepAliveMin))) options.keepAliveMin = Number.parseInt(keepAliveMin, 10);
     if (command === "pilot" && parallel.trim() !== "" && Number.isFinite(Number(parallel))) options.parallel = Number.parseInt(parallel, 10);
+    if (command === "pilot") {
+      if (wordlist === "custom" && !wordlistFile.trim()) { setErr(t("Custom wordlist: pick a list file")); setBusy(false); return; }
+      options.wordlist = wordlist === "custom" ? wordlistFile.trim() : wordlist; // always persist so duplicate/resume restore it exactly
+    }
     if (command === "pilot" && anchorUrl.trim()) options.anchorUrl = anchorUrl.trim();
     if (command === "pilot" && focus.trim()) options.focus = focus.trim();
     if (command === "pilot" && context.trim()) options.context = context.trim();
+    if (command === "pilot" && language) options.language = language;
 
     try {
       if (!(await checkSetup())) { setErr(t("Fix the failed setup checks in Settings before starting.")); setBusy(false); return; }
@@ -467,6 +488,21 @@ export function NewAssessment({ onCancel, apiSpec = false, initial }: { onCancel
             )}
           </label>
         ) : null}
+        {command === "pilot" ? (
+          <label className="my-2 flex flex-col gap-1 text-xs [&>span]:text-muted-foreground" title={t("language for the findings' titles/descriptions and the agent's notes. technical tokens — endpoints, payloads, category tags, evidence quotes — stay verbatim.")}>
+            <span>{t("Findings language")}</span>
+            <NativeSelect className="w-full" value={language} onChange={(e) => setLanguage(e.target.value)}>
+              <option value="">{t("English (default)")}</option>
+              <option value="Japanese">日本語 — Japanese</option>
+              <option value="Chinese">中文 — Chinese</option>
+              <option value="Korean">한국어 — Korean</option>
+              <option value="Spanish">Español — Spanish</option>
+              <option value="French">Français — French</option>
+              <option value="German">Deutsch — German</option>
+              <option value="Portuguese">Português — Portuguese</option>
+            </NativeSelect>
+          </label>
+        ) : null}
       </div>
 
       <Disclosure title={t("Advanced (rate · limits · crawl · headers)")}>
@@ -500,7 +536,27 @@ export function NewAssessment({ onCancel, apiSpec = false, initial }: { onCancel
               <Input value={parallel} onChange={(e) => setParallel(e.target.value)} placeholder={t("4 · 1 = sequential")} inputMode="numeric" />
             </label>
           ) : null}
+          {command === "pilot" ? (
+            <label className="my-2 flex flex-col gap-1 text-xs [&>span]:text-muted-foreground" title={t("forced-browse wordlist for unlinked/hidden paths. standard = ~130 curated entries (fast). extended = the bundled SecLists common.txt ~4.7k entries — much deeper; enumeration runs on a faster bulk lane (~rate/8) and backs off automatically if the target rate-limits. custom = your own list file, one path per line.")}>
+              <span>{t("Wordlist")}</span>
+              <NativeSelect className="w-full" value={wordlist} onChange={(e) => setWordlist(e.target.value as "standard" | "extended" | "custom")}>
+                <option value="standard">{t("standard — ~130 curated paths (default)")}</option>
+                <option value="extended">{t("extended — SecLists common.txt ~4.7k (bulk lane)")}</option>
+                <option value="custom">{t("custom — pick a list file…")}</option>
+              </NativeSelect>
+            </label>
+          ) : null}
         </div>
+        {command === "pilot" && wordlist === "custom" ? (
+          <div className="my-2 flex items-center gap-2 text-xs">
+            <Input className="min-w-0 flex-1" placeholder={t("wordlist file — one path per line (blank lines and # comments ignored)")} value={wordlistFile} onChange={(e) => setWordlistFile(e.target.value)} autoComplete="off" />
+            {desktopBridge?.pickFile ? (
+              <Button type="button" variant="outline" size="sm" onClick={() => void desktopBridge.pickFile().then((p: string | null) => { if (p) setWordlistFile(p); })}>
+                {t("Browse…")}
+              </Button>
+            ) : null}
+          </div>
+        ) : null}
         {command === "pilot" ? (
           <label className="my-2 flex flex-col gap-1 text-xs [&>span]:text-muted-foreground" title={t("goto-safe authed hub (the app menu). for sites where deep routes die on a direct/cold navigation: a route that bounces to an error page is reached by clicking its link from here instead, and this becomes the keepalive target. blank = off (unchanged).")}>
             <span>{t("Anchor URL (menu hub)")}</span>
@@ -603,7 +659,10 @@ export function NewAssessment({ onCancel, apiSpec = false, initial }: { onCancel
               <option value="cookie">{t("cookie file")}</option>
             </NativeSelect>
             {r.method === "credentials" ? (
-              <Input className="w-24 flex-none" placeholder={t("password")} type="password" value={r.password} onChange={(e) => setRole(i, { password: e.target.value })} />
+              <>
+                <Input className="w-36 flex-none" placeholder={t("username / email")} value={r.username} onChange={(e) => setRole(i, { username: e.target.value })} autoComplete="off" />
+                <Input className="w-24 flex-none" placeholder={t("password")} type="password" value={r.password} onChange={(e) => setRole(i, { password: e.target.value })} />
+              </>
             ) : null}
             {r.method === "cookie" ? (
               <>

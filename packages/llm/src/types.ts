@@ -17,6 +17,11 @@ export interface LlmResponse {
   inputTokens?: number;
   /** Provider-reported output (completion-side) tokens. */
   outputTokens?: number;
+  /** Prompt-side tokens served from the provider's prompt cache — Claude cache_read_input_tokens,
+   *  DeepSeek prompt_cache_hit_tokens, OpenAI prompt_tokens_details.cached_tokens. */
+  cacheReadTokens?: number;
+  /** Prompt-side tokens written INTO the provider cache (Claude cache_creation_input_tokens). */
+  cacheCreationTokens?: number;
 }
 
 export interface LlmClient {

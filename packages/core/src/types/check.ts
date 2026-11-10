@@ -26,6 +26,16 @@ export type CheckStatus =
   | "unverified" // it ran but reached no conclusion (bad baseline, partial read, unknown ownership…)
   | "blocked"; // cannot run this session: missing auth/CSRF/OOB/scope — concrete reason required
 
+/** Machine-readable reason for an inconclusive attempt. Derived from the tool contract and
+ * recorded evidence, never from response body text or credentials. Older ledger rows omit it. */
+export type CheckReasonCode =
+  | "invalid-baseline"
+  | "missing-evidence"
+  | "missing-result-contract"
+  | "missing-prerequisite"
+  | "unstable-response"
+  | "unknown";
+
 export interface CheckExecution {
   /** Deterministic dedup key — see checkKey() in core/checks.ts. */
   id: string;
@@ -59,6 +69,8 @@ export interface CheckExecution {
   status: CheckStatus;
   /** Concrete reason — REQUIRED for unverified/blocked/not-applicable so the gap is auditable. */
   reason?: string;
+  /** Optional structured reason for an inconclusive attempt; absent on older rows. */
+  reasonCode?: CheckReasonCode;
   /** Tool that produced this outcome (probe_xss, probe_authz, record_finding, screen_done, …). */
   tool?: string;
   /** Whether a valid baseline was established for the attempt (baseline is necessary but NOT sufficient for clean). */

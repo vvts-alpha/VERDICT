@@ -4,7 +4,7 @@
 
 import type { AssessmentState, AuthState, CheckExecution, CheckStatus, Finding, FindingVerdict, Phase, ScopePolicy, ScreenScanStatus, ScreenType, Severity } from "./types/index.js";
 import { coverage } from "./coverage.js";
-import { OBSERVATION_CHECK_CLASSES, rollupChecks } from "./checks.js";
+import { OBSERVATION_CHECK_CLASSES, rollupChecks, screenChecks } from "./checks.js";
 import { deriveRoleProgress, type RoleProgress } from "./view.js";
 import { mutationLedger, type MutationRow } from "./mutations.js";
 
@@ -40,6 +40,8 @@ export interface ReportFindingRow {
   /** 1-based indexes of other findings sharing this finding's dedup family+endpoint — distinct vulnerabilities
    *  on one mechanism (e.g. sibling disclosures on /ftp/{file}), shown as related but NOT merged. */
   related?: number[];
+  /** Every endpoint this root cause was observed on — merges accumulate here instead of spawning sibling rows. */
+  affectedEndpoints?: string[];
 }
 
 /** Loader returning raw req/resp for an evidenceId (the impure fs read is injected by the caller = cli/server). core stays pure. */
@@ -126,7 +128,7 @@ export interface ReportModel {
       byStatus: Record<CheckStatus, number>;
       /** planned slots still waiting for a satisfying execution. */
       unfulfilledPlans: number;
-      /** outcome rows without a conclusive answer (unverified + blocked + still running). */
+      /** Current unresolved outcome rows (unverified + blocked + still running); resolved attempts remain in byStatus and checks[]. */
       gaps: number;
       /** screens claiming a conclusive clean scan with zero ledger rows (legacy/log-derived coverage). */
       legacyCleanScreens: number;
@@ -195,6 +197,7 @@ export function buildReportModel(state: AssessmentState, now: Date = new Date(),
     scopeBasis: f.scopeBasis,
     description: f.description,
     reproSteps: f.reproSteps,
+    ...(f.affectedEndpoints?.length ? { affectedEndpoints: f.affectedEndpoints } : {}),
     evidence: f.evidenceIds.map((e): ReportEvidence => {
       const loaded = opts.loadEvidence?.(e) ?? null;
       // A missing-header ("[headers] ...") finding is proven by the response HEADER block alone — the HTML body is
@@ -267,9 +270,17 @@ export function buildReportModel(state: AssessmentState, now: Date = new Date(),
       .map((s) => [s, 0]),
   ) as Record<CheckStatus, number>;
   for (const c of state.checkExecutions) byStatus[c.status] += 1;
-  const checkGaps = state.checkExecutions.filter(
-    (c) => (c.status === "unverified" || c.status === "blocked" || c.status === "running") && !OBSERVATION_CHECK_CLASSES.has(c.checkClass),
-  ).length;
+  // Count current gaps from the same per-screen projection used by the coverage gate/WebUI.
+  // The ledger (checks[] and byStatus) still includes every earlier failed attempt.
+  const rowsByScreen = new Map<string, CheckExecution[]>();
+  for (const row of state.checkExecutions) {
+    const rows = rowsByScreen.get(row.screenId) ?? [];
+    rows.push(row);
+    rowsByScreen.set(row.screenId, rows);
+  }
+  const checkGaps = [...rowsByScreen].reduce(
+    (n, [screenId, rows]) => n + screenChecks({ checkExecutions: rows }, screenId).gaps.length, 0,
+  );
   const unfulfilledPlans = rollupChecks(state.checkExecutions).reduce((n, cell) => n + cell.unfulfilled.length, 0);
 
   // A screen is "checked" only by verdict-bearing rows — raw traffic observations neither gap nor back it.

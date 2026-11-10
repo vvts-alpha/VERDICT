@@ -51,7 +51,7 @@ export interface OpenAiLoopParams {
     onToolUse?: (name: string, input: unknown) => void;
     /** Called with each response's usage (real per-call spend, context re-billed each turn).
      *  usage carries the provider's prompt/completion split when the endpoint reports it. */
-    onTokens?: (delta: number, usage?: { inputTokens?: number; outputTokens?: number }) => void;
+    onTokens?: (delta: number, usage?: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheCreationTokens?: number }) => void;
     /** Stop after the current turn when this returns true (a done tool set its session flag). */
     shouldStop: () => boolean;
     /** Injectable fetch (tests). Defaults to global fetch. */
@@ -79,12 +79,21 @@ const AGENT_PREAMBLE =
     "You are an autonomous web/API security testing agent. Accomplish the stage goal by CALLING the provided tools — " +
     "do not describe what you would do, actually call the tools. Only the tools listed are available; there is no shell, " +
     "file system, or web access beyond them. When the goal for this stage is complete, call the stage's done/record tool " +
-    "(e.g. survey_done / screen_done / record_finding / record_methodology). Keep any prose brief.\n\n";
+    "(e.g. survey_done / screen_done / record_finding / record_methodology). Keep any prose brief, and keep each response SMALL: " +
+    "split large payloads (methodology plans, check batches, bulk findings) into several small tool calls instead of one giant call — " +
+    "an oversized reply is truncated and loses work.\n\n";
 
 
 interface ChatResponse {
     choices?: Array<{ message?: { content?: unknown; tool_calls?: ToolCall[]; reasoning_content?: unknown }; finish_reason?: string }>;
-    usage?: { total_tokens?: number; prompt_tokens?: number; completion_tokens?: number };
+    usage?: {
+        total_tokens?: number;
+        prompt_tokens?: number;
+        completion_tokens?: number;
+        prompt_cache_hit_tokens?: number;   // DeepSeek-style
+        prompt_cache_miss_tokens?: number;
+        prompt_tokens_details?: { cached_tokens?: number }; // OpenAI-style
+    };
     error?: { message?: string } | string;
 }
 
@@ -199,8 +208,9 @@ async function chatCompletion(
             if (response.error && isContextLimitError(JSON.stringify(response.error))) throw new ContextBudgetError(JSON.stringify(response.error).slice(0, 300));
             const tokens = response.usage?.total_tokens ?? (response.usage ? (response.usage.prompt_tokens ?? 0) + (response.usage.completion_tokens ?? 0) : 0);
             if (tokens > 0) {
+                const cacheRead = response.usage?.prompt_cache_hit_tokens ?? response.usage?.prompt_tokens_details?.cached_tokens;
                 p.onTokens?.(tokens, response.usage
-                    ? { inputTokens: response.usage.prompt_tokens, outputTokens: response.usage.completion_tokens }
+                    ? { inputTokens: response.usage.prompt_tokens, outputTokens: response.usage.completion_tokens, cacheReadTokens: cacheRead }
                     : undefined);
             }
             return response;
@@ -225,9 +235,10 @@ function createContext(p: OpenAiLoopParams, tools?: unknown): AgentContext {
         summarize: async (messages, maxTokens) => {
             const response = await chatCompletion(p, messages, undefined, maxTokens);
             const choice = response.choices?.[0];
-            if (response.error || !choice || choice.finish_reason === "length" || choice.message?.tool_calls?.length) {
+            if (response.error || !choice || choice.message?.tool_calls?.length) {
                 throw new Error("The model could not complete the history summary.");
             }
+            // A length-truncated handoff is still a usable summary — the caller bounds it to size.
             return contentToString(choice.message?.content);
         },
     });
@@ -286,6 +297,7 @@ async function runNativeMode(p: OpenAiLoopParams, byName: ToolMap): Promise<Open
     const context = createContext(p, oaTools);
     let turns = 0;
     let toolCallCount = 0;
+    let consecutiveLength = 0;
     for (let iter = 0; iter < p.maxTurns; iter++) {
         if (p.shouldStop()) return { turns, stopped: "shouldStop", toolCalls: toolCallCount };
         let resp: ChatResponse;
@@ -299,8 +311,39 @@ async function runNativeMode(p: OpenAiLoopParams, byName: ToolMap): Promise<Open
             return { turns, stopped: "error", error: `endpoint error: ${em.slice(0, 200)}`, toolCalls: toolCallCount };
         }
         if (resp.choices?.[0]?.finish_reason === "length") {
-            return { turns, stopped: "error", error: "Model response exceeded the reserved output budget; unfinished work must pause.", contextFailure: true, toolCalls: toolCallCount };
+            // Output cap hit mid-response — not a run-killer. Keep whatever was emitted (complete
+            // tool_calls still dispatch; a truncated call surfaces as a normal invalid-args tool
+            // error the model can see) and push it to split the work smaller next turn. Most length
+            // hits are one giant record_methodologies / compose_check payload that chunks fine.
+            consecutiveLength += 1;
+            const msg = resp.choices?.[0]?.message ?? {};
+            const partialCalls = (msg.tool_calls ?? []).map((tc, i) => ({ ...tc, id: tc.id ?? `call_${iter}_${i}` }));
+            messages.push({
+                role: "assistant",
+                content: (msg.content as unknown) ?? null,
+                ...(partialCalls.length ? { tool_calls: partialCalls } : {}),
+                ...(msg.reasoning_content !== undefined ? { reasoning_content: msg.reasoning_content } : {}),
+            });
+            const partialText = contentToString(msg.content).trim();
+            if (partialText) p.onText?.(`[truncated] ${partialText.slice(0, 400)}`);
+            let dispatched = 0;
+            for (const tc of partialCalls) {
+                if (p.shouldStop()) return { turns, stopped: "shouldStop", toolCalls: toolCallCount };
+                toolCallCount += 1;
+                dispatched += 1;
+                const text = await dispatchTool(byName, tc.function?.name ?? "", parseToolArgs(tc.function?.arguments), p.onToolUse);
+                messages.push({ role: "tool", tool_call_id: tc.id, content: text });
+            }
+            if (dispatched > 0) consecutiveLength = 0; // progress was made — reset the stall counter
+            messages.push({
+                role: "user",
+                content: `Your last response was truncated at the output limit (${consecutiveLength}x in a row${dispatched ? `, ${dispatched} tool call(s) still ran` : " before any tool call"}). Emit SHORTER responses — split large tool arguments into several small calls (a few plan/check entries per call) — and continue the stage.`,
+            });
+            if (dispatched === 0 && consecutiveLength >= 3)
+                return { turns, stopped: "error", error: "Model response exceeded the reserved output budget 3x with no usable tool call — stage cannot make progress.", contextFailure: true, toolCalls: toolCallCount };
+            continue;
         }
+        consecutiveLength = 0;
         const msg = resp.choices?.[0]?.message ?? {};
         const toolCalls = (msg.tool_calls ?? []).map((tc, i) => ({ ...tc, id: tc.id ?? `call_${iter}_${i}` }));
         messages.push({
@@ -349,6 +392,7 @@ async function runTextMode(p: OpenAiLoopParams, byName: ToolMap): Promise<OpenAi
     ];
     const context = createContext(p);
     let turns = 0;
+    let consecutiveLength = 0;
     for (let iter = 0; iter < p.maxTurns; iter++) {
         if (p.shouldStop()) return { turns, stopped: "shouldStop" };
         let resp: ChatResponse;
@@ -362,8 +406,40 @@ async function runTextMode(p: OpenAiLoopParams, byName: ToolMap): Promise<OpenAi
             return { turns, stopped: "error", error: `endpoint error: ${em.slice(0, 200)}` };
         }
         if (resp.choices?.[0]?.finish_reason === "length") {
-            return { turns, stopped: "error", error: "Model response exceeded the reserved output budget; unfinished work must pause.", contextFailure: true };
+            // Same recovery as native mode — the emitted text stays in history and a COMPLETE tool
+            // action that arrived before the cut still runs; a truncated JSON just gets the nudge.
+            consecutiveLength += 1;
+            const msg = resp.choices?.[0]?.message;
+            const content = contentToString(msg?.content).trim();
+            messages.push({ role: "assistant", content, ...(msg?.reasoning_content !== undefined ? { reasoning_content: msg.reasoning_content } : {}) });
+            if (content) p.onText?.(`[truncated] ${content.slice(0, 400)}`);
+            let action: AgentAction | null = null;
+            try {
+                const j = extractJson(content);
+                if (j && typeof j === "object") action = j as AgentAction;
+            } catch { /* truncated JSON — nothing salvageable */ }
+            const toolName = action?.tool ?? action?.name;
+            let dispatched = 0;
+            if (toolName && toolName !== "stop" && toolName !== "final" && toolName !== "done") {
+                const args = ((action?.args ?? action?.arguments) as Record<string, unknown>) ?? {};
+                const result = await dispatchTool(byName, toolName, args, p.onToolUse);
+                dispatched = 1;
+                consecutiveLength = 0;
+                messages.push({
+                    role: "user",
+                    content: `Tool ${toolName} returned (your reply was then truncated):\n${result}\n\nKeep each reply SHORT — one small tool call per response — and continue.`,
+                });
+            } else {
+                messages.push({
+                    role: "user",
+                    content: `Your last response was truncated at the output limit (${consecutiveLength}x in a row). Emit a SHORTER reply — put only a small portion of the work in each {"tool":...} JSON object — and continue.`,
+                });
+            }
+            if (dispatched === 0 && consecutiveLength >= 3)
+                return { turns, stopped: "error", error: "Model response exceeded the reserved output budget 3x with no usable tool call — stage cannot make progress.", contextFailure: true };
+            continue;
         }
+        consecutiveLength = 0;
         const msg = resp.choices?.[0]?.message;
         const content = contentToString(msg?.content).trim();
         messages.push({ role: "assistant", content, ...(msg?.reasoning_content !== undefined ? { reasoning_content: msg.reasoning_content } : {}) });
