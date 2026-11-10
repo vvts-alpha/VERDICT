@@ -24,6 +24,7 @@ scope_manifest.*.json
 
 # Private presentation materials must not be committed
 /decks/
+/slides/
 vault.json
 .env
 
@@ -58,6 +59,9 @@ shots/
 v-*.png
 tools/i18n-shot.cjs
 verify-*.mjs
+packages/crawler/shots-capture.cjs
+packages/crawler/slides-preview.cjs
+packages/crawler/form-recapture.cjs
 
 # Local release staging and installer outputs
 /bundle/
