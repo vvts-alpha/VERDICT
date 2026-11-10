@@ -139,3 +139,10 @@ node packages/cli/dist/main.js serve  # http://127.0.0.1:4317
 - [Desktop packaging](apps/desktop/PACKAGING.md) and [Windows build workflow](.github/workflows/windows-build.yml).
 - [Detection coverage](docs/VULNERABILITIES.md).
 - [Architecture](DESIGN.md), [UI conventions](docs/WEBUI_CONVENTIONS.md), and [contributor guidelines](AGENTS.md).
+
+## License
+
+[PolyForm Noncommercial 1.0.0](LICENSE) — free for personal, research, educational, and other
+noncommercial use (including internal use inside any noncommercial organization). Commercial use —
+selling the software, offering it as a paid service, or bundling it into a commercial product —
+requires a separate license from the author. This is not an OSI open-source license.

@@ -2,6 +2,7 @@
   "name": "veritas-newagent",
   "version": "2026.9.3",
   "private": true,
+  "license": "PolyForm-Noncommercial-1.0.0",
   "type": "module",
   "description": "VERITAS NewAgent — autonomous web/API pentest agent (TypeScript monorepo)",
   "packageManager": "pnpm@9.15.4",
