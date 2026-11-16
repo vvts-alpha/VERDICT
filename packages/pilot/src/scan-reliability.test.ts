@@ -236,7 +236,7 @@ test("partial JS stays retryable until a complete analysis is persisted", async 
   assert.equal(store.analyzedJsUrls("a-1").size, 1);
 });
 
-test("an explicit planning turn limit pauses and resume writes only missing plans", async (t) => {
+test("an explicit planning turn limit caps the stage (no pause) and resume writes only missing plans", async (t) => {
   modelEnv(t, "text");
   const { store, options } = fixture(t);
   for (let i = 1; i <= 8; i++) store.upsertScreen("a-1", screen(i));
@@ -256,10 +256,12 @@ test("an explicit planning turn limit pauses and resume writes only missing plan
     return actionResponse("text", "screen_done", { verdict: "clean", coverage: [] });
   });
   await runPilot({ ...options, maxTurns: 4, maxScreens: 8 });
-  assert.equal(store.isPaused("a-1"), true);
+  // A bounded turn cap is not a fault: the stage is left incomplete (3 of 8 plans) and the RUN keeps going —
+  // a resume picks the work back up, it never sits dead waiting for an operator.
+  assert.equal(store.isPaused("a-1"), false);
   const before = store.loadAssessment("a-1")!;
   assert.equal(before.events.filter((e) => e.type === "methodology_recorded").length, 3);
-  assert.ok(before.screenScans.every((sc) => sc.status === "queued"));
+  assert.ok(before.screenScans.every((sc) => sc.status !== "scanning"));
   phaseCalls = 0; resumed = true;
   await runPilot({ ...options, maxTurns: 30, maxScreens: 8 });
   const after = store.loadAssessment("a-1")!;
@@ -267,4 +269,5 @@ test("an explicit planning turn limit pauses and resume writes only missing plan
   const plans = after.events.filter((e) => e.type === "methodology_recorded");
   assert.equal(plans.length, 8);
   assert.equal(plans.filter((e) => e.payload.plan === "Original plan").length, 3);
+  assert.equal(plans.filter((e) => e.payload.plan === "Resumed missing plan").length, 5);
 });

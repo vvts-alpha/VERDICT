@@ -1127,6 +1127,15 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     opts.onTool?.(name, input);
   };
 
+  // A stage hit a bounded cutoff without finishing — that caps its unit of work, never the run. Note it for the
+  // operator (unless the caller reports its own incomplete unit, onIncomplete:"continue") and keep going.
+  const noteStageCapped = (stopped: string, onIncomplete?: "pause" | "continue"): void => {
+    if (onIncomplete === "continue") return;
+    const msg = `⏱ stage hit a bounded cutoff (${stopped}) before its completion tool — partial output stays recorded, the run continues (a resume re-runs unfinished stages)`;
+    opts.onText?.(msg);
+    opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: msg } });
+  };
+
   // A stage may stop early, but only its accepted completion tool makes it complete.
   const runStage = async (p: {
     system: string;
@@ -1136,9 +1145,11 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     model?: string;
     contextWindowTokens: number;
     shouldStop: () => boolean;
-    /** "pause" (default): an unfinished stage pauses the run. "continue": bounded cutoffs (max_turns / model stopped
-     *  calling tools) cap only this stage's unit of work — the caller marks it and the run moves on. Real errors
-     *  (provider/context/usage/auth) still pause either way. */
+    /** A bounded cutoff (max_turns / model stopped calling tools / quiet stage end) NEVER pauses the run — it caps
+     *  this stage's unit of work and the run moves on with whatever the ledger got; --resume redoes unfinished
+     *  stages. "continue" additionally suppresses the generic capped-stage note (the caller marks/notes the
+     *  incomplete unit itself, e.g. per-screen diagnosis). Real faults — provider/usage/context/auth/budget —
+     *  pause regardless. */
     onIncomplete?: "pause" | "continue";
     /** Parallel-diagnosis worker overrides: the session/tools/mcp-server bound to THAT worker. Default = the main
      *  session (single-worker path unchanged). A worker's tools close over its own session so per-screen state
@@ -1221,13 +1232,18 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: `⚠ stage ended early: ${res.error}` } });
         if (res.contextFailure) pauseRun(res.error ?? "Context recovery failed", "context");
       }
-      // A bounded cutoff (max_turns / model stopped calling tools) under onIncomplete:"continue" is the caller's
-      // problem — it marks its own unit of work incomplete and the run keeps going. Errors/usage/context still pause.
+      // A bounded cutoff (max_turns / model stopped calling tools) is a capped unit of work, not a fault — it
+      // NEVER pauses the run for any stage. The ledger already holds whatever the stage produced, and --resume
+      // re-runs unfinished stages. Errors/usage/context still pause above.
       const cappedStop = res.stopped === "max_turns" || res.stopped === "no_tool_calls";
-      if (!p.shouldStop() && !sess.paused && !(p.onIncomplete === "continue" && cappedStop)) pauseRun(res.error ?? `Stage stopped: ${res.stopped}`, "incomplete");
+      if (!p.shouldStop() && !sess.paused) {
+        if (!cappedStop) pauseRun(res.error ?? `Stage stopped: ${res.stopped}`, "incomplete");
+        else noteStageCapped(res.stopped, p.onIncomplete);
+      }
       return res.turns;
     }
     let turns = 0;
+    let stageError: string | null = null; // thrown non-usage error — a REAL fault, distinct from a bounded end
     // Token tally: the result message (cumulative usage at query end) arrives after shouldStop's early break, so
     // collapsing the stage with a done tool almost always left it unread at 0. So we accumulate per-turn assistant
     // usage (which survives an early break) and only overwrite with the authoritative total when the result is readable.
@@ -1310,6 +1326,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       if (isClaudeUsageLimit(m)) {
         pauseRun(m);
       } else {
+        stageError = m;
         opts.onText?.(`⚠ stage ended early: ${m}`);
         opts.store.appendEvent(opts.assessmentId, { type: "note", payload: { message: `⚠ stage ended early: ${m}` } });
       }
@@ -1332,7 +1349,16 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       cacheReadTokens: Math.max(0, (ru.cache_read_input_tokens ?? 0) - accCacheR) || undefined,
       cacheCreationTokens: Math.max(0, (ru.cache_creation_input_tokens ?? 0) - accCacheC) || undefined,
     } : undefined);
-    if (!p.shouldStop() && !sess.paused && p.onIncomplete !== "continue") pauseRun("Stage ended without its completion tool", "incomplete");
+    // A stage that ended without a thrown error (error_max_turns result / the model simply stopped) hit a BOUNDED
+    // cutoff — like the openai path's max_turns/no_tool_calls, it caps this stage's unit and never pauses the run.
+    // A thrown error is a real fault and keeps the pause behavior.
+    if (!p.shouldStop() && !sess.paused) {
+      if (stageError) {
+        if (p.onIncomplete !== "continue") pauseRun(`Stage ended early: ${stageError}`, "incomplete");
+      } else {
+        noteStageCapped("ended without its completion tool", p.onIncomplete);
+      }
+    }
     return turns;
   };
 

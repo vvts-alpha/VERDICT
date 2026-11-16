@@ -44,11 +44,12 @@ for (const mode of ["401", "429", "network", "no-tools", "max-turns", "done", "r
         maxTurns: mode === "target-auth-wall" ? 2 : 1, maxScreens: 1, scenarioPass: false, fingerprintPass: false, keepAliveMinutes: 0 });
       const state = store.loadAssessment("a-1")!;
       const completed = mode === "done" || mode === "resume-existing-finding";
-      // Bounded per-screen cutoffs (turn cap / model stopped emitting tools) no longer pause the run — the screen
-      // returns to queued and the run finishes (a later --resume retries it). Infra failures still pause.
-      const cappedContinue = mode === "max-turns" || mode === "no-tools";
+      // Bounded cutoffs (turn cap / model stopped emitting tools / stage ended without its completion tool) never
+      // pause the run — for ANY stage, survey included. The stage's partial output stays recorded; unfinished
+      // units stay queued for a later --resume. Only real faults (provider/auth/budget) pause.
+      const cappedContinue = mode === "max-turns" || mode === "no-tools" || mode === "survey-incomplete";
       assert.equal(store.isPaused("a-1"), !completed && !cappedContinue);
-      assert.equal(state.phase, completed || cappedContinue ? "report" : mode === "survey-incomplete" ? "phase1_recon" : "phase2_scan");
+      assert.equal(state.phase, completed || cappedContinue ? "report" : "phase2_scan");
       assert.equal(state.screenScans[0]?.status, mode === "resume-existing-finding" ? "finding" : completed ? "clean" : "queued");
       assert.equal(state.findings.length, mode === "resume-existing-finding" ? 1 : 0);
       if (!completed && !cappedContinue) assert.match(result.summary, /paused/i);

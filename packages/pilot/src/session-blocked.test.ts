@@ -251,7 +251,7 @@ class CredsDriver {
     return {
       url: this.url,
       title: "",
-      domSkeleton: "",
+      domSkeleton: "html>(body)",
       visibleText: ok ? "Welcome to your dashboard" : "Please log in",
       links: [`${base}#/login`],
       forms: ok ? [] : [{ action: "/rest/user/login", method: "post", fields: [{ name: "email", type: "text" }, { name: "password", type: "password" }] }],
