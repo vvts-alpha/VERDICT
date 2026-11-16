@@ -5,7 +5,7 @@
 // → so we don't pull in the DOM lib and clash with Node types.
 
 import type { BrowserContext, CDPSession, Dialog, Page } from "playwright-core";
-import type { CapturedExchange, Driver, FormObservation, Observation } from "../types.js";
+import type { CapturedExchange, Driver, FormObservation, InputObservation, Observation } from "../types.js";
 import { detectStuck } from "../auth.js";
 import { DEFAULT_BROWSER_UA } from "@veritas/core";
 
@@ -38,6 +38,8 @@ export interface PageSnapshot {
   links: string[];
   clickables?: { text: string; selector: string }[];
   forms: FormObservation[];
+  /** All visible fillable controls on the page — includes inputs OUTSIDE <form> and inputs WITHOUT name. */
+  inputs?: InputObservation[];
   virtualRoutes: string[];
 }
 
@@ -159,6 +161,7 @@ const PAGE_EXTRACT_FN = (): {
   links: string[];
   clickables: { text: string; selector: string }[];
   forms: { action: string | null; method: string; fields: { name: string; type: string }[] }[];
+  inputs: { selector: string; name: string; id: string; type: string; label: string; autocomplete: string }[];
   virtualRoutes: string[];
   scripts: string[];
 } => {
@@ -171,6 +174,7 @@ const PAGE_EXTRACT_FN = (): {
     links: [] as string[],
     clickables: [] as { text: string; selector: string }[],
     forms: [] as { action: string | null; method: string; fields: { name: string; type: string }[] }[],
+    inputs: [] as { selector: string; name: string; id: string; type: string; label: string; autocomplete: string }[],
     virtualRoutes: (g.__veritasRoutes || []) as string[],
     scripts: [] as string[],
   };
@@ -210,6 +214,43 @@ const PAGE_EXTRACT_FN = (): {
       }))
       .filter((x: { name: string }) => x.name.length > 0),
   }));
+  // Visible fillable controls — form membership / name attribute NOT required (framework forms go id-only).
+  // The selector is directly usable with page.fill: [name] preferred, #id next, tag[type] as last resort.
+  result.inputs = Array.from(doc.querySelectorAll("input,select,textarea"))
+    .filter((el: any) => {
+      const t = String(el.getAttribute("type") || "text").toLowerCase();
+      if (t === "hidden" || el.disabled) return false;
+      return el.getClientRects().length > 0; // rendered/visible only
+    })
+    .slice(0, 60)
+    .map((el: any) => {
+      const tag = String(el.tagName || "").toLowerCase();
+      const id = el.getAttribute("id") || "";
+      const name = el.getAttribute("name") || "";
+      const type = tag === "input" ? String(el.getAttribute("type") || "text").toLowerCase() : tag;
+      let label = String(el.getAttribute("aria-label") || "");
+      if (!label && id) {
+        const l = doc.querySelector(`label[for="${cssEsc(id)}"]`);
+        if (l) label = String(l.innerText || "").trim();
+      }
+      if (!label && typeof el.closest === "function" && el.closest("label")) {
+        label = String(el.closest("label").innerText || "").trim();
+      }
+      if (!label) label = String(el.getAttribute("placeholder") || el.getAttribute("title") || "");
+      const selector = name
+        ? `${tag}[name="${name.replace(/"/g, '\\"')}"]`
+        : id
+          ? `#${cssEsc(id)}`
+          : `${tag}[type="${type}"]`;
+      return {
+        selector,
+        name,
+        id,
+        type,
+        label: label.replace(/\s+/g, " ").slice(0, 80),
+        autocomplete: String(el.getAttribute("autocomplete") || "").toLowerCase(),
+      };
+    });
   result.scripts = Array.from(doc.querySelectorAll("script"))
     .map((s: any) => String(s.textContent || "").slice(0, 20000))
     .filter((t: string) => t.length > 0)
@@ -416,6 +457,7 @@ export class PlaywrightDriver implements Driver {
       links: [],
       clickables: [],
       forms: [],
+      inputs: [],
       virtualRoutes: [],
       scripts: [],
     };
@@ -573,6 +615,7 @@ export class PlaywrightDriver implements Driver {
       links: data?.links ?? [],
       clickables: data?.clickables ?? [],
       forms: data?.forms ?? [],
+      inputs: data?.inputs ?? [],
       virtualRoutes: data?.virtualRoutes ?? [],
     };
   }
@@ -593,6 +636,12 @@ export class PlaywrightDriver implements Driver {
       if (ok) return true;
     }
     return false;
+  }
+
+  /** Post-action render wait — menus/SPA route changes need the DOM to settle before the next snapshot. */
+  async settle(): Promise<void> {
+    await this.waitForDomStable();
+    await new Promise<void>((resolve) => setTimeout(resolve, this.opts.settleMs));
   }
 
   /** Upload a file (<input type=file>) via setInputFiles and submit. base64 also supports binary. */

@@ -14,6 +14,7 @@ export type {
   Driver,
   FormFieldObservation,
   FormObservation,
+  InputObservation,
   Observation,
 } from "./types.js";
 

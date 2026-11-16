@@ -30,6 +30,21 @@ export interface FormObservation {
   fields: FormFieldObservation[];
 }
 
+/** One VISIBLE fillable control on the page — captured independently of <form> membership and of whether it
+ *  carries a name attribute (framework forms like Angular [formField] often have id-only inputs). This is the
+ *  structural basis for "does this page render a login widget": a login page is one with a password input. */
+export interface InputObservation {
+  /** CSS selector usable directly with driver.fill / driver.clickFirst */
+  selector: string;
+  name: string;
+  id: string;
+  /** input type (lowercase) / "select" / "textarea" */
+  type: string;
+  /** aria-label / associated <label> / placeholder / title text */
+  label: string;
+  autocomplete: string;
+}
+
 /** A clickable UI control that is NOT a plain <a href> (buttons / submit inputs / [role=button] / [onclick]). These drive
  *  button-based navigation the a[href] link crawl misses; surfaced to the survey so it can click the navigational ones. */
 export interface ClickableObservation {
