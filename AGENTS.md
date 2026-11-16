@@ -42,6 +42,11 @@ Tests use `node:test`, `node:assert/strict`, and `tsx`. Add behavior-focused reg
 
 Follow the history's Conventional Commit style: `feat(desktop): ...`, `fix(pilot): ...`, or `docs: ...`. Keep commits focused. PRs should describe the problem, resulting behavior, validation commands, and relevant issues; include screenshots for UI changes.
 
+Before pushing:
+
+- `pnpm audit --audit-level low` must report zero findings — it is CI's first gate and fails the run in seconds on any advisory, including transitive deps. Fix by re-resolving/bumping the dependency chain (`pnpm update -r <pkg>` within declared ranges, or bump the direct dep); do not suppress advisories or weaken the audit level.
+- After pushing, check `gh run list` — don't leave a red CI unattended.
+
 ## Security & Architecture Rules
 
 Keep shared contracts in `core` and WebUI imports from core type-only. Preserve scope gates and append-only state events. Confirmation requires a failing negative control and at least two successful positive replays. Never commit `.env`, credentials, cookies, or private run artifacts; use authorized targets only.
