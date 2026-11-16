@@ -18,9 +18,9 @@ Map the application. Test across account roles. Review the requests, responses, 
 
 VERDICT combines model-guided investigation with deterministic probes and evidence review. The Windows app includes the runtime and runs the assessment service locally; no Node.js installation or separate server setup is required.
 
-<p align="center"><img src="assets/desktop-assessment.png" alt="VERDICT desktop displaying the reviewed Juice Shop assessment, site tree, progress, and findings" width="1200" /></p>
+<p align="center"><img src="assets/desktop-assessment.png" alt="Current VERDICT desktop showing a local Juice Shop assessment, site tree, check status, and findings" width="1200" /></p>
 
-*Desktop assessment view displaying a reviewed copy of the September Juice Shop run. Findings include confirmed entries and leads; the report separates their counts.*
+*A bounded local live assessment of OWASP Juice Shop in the current Electron interface, captured on November 16, 2026. Unfinished checks remain visible; Burp scanning and OOB callbacks were disabled for this run. These screenshots illustrate the workflow, rather than an exhaustive benchmark.*
 
 Use VERDICT on systems you own or are explicitly authorized to test. Automated probes enforce the configured scope. See [SECURITY.md](SECURITY.md).
 
@@ -59,13 +59,13 @@ Open **Settings → Models**.
 | **OrcaRouter** | Base URL is prefilled. Enter your API key and model IDs. |
 | **Other** | Enter a custom OpenAI-compatible Base URL, API key if required, and model IDs; local model servers are supported through this interface. |
 
-<p align="center"><img src="assets/desktop-model-settings.png" alt="Model Settings with OpenCodeGo selected, its API URL prefilled, and omen-alpha entered for Deep and Light models" width="1000" /></p>
+<p align="center"><img src="assets/desktop-model-settings.png" alt="OpenCodeGo model settings with deepseek-v4.1-flash selected for Deep and Light and independent context limits" width="1000" /></p>
 
-*Example configuration for the model used in the Juice Shop evaluation; enter your own API key.*
+*Model settings used for this local run: OpenCodeGo with `deepseek-v4.1-flash` for both Deep and Light. The API key is omitted; enter your own key.*
 
 **Deep** handles diagnosis and other investigation stages; **Light** handles survey and methodology work. Both can use the same model. **Check connections** tests the current fields without saving: model requests, automation-browser launch, and the read-only API connection when Burp scanning is enabled. Model checks may use quota. Select **Save** when ready; new assessments also run setup checks before launching.
 
-OpenCodeGo / `omen-alpha` has been used in the desktop evaluation below. OrcaRouter's selection, saving, and transport mapping have been tested; a live OrcaRouter assessment has not been run.
+The [September desktop evaluation](https://github.com/vvts-alpha/verdict-pub/blob/main/benchmarks/juice-shop/desktop-2026-09.md) used OpenCodeGo / `omen-alpha`. OrcaRouter's selection, saving, and transport mapping have been tested; a live OrcaRouter assessment has not been run.
 
 Under **Network**, leave Chromium path blank to detect Chrome/Edge. Configure an upstream proxy only when needed. **Agent → Operator context** stores target facts that prefill new assessments.
 
@@ -73,7 +73,7 @@ For API providers, **Models → Deep / Light max context** sets each model's tot
 
 ### 3. Start and follow an assessment
 
-1. Choose **Main → New → Web / API app**.
+1. Choose **Projects → New → Web / API app**.
 2. Enter the target URL, review scope, and supply any account roles and target context.
 3. Launch and follow the site tree, progress, findings, and live log.
 4. Inspect each finding's evidence, then use **Export / Import** to save a report.
