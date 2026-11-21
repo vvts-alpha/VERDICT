@@ -93,7 +93,8 @@ test("completion teardown/restart re-reads ledger; additions alone do not retry 
   assert.equal(completionProgress(restarted.unresolved, restarted.unresolved).continue, false);
 });
 
-test("completion-only report resume visits all 45 slots, never fabricates a verdict or target request", async (t) => {
+for (const completionPasses of [undefined, 0, Number.NaN, Number.POSITIVE_INFINITY, 2]) {
+test(`completion-only report resume with passes=${completionPasses} preserves unresolved slots`, async (t) => {
   const env = {
     VERDICT_LLM_PROVIDER: "openai", VERDICT_LLM_BASE_URL: "http://model.test/v1",
     VERDICT_LLM_MODEL: "deep", VERDICT_LLM_FAST_MODEL: "light", VERDICT_LLM_TOOL_MODE: "native",
@@ -125,9 +126,17 @@ test("completion-only report resume visits all 45 slots, never fabricates a verd
     await runPilot({
       store, assessmentId: "a-1", targetUrl: url, scope, profileDir: join(dir, "profile"), artifactsDir: join(dir, "artifacts"),
       roleCreds: new Map(), resume: true, // report-only recovery must not re-buy scenario, fingerprint or asset-review
-      completionPasses: 2, maxTurns: 1, maxScreens: 1, keepAliveMinutes: 0,
+      ...(completionPasses === undefined ? {} : { completionPasses }),
+      maxTurns: 1, maxScreens: 1, keepAliveMinutes: 0,
     });
-    assert.equal(prompts.length, 3, "two passes do not repeat unchanged slots");
+    if (completionPasses !== 2) {
+      assert.equal(prompts.length, 0, "default, disabled and invalid options never recheck unresolved slots");
+      assert.equal(store.checks("a-1").filter((c) => c.status === "planned").length, 45);
+      assert.equal(store.loadAssessment("a-1")!.screenScans[0]!.status, "clean", "skipping rechecks does not rewrite historical scan verdicts");
+      assert.equal(store.isPaused("a-1"), false);
+      return;
+    }
+    assert.equal(prompts.length, 3, "two explicit passes do not repeat unchanged slots");
     for (let i = 0; i < 45; i++) {
       assert.equal(prompts.filter((p) => p.includes(`param:p${String(i).padStart(2, "0")}`)).length, 1);
     }
@@ -143,6 +152,8 @@ test("completion-only report resume visits all 45 slots, never fabricates a verd
     }
   }
 });
+
+}
 
 test("completion concurrent addition mid-pass gets next pass, not a drain retry of the unchanged slot", async (t) => {
   const env = {

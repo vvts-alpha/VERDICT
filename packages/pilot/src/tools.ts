@@ -251,7 +251,7 @@ export const STAGE_TOOLS = {
   // recon extrapolation: after survey, read the mapped surface and forced-browse LLM-predicted unlinked endpoints.
   reconGuess: ["get_inventory", "probe_guesses", "probe_paths", "browser_navigate", "guess_done"],
   methodology: ["get_inventory", "record_methodology", "record_methodologies", "methodology_done"],
-  diagnose: ["get_screen", "login", "http_request", "compose_check", "probe_params", "probe_xss", "probe_dom_xss", "probe_stored_xss", "probe_ssti", "probe_sqli", "probe_nosql", "probe_cmdi", "probe_traversal", "probe_redirect", "probe_cors", "probe_graphql", "probe_graphql_op", "probe_proto", "probe_jwt", "probe_csrf", "probe_oob", "probe_ssrf", "probe_upload", "probe_logic", "probe_race", "probe_reset_poison", "probe_user_enum", "probe_secrets", "probe_headers", "analyze_session", "verify_access", "probe_idor", "probe_authz", "analyze_js", "probe_parser", "probe_xxe", "probe_websocket", "probe_cache", "probe_cache_poison", "probe_smuggling", "probe_crlf", "probe_host_header", "probe_oauth", "probe_method_bypass", "probe_rate_limit", "analyze_saml", "probe_deser", "browser_navigate", "browser_fill", "browser_click", "browser_upload", "record_finding", "resolve_asset_review", "coverage_status", "screen_done", "skip_screen"],
+  diagnose: ["get_screen", "get_shared_context", "login", "http_request", "compose_check", "probe_params", "probe_xss", "probe_dom_xss", "probe_stored_xss", "probe_ssti", "probe_sqli", "probe_nosql", "probe_cmdi", "probe_traversal", "probe_redirect", "probe_cors", "probe_graphql", "probe_graphql_op", "probe_proto", "probe_jwt", "probe_csrf", "probe_oob", "probe_ssrf", "probe_upload", "probe_logic", "probe_race", "probe_reset_poison", "probe_user_enum", "probe_secrets", "probe_headers", "analyze_session", "verify_access", "probe_idor", "probe_authz", "analyze_js", "probe_parser", "probe_xxe", "probe_websocket", "probe_cache", "probe_cache_poison", "probe_smuggling", "probe_crlf", "probe_host_header", "probe_oauth", "probe_method_bypass", "probe_rate_limit", "analyze_saml", "probe_deser", "browser_navigate", "browser_fill", "browser_click", "browser_upload", "record_finding", "resolve_asset_review", "coverage_status", "screen_done", "skip_screen"],
   // scenario (A04 cross-cutting logic): overview the inventory + fire multi-step request chains via probe_scenario. Once, after per-screen diagnosis.
   scenario: ["get_inventory", "login", "http_request", "compose_check", "browser_navigate", "browser_fill", "browser_click", "probe_scenario", "probe_race", "probe_reset_poison", "probe_user_enum", "probe_secrets", "record_finding", "scenario_done"],
   // fingerprint (A06 known-vulnerable components): fingerprint_scan to collect versions, evaluate known CVEs (cve_lookup opt-in) and record.
@@ -2878,12 +2878,13 @@ export function buildTools(s: PilotSession) {
     // ───────────────────────── diagnosis (STAGE 3) ─────────────────────────
     tool(
       "get_screen",
-      "Return the screen currently under diagnosis: its full detail, its planned checks, the roles available, and known object ids seen on other screens (for cross-user access-control tests).",
+      "Return the screen currently under diagnosis: its detail, planned checks, available roles and relevant finding keys. Cross-screen object IDs and global findings are available on demand via get_shared_context.",
       { screenId: z.string().optional() },
       async ({ screenId }) => {
         const id = screenId ?? s.currentScreenId;
         const sc = s.inv.screens().find((x) => x.screenId === id);
         if (!sc) return txt(`no screen '${id}'`);
+        const endpoints = new Set([sc.urlTemplate, ...sc.apis.map((a) => a.urlTemplate)].map((u) => normEndpoint(u, s.targetUrl)));
         return txt(
           JSON.stringify({
             screen: { ...screenDigest(sc), observedUrls: sc.observedUrls.slice(0, 6), description: sc.description },
@@ -2899,10 +2900,25 @@ export function buildTools(s: PilotSession) {
               .map((c) => ({ class: c.checkClass, target: c.target, param: c.param, status: c.status })),
             currentRole: s.currentRole || "unauth",
             rolesAvailable: availableRoles(s),
-            knownObjectIds: knownObjectIds(s),
-            alreadyConfirmed: [...s.findingsByKey.keys()],
+            // Cross-screen identifiers and unrelated findings are read on demand, never copied into each screen.
+            sharedContextTool: "get_shared_context",
+            alreadyConfirmed: [...s.findingsByKey.keys()].filter((key) => key.startsWith("app:") || endpoints.has(key.split("::")[1] ?? "")),
           }),
         );
+      },
+    ),
+    tool(
+      "get_shared_context",
+      "Read cross-screen object IDs for cross-user access checks and a paginated list of confirmed finding keys for deduplication. Reads current run state; it performs no target requests.",
+      { offset: z.number().int().min(0).optional(), limit: z.number().int().min(1).max(40).optional() },
+      async ({ offset = 0, limit = 20 }) => {
+        const keys = [...s.findingsByKey.keys()];
+        return txt(JSON.stringify({
+          knownObjectIds: knownObjectIds(s),
+          alreadyConfirmed: keys.slice(offset, offset + limit),
+          totalFindings: keys.length,
+          nextOffset: offset + limit < keys.length ? offset + limit : null,
+        }));
       },
     ),
     tool(

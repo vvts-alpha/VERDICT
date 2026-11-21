@@ -80,3 +80,38 @@ test("prompt usage calibrates the estimate upward and tools count toward remaini
     assert.ok(samples[1]!.inputTokens >= before * 2);
     assert.equal(samples[1]!.remainingTokens, 256000 - samples[1]!.inputTokens - samples[1]!.reservedTokens);
 });
+
+
+test("large model windows compact replayed history well before reaching model capacity", async () => {
+    const messages = [...head, ...Array.from({ length: 10 }, (_, i) => round(i, 12_000)).flat()];
+    let summaries = 0;
+    const context = new AgentContext({ windowTokens: 1_000_000, summarize: async () => {
+        summaries++;
+        return "Prior checks and evidence references remain in the store. Continue the current plan.";
+    } });
+    const before = context.estimate(messages);
+    assert.ok(before < 100_000, "history is far below the model's hard capacity");
+    await context.prepare(messages);
+    assert.ok(summaries > 0);
+    assert.ok(context.estimate(messages) < before / 2);
+    assert.deepEqual(messages.slice(-4), [...round(8, 12_000), ...round(9, 12_000)]);
+});
+
+test("large immutable instructions and schemas do not cause empty or repeated summaries", async () => {
+    const instructions: ChatMessage[] = [{ role: "system", content: "s".repeat(150_000) }, head[1]!];
+    const messages = [...instructions, ...round(1, 100)];
+    let summaries = 0;
+    const context = new AgentContext({ windowTokens: 1_000_000, tools: [{ description: "t".repeat(150_000) }], summarize: async () => {
+        summaries++;
+        return "Evidence retained in the store.";
+    } });
+    await context.prepare(messages);
+    assert.equal(summaries, 0, "static overhead alone does not trigger the history budget");
+    messages.push(...Array.from({ length: 10 }, (_, i) => round(i + 2, 12_000)).flat());
+    await context.prepare(messages);
+    assert.ok(summaries > 0);
+    const count = summaries;
+    await context.prepare(messages);
+    assert.equal(summaries, count, "a successful summary leaves room for continuation");
+    assert.deepEqual(messages.slice(0, 2), instructions);
+});

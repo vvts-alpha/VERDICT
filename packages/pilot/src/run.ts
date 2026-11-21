@@ -1,3 +1,4 @@
+import { DIAGNOSIS_INITIAL_TOOLS } from "./tool-catalog.js";
 import { restoreMethodologyPlans } from "./methodology.js";
 // Claude-led 3-stage orchestrator.
 //
@@ -91,7 +92,7 @@ export interface RunPilotOptions {
   /** Cap on the number of screens to diagnose (default 120). */
   maxScreens?: number;
   /** Bounded passes over unresolved check slots (up to 20 per diagnosis stage). New slots get a later pass;
-   *  an unchanged ledger stops early. Default 2, maximum 8; 0 disables. */
+   *  an unchanged ledger stops early. Default 0 (opt-in), maximum 8. */
   completionPasses?: number;
   /** Whether to run the post-diagnosis full-asset review: every reachable HTML document + first-party JS
    *  bundle is chunked and read by the LLM, then a bounded stage verifies the observations. Default true.
@@ -1141,6 +1142,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
     system: string;
     goal: string;
     allowed: readonly string[];
+    initialTools?: readonly string[];
     maxTurns: number;
     model?: string;
     contextWindowTokens: number;
@@ -1186,6 +1188,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
         goal: p.goal,
         tools: tdefs as unknown as PilotToolDef[],
         allowed: p.allowed,
+        initialTools: p.initialTools,
         maxTurns: p.maxTurns,
         contextWindowTokens: p.contextWindowTokens,
         contextCheckpoint: () => JSON.stringify({
@@ -1837,6 +1840,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
           system: DIAGNOSE_PROMPT,
           goal: goalOverride ?? `Diagnose screen ${sc.screenId} (${sc.urlTemplate}). Call get_screen for its detail and plan, test that plan with evidence discipline, then screen_done.`,
           allowed: allowedFor("diagnose"),
+          initialTools: DIAGNOSIS_INITIAL_TOOLS,
           maxTurns: perScreen,
           onIncomplete: "continue",
           model: screenIsHighValue(sc) ? deepModel : fastModel, // only high-value screens go deep (opus)
@@ -2145,10 +2149,10 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
       await drainQueued();
       session.currentScreenId = null;
 
-      const requestedPasses = opts.completionPasses ?? 2;
+      const requestedPasses = opts.completionPasses ?? 0;
       const completionPasses = Number.isFinite(requestedPasses)
         ? Math.max(0, Math.min(8, Math.floor(requestedPasses)))
-        : 2;
+        : 0;
       // Startup/resume: reconstruct from persisted rows rather than replaying an in-memory cursor. Excluded
       // screens remain excluded; neither a crash nor a completion-only resume turns them into clean verdicts.
       const completionSnapshot = (onlyIds?: ReadonlySet<string>) => {
@@ -2251,7 +2255,7 @@ export async function runPilot(opts: RunPilotOptions): Promise<PilotResult> {
           session.assetReviewDone = false;
           // Enroll every observation as a planned "asset-review" check so the ledger — not the turn
           // budget — decides what's finished. The stage resolves them via resolve_asset_review;
-          // leftovers stay planned and the completion pass below picks them up.
+          // leftovers stay planned for an explicitly enabled completion pass.
           enrollObservations(session, rev.observations);
           const obsList = rev.observations
             .slice(0, 40)

@@ -62,6 +62,7 @@ commands:
   pilot   --manifest <file.json> | --url <url> [--model <m>] [--fast-model <m>] [--max-turns <n>] [--max-screens <n>] [--max-survey-screens <n>] [--rate <ms>] [--headed] [--focus "<text>"] [--context "<text>"] [--browser-path <bin>] [--browser-channel <name>] [--no-sandbox] [--out <dir>]
             --max-screens caps how many screens get diagnosed (default 120); --max-survey-screens caps how many the survey maps (default unlimited — stops exploring once reached)
             --wordlist <standard|extended|path> picks the probe_paths forced-browse list — "standard" = the ~130-entry built-in (default), "extended" = the bundled SecLists common.txt (~4.7k), or a path to a custom list file
+            --completion-passes <n> opts into rechecking unresolved slots after diagnosis (default 0: disabled; maximum 8). Unresolved checks remain recorded.
             --parallel <n> runs up to n diagnosis workers concurrently — one per role with session material + one unauth (default 4, 1 = sequential)
             ★Claude-led: Claude drives the tools (browser/http/login/record) to autonomously explore, verify, and record
             --focus "<text>": operator emphasis injected as the TOP priority of the A04 scenario stage (not per-screen diagnosis). e.g. "focus on the payment flow and IDOR in /api/orders"

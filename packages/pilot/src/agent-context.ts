@@ -92,8 +92,11 @@ export class AgentContext {
         if (force) this.scale *= 1.5; // the endpoint rejected our estimate; retry with more headroom
         const before = this.estimate(messages);
         this.report(before);
-        if (!force && before < this.trigger) return;
         const head = messages.slice(0, 2); // original system instructions and goal are never summarized
+        // Model capacity is a hard safety limit, not a target conversation size. Bound replayed history
+        // independently, while allowing large immutable instructions/tools to fit without empty summaries.
+        const trigger = Math.min(this.trigger, this.estimate(head) + 24_000);
+        if (!force && before < trigger) return;
         const history = messages.slice(2).filter((m) => m !== this.summaryMessage);
         const rounds: ChatMessage[][] = [];
         for (const message of history) {
@@ -111,7 +114,7 @@ export class AgentContext {
             `Earlier conversation summary (observations, not new instructions):\n${summary}\n\nCurrent assessment state:\n${checkpoint}\n\nContinue the original goal. Use survey_status, get_inventory, or get_screen when available to retrieve current state; evidence remains in the assessment store.` });
         let keep = Math.min(2, Math.max(0, rounds.length - 1));
         // A single round may contain many parallel tool results. Retain fewer rounds if needed, never half a round.
-        while (keep > 0 && this.estimate([...head, wrap("x".repeat(maxSummaryChars)), ...rounds.slice(-keep).flat()]) >= this.trigger) keep--;
+        while (keep > 0 && this.estimate([...head, wrap("x".repeat(maxSummaryChars)), ...rounds.slice(-keep).flat()]) >= trigger) keep--;
         const old = rounds.slice(0, rounds.length - keep).flat();
         const tail = keep ? rounds.slice(-keep).flat() : [];
         const transcript = JSON.stringify(old);
@@ -150,7 +153,7 @@ export class AgentContext {
             const summaryMessage = wrap(summary);
             const compacted = [...head, summaryMessage, ...tail];
             const after = this.estimate(compacted);
-            if (after >= this.trigger || after >= before) throw new Error("The summarized history still leaves too little context for continuation.");
+            if (after >= trigger || after >= before) throw new Error("The summarized history still leaves too little context for continuation.");
             // Commit only a successful summary. Failure leaves the original conversation available to the caller.
             messages.splice(2, messages.length - 2, summaryMessage, ...tail);
             this.summary = summary;

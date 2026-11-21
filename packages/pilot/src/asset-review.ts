@@ -179,29 +179,38 @@ export async function reviewAssets(args: {
     for (let off = 0; off < asset.body.length; off += CHUNK_CHARS) chunks.push(asset.body.slice(off, off + CHUNK_CHARS));
     const obs: AssetObservation[] = [];
     let analyzed = 0;
-    const failedChunks: number[] = [];
-    for (let i = 0; i < chunks.length; i++) {
-      if (args.shouldAbort?.()) break;
-      try {
+    // Bound model concurrency without retaining duplicate mutable coverage counters in workers.
+    // Commit results in source order; only fully validated chunks count as analyzed.
+    const results: Array<AssetObservation[] | undefined> = new Array(chunks.length);
+    let nextChunk = 0;
+    const workers = await Promise.allSettled(Array.from({ length: Math.min(3, chunks.length) }, async () => {
+      while (!args.shouldAbort?.()) {
+        const i = nextChunk++;
         const chunk = chunks[i];
-        if (chunk === undefined) continue;
-        const r = await llm.complete({ system: REVIEW_SYSTEM, prompt: chunkPrompt(asset, i, chunks.length, chunk), model: args.model, timeoutMs: 120_000 });
-        const parsed = extractJson(r.text);
-        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) ||
-            !Array.isArray((parsed as Record<string, unknown>).observations)) {
-          throw new TypeError("invalid asset-review response");
-        }
-        const chunkObs: AssetObservation[] = [];
-        for (const [j, raw] of (parsed as { observations: unknown[] }).observations.entries()) {
-          const o = sanitizeObs(raw, `chunk ${i + 1}, observation ${j + 1}`, chunk, i * CHUNK_CHARS);
-          if (!o) throw new TypeError("invalid asset-review observation");
-          chunkObs.push(o);
-        }
-        obs.push(...chunkObs); // atomic per chunk: a malformed later observation cannot imply coverage
-        analyzed++;
-      } catch {
-        failedChunks.push(i);
+        if (chunk === undefined) break;
+        try {
+          const r = await llm.complete({ system: REVIEW_SYSTEM, prompt: chunkPrompt(asset, i, chunks.length, chunk), model: args.model, timeoutMs: 120_000 });
+          const parsed = extractJson(r.text);
+          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) ||
+              !Array.isArray((parsed as Record<string, unknown>).observations)) {
+            throw new TypeError("invalid asset-review response");
+          }
+          const chunkObs: AssetObservation[] = [];
+          for (const [j, raw] of (parsed as { observations: unknown[] }).observations.entries()) {
+            const o = sanitizeObs(raw, `chunk ${i + 1}, observation ${j + 1}`, chunk, i * CHUNK_CHARS);
+            if (!o) throw new TypeError("invalid asset-review observation");
+            chunkObs.push(o);
+          }
+          results[i] = chunkObs;
+        } catch { /* Failed chunks stay incomplete; other queued chunks can still be reviewed. */ }
       }
+    }));
+    // A failing stop/budget callback must still drain other in-flight reads before teardown.
+    for (const worker of workers) if (worker.status === "rejected") throw worker.reason;
+    for (const result of results) {
+      if (!result) continue;
+      obs.push(...result);
+      analyzed++;
     }
     const review: AssetReview = {
       url: safeAssetUrl(asset.url),

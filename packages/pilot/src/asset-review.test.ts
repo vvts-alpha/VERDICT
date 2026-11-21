@@ -8,6 +8,7 @@ import { AssessmentStore, deriveScopeFromSingleUrl } from "@veritas/core";
 import { InventoryBuilder } from "@veritas/crawler";
 import { EvidenceStore, FetchHttpClient } from "@veritas/scanner";
 import { FakeLlmClient } from "@veritas/llm";
+import type { LlmClient, LlmResponse } from "@veritas/llm";
 import { FakeHttpClient } from "@veritas/scanner";
 import { assetObservationResource, collectAssets, enrollObservations, reviewAssets, safeAssetUrl, type FetchedAsset } from "./asset-review.js";
 import type { PilotSession } from "./tools.js";
@@ -310,3 +311,55 @@ test("resume/re-enrollment reproduces identities instead of creating or overwrit
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+
+for (const stopEarly of [false, true]) {
+  test(`asset review bounds concurrent reads, preserves chunk order and drains in-flight calls (stop=${stopEarly})`, async () => {
+    const { s, dir } = session();
+    let active = 0;
+    let peak = 0;
+    let stopped = false;
+    const pending: Array<{ resolve: (r: LlmResponse) => void; reject: (e: Error) => void }> = [];
+    const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+    const llm: LlmClient = { complete: async () => {
+      active++;
+      peak = Math.max(peak, active);
+      try {
+        return await new Promise<LlmResponse>((resolve, reject) => { pending.push({ resolve, reject }); });
+      } finally { active--; }
+    } };
+    const response: LlmResponse = { model: "fake", text: '{"observations":[{"type":"endpoint","detail":"synthetic lead"}]}' };
+    try {
+      const work = reviewAssets({ session: s, llm, assets: [asset("x".repeat(120_000))], shouldAbort: () => stopped });
+      assert.equal(pending.length, 3);
+      assert.equal(active, 3);
+      if (stopEarly) stopped = true;
+      pending[1]!.resolve(response); // chunk 2 finishes first
+      await tick();
+      if (!stopEarly) {
+        assert.equal(pending.length, 4, "exactly one freed slot launches the next chunk");
+        pending[3]!.reject(new Error("synthetic model failure"));
+        await tick();
+        assert.equal(pending.length, 5, "a failed chunk does not strand later chunks");
+        pending[4]!.resolve(response);
+      } else {
+        assert.equal(pending.length, 3, "stop prevents any further model call");
+      }
+      pending[2]!.resolve(response);
+      pending[0]!.resolve(response); // chunk 1 finishes last
+      const out = await work;
+      assert.equal(peak, 3);
+      assert.equal(active, 0, "all in-flight reads finish before returning/closing the store");
+      const review = out.reviews[0]!;
+      assert.equal(review.chunksTotal, 5);
+      assert.equal(review.chunksAnalyzed, stopEarly ? 3 : 4);
+      assert.equal(review.complete, false, "failed or unstarted chunks never imply full coverage");
+      assert.deepEqual(review.observations.map((o) => o.location), (stopEarly ? [1, 2, 3] : [1, 2, 3, 5]).map((i) => `chunk ${i}, observation 1`));
+      const events = s.store.loadAssessment("a-1")!.events.filter((e) => e.type === "asset_reviewed");
+      assert.equal(events.length, 1, "one deterministic coverage record per asset");
+    } finally {
+      s.store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}

@@ -1,3 +1,4 @@
+import { stageToolCatalog, TOOL_LOADER } from "./tool-catalog.js";
 import { boundedToolText } from "./tool-output.js";
 import { createProviderHeaders } from "@veritas/llm";
 // Provider-agnostic agentic tool-calling loop for the pilot stages, against an OpenAI-compatible
@@ -40,6 +41,8 @@ export interface OpenAiLoopParams {
     tools: PilotToolDef[];
     /** Allowlist by bare tool name — only these are offered + accepted (locked toolbox). */
     allowed: readonly string[];
+    /** Optional initial schema set; remaining stage-authorized tools load explicitly on demand. */
+    initialTools?: readonly string[];
     maxTurns: number;
     /** Total input + output capacity of this stage's model; defaults to 256,000 tokens. */
     contextWindowTokens?: number;
@@ -272,7 +275,7 @@ interface AgentAction {
 async function dispatchTool(byName: ToolMap, name: string, args: Record<string, unknown>, onToolUse?: (n: string, i: unknown) => void): Promise<string> {
     onToolUse?.(name, args);
     const toolDef = byName.get(name);
-    if (!toolDef) return `ERROR: tool "${name}" is not available in this stage`; // never dispatched — locked toolbox
+    if (!toolDef) return `ERROR: tool "${name}" is not available in this stage${byName.has(TOOL_LOADER) ? `; if listed in ${TOOL_LOADER}, load its definition first` : ""}`; // never dispatched — locked toolbox
     const parsed = z.object(toolDef.inputSchema as z.ZodRawShape).safeParse(args);
     if (!parsed.success) {
         return `ERROR: invalid arguments for ${name}: ${parsed.error.issues.map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`).join("; ").slice(0, 240)}`;
@@ -286,10 +289,11 @@ async function dispatchTool(byName: ToolMap, name: string, args: Record<string, 
 
 /** Native OpenAI function-calling loop. Returns the turn count + how many tool calls the model actually made (0 = the endpoint ignored the tools param). */
 async function runNativeMode(p: OpenAiLoopParams, byName: ToolMap): Promise<OpenAiLoopResult & { toolCalls: number }> {
-    const oaTools = [...byName.values()].map((t) => ({
+    const schemaOf = (t: PilotToolDef) => ({
         type: "function" as const,
         function: { name: t.name, description: t.description, parameters: toolParametersSchema(t.inputSchema) },
-    }));
+    });
+    const oaTools = [...byName.values()].map(schemaOf);
     const messages: ChatMessage[] = [
         { role: "system", content: AGENT_PREAMBLE + p.system },
         { role: "user", content: p.goal },
@@ -302,6 +306,11 @@ async function runNativeMode(p: OpenAiLoopParams, byName: ToolMap): Promise<Open
         if (p.shouldStop()) return { turns, stopped: "shouldStop", toolCalls: toolCallCount };
         let resp: ChatResponse;
         try {
+            // The loader only appends definitions. Keep the same array so context accounting sees the live catalog.
+            if (oaTools.length !== byName.size) {
+                const loaded = new Set(oaTools.map((t) => t.function.name));
+                oaTools.push(...[...byName.values()].filter((t) => !loaded.has(t.name)).map(schemaOf));
+            }
             resp = await managedCompletion(p, context, messages, oaTools);
         } catch (e) {
             return { turns, stopped: "error", error: String(e instanceof Error ? e.message : e).slice(0, 200), toolCalls: toolCallCount, ...(e instanceof ContextBudgetError ? { contextFailure: true } : {}) };
@@ -380,14 +389,14 @@ const TEXT_MODE_INSTRUCTIONS = (spec: string): string =>
 
 /** Text (ReAct) loop: the model emits a {\"tool\",\"args\"} JSON object in plain content. Works on any chat endpoint. */
 async function runTextMode(p: OpenAiLoopParams, byName: ToolMap): Promise<OpenAiLoopResult> {
-    const spec = [...byName.values()]
+    const spec = () => [...byName.values()]
         .map((t) => {
             const props = (toolParametersSchema(t.inputSchema).properties as Record<string, unknown>) ?? {};
             return `- ${t.name}: ${t.description}\n    args: ${JSON.stringify(props)}`;
         })
         .join("\n");
     const messages: ChatMessage[] = [
-        { role: "system", content: AGENT_PREAMBLE + TEXT_MODE_INSTRUCTIONS(spec) + p.system },
+        { role: "system", content: AGENT_PREAMBLE + TEXT_MODE_INSTRUCTIONS(spec()) + p.system },
         { role: "user", content: p.goal },
     ];
     const context = createContext(p);
@@ -397,6 +406,8 @@ async function runTextMode(p: OpenAiLoopParams, byName: ToolMap): Promise<OpenAi
         if (p.shouldStop()) return { turns, stopped: "shouldStop" };
         let resp: ChatResponse;
         try {
+            // Loaded definitions remain in the immutable instruction head across history summaries.
+            messages[0]!.content = AGENT_PREAMBLE + TEXT_MODE_INSTRUCTIONS(spec()) + p.system;
             resp = await managedCompletion(p, context, messages); // no tools param — plain chat
         } catch (e) {
             return { turns, stopped: "error", error: String(e instanceof Error ? e.message : e).slice(0, 200), ...(e instanceof ContextBudgetError ? { contextFailure: true } : {}) };
@@ -478,8 +489,7 @@ async function runTextMode(p: OpenAiLoopParams, byName: ToolMap): Promise<OpenAi
  */
 export async function runOpenAiAgentLoop(p: OpenAiLoopParams): Promise<OpenAiLoopResult> {
     p = { ...p, headers: { ...createProviderHeaders(p.baseURL), ...p.headers } };
-    const allowedSet = new Set(p.allowed);
-    const byName: ToolMap = new Map(p.tools.filter((t) => allowedSet.has(t.name)).map((t) => [t.name, t] as const));
+    const byName: ToolMap = stageToolCatalog(p.tools, p.allowed, p.initialTools);
     const mode = p.mode ?? "auto";
 
     if (mode === "text") return runTextMode(p, byName);
