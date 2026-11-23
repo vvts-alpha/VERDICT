@@ -24,6 +24,7 @@ import type { UserRow } from "./users-db.js";
 import { Supervisor, isRunCommand, isSupportedRun, type RunLauncherConfig, type StartRunInput } from "./supervisor.js";
 import { Relay } from "./relay.js";
 import { continueSession, SessionContinuationError } from "./continue-session.js";
+import { enforceLaunchPaths, enforceSavedRunPaths, LaunchPathError, resolveRunFile, type LaunchPathPolicy } from "./launch-paths.js";
 
 export interface ServerOptions {
   runsDir: string;
@@ -31,6 +32,8 @@ export interface ServerOptions {
   localAuthToken?: string;
   port?: number;
   host?: string;
+  /** Extra Host-header names accepted besides the bound address (and, on wildcard binds, localhost + local interface IPs). */
+  allowedHosts?: string[];
   /** Built webui (served statically). If unset, API/WS only */
   webRoot?: string;
   /** events polling interval (ms). Default 1000 */
@@ -337,6 +340,21 @@ function handleUserApi(req: IncomingMessage, res: ServerResponse, db: UsersDb, p
 // + Phase-1 control plane: start a run (/api/run) / stop / resume (via supervisor).
 function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOptions, supervisor?: Supervisor, principal?: Principal): void {
   const url = req.url ?? "";
+  const usersDb = opts.usersDb;
+  // Only the token-gated desktop session may hand the child arbitrary local paths (they are its own user's files).
+  const launchPolicy: LaunchPathPolicy = {
+    runsDir: opts.runsDir,
+    allowLocalPaths: opts.localAuthToken !== undefined && !usersDb,
+    canUseRun: (runId) => !usersDb || (!!principal && canAccessRun(usersDb, principal, runId)),
+  };
+  const savedRunPathError = (id: string): string | null => {
+    try {
+      enforceSavedRunPaths(opts.runsDir, id, launchPolicy);
+      return null;
+    } catch (e) {
+      return e instanceof LaunchPathError ? e.message : "Saved run settings are invalid";
+    }
+  };
 
   // Start a run: body = { command, manifest, options }. supervisor spawns the CLI and returns a new id.
   if (url === "/api/run") {
@@ -377,6 +395,11 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
         return sendJson(res, 400, { error: e instanceof Error ? e.message : String(e) });
       }
       try {
+        enforceLaunchPaths(input.manifest, input.options, launchPolicy);
+      } catch (e) {
+        return sendJson(res, 400, { error: e instanceof LaunchPathError ? e.message : "invalid launch paths" });
+      }
+      try {
         const { id } = supervisor.start(input);
         if (opts.usersDb && principal) {
           opts.usersDb.setRunOwner(id, principal.userId);
@@ -402,6 +425,8 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
     }
     if (supervisor.isRunning(id)) return sendJson(res, 409, { error: "already running" });
     if (!isSupportedRun(opts.runsDir, id)) return sendJson(res, 400, { error: "This saved assessment type is no longer supported" });
+    const pathError = savedRunPathError(id);
+    if (pathError) return sendJson(res, 400, { error: pathError });
     supervisor.resume(id);
     return sendJson(res, 200, { ok: true });
   }
@@ -512,6 +537,9 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
   let m = url.match(/^\/api\/assessments\/([^/]+)\/(pause|resume)$/);
   if (m) {
     const id = decodeURIComponent(m[1] ?? "");
+    const respawn = m[2] === "resume" && !!supervisor && !supervisor.isRunning(id) && isSupportedRun(opts.runsDir, id);
+    const pathError = respawn ? savedRunPathError(id) : null;
+    if (pathError) return sendJson(res, 400, { error: pathError });
     const store = openStore(id);
     if (!store) return sendJson(res, 404, { error: "not found" });
     return mutateAndReply(id, store, () => {
@@ -520,7 +548,7 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
       // nothing ever respawned. When the supervisor is available and no child is alive, spawn `pilot --resume`.
       // A live child ignores this (it resumes by polling the flag between screens); supervisor.resume throws on
       // unsupported run types, guarded identically to /api/run/:id/resume.
-      if (m![2] === "resume" && supervisor && !supervisor.isRunning(id) && isSupportedRun(opts.runsDir, id)) supervisor.resume(id);
+      if (respawn) supervisor!.resume(id);
     });
   }
 
@@ -714,7 +742,11 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
       try {
         const input = JSON.parse(body) as { cookieFile: string; handoffId?: string; role?: string };
         if (typeof input.cookieFile !== "string") throw new Error("cookieFile required");
-        sendJson(res, 200, continueSession(opts.runsDir, id, input, store, supervisor));
+        if (!supervisor.isRunning(id)) {
+          const pathError = savedRunPathError(id);
+          if (pathError) throw new SessionContinuationError(pathError);
+        }
+        sendJson(res, 200, continueSession(opts.runsDir, id, input, store, supervisor, usersDb ? launchPolicy.canUseRun : undefined));
       } catch (e) {
         sendJson(res, 400, { error: e instanceof SessionContinuationError ? e.message : "Could not continue; check the captured session and saved run", ...(e instanceof SessionContinuationError && e.roles ? { roles: e.roles } : {}) });
       } finally { store.close(); }
@@ -753,6 +785,14 @@ function handleControl(req: IncomingMessage, res: ServerResponse, opts: ServerOp
       } catch (e) {
         closeQuietly();
         return sendJson(res, 400, { error: `invalid body: ${String(e instanceof Error ? e.message : e).slice(0, 120)}` });
+      }
+      if (usersDb) {
+        try {
+          cookieFile = resolveRunFile(cookieFile, launchPolicy);
+        } catch (e) {
+          closeQuietly();
+          return sendJson(res, 400, { error: e instanceof LaunchPathError ? e.message : "invalid cookieFile" });
+        }
       }
       const runsAbs = resolve(opts.runsDir);
       if (cookieFile !== runsAbs && !cookieFile.startsWith(runsAbs + sep)) {
@@ -1354,7 +1394,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
     res.setHeader("X-Frame-Options", "DENY");
     try {
       if (!validateRequestPath(req)) return sendJson(res, 400, { error: "invalid request path" });
-      if (!isTrustedRequest(req, host)) return sendJson(res, 403, { error: "untrusted request origin or host" });
+      if (!isTrustedRequest(req, host, opts.allowedHosts)) return sendJson(res, 403, { error: "untrusted request origin or host" });
       if (!hasLocalToken(req, opts.localAuthToken)) return sendJson(res, 401, { error: "unauthorized" });
       handleHttp(req, res, opts, supervisor, relay, httpCtx);
     } catch (error) { requestFailure(res, error); }
@@ -1380,7 +1420,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
       relay.handleSession(ws, req);
     });
   httpServer.on("upgrade", (req, socket, head) => {
-    if (!validateRequestPath(req) || !isTrustedRequest(req, host)) return void socket.destroy();
+    if (!validateRequestPath(req) || !isTrustedRequest(req, host, opts.allowedHosts)) return void socket.destroy();
     const pathname = (req.url ?? "").split("?")[0] ?? "";
     if (pathname !== "/ws/agent" && !hasLocalToken(req, opts.localAuthToken)) return void socket.destroy();
     const cfg = opts.authPasswords;

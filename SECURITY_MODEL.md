@@ -9,8 +9,8 @@ VERDICT は認可済みの Web/API ターゲットを診断する攻撃ツール
 主な信頼境界:
 1. **診断対象サイト ↔ VERDICT**（最重要）: 対象サイトのレスポンス・DOM・JS・リダイレクト・ヘッダはすべて攻撃者制御の可能性がある。これが crawler / scanner / pilot / LLM プロンプト / SQLite / WebUI / レポート (HTML/PDF/MD/CSV) へ流れ込む。
 2. **LLM 出力 ↔ ツール実行**: 対象サイト由来の文字列が LLM コンテキストに入り、LLM が MCP ツール（`http_request`、`probe_*`、`browser_*`）を呼ぶ。プロンプトインジェクションでスコープ外アクセスや破壊的操作を誘導されうる。最終防壁はスコープゲート `isInScope`（`packages/core/src/scope-check.ts`）。
-3. **ブラウザ/他ローカルプロセス ↔ ローカルサーバー**: `@veritas/server` は 127.0.0.1 の空きポートで HTTP/WS を提供。デスクトップではメインプロセスが `x-verdict-token` を全リクエストに付与（`apps/desktop/src/main.ts`）、`isTrustedRequest`（Host/Origin/Sec-Fetch-Site 検証で DNS rebinding・CSRF 防止、`packages/server/src/request-security.ts`）。
-4. **ネットワーク利用者 ↔ `serve --host 0.0.0.0`**: CLI の `serve` は LAN 公開可能。認証はパスワード 2 ロール（operator/viewer、HMAC Cookie、`auth.ts`）または `--multi-user`（scrypt、セッション DB、run 所有者ゲート、監査ログ、`server.ts`/`users-db.ts`）。認証なしでも起動できる（`--no-auth`）。
+3. **ブラウザ/他ローカルプロセス ↔ ローカルサーバー**: `@veritas/server` は 127.0.0.1 の空きポートで HTTP/WS を提供。デスクトップではメインプロセスが `x-verdict-token` を全リクエストに付与（`apps/desktop/src/main.ts`）、`isTrustedRequest`（Host/Origin/Sec-Fetch-Site 検証で DNS rebinding・CSRF 防止、`packages/server/src/request-security.ts`）。Host 名は bind 先・localhost・（ワイルドカード bind 時は）ローカルインターフェース IP・`--allowed-host` 指定名のみ許可。
+4. **ネットワーク利用者 ↔ `serve --host 0.0.0.0`**: CLI の `serve` は LAN 公開可能。認証はパスワード 2 ロール（operator/viewer、HMAC Cookie、`auth.ts`）または `--multi-user`（scrypt、セッション DB、run 所有者ゲート、監査ログ、`server.ts`/`users-db.ts`）。ループバック以外への認証なし公開は `--allow-unauthenticated` の明示指定がない限り起動を拒否する。サーバー経由で起動する run の `options.wordlist` は同梱 ID（`standard`/`extended`）のみ、manifest の `cookieFile` は呼び出し元が所有する run ディレクトリ内の実ファイルのみ許可（`launch-paths.ts`、違反は 400）。デスクトップ（起動トークン付き・単一ユーザー）はローカルパス指定を維持。
 5. **Electron レンダラー ↔ メインプロセス**: `contextIsolation: true`、`nodeIntegration: false`、preload の `verdictDesktop` ブリッジ（設定 get/set、ファイル選択、埋め込みブラウザ操作、セッション取得）。埋め込みブラウザ（`attended-browser.ts`）は別パーティションで対象サイトを表示し、証明書エラーを無視する。
 6. **サーバー ↔ CLI 子プロセス**: `Supervisor` が `spawn` で CLI を起動（引数配列、シェルなし）。マニフェスト・オプションは run ディレクトリに保存。
 
