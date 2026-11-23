@@ -58,7 +58,7 @@ VERDICT は認可済みの Web/API ターゲットを診断する攻撃ツール
 - 証拠規律（陰性対照 + 2 回の陽性リプレイ）、findings-QA は降格のみ
 - `validateRequestPath`（run ID を `[a-z0-9_-]` に制限、`..` 拒否）、`isContainedPath` による静的配信の封じ込め
 - `isTrustedRequest`（Host 固定・Origin 同一・Sec-Fetch-Site）、デスクトップのローカルトークン
-- Cookie: HttpOnly・SameSite=Strict、HMAC 署名、timingSafeEqual、ログイン試行制限、scrypt、ダミーハッシュでユーザー列挙防止
+- Cookie: HttpOnly。共有パスワード方式（`auth.ts`）は SameSite=Strict、`--multi-user` のセッション Cookie（`authn.ts` `verdict_session`）は SameSite=Lax、HMAC 署名、timingSafeEqual、ログイン試行制限、scrypt、ダミーハッシュでユーザー列挙防止
 - Electron: contextIsolation、nodeIntegration 無効、外部 URL は OS ブラウザ、will-navigate 制限
 - 子プロセス起動は引数配列（シェル非経由）、ビルトイン Bash/Write ツールは LLM に不許可
 - CI で `pnpm audit --audit-level low`
