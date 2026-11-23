@@ -76,3 +76,23 @@ test("malformed paths and JSON shapes return errors without terminating the serv
     assert.equal((await fetch(`${srv.url}/api/assessments`)).status, 200);
   } finally { await srv.close(); rmSync(runsDir, { recursive: true, force: true }); }
 });
+
+function rawRequest(port: number, headers: Record<string, string>): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const req = request({ host: "127.0.0.1", port, path: "/api/assessments", headers }, (res) => { res.resume(); resolve(res.statusCode!); });
+    req.on("error", reject); req.end();
+  });
+}
+
+test("wildcard binds still reject DNS-rebinding Host names", async () => {
+  const runsDir = mkdtempSync(join(tmpdir(), "verdict-wildcard-"));
+  const srv = await startServer({ runsDir, host: "0.0.0.0", allowedHosts: ["verdict.lan"] });
+  const p = srv.port;
+  try {
+    assert.equal(await rawRequest(p, { host: `evil.example:${p}`, origin: `http://evil.example:${p}`, "sec-fetch-site": "same-origin" }), 403);
+    assert.equal(await rawRequest(p, { host: `evil.example:${p}` }), 403);
+    assert.equal(await rawRequest(p, { host: `127.0.0.1:${p}` }), 200);
+    assert.equal(await rawRequest(p, { host: `localhost:${p}`, origin: `http://localhost:${p}` }), 200);
+    assert.equal(await rawRequest(p, { host: `verdict.lan:${p}`, origin: `http://verdict.lan:${p}` }), 200);
+  } finally { await srv.close(); rmSync(runsDir, { recursive: true, force: true }); }
+});

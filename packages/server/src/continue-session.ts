@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { join, relative, isAbsolute } from "node:path";
 import type { AssessmentStore } from "@veritas/core";
+import { LaunchPathError, resolveRunFile } from "./launch-paths.js";
 
 export class SessionContinuationError extends Error {
   constructor(message: string, readonly roles?: string[]) { super(message); }
@@ -10,11 +11,22 @@ export class SessionContinuationError extends Error {
 export function continueSession(
   runsDir: string, id: string, input: { cookieFile: string; handoffId?: string; role?: string },
   store: AssessmentStore, supervisor: { isRunning(id: string): boolean; resume(id: string): void },
+  /** Multi-user: the file must also lie inside a run directory the caller may access. */
+  canUseRun?: (runId: string) => boolean,
 ): { action: "injected" | "restarted" } {
-  const root = realpathSync(runsDir);
-  const file = realpathSync(input.cookieFile);
-  const rel = relative(root, file);
-  if (!rel || rel.startsWith("..") || isAbsolute(rel)) throw new SessionContinuationError("Session file must be inside the runs directory");
+  let file: string;
+  if (canUseRun) {
+    try {
+      file = resolveRunFile(input.cookieFile, { runsDir, canUseRun });
+    } catch (e) {
+      throw new SessionContinuationError(e instanceof LaunchPathError ? e.message : "Session file must be inside the runs directory");
+    }
+  } else {
+    const root = realpathSync(runsDir);
+    file = realpathSync(input.cookieFile);
+    const rel = relative(root, file);
+    if (!rel || rel.startsWith("..") || isAbsolute(rel)) throw new SessionContinuationError("Session file must be inside the runs directory");
+  }
   const capture = JSON.parse(readFileSync(file, "utf8")) as { cookies?: unknown[]; origins?: unknown[] };
   if (!(Array.isArray(capture.cookies) && capture.cookies.length) && !(Array.isArray(capture.origins) && capture.origins.length)) {
     throw new SessionContinuationError("Capture a non-empty browser session first");

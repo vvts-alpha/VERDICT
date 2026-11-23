@@ -121,8 +121,10 @@ commands:
             ingest an OpenAPI 3.x / Swagger 2.0 spec (JSON) → seed the screen inventory so the browser-free scan/logic can assess a pure-API target. --url = where the API lives (base). with --id, overlay the spec on an existing crawl (fills endpoints the UI never called). token-protected APIs: put Authorization: Bearer … in the manifest's http.headers.
   redteam --url <chat-ui-url> | --manifest <file.json>  --canary <token> [--headed] [--max-replays <n>] [--composer <sel>] [--send <sel>] [--new-chat <sel>] [--file-input <sel>] [--transcript <sel>] [--browser-path <bin>] [--no-sandbox] [--out <dir>]
             (alias: assistant) LLM/AI-assistant red-team: drive a deployed chatbot and confirm canary leaks. the canary is planted out-of-band by the operator in the system prompt / custom instructions and passed via --canary or manifest assistant.canary
-  serve   [--port <n>] [--host <h>] [--out <dir>] [--web-root <dir>] [--no-web] [--password <pw>] [--viewer-password <pw>] [--no-auth] [--no-launch]
+  serve   [--port <n>] [--host <h>] [--allowed-host <name>]... [--out <dir>] [--web-root <dir>] [--no-web] [--password <pw>] [--viewer-password <pw>] [--no-auth] [--allow-unauthenticated] [--no-launch]
             start the observability WebUI + state API/WS (default 127.0.0.1:4317. expose to LAN with --host 0.0.0.0)
+            the Host header must be localhost, a local interface IP, or a name given with --allowed-host (DNS-rebinding guard)
+            a non-loopback --host without auth is refused unless --allow-unauthenticated is given
             two roles gate the WebUI/API/WS (/login + signed cookie): operator = env VERDICT_WEB_PASSWORD / --password (full: New/Resume/Stop/mutate);
             viewer = env VERDICT_WEB_PASSWORD_VIEWER / --viewer-password (read-only). ENV preferred over args. --no-auth disables the gate
             --multi-user enables per-account auth (admin/user roles; verdict-server.db beside the runs dir) — bootstrap via 'veritas user bootstrap'
@@ -1548,6 +1550,8 @@ async function cmdServe(args: string[]): Promise<void> {
       "no-auth": { type: "boolean" },
       "no-launch": { type: "boolean" },
       "multi-user": { type: "boolean" },
+      "allowed-host": { type: "string", multiple: true },
+      "allow-unauthenticated": { type: "boolean" },
     },
   });
   const runsDir = values.out ?? RUNS_DIR_DEFAULT;
@@ -1590,6 +1594,12 @@ async function cmdServe(args: string[]): Promise<void> {
       }
     }
   }
+  const loopbackHost = /^(?:127(?:\.\d{1,3}){3}|localhost|::1|\[::1\])$/i.test(host);
+  if (!loopbackHost && !authPasswords && !usersDb && !values["allow-unauthenticated"]) {
+    console.error(`error: refusing to serve on ${host} without auth — any device on the network could control assessments and launch runs.`);
+    console.error("       set VERDICT_WEB_PASSWORD (or --password), enable --multi-user, or pass --allow-unauthenticated to accept the risk.");
+    process.exit(1);
+  }
   // Launch/stop/resume runs from the WebUI (the server spawns the CLI as a child process). --no-launch disables it.
   // Requires launching from the built CLI (dist/main.js); spawning isn't possible under tsx dev.
   const cliPath = process.argv[1] ?? "";
@@ -1602,6 +1612,7 @@ async function cmdServe(args: string[]): Promise<void> {
     runsDir,
     port,
     host,
+    ...(values["allowed-host"]?.length ? { allowedHosts: values["allowed-host"] } : {}),
     ...(webRoot ? { webRoot } : {}),
     ...(authPasswords ? { authPasswords } : {}),
     ...(usersDb ? { usersDb } : {}),

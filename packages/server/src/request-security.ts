@@ -1,5 +1,6 @@
 import { timingSafeEqual } from "node:crypto";
 import type { IncomingMessage } from "node:http";
+import { networkInterfaces } from "node:os";
 
 export const LOCAL_TOKEN_HEADER = "x-verdict-token";
 
@@ -20,15 +21,31 @@ export function validateRequestPath(req: IncomingMessage): boolean {
   }
 }
 
+const bareHost = (h: string): string => h.toLowerCase().replace(/^\[|\]$/g, "").replace(/%.*$/, "");
+
+/** Host names that address this listener. Wildcard binds accept localhost and the machine's own interface
+ *  addresses, never arbitrary names — a DNS-rebinding page always sends its own name as Host. */
+export function isAllowedHostName(hostname: string, boundHost: string, allowedHosts: readonly string[] = []): boolean {
+  const host = bareHost(hostname);
+  const bound = bareHost(boundHost);
+  if (allowedHosts.some((h) => bareHost(h) === host)) return true;
+  if (host === bound) return true;
+  const loopbackName = host === "localhost";
+  if (bound === "0.0.0.0" || bound === "::") {
+    if (loopbackName) return true;
+    return Object.values(networkInterfaces()).some((list) => (list ?? []).some((i) => bareHost(i.address) === host));
+  }
+  return loopbackName && (bound === "127.0.0.1" || bound === "::1" || bound === "localhost");
+}
+
 /** Browser requests must originate in the UI. Missing Origin remains valid for CLI clients. */
-export function isTrustedRequest(req: IncomingMessage, boundHost: string): boolean {
+export function isTrustedRequest(req: IncomingMessage, boundHost: string, allowedHosts: readonly string[] = []): boolean {
   try {
     const authority = req.headers.host;
     if (!authority || !/^[a-z0-9.:[\]-]+$/i.test(authority)) return false;
     const base = new URL(`http://${authority}`);
-    // Prevent DNS rebinding to the loopback listener. Wildcard binds retain CLI LAN hosting support.
-    if (boundHost !== "0.0.0.0" && boundHost !== "::" && base.hostname !== boundHost &&
-        !(boundHost === "127.0.0.1" && base.hostname === "localhost")) return false;
+    // Prevent DNS rebinding: the Host name must be one this listener is actually addressed by.
+    if (!isAllowedHostName(base.hostname, boundHost, allowedHosts)) return false;
     if (Number(base.port || 80) !== req.socket.localPort) return false;
     const origin = req.headers.origin;
     if (origin !== undefined && origin !== base.origin) return false;

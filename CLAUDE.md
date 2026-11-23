@@ -66,7 +66,7 @@ pnpm --filter @veritas/cli dev <command> [opts]            # tsx, src-resolved
 | `burp-scan --id <id>` | Launch a Burp Pro **active scan** via the Audit REST API → poll → import → AI re-verify High+ (no XML export). Needs `BURP_AUDIT_API`. |
 | `spec-import --spec <openapi.json> --url <base>` | Ingest an OpenAPI 3.x / Swagger 2.0 spec to seed `screen_inventory.json` for a **browser-free pure-API** scan (`--id` overlays onto an existing crawl). |
 | `assess` | **Deterministic** one-shot: crawl → label → scan → logic → report (`--login-url`/`--login-wait` for headed login). |
-| `serve` | Observability WebUI + state API/WS (default `127.0.0.1:4317`; `--host 0.0.0.0` to expose). |
+| `serve` | Observability WebUI + state API/WS (default `127.0.0.1:4317`; `--host 0.0.0.0` to expose — Host must be localhost / a local interface IP / an `--allowed-host` name; unauthenticated non-loopback serve needs `--allow-unauthenticated`). |
 | `shots --id <id>` | Backfill per-screen screenshots into an existing run (reuses its browser-profile; navigate-only). |
 | `header-audit --id <id>` | Deterministic Info-level header checks (`--headers csp,hsts,…`). Toggle = run it or not. |
 | `burp-import --id <id> --report <xml>` | Parse a Burp Pro XML report, merge **net-new** issues (deduped vs agent findings). |
