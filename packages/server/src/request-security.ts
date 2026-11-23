@@ -21,7 +21,15 @@ export function validateRequestPath(req: IncomingMessage): boolean {
   }
 }
 
-const bareHost = (h: string): string => h.toLowerCase().replace(/^\[|\]$/g, "").replace(/%.*$/, "");
+/** Canonical host spelling (URL-normalized: lowercased, IPv6 compressed, brackets and zone id dropped). */
+const bareHost = (h: string): string => {
+  const raw = h.trim().replace(/^\[|\]$/g, "").replace(/%.*$/, "");
+  try {
+    return new URL(`http://${raw.includes(":") ? `[${raw}]` : raw}`).hostname.replace(/^\[|\]$/g, "");
+  } catch {
+    return raw.toLowerCase();
+  }
+};
 
 /** Host names that address this listener. Wildcard binds accept localhost and the machine's own interface
  *  addresses, never arbitrary names — a DNS-rebinding page always sends its own name as Host. */

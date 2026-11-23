@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { WebSocket } from "ws";
 import { AssessmentStore, deriveScopeFromSingleUrl } from "@veritas/core";
 import { startServer } from "./server.js";
+import { isAllowedHostName } from "./request-security.js";
 
 function wsResult(url: string, headers: Record<string, string>): Promise<boolean> {
   return new Promise((resolve) => {
@@ -95,4 +96,10 @@ test("wildcard binds still reject DNS-rebinding Host names", async () => {
     assert.equal(await rawRequest(p, { host: `localhost:${p}`, origin: `http://localhost:${p}` }), 200);
     assert.equal(await rawRequest(p, { host: `verdict.lan:${p}`, origin: `http://verdict.lan:${p}` }), 200);
   } finally { await srv.close(); rmSync(runsDir, { recursive: true, force: true }); }
+});
+
+test("Host allowlist compares canonical addresses", () => {
+  assert.equal(isAllowedHostName("[::1]", "127.0.0.1", ["0:0:0:0:0:0:0:1"]), true);
+  assert.equal(isAllowedHostName("VERDICT.lan", "0.0.0.0", ["verdict.LAN"]), true);
+  assert.equal(isAllowedHostName("evil.example", "0.0.0.0", ["verdict.lan"]), false);
 });
